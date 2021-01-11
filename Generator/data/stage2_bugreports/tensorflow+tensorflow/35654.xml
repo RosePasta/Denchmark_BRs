@@ -1,0 +1,296 @@
+<bug id='35654' author='ywu94' open_date='2020-01-08T01:54:04Z' closed_time='2020-01-09T02:47:56Z'>
+	<summary>LSTM &amp; LSTMCell with dropout are not working in Subclassed Keras Model.</summary>
+	<description>
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow):Yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): macOS Mojave, no GPU
+TensorFlow installed from (source or binary):pip
+TensorFlow version (use command below):2.0.0
+Python version:3.7
+
+Describe the current behavior
+LSTM with dropout are not working in customized keras model. If the dropout is set to 0 the codes work.
+Code to reproduce the issue
+Provide a reproducible test case that is the bare minimum necessary to generate the problem.
+&lt;denchmark-code&gt;import tensorflow as tf
+from tensorflow.keras.layers import *
+import numpy
+
+assert tf.__version__=="2.0.0", f"Expect TF-2.0.0 but get {tf.__version__}"
+
+class multiplicative_attention_model(tf.keras.Model):
+	"""
+	A Tensorflow 2.0 implementation of encoder-decoder attention model as illustrated in Effective Approaches to Attention-based Neural Machine Translation.
+	The following types of attentions are implemented:
+	• Global attention with dot alignment
+	• Local attention with monotonic alignment
+	
+	# Arguments:
+
+		attn_mode: `global` or `local`
+		input_shape: shape of input data, should be a two-dimensional tuple (batch, n_step)
+		input_vocab_size: size of input vocabulary size excluding &lt;EOS&gt;
+		output_vocab_size: size of output vocabulary size excluding &lt;EOS&gt;
+		input_embed_dim: word embedding dimension for input
+		hidden_state_dim: hidden state dimension for encoder and decoder LSTM
+		local_attn_window: the context vector will be extracted from window [current_position ± local_attn_window]
+		name: name of the model
+
+	# Paper:
+
+		https://www-nlp.stanford.edu/pubs/emnlp15_attn.pdf
+
+	# Examples
+
+	```python
+		# Expected shape for input data and output data
+		attn_mode = "global"
+		input_shape = (None,40)
+		input_vocab_size = 200
+		output_vocab_size = 300
+
+		# Initialize Model
+		model = multiplicative_attention_model(attn_mode, input_shape, input_vocab_size, output_vocab_size)
+
+		# Compile Model
+		learning_rate = 1e-3
+		model.compile(loss=tf.keras.losses.sparse_categorical_crossentropy,
+					  optimizer=tf.keras.optimizers.Adam(learning_rate),
+					  metrics=[tf.keras.metrics.sparse_categorical_accuracy]
+					  )
+
+		# Call Model once to build the model
+		_ = model(tf.ones(shape=(1,40)))
+
+		# Take a look at model
+		model.summary()
+	```
+	"""
+	def __init__(self, attn_mode, input_shape, input_vocab_size, output_vocab_size, name="Multiplicative-Attention", input_embed_dim=200, hidden_state_dim=200, local_attn_window=None, **kwargs):
+		super(multiplicative_attention_model, self).__init__(name=name, **kwargs)
+
+		# Expect attention model to be either global or local
+		assert attn_mode == "global" or attn_mode == "local", f"Expect 'global' or 'local' for attn_mode, get {attn_mode} instead"
+		self.attn_mode = attn_mode
+
+		# Expect input shape to be two-dimensional
+		assert isinstance(input_shape, tuple), "Expect tuple for input_shape, get {type(input_shape)} instead"
+		assert len(input_shape) == 2, "Expect 2-dim tuple for input_shape, get {len(input_shape)}-dim instead"
+		_, self._n_step = input_shape
+
+		# Embedding layer for input
+		self._embedding_layer = Embedding(input_dim=input_vocab_size+1, output_dim=input_embed_dim, input_length=self._n_step)
+
+		# LSTM encoder
+		self._lstm_encoder_layer_1 = LSTM(units=hidden_state_dim, dropout=0.2, recurrent_dropout=0.2, activation="tanh", recurrent_activation="sigmoid", use_bias=True, return_sequences=True, return_state=True)
+		self._lstm_encoder_layer_2 = LSTM(units=hidden_state_dim, dropout=0.2, recurrent_dropout=0.2, activation="tanh", recurrent_activation="sigmoid", use_bias=True, return_sequences=True, return_state=True)
+
+		# LSTM decoder
+		self._lstm_decoder_cell_1 = LSTMCell(units=hidden_state_dim, dropout=0.2, recurrent_dropout=0.2, activation="tanh", recurrent_activation="sigmoid", use_bias=True)
+		self._lstm_decoder_cell_2 = LSTMCell(units=hidden_state_dim, dropout=0.2, recurrent_dropout=0.2, activation="tanh", recurrent_activation="sigmoid", use_bias=True)
+		self._decoder_state_array = tf.TensorArray(dtype=tf.float32, size=self._n_step, clear_after_read=True)
+
+		# Attention utility
+		if self.attn_mode == "global":
+			pass
+		if self.attn_mode == "local":
+			assert isinstance(local_attn_window, int), f"Expect integer for local_attn_window, get {type(local_attn_window)} instead"
+			assert local_attn_window &gt; 0, "Expect positive value for local_attn_window"
+			self.D = local_attn_window
+
+		# Utility layer
+		self._concat_layer = Concatenate()
+
+		# Output layer
+		self._ffnn_decoder_sequence_layer = TimeDistributed(Dense(output_vocab_size+1))
+	
+	def call(self, inputs, training=False):
+		# Embedding
+		inputs_embed = self._embedding_layer(inputs)
+
+		# Encoder
+		encoder_1_sequence, encoder_1_hidden_state, encoder_1_cell_state = self._lstm_encoder_layer_1(inputs=inputs_embed, training=training)
+		encoder_2_sequence, encoder_2_hidden_state, encoder_2_cell_state = self._lstm_encoder_layer_2(inputs=encoder_1_sequence, initial_state=[encoder_1_hidden_state, encoder_1_cell_state], training=training)
+		decoder_1_input = tf.transpose(encoder_2_sequence, [1, 0, 2])
+		decoder_1_states = [encoder_1_hidden_state, encoder_1_cell_state]
+		decoder_2_states = [encoder_2_hidden_state, encoder_2_cell_state]
+
+		# Decoder
+		for step in range(self._n_step):
+			decoder_1_hidden_state, decoder_1_states = self._lstm_decoder_cell_1(inputs=decoder_1_input[step],states=decoder_1_states, training=training)
+			decoder_2_hidden_state, decoder_2_states = self._lstm_decoder_cell_2(inputs=decoder_1_hidden_state, states=decoder_2_states, training=training)
+			if self.attn_mode == "global":
+				attention_score = tf.nn.softmax(tf.einsum("ijk,ik-&gt;ij", encoder_2_sequence, decoder_2_hidden_state))
+				context_vector = tf.einsum("ijk,ij-&gt;ik", encoder_2_sequence, attention_score)
+			if self.attn_mode == "local":
+				lb, ub = max(0, step-self.D), min(self._n_step-1,step+self.D)
+				encoder_2_sequence_part = encoder_2_sequence[:,lb:ub+1,:]
+				attention_score = tf.nn.softmax(tf.einsum("ijk,ik-&gt;ij", encoder_2_sequence_part, decoder_2_hidden_state))
+				context_vector = tf.einsum("ijk,ij-&gt;ik", encoder_2_sequence_part, attention_score)
+			output_vector = self._concat_layer([decoder_2_hidden_state, context_vector])
+			self._decoder_state_array = self._decoder_state_array.write(step,output_vector)
+		decoder_sequence = tf.transpose(self._decoder_state_array.stack(), [1, 0, 2])
+
+		# Softmax outputs
+		outputs = tf.nn.softmax(self._ffnn_decoder_sequence_layer(decoder_sequence))
+		return outputs
+
+attn_mode = "local"
+input_shape = (None,20)
+input_vocab_size = 200
+output_vocab_size = 300
+
+# Initialize Model
+model = multiplicative_attention_model(attn_mode, input_shape, input_vocab_size, output_vocab_size, local_attn_window=4)
+
+# Compile Model
+learning_rate = 1e-2
+model.compile(loss=tf.keras.losses.sparse_categorical_crossentropy,
+              optimizer=tf.keras.optimizers.Adam(learning_rate),
+              metrics=[tf.keras.metrics.sparse_categorical_accuracy]
+              )
+
+x = tf.constant(np.random.choice(range(201),size=(10000,20)))
+y = tf.constant(np.random.choice(range(301),size=(10000,20)))
+
+model.fit(x,y,batch_size=1024)
+&lt;/denchmark-code&gt;
+
+Other info / logs
+Include any logs or source code that would be helpful to diagnose the problem. If including tracebacks, please include the full traceback. Large logs and files should be attached.
+&lt;denchmark-code&gt;---------------------------------------------------------------------------
+TypeError                                 Traceback (most recent call last)
+~/.virtualenvs/python3env/lib/python3.7/site-packages/tensorflow_core/python/eager/execute.py in quick_execute(op_name, num_outputs, inputs, attrs, ctx, name)
+     60                                                op_name, inputs, attrs,
+---&gt; 61                                                num_outputs)
+     62   except core._NotOkStatusException as e:
+
+TypeError: An op outside of the function building code is being passed
+a "Graph" tensor. It is possible to have Graph tensors
+leak out of the function building context by including a
+tf.init_scope in your function building code.
+For example, the following function will fail:
+  @tf.function
+  def has_init_scope():
+    my_constant = tf.constant(1.)
+    with tf.init_scope():
+      added = my_constant * 2
+The graph tensor has name: Multiplicative-Attention_6/lstm_cell_34/cond/Identity:0
+
+During handling of the above exception, another exception occurred:
+
+_SymbolicException                        Traceback (most recent call last)
+&lt;ipython-input-31-fab8afc8ed12&gt; in &lt;module&gt;
+----&gt; 1 model.fit(x,y,batch_size=64)
+
+~/.virtualenvs/python3env/lib/python3.7/site-packages/tensorflow_core/python/keras/engine/training.py in fit(self, x, y, batch_size, epochs, verbose, callbacks, validation_split, validation_data, shuffle, class_weight, sample_weight, initial_epoch, steps_per_epoch, validation_steps, validation_freq, max_queue_size, workers, use_multiprocessing, **kwargs)
+    726         max_queue_size=max_queue_size,
+    727         workers=workers,
+--&gt; 728         use_multiprocessing=use_multiprocessing)
+    729 
+    730   def evaluate(self,
+
+~/.virtualenvs/python3env/lib/python3.7/site-packages/tensorflow_core/python/keras/engine/training_v2.py in fit(self, model, x, y, batch_size, epochs, verbose, callbacks, validation_split, validation_data, shuffle, class_weight, sample_weight, initial_epoch, steps_per_epoch, validation_steps, validation_freq, **kwargs)
+    322                 mode=ModeKeys.TRAIN,
+    323                 training_context=training_context,
+--&gt; 324                 total_epochs=epochs)
+    325             cbks.make_logs(model, epoch_logs, training_result, ModeKeys.TRAIN)
+    326 
+
+~/.virtualenvs/python3env/lib/python3.7/site-packages/tensorflow_core/python/keras/engine/training_v2.py in run_one_epoch(model, iterator, execution_function, dataset_size, batch_size, strategy, steps_per_epoch, num_samples, mode, training_context, total_epochs)
+    121         step=step, mode=mode, size=current_batch_size) as batch_logs:
+    122       try:
+--&gt; 123         batch_outs = execution_function(iterator)
+    124       except (StopIteration, errors.OutOfRangeError):
+    125         # TODO(kaftan): File bug about tf function and errors.OutOfRangeError?
+
+~/.virtualenvs/python3env/lib/python3.7/site-packages/tensorflow_core/python/keras/engine/training_v2_utils.py in execution_function(input_fn)
+     84     # `numpy` translates Tensors to values in Eager mode.
+     85     return nest.map_structure(_non_none_constant_value,
+---&gt; 86                               distributed_function(input_fn))
+     87 
+     88   return execution_function
+
+~/.virtualenvs/python3env/lib/python3.7/site-packages/tensorflow_core/python/eager/def_function.py in __call__(self, *args, **kwds)
+    455 
+    456     tracing_count = self._get_tracing_count()
+--&gt; 457     result = self._call(*args, **kwds)
+    458     if tracing_count == self._get_tracing_count():
+    459       self._call_counter.called_without_tracing()
+
+~/.virtualenvs/python3env/lib/python3.7/site-packages/tensorflow_core/python/eager/def_function.py in _call(self, *args, **kwds)
+    518         # Lifting succeeded, so variables are initialized and we can run the
+    519         # stateless function.
+--&gt; 520         return self._stateless_fn(*args, **kwds)
+    521     else:
+    522       canon_args, canon_kwds = \
+
+~/.virtualenvs/python3env/lib/python3.7/site-packages/tensorflow_core/python/eager/function.py in __call__(self, *args, **kwargs)
+   1821     """Calls a graph function specialized to the inputs."""
+   1822     graph_function, args, kwargs = self._maybe_define_function(args, kwargs)
+-&gt; 1823     return graph_function._filtered_call(args, kwargs)  # pylint: disable=protected-access
+   1824 
+   1825   @property
+
+~/.virtualenvs/python3env/lib/python3.7/site-packages/tensorflow_core/python/eager/function.py in _filtered_call(self, args, kwargs)
+   1139          if isinstance(t, (ops.Tensor,
+   1140                            resource_variable_ops.BaseResourceVariable))),
+-&gt; 1141         self.captured_inputs)
+   1142 
+   1143   def _call_flat(self, args, captured_inputs, cancellation_manager=None):
+
+~/.virtualenvs/python3env/lib/python3.7/site-packages/tensorflow_core/python/eager/function.py in _call_flat(self, args, captured_inputs, cancellation_manager)
+   1222     if executing_eagerly:
+   1223       flat_outputs = forward_function.call(
+-&gt; 1224           ctx, args, cancellation_manager=cancellation_manager)
+   1225     else:
+   1226       gradient_name = self._delayed_rewrite_functions.register()
+
+~/.virtualenvs/python3env/lib/python3.7/site-packages/tensorflow_core/python/eager/function.py in call(self, ctx, args, cancellation_manager)
+    509               inputs=args,
+    510               attrs=("executor_type", executor_type, "config_proto", config),
+--&gt; 511               ctx=ctx)
+    512         else:
+    513           outputs = execute.execute_with_cancellation(
+
+~/.virtualenvs/python3env/lib/python3.7/site-packages/tensorflow_core/python/eager/execute.py in quick_execute(op_name, num_outputs, inputs, attrs, ctx, name)
+     73       raise core._SymbolicException(
+     74           "Inputs to eager execution function cannot be Keras symbolic "
+---&gt; 75           "tensors, but found {}".format(keras_symbolic_tensors))
+     76     raise e
+     77   # pylint: enable=protected-access
+
+_SymbolicException: Inputs to eager execution function cannot be Keras symbolic tensors, but found [&lt;tf.Tensor 'Multiplicative-Attention_6/lstm_cell_34/cond/Identity:0' shape=(None, 200) dtype=float32&gt;, &lt;tf.Tensor 'Multiplicative-Attention_6/lstm_cell_34/cond_4/Identity:0' shape=(None, 200) dtype=float32&gt;, &lt;tf.Tensor 'Multiplicative-Attention_6/lstm_cell_35/cond/Identity:0' shape=(None, 200) dtype=float32&gt;, &lt;tf.Tensor 'Multiplicative-Attention_6/lstm_cell_35/cond_4/Identity:0' shape=(None, 200) dtype=float32&gt;]
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='ywu94' date='2020-01-08T03:05:00Z'>
+		Issue replicating for TF-2.0.0-kindly find the &lt;denchmark-link:https://colab.sandbox.google.com/gist/oanush/b38d04d7bc3da967c0c8d89e318e225a/35654.ipynb&gt;gist&lt;/denchmark-link&gt;
+ of colab.Thanks!
+		</comment>
+		<comment id='2' author='ywu94' date='2020-01-09T02:47:56Z'>
+		Thanks for reporting the issue.
+The problem happens when you use LSTMCell with dropouts. In tf2, LSTMcell cached the dropout mask to achieve the variational dropout for better accuracy. On the other hand, the cached dropout mask need to be reset for every batch, otherwise the following batch will try to use a mask from previous batch. We do the reset in the LSTM layer for user, but if you use the LSTMcell, then you have to reset them manually in the code. eg
+&lt;denchmark-code&gt;# Decoder
+self._lstm_decoder_cell_1.reset_dropout_mask()
+self._lstm_decoder_cell_1.reset_recurrent_dropout_mask()
+self._lstm_decoder_cell_2.reset_dropout_mask()
+self._lstm_decoder_cell_2.reset_recurrent_dropout_mask()
+
+for step in range(self._n_step):
+    .....
+&lt;/denchmark-code&gt;
+
+Then you code should run without issue.
+		</comment>
+		<comment id='3' author='ywu94' date='2020-01-09T02:47:58Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/35654&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/35654&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

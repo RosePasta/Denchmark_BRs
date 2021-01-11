@@ -1,0 +1,356 @@
+<bug id='7678' author='peterzhang2029' open_date='2018-01-19T03:09:56Z' closed_time='2018-08-15T10:39:23Z'>
+	<summary>Fluid实现RNN机器翻译时，出现由于部分层的输出后面没有被用到而产生的悬挂问题</summary>
+	<description>
+配置如下：
+def lstm_step(x_t, hidden_t_prev, cell_t_prev, size):
+    def linear(inputs):
+        return fluid.layers.fc(input=inputs, size=size, bias_attr=True)
+
+    forget_gate = fluid.layers.sigmoid(x=linear([hidden_t_prev, x_t]))
+    input_gate = fluid.layers.sigmoid(x=linear([hidden_t_prev, x_t]))
+    output_gate = fluid.layers.sigmoid(x=linear([hidden_t_prev, x_t]))
+    cell_tilde = fluid.layers.tanh(x=linear([hidden_t_prev, x_t]))
+
+    cell_t = fluid.layers.sums(input=[
+        fluid.layers.elementwise_mul(
+            x=forget_gate, y=cell_t_prev), fluid.layers.elementwise_mul(
+                x=input_gate, y=cell_tilde)
+    ])
+
+    hidden_t = fluid.layers.elementwise_mul(
+        x=output_gate, y=fluid.layers.tanh(x=cell_t))
+
+    return hidden_t, cell_t
+
+
+def seq_to_seq_net(embedding_dim, encoder_size, decoder_size, source_dict_dim,
+                   target_dict_dim, is_generating, beam_size, max_length):
+    """Construct a seq2seq network."""
+
+    def bi_lstm_encoder(input_seq, gate_size):
+        # Linear transformation part for input gate, output gate, forget gate
+        # and cell activation vectors need be done outside of dynamic_lstm.
+        # So the output size is 4 times of gate_size.
+        input_forward_proj = fluid.layers.fc(input=input_seq,
+                                             size=gate_size * 4,
+                                             act='tanh',
+                                             bias_attr=True)
+        forward, _ = fluid.layers.dynamic_lstm(
+            input=input_forward_proj, size=gate_size * 4, use_peepholes=False)
+        input_reversed_proj = fluid.layers.fc(input=input_seq,
+                                              size=gate_size * 4,
+                                              act='tanh',
+                                              bias_attr=True)
+        reversed, _ = fluid.layers.dynamic_lstm(
+            input=input_reversed_proj,
+            size=gate_size * 4,
+            is_reverse=True,
+            use_peepholes=False)
+        return forward, reversed
+
+    src_word_idx = fluid.layers.data(
+        name='source_sequence', shape=[1], dtype='int64', lod_level=1)
+
+    src_embedding = fluid.layers.embedding(
+        input=src_word_idx,
+        size=[source_dict_dim, embedding_dim],
+        dtype='float32')
+
+    src_forward, src_reversed = bi_lstm_encoder(
+        input_seq=src_embedding, gate_size=encoder_size)
+
+    encoded_vector = fluid.layers.concat(
+        input=[src_forward, src_reversed], axis=1)
+    '''
+    encoded_proj = fluid.layers.fc(input=encoded_vector,
+                                   size=decoder_size,
+                                   bias_attr=False)
+    '''
+    context = fluid.layers.sequence_pool(
+        input=encoded_vector, pool_type='last')
+
+    backward_first = fluid.layers.sequence_pool(
+        input=src_reversed, pool_type='first')
+    
+    decoder_boot = fluid.layers.fc(input=backward_first,
+                                   size=decoder_size,
+                                   bias_attr=False,
+                                   act='tanh')
+
+    def lstm_decoder_with_attention(target_embedding, decoder_boot, context, decoder_size):
+        
+        rnn = fluid.layers.DynamicRNN()
+
+        cell_init = fluid.layers.fill_constant_batch_size_like(
+            input=decoder_boot,
+            value=0.0,
+            shape=[-1, decoder_size],
+            dtype='float32')
+        cell_init.stop_gradient = False
+
+        with rnn.block():
+            current_word = rnn.step_input(target_embedding)
+            context = rnn.static_input(context)
+            
+            hidden_mem = rnn.memory(init=decoder_boot, need_reorder=True)
+            cell_mem = rnn.memory(init=cell_init)
+            decoder_inputs = fluid.layers.concat(
+                input=[context, current_word], axis=1)
+            h, c = lstm_step(decoder_inputs, hidden_mem, cell_mem, decoder_size)
+            rnn.update_memory(hidden_mem, h)
+            rnn.update_memory(cell_mem, c)
+            out = fluid.layers.fc(input=h,
+                                  size=target_dict_dim,
+                                  bias_attr=True,
+                                  act='softmax')
+            rnn.output(out)
+        return rnn()
+
+    if not is_generating:
+        trg_word_idx = fluid.layers.data(
+            name='target_sequence', shape=[1], dtype='int64', lod_level=1)
+
+        trg_embedding = fluid.layers.embedding(
+            input=trg_word_idx,
+            size=[target_dict_dim, embedding_dim],
+            dtype='float32')
+
+        prediction = lstm_decoder_with_attention(trg_embedding,
+                                                 decoder_boot,
+                                                 context,
+                                                 decoder_size)
+        label = fluid.layers.data(
+            name='label_sequence', shape=[1], dtype='int64', lod_level=1)
+        cost = fluid.layers.cross_entropy(input=prediction, label=label)
+        avg_cost = fluid.layers.mean(x=cost)
+
+        feeding_list = ["source_sequence", "target_sequence", "label_sequence"]
+
+        return avg_cost, feeding_list
+当上面去掉上面语句的注释时：
+    encoded_proj = fluid.layers.fc(input=encoded_vector,
+                                   size=decoder_size,
+                                   bias_attr=False)
+会报错：
+&lt;denchmark-code&gt;Traceback (most recent call last):
+  File "nmt.py", line 316, in &lt;module&gt;
+    train()
+  File "nmt.py", line 239, in train
+    optimizer.minimize(avg_cost)
+  File "/home/zhangchao/.jumbo/lib/python2.7/site-packages/paddle/v2/fluid/optimizer.py", line 214, in minimize
+    error_clip_callback)
+  File "/home/zhangchao/.jumbo/lib/python2.7/site-packages/paddle/v2/fluid/backward.py", line 401, in append_backward
+    raise ValueError("param %s is not in map" % param)
+ValueError: param fc_2.w_0 is not in map
+&lt;/denchmark-code&gt;
+
+encoded_proj 变量后面并没有被用到，如果将这句注释掉，程序是可以正确运行的。如果出现了这类悬挂变量，程序也应该是正常运行才对吧。
+	</description>
+	<comments>
+		<comment id='1' author='peterzhang2029' date='2018-01-25T08:04:48Z'>
+		简化了一下模型，共两个文件train.py和network_conf.py：
+其中 network_conf.py:
+&lt;denchmark-code&gt;import paddle.v2.fluid as fluid
+
+
+def lstm_step(x_t, hidden_t_prev, cell_t_prev, size):
+    def linear(inputs):
+        return fluid.layers.fc(input=inputs, size=size, bias_attr=True)
+
+    forget_gate = fluid.layers.sigmoid(x=linear([hidden_t_prev, x_t]))
+    input_gate = fluid.layers.sigmoid(x=linear([hidden_t_prev, x_t]))
+    output_gate = fluid.layers.sigmoid(x=linear([hidden_t_prev, x_t]))
+    cell_tilde = fluid.layers.tanh(x=linear([hidden_t_prev, x_t]))
+
+    cell_t = fluid.layers.sums(input=[
+        fluid.layers.elementwise_mul(
+            x=forget_gate, y=cell_t_prev), fluid.layers.elementwise_mul(
+                x=input_gate, y=cell_tilde)
+    ])
+
+    hidden_t = fluid.layers.elementwise_mul(
+        x=output_gate, y=fluid.layers.tanh(x=cell_t))
+
+    return hidden_t, cell_t
+
+
+def seq_to_seq_net(embedding_dim, encoder_size, decoder_size, source_dict_dim,
+                   target_dict_dim):
+    
+    src_word_idx = fluid.layers.data(
+        name='source_sequence', shape=[1], dtype='int64', lod_level=1)
+
+    encoded_vector = fluid.layers.embedding(
+        input=src_word_idx,
+        size=[source_dict_dim, embedding_dim],
+        dtype='float32')
+    
+    ''' 去掉注释会报 param fc_0.w_0 is not in map
+    encoded_proj = fluid.layers.fc(input=encoded_vector,
+                                   size=decoder_size,
+                                   bias_attr=False)
+    '''
+    
+    encoded_last = fluid.layers.sequence_pool(
+        input=encoded_vector, pool_type='last')
+
+    decoder_boot = fluid.layers.fc(input=encoded_last,
+                                   size=decoder_size,
+                                   bias_attr=False,
+                                   act='tanh')
+
+    def lstm_decoder_without_attention(target_embedding, decoder_boot, decoder_size):
+        
+        rnn = fluid.layers.DynamicRNN()
+
+        cell_init = fluid.layers.fill_constant_batch_size_like(
+            input=decoder_boot,
+            value=0.0,
+            shape=[-1, decoder_size],
+            dtype='float32')
+        cell_init.stop_gradient = False
+
+        with rnn.block():
+            current_word = rnn.step_input(target_embedding)
+            
+            hidden_mem = rnn.memory(init=decoder_boot, need_reorder=True)
+            cell_mem = rnn.memory(init=cell_init)
+            
+            h, c = lstm_step(current_word, hidden_mem, cell_mem, decoder_size)
+            rnn.update_memory(hidden_mem, h)
+            rnn.update_memory(cell_mem, c)
+            out = fluid.layers.fc(input=h,
+                                  size=target_dict_dim,
+                                  bias_attr=True,
+                                  act='softmax')
+            rnn.output(out)
+        return rnn()
+
+    trg_word_idx = fluid.layers.data(
+        name='target_sequence', shape=[1], dtype='int64', lod_level=1)
+
+    trg_embedding = fluid.layers.embedding(
+        input=trg_word_idx,
+        size=[target_dict_dim, embedding_dim],
+        dtype='float32')
+
+    prediction = lstm_decoder_without_attention(trg_embedding,
+                                             decoder_boot,
+                                             decoder_size)
+    label = fluid.layers.data(
+        name='label_sequence', shape=[1], dtype='int64', lod_level=1)
+    cost = fluid.layers.cross_entropy(input=prediction, label=label)
+    avg_cost = fluid.layers.mean(x=cost)
+
+    feeding_list = ["source_sequence", "target_sequence", "label_sequence"]
+
+    return avg_cost, feeding_list
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='2' author='peterzhang2029' date='2018-01-25T08:06:22Z'>
+		train.py为：
+&lt;denchmark-code&gt;"""seq2seq model for fluid."""
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
+import numpy as np
+import time
+
+import paddle.v2 as paddle
+import paddle.v2.fluid as fluid
+import paddle.v2.fluid.core as core
+import paddle.v2.fluid.framework as framework
+from paddle.v2.fluid.executor import Executor
+
+from network_conf import seq_to_seq_net
+
+def to_lodtensor(data, place):
+    seq_lens = [len(seq) for seq in data]
+    cur_len = 0
+    lod = [cur_len]
+    for l in seq_lens:
+        cur_len += l
+        lod.append(cur_len)
+    flattened_data = np.concatenate(data, axis=0).astype("int64")
+    flattened_data = flattened_data.reshape([len(flattened_data), 1])
+    lod_t = core.LoDTensor()
+    lod_t.set(flattened_data, place)
+    lod_t.set_lod([lod])
+    return lod_t, lod[-1]
+
+
+def lodtensor_to_ndarray(lod_tensor):
+    dims = lod_tensor.get_dims()
+    ndarray = np.zeros(shape=dims).astype('float32')
+    for i in xrange(np.product(dims)):
+        ndarray.ravel()[i] = lod_tensor.get_float_element(i)
+    return ndarray
+
+embedding_dim = encoder_size = decoder_size = 512
+dict_size = 30000
+learning_rate = 0.0002
+batch_size = 32
+use_gpu = True
+pass_num = 1
+
+def train():
+    avg_cost, feeding_list = seq_to_seq_net(
+        embedding_dim,
+        encoder_size,
+        decoder_size,
+        dict_size,
+        dict_size)
+
+    # clone from default main program
+    optimizer = fluid.optimizer.Adam(learning_rate=learning_rate)
+    optimizer.minimize(avg_cost)
+
+    train_batch_generator = paddle.batch(
+        paddle.reader.shuffle(
+            paddle.dataset.wmt14.train(dict_size), buf_size=1000),
+        batch_size=batch_size)
+
+    place = core.CUDAPlace(0) if use_gpu else core.CPUPlace()
+    exe = Executor(place)
+    exe.run(framework.default_startup_program())
+
+    for pass_id in xrange(pass_num):
+        pass_start_time = time.time()
+        words_seen = 0
+        for batch_id, data in enumerate(train_batch_generator()):
+            src_seq, word_num = to_lodtensor(map(lambda x: x[0], data), place)
+            words_seen += word_num
+            trg_seq, word_num = to_lodtensor(map(lambda x: x[1], data), place)
+            words_seen += word_num
+            lbl_seq, _ = to_lodtensor(map(lambda x: x[2], data), place)
+
+            fetch_outs = exe.run(framework.default_main_program(),
+                                 feed={
+                                     feeding_list[0]: src_seq,
+                                     feeding_list[1]: trg_seq,
+                                     feeding_list[2]: lbl_seq
+                                 },
+                                 fetch_list=[avg_cost])
+
+            avg_cost_val = np.array(fetch_outs[0])
+            print('pass_id=%d, batch_id=%d, train_loss: %f' %
+                  (pass_id, batch_id, avg_cost_val))
+
+        pass_end_time = time.time()
+        time_consumed = pass_end_time - pass_start_time
+        words_per_sec = words_seen / time_consumed
+        print("pass_id=%d, words/s: %f, sec/pass: %f" %
+              (pass_id, words_per_sec, time_consumed))
+
+
+if __name__ == '__main__':
+    train()
+
+&lt;/denchmark-code&gt;
+
+将两个文件放在同意目录下 运行 python train.py即可执行， 默认使用GPU。
+		</comment>
+	</comments>
+</bug>

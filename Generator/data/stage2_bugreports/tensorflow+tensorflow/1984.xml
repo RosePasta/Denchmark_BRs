@@ -1,0 +1,163 @@
+<bug id='1984' author='lahwran' open_date='2016-04-16T16:59:48Z' closed_time='2020-01-24T21:28:52Z'>
+	<summary>Unclear what parallel_iterations does in While/scan (docs issue, possible functional_ops issue)</summary>
+	<description>
+It's unclear from both the code and documentation why scan() defaults to 10 parallel iterations. doesn't that cause it to sometimes run the function before the accumulated value is available? I also poked around and read the documentation for While, and that didn't clear things up. Things it looks like it might do:
+
+Run steps in parallel if and only if there are no graph dependencies on the last step
+Run steps in parallel but provide nonsense values for graph dependencies on the last step
+Ignore it because the parameter doesn't do anything yet?
+Do magic beyond my ken to skip ahead in serial computations? if so, can I tell it to only run the last one, thereby creating a halting oracle?
+
+&lt;denchmark-h:h3&gt;Steps to reproduce&lt;/denchmark-h&gt;
+
+
+read the docs in master for scan() and while()
+read the code for functional_ops.scan()
+compare to the code for functional_ops.map_fn()
+be confused that scan() appears to get the right answer when you use it
+
+	</description>
+	<comments>
+		<comment id='1' author='lahwran' date='2016-04-18T04:54:17Z'>
+		scan is defined in terms of while_loop.  So I will try to answer your question using while_loop.
+while_loop implements non-strict semantics.  An iteration can start as soon as one of the ops for this iteration is ready (i.e., all its inputs are available.) for execution.  So a while_loop can easily have multiple iterations running in parallel.  For example, for scan, even if the accumulated value is not available in a step, the step can still start and execute any ops that don't depend on the accumulated value. One problem to allow multiple iterations to run in parallel is resource management. parallel_iterations is introduced to give users some control of memory consumption and execution order.
+For correct programs, a while_loop should compute the same value for any value of parallel_iterations &gt;= 1.
+		</comment>
+		<comment id='2' author='lahwran' date='2016-04-18T04:56:13Z'>
+		&lt;denchmark-link:https://github.com/yuanbyu&gt;@yuanbyu&lt;/denchmark-link&gt;
+: can you document this somewhere in control_flow_ops.py ?
+		</comment>
+		<comment id='3' author='lahwran' date='2016-04-18T05:22:56Z'>
+		I will. But let us first see if it clears up the question(s) by lahwran@.
+		</comment>
+		<comment id='4' author='lahwran' date='2016-04-18T12:23:29Z'>
+		It does, and that's an impressively more fine-grained parallelism implementation than I expected. Cool!
+		</comment>
+		<comment id='5' author='lahwran' date='2016-04-20T18:24:44Z'>
+		Thanks. Added some more documentations.
+		</comment>
+		<comment id='6' author='lahwran' date='2018-01-23T08:27:58Z'>
+		&lt;denchmark-link:https://github.com/yuanbyu&gt;@yuanbyu&lt;/denchmark-link&gt;
+ I believe your comment should be directly put into the documentation. Specifically, the following should be added:
+
+while_loop implements non-strict semantics. An iteration can start as soon as one of the ops for this iteration is ready (i.e., all its inputs are available.) for execution. So a while_loop can easily have multiple iterations running in parallel.
+
+However, I think you meant to say "(i.e., NOT all its inputs are available.)".
+Also, it would be useful to know if these semantics depend on the order of the inputs or not.  For instance, suppose we want to run some function f(x) 10 times. If the argument order is important for  non-strict semantics, then the first example cannot run in parallel because the iteration counter is holding everything up, while the second version should indeed run in parallel:
+&lt;denchmark-code&gt;i = tf.constant(0) 
+x = ... 
+cond1 = lambda i, x: tf.less(i, 10) 
+def body1(i, x):
+       y = f(x)
+       return i+1, y  
+tf.while_loop(cond1, body1, [i, x])
+
+cond2 = lambda x,i: tf.less(i, 10) 
+def body2(x,i):
+       y = f(x)
+       return y, i+1
+tf.while_loop(cond2, body2, [x,i])
+
+&lt;/denchmark-code&gt;
+
+In any event, I feel that such a discussion should definitely be included in the docs since there is no real discussion around the canonical "for loop" implementation that is provided:
+
+python i = tf.constant(0) c = lambda i: tf.less(i, 10) b = lambda i: tf.add(i, 1) r = tf.while_loop(c, b, [i])
+
+		</comment>
+		<comment id='7' author='lahwran' date='2018-01-24T19:17:17Z'>
+		&lt;denchmark-link:https://github.com/mholzel&gt;@mholzel&lt;/denchmark-link&gt;
+ "(i.e., all its inputs are available)" is correct. An iteration can start as soon as one of the ops for this iteration is ready. An op is ready when all of its inputs are available.
+		</comment>
+		<comment id='8' author='lahwran' date='2018-01-24T19:30:24Z'>
+		Right, "all its inputs" means "all the Op's inputs" not "all the loop's inputs". Would you like to submit a PR to incorporate the comment in the doc in a way that you think is going to comprehensible? Sometimes it's hard to tell from inside the codebase :/
+		</comment>
+		<comment id='9' author='lahwran' date='2018-01-24T19:58:33Z'>
+		I could do the PR, but I still do not understand this completely myself....
+I think the docs should be updated with a MWE to illustrate exactly what is going on. If you have a good example which demonstrates good vs bad practice, I would appreciate it. Particularly, I think the docs need to have an example that illustrates the "gotchas" here, that is, the innocuous things that might be slowing down the ability to parallelize the loop.
+For instance, a "while loop" written to emulate the behavior of a "for loop" will have an internal counter. Will that counter limit tensorflow's ability to parallelize the loop?
+Example:
+&lt;denchmark-code&gt;i = tf.constant(0) 
+x = ... 
+cond_ix = lambda i, x: tf.less(i, 10) 
+
+def body1(i, x):
+       y = f(x)
+       return i+1, y  
+tf.while_loop(cond_ix, body1, [i, x])
+&lt;/denchmark-code&gt;
+
+A fundamental question that I cannot tease out of your statements is whether more than one call to body1(x) can run in parallel?
+		</comment>
+		<comment id='10' author='lahwran' date='2018-01-24T20:13:53Z'>
+		Let's take the limiting case where parallel_iterations is infinity. Now, if you imagine unrolling the whole loop as a dataflow graph, then the graph will just execute according to its data dependencies.
+So in your example, there can't be two instances of y running in parallel, because y's input in step i+1 is the output of y in step i. Likewise, there can't be two instances of i+1 running in parallel for the same reason.
+However, if f(.) is slow, all the i+1 ops will run ahead to completion without waiting for even the f(.) in the first iteration to complete, because there's no dependency of f that's needed to compute the next i.
+If you had said
+&lt;denchmark-code&gt;i = tf.constant(0) 
+x = ... 
+cond_ix = lambda i, x: tf.less(i, 10) 
+
+def body1(i, x):
+       y = g(i)
+       return i+1, y  
+tf.while_loop(cond_ix, body1, [i, x])
+&lt;/denchmark-code&gt;
+
+then if g were slow you could easily end up with g(0), g(1), ..., g(9) all running in parallel because there's no dependency on the output of g(0) that is needed to start g(1).
+		</comment>
+		<comment id='11' author='lahwran' date='2018-01-24T20:27:28Z'>
+		Excellent example and discussion. Precisely along the lines of what should be in the docs.
+		</comment>
+		<comment id='12' author='lahwran' date='2018-01-26T23:56:07Z'>
+		&lt;denchmark-link:https://github.com/mholzel&gt;@mholzel&lt;/denchmark-link&gt;
+ Would you be interested in doing PR based on the information in the above reply from &lt;denchmark-link:https://github.com/michaelisard&gt;@michaelisard&lt;/denchmark-link&gt;
+? If you do it'd be very helpful!
+		</comment>
+		<comment id='13' author='lahwran' date='2018-01-27T12:39:09Z'>
+		Yes. But this week is very busy. I will try to get to it next week.
+		</comment>
+		<comment id='14' author='lahwran' date='2018-02-01T02:07:59Z'>
+		Thank you! We are looking forward to your PR.
+		</comment>
+		<comment id='15' author='lahwran' date='2018-07-30T12:52:22Z'>
+		Is there a way to tell while_loop: "Use as much parallelism as you want"?
+I tried parallel_iterations=np.iinfo(np.int).max which worked until TF 1.9, but now breaks.
+		</comment>
+		<comment id='16' author='lahwran' date='2018-07-30T19:16:48Z'>
+		&lt;denchmark-link:https://github.com/ebrevdo&gt;@ebrevdo&lt;/denchmark-link&gt;
+ any idea? (Reopening since this is being worked on: we can close when the PR is donw.)
+		</comment>
+		<comment id='17' author='lahwran' date='2018-08-15T02:50:42Z'>
+		Please remove the assignee, as this issue is inviting external contributions. Otherwise, remove the contributions welcome label. Thank you.
+		</comment>
+		<comment id='18' author='lahwran' date='2018-08-15T03:03:13Z'>
+		100 is a safe number
+&lt;denchmark-link:#&gt;…&lt;/denchmark-link&gt;
+
+
+On Tue, Aug 14, 2018, 7:51 PM Alfred Sorten Wolf ***@***.***&gt; wrote:
+ Please remove the assignee, as this issue is inviting external
+ contributions. Otherwise, remove the contributions welcome label. Thank
+ you.
+
+ —
+ You are receiving this because you were mentioned.
+ Reply to this email directly, view it on GitHub
+ &lt;#1984 (comment)&gt;,
+ or mute the thread
+ &lt;https://github.com/notifications/unsubscribe-auth/ABtim80z6qjTZAG6bmGZo0AIxCDJ0RK8ks5uQ4yrgaJpZM4II93M&gt;
+ .
+
+
+
+		</comment>
+		<comment id='19' author='lahwran' date='2018-09-12T18:56:28Z'>
+		&lt;denchmark-link:https://github.com/mholzel&gt;@mholzel&lt;/denchmark-link&gt;
+ Hi, any update on the PR you are working on ? Could you please reference the PR# if you've created.
+		</comment>
+		<comment id='20' author='lahwran' date='2020-01-24T21:28:52Z'>
+		I think this is obsolete?
+		</comment>
+	</comments>
+</bug>

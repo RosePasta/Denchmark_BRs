@@ -1,0 +1,174 @@
+<bug id='13303' author='BloodAxe' open_date='2018-11-27T14:07:36Z' closed_time='2018-12-13T12:13:52Z'>
+	<summary>Support for Squeeze &amp; Gather operations in DNN</summary>
+	<description>
+When trying to import ONNX model that has Squeeze or Gather ops, application crashes with exception:
+&lt;denchmark-code&gt;OpenCV(4.0.0) Error: Requested object was not found (Blob 3 not found in const blobs) in cv::dnn::dnn4_v20180917::ONNXImporter::getBlob, file D:\Develop\opencv\opencv\sources\modules\dnn\src\onnx\onnx_importer.cpp, line 272
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h5&gt;System information (version)&lt;/denchmark-h&gt;
+
+
+OpenCV =&gt; 4.0
+Operating System / Platform =&gt; Windows 10 64 Bit
+Compiler =&gt; Visual Studio 2017
+Pytorch 0.4.1 / Pytorch 1.0 RC / ONNX 0.1.13
+
+&lt;denchmark-h:h5&gt;Detailed description&lt;/denchmark-h&gt;
+
+A model exported in ONNX format from PyTorch cannot be imported in OpenCV. After digging, it seems that the problem caused by operations like onnx::Squeeze or onnx::Gather which are not supported by OpenCV.
+&lt;denchmark-h:h5&gt;Steps to reproduce&lt;/denchmark-h&gt;
+
+&lt;denchmark-code&gt;from __future__ import print_function
+
+import torch
+from torch import nn
+from torch.autograd import Variable
+
+
+class SimpleNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, image):
+        batch_size = image.size(0)
+        channels = image.size(1)
+        image = image.permute(0, 2, 3, 1).contiguous().view(batch_size, -1, channels)
+        return image
+
+
+input_names = ['image']
+output_names = ['pixels']
+
+model = SimpleNet()
+dummy_input = Variable(torch.randn(1, 3, 512, 512))
+
+if torch.cuda.is_available():
+    dummy_input = dummy_input.cuda()
+    model = model.cuda()
+
+torch.onnx.export(model, dummy_input, 'export/test.onnx',
+                  verbose=True,
+                  input_names=input_names,
+                  output_names=output_names,
+                  export_params=True)
+&lt;/denchmark-code&gt;
+
+This produces a following ONNX graph:
+&lt;denchmark-code&gt;graph(%image : Float(1, 3, 512, 512)) {
+  %1 : Dynamic = onnx::Shape(%image), scope: SimpleNet
+  %2 : Dynamic = onnx::Slice[axes=[0], ends=[1], starts=[0]](%1), scope: SimpleNet
+  %3 : Long() = onnx::Squeeze[axes=[0]](%2), scope: SimpleNet
+  %4 : Dynamic = onnx::Shape(%image), scope: SimpleNet
+  %5 : Dynamic = onnx::Slice[axes=[0], ends=[2], starts=[1]](%4), scope: SimpleNet
+  %6 : Long() = onnx::Squeeze[axes=[0]](%5), scope: SimpleNet
+  %7 : Float(1, 512, 512, 3) = onnx::Transpose[perm=[0, 2, 3, 1]](%image), scope: SimpleNet
+  %8 : Long() = onnx::Constant[value={-1}](), scope: SimpleNet
+  %9 : Dynamic = onnx::Unsqueeze[axes=[0]](%3), scope: SimpleNet
+  %10 : Dynamic = onnx::Unsqueeze[axes=[0]](%8), scope: SimpleNet
+  %11 : Dynamic = onnx::Unsqueeze[axes=[0]](%6), scope: SimpleNet
+  %12 : Dynamic = onnx::Concat[axis=0](%9, %10, %11), scope: SimpleNet
+  %pixels : Float(1, 262144, 3) = onnx::Reshape(%7, %12), scope: SimpleNet
+  return (%pixels);
+}
+&lt;/denchmark-code&gt;
+
+Next line will trigger an exception in ONNXImporter:
+auto net = cv::dnn::readNetFromONNX("export/test.onnx");
+&lt;denchmark-code&gt;OpenCV(4.0.0) Error: Requested object was not found (Blob 3 not found in const blobs) in cv::dnn::dnn4_v20180917::ONNXImporter::getBlob, file D:\Develop\opencv\opencv\sources\modules\dnn\src\onnx\onnx_importer.cpp, line 272
+&lt;/denchmark-code&gt;
+
+This issue has been reproduced using models exported with PyTorch 0.4.1 (Emits Squeeze op) and on PyTorch 1.0RC (Emits Gather op). Both fails with same exception message.
+	</description>
+	<comments>
+		<comment id='1' author='BloodAxe' date='2018-11-27T14:22:13Z'>
+		related: &lt;denchmark-link:https://github.com/opencv/opencv/issues/12869&gt;#12869&lt;/denchmark-link&gt;
+
+The thing is that Squeeze and Gather are not deep learning layers in terms of OpenCV (or Caffe, in example). However some of frameworks use this operations for different internal computations (in example, operations on shapes). We already had an experience with enabling such kind of graphs from TensorFlow and there are two approaches: graph transformations replacing most common subgraph patterns to single DL layer and creating text graph representation (as .caffemodel and .prototxt pair in Caffe) which users can modify to match OpenCV's expectations.
+		</comment>
+		<comment id='2' author='BloodAxe' date='2018-12-04T09:54:08Z'>
+		We need to know if resulting graph is correct and there is no bug in Pytorch's ONNX exporter.
+As for me it's a kind of strange when all the shapes are determined but ONNX graph includes nodes which do the same computations every time. Is there a way to fuse constant operations in Pytorch before export?
+It'd be nice to have something like this:
+&lt;denchmark-code&gt;graph(%image : Float(1, 3, 512, 512)) {
+  %1 : Float(1, 512, 512, 3) = onnx::Transpose[perm=[0, 2, 3, 1]](%image), scope: SimpleNet
+  %2 : Dynamic = onnx::Constant[value= 1 -1  3 [ CPULongType{3} ]](), scope: SimpleNet
+  %pixels : Float(1, 262144, 3) = onnx::Reshape(%1, %2), scope: SimpleNet
+  return (%pixels);
+}
+&lt;/denchmark-code&gt;
+
+(received by using batch_size = int(image.size(0)) and channels = int(image.size(1)))
+		</comment>
+		<comment id='3' author='BloodAxe' date='2018-12-12T10:28:36Z'>
+		&lt;denchmark-link:https://github.com/BloodAxe&gt;@BloodAxe&lt;/denchmark-link&gt;
+,  On the other hand we several times tried to find some information about internal blobs shapes inside the ONNX graphs. I'll try it again with  of .
+message ValueInfoProto {
+  // This field MUST be present in this version of the IR.
+  optional string name = 1;     // namespace Value
+  // This field MUST be present in this version of the IR.
+  optional TypeProto type = 2;
+  // A human-readable documentation for this value. Markdown is allowed.
+  optional string doc_string = 3;
+}
+message GraphProto {
+  // The nodes in the graph, sorted topologically.
+  repeated NodeProto node = 1;
+
+  // The name of the graph.
+  optional string name = 2;   // namespace Graph
+
+  // A list of named tensor values, used to specify constant inputs of the graph.
+  // Each TensorProto entry must have a distinct name (within the list) that
+  // also appears in the input list.
+  repeated TensorProto initializer = 5;
+
+  // A human-readable documentation for this graph. Markdown is allowed.
+  optional string doc_string = 10;
+
+  // The inputs and outputs of the graph.
+  repeated ValueInfoProto input = 11;  // &lt;-- here it is
+  repeated ValueInfoProto output = 12;
+
+  // Information for the values in the graph. The ValueInfoProto.name's
+  // must be distinct. It is optional for a value to appear in value_info list.
+  repeated ValueInfoProto value_info = 13;
+		</comment>
+		<comment id='4' author='BloodAxe' date='2018-12-12T14:42:49Z'>
+		&lt;denchmark-link:https://github.com/BloodAxe&gt;@BloodAxe&lt;/denchmark-link&gt;
+, This PR fixes your example: &lt;denchmark-link:https://github.com/opencv/opencv/pull/13427&gt;#13427&lt;/denchmark-link&gt;
+, thank you!
+Do you mind if we add your network in our tests? (see &lt;denchmark-link:https://github.com/opencv/opencv_extra/pull/558&gt;opencv/opencv_extra#558&lt;/denchmark-link&gt;
+)
+		</comment>
+		<comment id='5' author='BloodAxe' date='2018-12-12T17:43:35Z'>
+		Thanks a lot for your fix! I will definitely try it. Sure, feel free to use it for tests.
+		</comment>
+		<comment id='6' author='BloodAxe' date='2019-01-23T21:13:59Z'>
+		Still getting this error:
+Blob 178 not found in const blobs in function 'getBlob'
+The relevant operation is:
+&lt;denchmark-code&gt;%178 : Long() = onnx::Gather[axis=0](%177, %176), scope: SSD
+&lt;/denchmark-code&gt;
+
+opencv-contrib-python==4.0.0.21
+opencv-python==4.0.0.21
+torch==1.0.0
+Using an ONNX model exported from PyTorch (&lt;denchmark-link:https://github.com/amdegroot/ssd.pytorch&gt;https://github.com/amdegroot/ssd.pytorch&lt;/denchmark-link&gt;
+)
+		</comment>
+		<comment id='7' author='BloodAxe' date='2019-04-15T14:18:29Z'>
+		
+Still getting this error:
+Blob 178 not found in const blobs in function 'getBlob'
+The relevant operation is:
+%178 : Long() = onnx::Gather[axis=0](%177, %176), scope: SSD
+
+opencv-contrib-python==4.0.0.21
+opencv-python==4.0.0.21
+torch==1.0.0
+Using an ONNX model exported from PyTorch (https://github.com/amdegroot/ssd.pytorch)
+
+Upgrading opencv to 4.1.0 can solve this problem.
+		</comment>
+	</comments>
+</bug>

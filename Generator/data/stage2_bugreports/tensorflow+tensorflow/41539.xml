@@ -1,0 +1,413 @@
+<bug id='41539' author='ppwwyyxx' open_date='2020-07-19T11:20:39Z' closed_time='2020-10-12T21:06:48Z'>
+	<summary>nccl_ops.all_sum does not correctly reduce gradients</summary>
+	<description>
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): ubuntu 18.04
+Mobile device (e.g. iPhone 8, Pixel 2, Samsung Galaxy) if the issue happens on mobile device:n/a
+TensorFlow installed from (source or binary):binary
+TensorFlow version (use command below): v2.2.0-rc3-33-g70087ab4f4 2.2.0-rc4
+Python version:3.7
+Bazel version (if compiling from source):n/a
+GCC/Compiler version (if compiling from source):n/a
+CUDA/cuDNN version:10.1/7.6.5
+GPU model and memory:P100, V100
+
+Describe the current behavior
+The allreduce operation nccl_ops.all_sum does not correctly sum gradients. The results are incorrect.
+Standalone code to reproduce the issue
+#!/usr/bin/env python
+import argparse
+from tensorflow.compat import v1 as tf
+import tqdm
+
+def split_grad_list(grad_list):
+    g = []
+    v = []
+    for tower in grad_list:
+        g.append([x[0] for x in tower])
+        v.append([x[1] for x in tower])
+    return g, v
+
+def allreduce_grads(all_grads):
+    # reduce gradients for N variables on K devices
+    from tensorflow.python.ops import nccl_ops as nccl
+    nr_tower = len(all_grads)
+    assert nr_tower &gt; 1
+    new_all_grads = []  # N x K
+    for grads in zip(*all_grads):
+        # k grads
+        summed = nccl.all_sum(grads)
+
+        grads_for_devices = []  # K
+        true_sum = tf.add_n(grads)
+        for g in summed:
+            diff = tf.abs(true_sum - g)
+            eql = diff &lt; 1e-4
+            nccl_res_correct = tf.reduce_all(eql, name="corr_" + grads[0].op.name)
+
+            def flat(x):
+                x = tf.reshape(x, [-1])
+                x = tf.slice(x, [0], [tf.minimum(tf.size(x), 200)])
+                return x
+
+            assert_op = tf.debugging.Assert(nccl_res_correct, [
+                tf.reduce_max(diff), flat(true_sum), flat(g)], summarize=1000,
+                name='assert_' + grads[0].op.name)
+            with tf.control_dependencies([assert_op]):
+                g = tf.identity(g)
+            grads_for_devices.append(g)
+        new_all_grads.append(grads_for_devices)
+    # transpose to K x N
+    ret = list(zip(*new_all_grads))
+    return ret
+
+def build_graph(image, label, idx):
+    v1 = tf.get_variable('aaa/W', shape=[3, 3, 3, 64], trainable=True)
+    v2 = tf.get_variable('bbb/W', shape=[3, 3, 3, 64], trainable=True)
+    v = v1 if idx == 0 else v2
+    image = tf.nn.conv2d(image, v, 1, padding='SAME', data_format='NCHW')
+
+    def conv(name, x, chan, stride=1):
+        with tf.variable_scope(name):
+            in_chan = x.shape[1]
+            W = tf.get_variable('W', [3, 3, in_chan, chan])
+            ret = tf.nn.conv2d(x, W, strides=stride, padding="SAME", data_format="NCHW")
+            return tf.nn.relu(ret)
+
+    x = conv('conv1', image, 64)
+    x = conv('conv2', x, 64)
+    x = conv('conv3', x, 1280, stride=2)
+    x = conv('conv4', x, 1280, stride=2)
+    x = conv('conv5', x, 10)
+    logits = tf.reduce_mean(x, axis=[2, 3])
+    cost = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=logits, labels=label)
+    cost = tf.reduce_mean(cost, name='cross_entropy_loss')
+    return cost
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--gpu', type=int)
+    args = parser.parse_args()
+    num_gpu = args.gpu
+
+    with tf.Graph().as_default():
+        opt = tf.train.GradientDescentOptimizer(0.001)
+
+        grad_list = []
+        for k in range(num_gpu):
+            with tf.device("/gpu:{}".format(k)), tf.variable_scope("tower{}".format(k)):
+                print("Building {} ...".format(k))
+                image = tf.random.uniform([32, 3, 30, 30])
+                label = tf.random.uniform([32], maxval=9, dtype=tf.int32)
+                cost = build_graph(image, label, k)
+                varlist = [x for x in tf.trainable_variables() if x.name.startswith("tower{}".format(k))]
+                print("Varlist for tower {}: ".format(k), [x.name for x in varlist])
+                wd_cost = [tf.reduce_sum(x) * 1e-3 for x in varlist]
+                cost = tf.add_n([cost] + wd_cost)
+                grads = opt.compute_gradients(cost, var_list=varlist)
+                grad_list.append(grads)
+
+        all_grads, all_vars = split_grad_list(grad_list)
+        all_grads = allreduce_grads(all_grads)
+        grad_list = [list(zip(gs, vs)) for gs, vs in zip(all_grads, all_vars)]
+
+        train_ops = []
+        for idx, grad_and_vars in enumerate(grad_list):
+            with tf.device('/gpu:{}'.format(idx)):
+                train_ops.append(opt.apply_gradients(
+                    grad_and_vars, name='apply_grad_{}'.format(idx)))
+        train_op = tf.group(*train_ops)
+
+        sess = tf.Session()
+        sess.run(tf.global_variables_initializer())
+        print("Training ...")
+        for k in tqdm.trange(5000):
+            sess.run(train_op)
+The above code trains a toy network on random data, and allreduce the gradients using nccl_ops.all_sum. It checks the allreduce results against the sum of gradients computed by a naive add_n, and asserts that the difference is reasonably small. However, the difference can be quite large sometimes and the assertion usually fails within 100 steps of training.
+The code above (written in TF1 style) can be run on a machine with &gt;=2 GPUs using
+&lt;denchmark-code&gt;$ TF2_BEHAVIOR=0 python a.py --gpu 2
+Building 0 ...
+ Varlist for tower 0:  ['tower0/aaa/W:0', 'tower0/bbb/W:0', 'tower0/conv1/W:0', 'tower0/conv2/W:0', 'tower0/conv3/W:0', 'tower0/conv4/W:0', 'tower0/conv5/W:0']                                      
+Building 1 ...  
+Varlist for tower 1:  ['tower1/aaa/W:0', 'tower1/bbb/W:0', 'tower1/conv1/W:0', 'tower1/conv2/W:0', 'tower1/conv3/W:0', 'tower1/conv4/W:0', 'tower1/conv5/W:0'] 
+1%|▉                                                                    | 71/5000 [00:06&lt;07:39, 10.73it/s]    
+Traceback (most recent call last):                                                                                                                                                                  
+  File "/private/home/yuxinwu/env/py37-tf2.2v2/lib/python3.7/site-packages/tensorflow/python/client/session.py", line 1365, in _do_call                                                             
+    return fn(*args)                                                                                                                                                                                
+  File "/private/home/yuxinwu/env/py37-tf2.2v2/lib/python3.7/site-packages/tensorflow/python/client/session.py", line 1350, in _run_fn                                                              
+    target_list, run_metadata)                                                                                                                                                                      
+  File "/private/home/yuxinwu/env/py37-tf2.2v2/lib/python3.7/site-packages/tensorflow/python/client/session.py", line 1443, in _call_tf_sessionrun                                                  
+    run_metadata)                                                                                                                                                                                   
+tensorflow.python.framework.errors_impl.InvalidArgumentError: 2 root error(s) found.                                                                                                                
+  (0) Invalid argument: assertion failed: [0.00100000016] [0.00234295963 0.00230941921 0.00176228327 0.00197261758 0.00213356828 0.00188576151 0.00211580051 0.00221353304 
+&lt;/denchmark-code&gt;
+
+My initial investigation suggests (no proof, just a guess) that the bug might appear because the gradients are computed on each GPU in different order.
+The bug was found to exist in TF 1.15 as well. Have not tested earlier versions.
+The bug rarely triggers itself if I revert &lt;denchmark-link:https://github.com/tensorflow/tensorflow/pull/31481&gt;#31481&lt;/denchmark-link&gt;
+, which is a PR that make allreduce ops scheduled as early as possible.
+ with the ring implementation does not seem to have similar issue, but it significantly slows down my training.
+cc &lt;denchmark-link:https://github.com/dubey&gt;@dubey&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/yuefengz&gt;@yuefengz&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/chsigg&gt;@chsigg&lt;/denchmark-link&gt;
+  who may have context on this issue.
+	</description>
+	<comments>
+		<comment id='1' author='ppwwyyxx' date='2020-07-21T00:20:09Z'>
+		Hi &lt;denchmark-link:https://github.com/ppwwyyxx&gt;@ppwwyyxx&lt;/denchmark-link&gt;
+, I ran this script with 2.2.0 and 2 GPUs and it completed training without error. I also tried with 4 GPUs and saw no error. I was running it on GCP with the Deep Learning VM Image, so possibly some slight (relevant) differences in the versions.
+Am I understanding correctly that if PR &lt;denchmark-link:https://github.com/tensorflow/tensorflow/pull/31481&gt;#31481&lt;/denchmark-link&gt;
+ is reverted, then you are able to run the script without error. But occasionally the script will fail?
+		</comment>
+		<comment id='2' author='ppwwyyxx' date='2020-07-21T02:46:26Z'>
+		Thanks for the response. I just did a fresh reinstall of TF2.2 from pip install tensorflow==2.2. Then I found that:
+
+I can reliably (3 out of 3 times all within 500 steps) reproduce the issue on a machine with only 2 P100s using all 2 GPUs
+I cannot reproduce it on a machine with 8 V100s (to be precise, this is V100-SXM2-32GB), using first 2 or first 4 of the 8 GPUs
+I can reliably (3 out of 3 times all within 1000 steps) reproduce it on a machine with 8 V100s (V100-SXM2-32GB) using all 8 GPUs (run with --gpu 8)
+I can reliably reproduce it on a machine with 2 V100s (Quadro GV100) using all 2 GPUs.
+
+It looks like it may require using all GPUs on a machine to reproduce.
+Since it's likely a concurrency issue, it's very possible that hardware and other softwares (cuda, cudnn, etc) both affect it. I hope the above details help find the right environment. If not, I may try narrow it down further (e.g. provide a docker?).
+If I revert the PR, I stopped seeing the above simple script failing, but my original training (to which I added a similar check) still can fail, but fails much more infrequently.
+		</comment>
+		<comment id='3' author='ppwwyyxx' date='2020-07-22T18:09:44Z'>
+		&lt;denchmark-link:https://github.com/nikitamaia&gt;@nikitamaia&lt;/denchmark-link&gt;
+ any progress in reproducing the error?
+		</comment>
+		<comment id='4' author='ppwwyyxx' date='2020-07-22T20:58:34Z'>
+		I was able to reproduce the error but without much consistency. have 4 P100s on my machine and running  TF2_BEHAVIOR=0 python a.py --gpu 4 doesn't fail every time. When I did see the error it was just after step 500. So far running with 2/4 GPUs hasn't produced the error.
+		</comment>
+		<comment id='5' author='ppwwyyxx' date='2020-07-22T21:13:01Z'>
+		Thanks. At least it proves the bug exists. I'm looking forward to a fix given the seriousness of the issue.
+		</comment>
+		<comment id='6' author='ppwwyyxx' date='2020-07-22T22:13:37Z'>
+		Hi &lt;denchmark-link:https://github.com/ppwwyyxx&gt;@ppwwyyxx&lt;/denchmark-link&gt;
+ can you confirm that you run  with NCCL and not the default ring implementation?  It isn't really expected that  is slower than .
+		</comment>
+		<comment id='7' author='ppwwyyxx' date='2020-07-22T23:07:14Z'>
+		Oh, I was not clear about that. I was trying collective_ops.all_reduce with the default communiation_hint, so it's likely not using nccl, which is probably why it does not have the same bug. I have not tried letting collective_ops.all_reduce use nccl.
+		</comment>
+		<comment id='8' author='ppwwyyxx' date='2020-07-22T23:26:56Z'>
+		I can reproduce the bug using collective_ops.all_reduce(communication_hint='nccl'). I've not used it before so I might not be using it correctly. The updated script looks like this:
+
+click
+#!/usr/bin/env python
+import argparse
+import threading
+from tensorflow.compat import v1 as tf
+import tqdm
+
+def split_grad_list(grad_list):
+    g = []
+    v = []
+    for tower in grad_list:
+        g.append([x[0] for x in tower])
+        v.append([x[1] for x in tower])
+    return g, v
+
+_module_lock = threading.Lock()
+_shared_cnt_counter = 0
+
+
+def _get_shared_cnt():
+    global _shared_cnt_counter
+
+    with _module_lock:
+        val = _shared_cnt_counter
+        _shared_cnt_counter += 1
+    return val
+
+def allreduce_grads(all_grads):
+    # reduce gradients for N variables on K devices
+    from tensorflow.python.ops import nccl_ops as nccl
+    nr_tower = len(all_grads)
+    assert nr_tower &gt; 1
+    new_all_grads = []  # N x K
+    for grads in zip(*all_grads):
+        USE_NCCL_OPS = True
+        # k grads
+        if USE_NCCL_OPS:
+            summed = nccl.all_sum(grads)
+        else:
+            from tensorflow.python.ops import collective_ops
+            summed = []
+            shared_cnt = _get_shared_cnt()
+            for t in grads:
+                with tf.device(t.device):
+                    t = collective_ops.all_reduce(
+                        t, len(grads), 3, shared_cnt + 300,
+                        'Add', 'Id', communication_hint='nccl')
+                    summed.append(t)
+
+        grads_for_devices = []  # K
+        true_sum = tf.add_n(grads)
+        for g in summed:
+            diff = tf.abs(true_sum - g)
+            eql = diff &lt; 1e-4
+            nccl_res_correct = tf.reduce_all(eql, name="corr_" + grads[0].op.name)
+
+            def flat(x):
+                x = tf.reshape(x, [-1])
+                x = tf.slice(x, [0], [tf.minimum(tf.size(x), 200)])
+                return x
+
+            assert_op = tf.debugging.Assert(nccl_res_correct, [
+                tf.reduce_max(diff), flat(true_sum), flat(g)], summarize=1000,
+                name='assert_' + grads[0].op.name)
+            with tf.control_dependencies([assert_op]):
+                g = tf.identity(g)
+            grads_for_devices.append(g)
+        new_all_grads.append(grads_for_devices)
+    # transpose to K x N
+    ret = list(zip(*new_all_grads))
+    return ret
+
+def build_graph(image, label, idx):
+    v1 = tf.get_variable('aaa/W', shape=[3, 3, 3, 64], trainable=True)
+    v2 = tf.get_variable('bbb/W', shape=[3, 3, 3, 64], trainable=True)
+    v = v1 if idx == 0 else v2
+    image = tf.nn.conv2d(image, v, 1, padding='SAME', data_format='NCHW')
+
+    def conv(name, x, chan, stride=1):
+        with tf.variable_scope(name):
+            in_chan = x.shape[1]
+            W = tf.get_variable('W', [3, 3, in_chan, chan])
+            ret = tf.nn.conv2d(x, W, strides=stride, padding="SAME", data_format="NCHW")
+            return tf.nn.relu(ret)
+
+    x = conv('conv1', image, 64)
+    x = conv('conv2', x, 64)
+    x = conv('conv3', x, 1280, stride=2)
+    x = conv('conv4', x, 1280, stride=2)
+    x = conv('conv5', x, 10)
+    logits = tf.reduce_mean(x, axis=[2, 3])
+    cost = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=logits, labels=label)
+    cost = tf.reduce_mean(cost, name='cross_entropy_loss')
+    return cost
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--gpu', type=int)
+    args = parser.parse_args()
+    num_gpu = args.gpu
+
+    with tf.Graph().as_default():
+        opt = tf.train.GradientDescentOptimizer(0.001)
+
+        grad_list = []
+        for k in range(num_gpu):
+            with tf.device("/gpu:{}".format(k)), tf.variable_scope("tower{}".format(k)):
+                print("Building {} ...".format(k))
+                image = tf.random.uniform([32, 3, 30, 30])
+                label = tf.random.uniform([32], maxval=9, dtype=tf.int32)
+                cost = build_graph(image, label, k)
+                varlist = [x for x in tf.trainable_variables() if x.name.startswith("tower{}".format(k))]
+                print("Varlist for tower {}: ".format(k), [x.name for x in varlist])
+                wd_cost = [tf.reduce_sum(x) * 1e-3 for x in varlist]
+                cost = tf.add_n([cost] + wd_cost)
+                grads = opt.compute_gradients(cost, var_list=varlist)
+                grad_list.append(grads)
+
+        all_grads, all_vars = split_grad_list(grad_list)
+        all_grads = allreduce_grads(all_grads)
+        grad_list = [list(zip(gs, vs)) for gs, vs in zip(all_grads, all_vars)]
+
+        train_ops = []
+        for idx, grad_and_vars in enumerate(grad_list):
+            with tf.device('/gpu:{}'.format(idx)):
+                train_ops.append(opt.apply_gradients(
+                    grad_and_vars, name='apply_grad_{}'.format(idx)))
+        train_op = tf.group(*train_ops)
+
+        sess = tf.Session()
+        sess.run(tf.global_variables_initializer())
+        print("Training ...")
+        for k in tqdm.trange(5000):
+            sess.run(train_op)
+
+		</comment>
+		<comment id='9' author='ppwwyyxx' date='2020-07-31T20:44:38Z'>
+		Going through your code, my best guess is there is a problem (race condition?) with the way true_sum (the source of truth) is calculated in the code. I changed your code by ensuring the true_sum is calculated at the same time as tf.all_sum:
+&lt;denchmark-code&gt;true_sum = tf.add_n(grads)
+with tf.control_dependencies([true_sum.op]):
+    summed = nccl.all_sum(grads)
+&lt;/denchmark-code&gt;
+
+On my setup, the assert errors are gone. Please let me know if this fixes your problem as well.
+On the reason why collective_ops.all_reduce does not cause this issue, my best explanation is since the ring algorithm is significantly slower than nccl native implementation, thetrue_sum calculation always happens to run before all_sum.
+		</comment>
+		<comment id='10' author='ppwwyyxx' date='2020-07-31T21:11:38Z'>
+		This change does make the error disappear. However, I don't think this supports the hypothesis that  is incorrect. I think the error probably disappears in the same way why reverting &lt;denchmark-link:https://github.com/tensorflow/tensorflow/pull/31481&gt;#31481&lt;/denchmark-link&gt;
+ can make the error disappear: reverting the PR will delay the execution of NCCL allreduce. And my guess is that there are issues in Tensorflow or NCCL that can be triggered unless they are explictly delayed. Also, assuming your hypothesis is correct, it still means that there is a serious bug in tensorflow.
+I believe the result of  is incorrect because this is how I found the bug and made the above repro: a model that I regularly train with NCCL started to diverge after &lt;denchmark-link:https://github.com/tensorflow/tensorflow/pull/31481&gt;#31481&lt;/denchmark-link&gt;
+ was added. And if I use either  to aggregate gradients, or if I revert &lt;denchmark-link:https://github.com/tensorflow/tensorflow/pull/31481&gt;#31481&lt;/denchmark-link&gt;
+, it can converge.
+
+Please let me know if this fixes your problem as well.
+
+This does not fix the problem because in a real training I expect to use only NCCL (not tf.add_n) for its speed, and I believe its results are incorrect.
+		</comment>
+		<comment id='11' author='ppwwyyxx' date='2020-07-31T21:23:41Z'>
+		I also have another guess for which I don't have much evidence: I think NCCL allreduce can more likely produce wrong results when different workers compute gradients in different orders, although this situation is part of the consideration of NcclManager.
+This is completely a guess from intuition. This guess leads me to create the above example, in which I explicitly let each worker use the variables differently so that they will compute the gradients w.r.t aaa/w and bbb/W in a different order: some workers use them at the beginning of the model, while some other workers use them only for regularization loss.
+		</comment>
+		<comment id='12' author='ppwwyyxx' date='2020-09-01T18:55:51Z'>
+		Any updates after a month?
+		</comment>
+		<comment id='13' author='ppwwyyxx' date='2020-09-02T00:02:01Z'>
+		Any updates after a month?
+		</comment>
+		<comment id='14' author='ppwwyyxx' date='2020-10-08T22:14:10Z'>
+		TensorFlow is reproducibly giving wrong gradients, but there are no updates to address it in &gt;2 months. This is very surprising.
+		</comment>
+		<comment id='15' author='ppwwyyxx' date='2020-10-08T22:43:03Z'>
+		&lt;denchmark-link:https://github.com/ppwwyyxx&gt;@ppwwyyxx&lt;/denchmark-link&gt;
+ Thank you for your follow up. After the &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/41539#issuecomment-667348808&gt;fix to your repro code&lt;/denchmark-link&gt;
+ the error could not reproduced. You mentioned you have other instances which experience the same error. Could you possibly share a repro code?
+		</comment>
+		<comment id='16' author='ppwwyyxx' date='2020-10-08T22:51:39Z'>
+		I would not call it a "fix" because the original code does not contain user-side bugs (at least not pointed out so far).
+The "fix" is in fact a  that no longer shows the bug. But as I mentioned in &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/41539#issuecomment-667358562&gt;#41539 (comment)&lt;/denchmark-link&gt;
+, this alternative way does not apply in a real training, because in reality it would be dumb and extremely inefficient to compute the sum twice.
+		</comment>
+		<comment id='17' author='ppwwyyxx' date='2020-10-08T23:03:20Z'>
+		As you mentioned, the original code indeed shows an error. What it does not reproduce is what the title suggests, "nccl_ops.all_sum does not correctly reduce gradients". The "fix" just makes sure the source of truth (true_sum) is calculated at the same time as "nccl_ops.all_sum". The "fix" is in no way a suggestion to fix the original error (whatever it may be).
+		</comment>
+		<comment id='18' author='ppwwyyxx' date='2020-10-08T23:14:02Z'>
+		Nevertheless, I will escalate this bug. Hopefully it is fixed soon.
+		</comment>
+		<comment id='19' author='ppwwyyxx' date='2020-10-09T08:01:50Z'>
+		My model with batch size = 8 and &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/master/tensorflow/python/keras/layers/normalization_v2.py&gt;sync bn&lt;/denchmark-link&gt;
+ worked very well at TPU, but when use 2×V100, the result is  1-2% lower
+I use  for TPU and   for GPU.
+		</comment>
+		<comment id='20' author='ppwwyyxx' date='2020-10-12T21:06:50Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/41539&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/41539&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='21' author='ppwwyyxx' date='2020-10-12T21:10:44Z'>
+		We have reverted &lt;denchmark-link:https://github.com/tensorflow/tensorflow/pull/31481&gt;#31481&lt;/denchmark-link&gt;
+.  Please reopen if this is still an issue.
+		</comment>
+		<comment id='22' author='ppwwyyxx' date='2020-10-12T21:13:27Z'>
+		Why does &lt;denchmark-link:https://github.com/tensorflow/tensorflow/pull/31481&gt;#31481&lt;/denchmark-link&gt;
+ cause this issue?
+		</comment>
+		<comment id='23' author='ppwwyyxx' date='2020-10-12T22:12:44Z'>
+		We have reverted &lt;denchmark-link:https://github.com/tensorflow/tensorflow/pull/31481&gt;#31481&lt;/denchmark-link&gt;
+ to unblock users, but we don't have a good handle on the root cause.  We will continue to investigate the root cause.
+		</comment>
+		<comment id='24' author='ppwwyyxx' date='2020-10-12T22:35:11Z'>
+		Sounds good! Thanks for investigating. Shall we keep the issue open then, just like &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/41980&gt;#41980&lt;/denchmark-link&gt;
+ ?
+		</comment>
+	</comments>
+</bug>

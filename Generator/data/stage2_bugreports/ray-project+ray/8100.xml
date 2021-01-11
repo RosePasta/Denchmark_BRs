@@ -1,0 +1,153 @@
+<bug id='8100' author='angelolovatto' open_date='2020-04-20T12:14:58Z' closed_time='2020-11-27T00:00:35Z'>
+	<summary>[rllib] Trainer global vars not synced when restoring</summary>
+	<description>
+&lt;denchmark-h:h3&gt;What is the problem?&lt;/denchmark-h&gt;
+
+When restoring an agent, global_vars isn't restored, which causes the policy's global timestep to initialize with 0. Furthermore, if using Trainer.compute_action after restoring, initial timestep passed will be 0, which may trigger exploration behavior which was only intended for the beginning of training. I suppose including and syncing global_vars when saving and restoring would fix the issue.
+One more thing I noticed though: global_vars["timestep"] is only updated before the call to _train(). This makes the global timestep lag behind the actual one by one iteration every time. I suppose a reasonable fix would be to update global_vars["timestep"] after the call to _train() as well. Any thoughts?
+Ray version and other system information (Python version, TensorFlow version, OS):
+Ray 0.8.4
+Python 3.8
+PyTorch 1.4.0
+macOS Catalina 10.15.4
+&lt;denchmark-h:h3&gt;Reproduction (REQUIRED)&lt;/denchmark-h&gt;
+
+Please provide a script that can be run to reproduce the issue. The script should have no external library dependencies (i.e., use fake or mock data / environments):
+import logging
+
+import ray
+from ray.rllib.agents.pg import PGTrainer as agent_cls
+
+
+def main():
+    ray.init()
+    logging.getLogger("ray.rllib").setLevel(logging.DEBUG)
+
+    config = {"use_pytorch": True, "use_exec_api": False}
+    agent = agent_cls(env="CartPole-v0", config=config)
+    for _ in range(4):
+        info = agent.train()
+
+    print(agent.optimizer.num_steps_sampled)
+    print(agent.global_vars)
+    print(agent.get_policy().global_timestep)
+
+    obj = agent.save_to_object()
+
+    agent2 = agent_cls(env="CartPole-v0", config=config)
+    agent2.restore_from_object(obj)
+
+    print(agent2.optimizer.num_steps_sampled)
+    print(agent2.global_vars)
+    print(agent2.get_policy().global_timestep)
+
+
+if __name__ == "__main__":
+    main()
+If we cannot run your script, we cannot fix your issue.
+
+ I have verified my script runs in a clean environment and reproduces the issue.
+ I have verified the issue also occurs with the latest wheels.
+
+	</description>
+	<comments>
+		<comment id='1' author='angelolovatto' date='2020-04-21T06:13:30Z'>
+		Is this resolved when use_exec_api: True? If so, this will be fixed as we roll forward with enabling that by default.
+		</comment>
+		<comment id='2' author='angelolovatto' date='2020-04-21T13:58:41Z'>
+		Hi Eric, thanks for the reply!
+I'm not too familiar with the new api, but I tested setting use_exec_api: True (and commented the prints related to the optimizer) and got these results:
+2020-04-21 10:53:14,488	INFO resource_spec.py:204 -- Starting Ray with 2.49 GiB memory available for workers and up to 1.25 GiB for objects. You can adjust these settings with ray.init(memory=&lt;bytes&gt;, object_store_memory=&lt;bytes&gt;).
+2020-04-21 10:53:14,717	WARNING services.py:916 -- Redis failed to start, retrying now.
+2020-04-21 10:53:14,972	INFO services.py:1146 -- View the Ray dashboard at localhost:8265
+2020-04-21 10:53:15,643	INFO trainer.py:583 -- Current log_level is WARN. For more information, set 'log_level': 'INFO' / 'DEBUG' or use the -v and -vv flags.
+2020-04-21 10:53:15,698	WARNING trainer_template.py:123 -- The experimental distributed execution API is enabled for this algorithm. Disable this by setting 'use_exec_api': False.
+2020-04-21 10:53:15,698	INFO trainable.py:217 -- Getting current IP.
+2020-04-21 10:53:15,698	WARNING util.py:37 -- Install gputil for GPU system monitoring.
+{'timestep': 0}
+7800
+2020-04-21 10:53:22,458	WARNING trainer_template.py:123 -- The experimental distributed execution API is enabled for this algorithm. Disable this by setting 'use_exec_api': False.
+2020-04-21 10:53:22,459	INFO trainable.py:217 -- Getting current IP.
+2020-04-21 10:53:22,459	WARNING util.py:37 -- Install gputil for GPU system monitoring.
+2020-04-21 10:53:22,474	INFO trainable.py:217 -- Getting current IP.
+2020-04-21 10:53:22,474	INFO trainable.py:422 -- Restored on 192.168.15.16 from checkpoint: /Users/angelolovatto/ray_results/PG_CartPole-v0_2020-04-21_10-53-22odninfol/tmpz6nrzunyrestore_from_object/checkpoint-4
+2020-04-21 10:53:22,474	INFO trainable.py:430 -- Current state after restoring: {'_iteration': 4, '_timesteps_total': None, '_time_total': 6.702746868133545, '_episodes_total': 143}
+{'timestep': 0}
+0
+Which means that the trainer global vars weren't updated at all and the policy's global timestep was not restored :(
+I also noticed that _timesteps_total is None in the last logger message. Not sure if that's intended behavior.
+Hope this helps!
+		</comment>
+		<comment id='3' author='angelolovatto' date='2020-04-21T19:20:33Z'>
+		&lt;denchmark-link:https://github.com/angelolovatto&gt;@angelolovatto&lt;/denchmark-link&gt;
+ some of those internal variables are only used by the legacy API and are not updated; but the global vars should be set properly on the workers, e.g. when you run
+&lt;denchmark-code&gt;import logging
+
+import ray
+from ray.rllib.agents.pg import PGTrainer as agent_cls
+
+
+def main():
+    ray.init()
+    logging.getLogger("ray.rllib").setLevel(logging.ERROR)
+
+    config = {"use_pytorch": True}
+    agent = agent_cls(env="CartPole-v0", config=config)
+    for _ in range(4):
+        info = agent.train()
+
+    print("---before---")
+    print(agent.workers.local_worker().get_global_vars())
+    print(agent.get_policy().global_timestep)
+
+    obj = agent.save_to_object()
+
+    agent2 = agent_cls(env="CartPole-v0", config=config)
+    agent2.restore_from_object(obj)
+
+    print("---after---")
+    agent2.train()
+    print(agent2.workers.local_worker().get_global_vars())
+    print(agent2.get_policy().global_timestep)
+
+
+if __name__ == "__main__":
+    main()
+&lt;/denchmark-code&gt;
+
+You get as output
+&lt;denchmark-code&gt;---before---
+{'timestep': 800}
+800
+
+...
+
+---after---
+{'timestep': 1000}
+1000
+&lt;/denchmark-code&gt;
+
+You can add print() statements to rollout_worker.py::set_global_vars() to monitor when the worker global vars are updated. Note that the policy global timestep is not updated until a call to train.
+		</comment>
+		<comment id='4' author='angelolovatto' date='2020-11-12T23:45:41Z'>
+		Hi, I'm a bot from the Ray team :)
+To help human contributors to focus on more relevant issues, I will automatically add the stale label to issues that have had no activity for more than 4 months.
+If there is no further activity in the 14 days, the issue will be closed!
+
+If you'd like to keep the issue open, just leave any comment, and the stale label will be removed!
+If you'd like to get more attention to the issue, please tag one of Ray's contributors.
+
+You can always ask for help on our &lt;denchmark-link:https://discuss.ray.io/&gt;discussion forum&lt;/denchmark-link&gt;
+ or &lt;denchmark-link:https://github.com/ray-project/ray#getting-involved&gt;Ray's public slack channel&lt;/denchmark-link&gt;
+.
+		</comment>
+		<comment id='5' author='angelolovatto' date='2020-11-27T00:00:27Z'>
+		Hi again! The issue will be closed because there has been no more activity in the 14 days since the last message.
+Please feel free to reopen or open a new issue if you'd still like it to be addressed.
+Again, you can always ask for help on our &lt;denchmark-link:https://discuss.ray.io&gt;discussion forum&lt;/denchmark-link&gt;
+ or &lt;denchmark-link:https://github.com/ray-project/ray#getting-involved&gt;Ray's public slack channel&lt;/denchmark-link&gt;
+.
+Thanks again for opening the issue!
+		</comment>
+	</comments>
+</bug>

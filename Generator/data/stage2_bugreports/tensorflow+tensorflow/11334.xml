@@ -1,0 +1,247 @@
+<bug id='11334' author='faifai21' open_date='2017-07-06T20:31:54Z' closed_time='2018-03-20T18:49:13Z'>
+	<summary>Memory Overhead/Leak in Android lib</summary>
+	<description>
+&lt;denchmark-h:h3&gt;System information&lt;/denchmark-h&gt;
+
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): Yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04):  Nexus 6p, Android v7.1.2
+TensorFlow installed from (source or binary): source
+TensorFlow version (use command below):  1.2.0-rc2
+Python version: 2.7.10
+Bazel version (if compiling from source): 0.4.5-homebrew
+CUDA/cuDNN version: N/A
+GPU model and memory:
+Exact command to reproduce:
+-- Selective Headers: bazel build -c opt --copt="-DSELECTIVE_REGISTRATION" --copt="-DSUPPORT_SELECTIVE_REGISTRATION" //tensorflow/contrib/android:libtensorflow_inference.so --crosstool_top=//external:android/crosstool --host_crosstool_top=@bazel_tools//tools/cpp:toolchain --cpu=armeabi-v7a
+-- Added tensorflow/core/kernels/random_shuffle_queue_op.cc and tensorflow/core/kernels/random_shuffle_op.cc to tf_op_files.txt file
+-- Removed unused nodes: bazel build tensorflow/tools/graph_transforms:transform_graph bazel-bin/tensorflow/tools/graph_transforms/transform_graph \ --in_graph=model.pb \ --out_graph=optimized_model.pb \ --inputs='input' \ --outputs='output' \ --transforms=' strip_unused_nodes(type=float, shape="1,299,299,3")'
+
+&lt;denchmark-h:h3&gt;Describe the problem&lt;/denchmark-h&gt;
+
+The Tensorflow Android library is using a lot more memory than I expected. It almost seems like it's maintaining a reference to all input arrays, as memory usage balloons the longer the model is used.
+Here is an example of the memory usage with feed/run/fetch commented out (source code below):
+&lt;denchmark-link:https://user-images.githubusercontent.com/4616968/27930636-3342a548-624c-11e7-91ed-3f4f56b7cf5f.png&gt;&lt;/denchmark-link&gt;
+
+Here is the same timeframe, with the only difference being that feed/run/fetch is enabled:
+&lt;denchmark-link:https://user-images.githubusercontent.com/4616968/27930738-954e125e-624c-11e7-82f2-cc21e67bc5d3.png&gt;&lt;/denchmark-link&gt;
+
+Memory usage is over three times worse. The longer I leave the model running, the more memory usage increases (it eventually gets to 110 mb).
+The below method is being called at a rate of 4.419011933 per sec (i.e. it's processing 4.412 input arrays per second), where each input array is of size 96*96*3 (27648).
+This is being run on a Nexus 6p, running stock 7.1.2. The model is a conv net with inception, batch norm and dropout, trained using tensorflow slim.
+&lt;denchmark-h:h3&gt;Source code / logs&lt;/denchmark-h&gt;
+
+Commented out:
+public float[] runInference(float[] pixels) {
+        assertRightSize(pixels);
+        final float[] outputArray = new float[128];
+        // Simulate some sort of output
+        Arrays.fill(outputArray, new Random().nextInt(1000)/new Random().nextFloat());
+//     inferenceInterface.feed("phase_train", new bool[]{false});
+//     inferenceInterface.feed("input", pixels, 1, 96, 96, 3);
+//     inferenceInterface.run(new String[]{"output"});
+        // Copy the output Tensor back into the output array.
+//     inferenceInterface.fetch("output", outputArray);
+
+        return outputArray;
+    }
+Enabled:
+public float[] runInference(float[] pixels) {
+        assertRightSize(pixels);
+        final float[] outputArray = new float[128];
+        inferenceInterface.feed("phase_train", new bool[]{false});
+        inferenceInterface.feed("input", pixels, 1, 96, 96, 3);
+        inferenceInterface.run(new String[]{"output"});
+        // Copy the output Tensor back into the output array.
+        inferenceInterface.fetch("output", outputArray);
+
+        return outputArray;
+    }
+where float[] pixels is a float array of size 27648, denoting the pixels in an image of size 96x96.
+The custom code is an update to the InferenceInterface to accept boolean types during feeding:
+public void feed(String inputName, boolean[] src, long... dims) {
+        byte[] b = new byte[src.length];
+        for (int i = 0; i &lt; src.length; ++i) {
+            b[i] = (byte) (src[i] ? 1 : 0);
+        }
+        addFeed(inputName, Tensor.create(DataType.BOOL, dims, ByteBuffer.wrap(b)));
+    }
+Please let me know if there's any other information I can provide.
+	</description>
+	<comments>
+		<comment id='1' author='faifai21' date='2017-07-07T16:58:58Z'>
+		It looks to me like there's a related discussion about the overheads of feed/run/fetch in &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/8712&gt;#8712&lt;/denchmark-link&gt;
+. Does any of that help?
+		</comment>
+		<comment id='2' author='faifai21' date='2017-07-07T21:30:30Z'>
+		&lt;denchmark-link:https://github.com/cy89&gt;@cy89&lt;/denchmark-link&gt;
+ thanks for the response. I read that issue before posting mine and it was related. Unfortunately, the discussion turned towards timing and performance as opposed to memory allocation.
+		</comment>
+		<comment id='3' author='faifai21' date='2017-07-07T22:58:53Z'>
+		Makes sense. &lt;denchmark-link:https://github.com/petewarden&gt;@petewarden&lt;/denchmark-link&gt;
+, are there perhaps any updates about our Android TF ecosystem and its memory usage behavior?
+		</comment>
+		<comment id='4' author='faifai21' date='2017-07-10T21:02:38Z'>
+		&lt;denchmark-link:https://github.com/faifai21&gt;@faifai21&lt;/denchmark-link&gt;
+ Thanks for the detailed report! Are you able to determine exactly how much the memory use increases per inference pass? If you change the size of your input array, does the rate of increase vary proportionally? I'm just curious if something else in the run() call could be allocating memory that never gets cleaned up.
+&lt;denchmark-link:https://github.com/asimshankar&gt;@asimshankar&lt;/denchmark-link&gt;
+ Any idea why this might be happening, given that closeFetches() and closeFeeds() are both guaranteed to be called every invocation of TensorFlowInferenceInterface.run()?
+		</comment>
+		<comment id='5' author='faifai21' date='2017-07-10T21:16:05Z'>
+		There was a leak in 1.2.0-rc0 and prior versions,
+fixed by &lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/8304e197ea9eeb617f224a1ba0cc4068596098d1&gt;8304e19&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://github.com/faifai21&gt;@faifai21&lt;/denchmark-link&gt;
+ : Since you're building from source, could you confirm that your build includes the commit mentioned above?
+		</comment>
+		<comment id='6' author='faifai21' date='2017-07-11T02:52:12Z'>
+		&lt;denchmark-link:https://github.com/asimshankar&gt;@asimshankar&lt;/denchmark-link&gt;
+ I just checked and that commit is included in the build. I can try rebuilding from the latest release and see if the issue goes away.
+
+Are you able to determine exactly how much the memory use increases per inference pass?
+
+&lt;denchmark-link:https://github.com/andrewharp&gt;@andrewharp&lt;/denchmark-link&gt;
+ I'll get you that information first thing tomorrow morning.
+		</comment>
+		<comment id='7' author='faifai21' date='2017-07-11T22:11:13Z'>
+		&lt;denchmark-link:https://github.com/asimshankar&gt;@asimshankar&lt;/denchmark-link&gt;
+ I pulled in the latest master and built against commit &lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/99a38ffd9d77c55ca6d0c373c6d4b72686284ac5&gt;99a38ff&lt;/denchmark-link&gt;
+. The memory leak is still occurring though.
+&lt;denchmark-link:https://github.com/andrewharp&gt;@andrewharp&lt;/denchmark-link&gt;
+ It seems like memory is increasing by ~0.1 MB per inference pass, which makes sense as each input array is around 110kb. As well, increasing the size of the input array does cause the memory leak to increase:
+
+With an input array of 96*96*3, each input array was 110kb. Memory usage was increasing at ~0.5 mb per sec. With 4.41 inputs processed per sec, it can be inferred that memory was increasing by ~0.11 mb per run.
+With an input array of 120*120*3, each input array was 172kb. Memory usage was increasing at 0.7 mb per sec. Since input size was increased, we were processing slightly less inputs per sec than before. Assuming we were processing 4.1 inputs per sec now, we can infer that each run increased memory by ~0.17mb.
+
+I was unable to increase input size by anymore, as that caused BufferOverflow exceptions with FloatBuffer as the input array was copied over when creating the Tensor.
+		</comment>
+		<comment id='8' author='faifai21' date='2017-07-11T22:21:48Z'>
+		I also tried decreasing the size of the input array to 30*30*3, which resulted in each input having a size of 10kb. The memory leak was still present, but it was much less apparent. As expected though, memory usage increased by ~0.01 mb per run.
+		</comment>
+		<comment id='9' author='faifai21' date='2017-07-12T12:06:43Z'>
+		&lt;denchmark-link:https://github.com/andrewharp&gt;@andrewharp&lt;/denchmark-link&gt;
+ We are also experiencing the same issue with tensorflow library on android. The memory keeps on increasing as the number of inference runs keep on increasing. This is leading to lot of out of memory errors in our application.
+We tried creating a new TensorFlowInferenceInterface after every inference but even that did not solve the problem. It looks like a memory leak in tensorflow c++ library.
+		</comment>
+		<comment id='10' author='faifai21' date='2017-07-12T16:53:08Z'>
+		
+We tried creating a new TensorFlowInferenceInterface after every inference but even that did not solve the problem.
+
+I tried the same thing, and can confirm that the memory leak was still there.
+		</comment>
+		<comment id='11' author='faifai21' date='2017-07-17T17:56:27Z'>
+		&lt;denchmark-link:https://github.com/andrewharp&gt;@andrewharp&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/asimshankar&gt;@asimshankar&lt;/denchmark-link&gt;
+ any updates on this?
+		</comment>
+		<comment id='12' author='faifai21' date='2017-07-19T21:01:45Z'>
+		We've also found this issue in our iOS tensorflow library (also built from source), which makes sense, given that the memory leak seems to be in C/C++ code.
+		</comment>
+		<comment id='13' author='faifai21' date='2017-07-25T23:37:26Z'>
+		Experiencing the same problem as above: lots of memory leakage due to the feeding operation.
+While I'm sure I'm missing a lot of intricacies here, the source seems obvious to me. During every call to feed, we are allocating new memory for the input tensor (float tensor in my case):
+addFeed(inputName, Tensor.create(dims, FloatBuffer.wrap(src))); 
+Is there no way to overwrite the data in the existing FloatBuffer after the initial feed call? Instead of allocating space for a new Tensor each time (with the call to create)? Would that not solve the memory leak we are experiencing?
+		</comment>
+		<comment id='14' author='faifai21' date='2017-07-25T23:57:36Z'>
+		&lt;denchmark-link:https://github.com/faifai21&gt;@faifai21&lt;/denchmark-link&gt;
+ : No updates yet unfortunately. Since you have this in C++ land as well, perhaps you could come up with a small C++ snippet that demonstrates this - and it might make it easier to trace any problems by running the sample on a desktop/laptop instead of a mobile device.
+&lt;denchmark-link:https://github.com/Mr-Grieves&gt;@Mr-Grieves&lt;/denchmark-link&gt;
+ : I'm not following. During every call to  a new  is created, but it is released with a call to &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/r1.3/tensorflow/contrib/android/java/org/tensorflow/contrib/android/TensorFlowInferenceInterface.java#L157&gt;closeFeeds()&lt;/denchmark-link&gt;
+ on every call to .  Are you experiencing "leaks" or is it that total memory usage is higher than you'd want (and waits for a garbage collection cycle to come down)?
+		</comment>
+		<comment id='15' author='faifai21' date='2017-07-27T19:35:44Z'>
+		&lt;denchmark-link:https://github.com/asimshankar&gt;@asimshankar&lt;/denchmark-link&gt;
+: The latter. I'm new to Java and still not totally comfortable with the idea of leaving objects around to be cleaned up by the GC... My app runs as desired initially, but slows down over time, and eventually grinds to a halt. I initially thought this issue was being caused by a memory leak, but perhaps the memory management is running as it should and the cause of the slowdown lies somewhere else...
+I've attached a screenshot of my Memory and CPU monitors. GC events are being triggered every 10s or so, with 99% of the allocations occurring during the addFeed(inputName, Tensor.create(dims, FloatBuffer.wrap(src)));.
+If the memory is not the problem, my issue is most likely CPU related, in which case I am posting in the wrong thread.
+&lt;denchmark-link:https://user-images.githubusercontent.com/19175336/28688053-6c3455d4-72c5-11e7-981e-114d0cdf3d3d.png&gt;&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='16' author='faifai21' date='2017-07-27T19:53:39Z'>
+		&lt;denchmark-link:https://github.com/Mr-Grieves&gt;@Mr-Grieves&lt;/denchmark-link&gt;
+ It could be thermal throttling slowing down the CPU frequency after sustained load. I'm not sure if you can view this in Android Studio, but you could try &lt;denchmark-link:https://stackoverflow.com/questions/3021054/how-to-read-cpu-frequency-on-android-device&gt;printing the frequency&lt;/denchmark-link&gt;
+ manually via  and see if it changes during a run.
+		</comment>
+		<comment id='17' author='faifai21' date='2017-07-27T23:31:03Z'>
+		&lt;denchmark-link:https://github.com/asimshankar&gt;@asimshankar&lt;/denchmark-link&gt;
+ Thanks for the response. I've spoken to our iOS engineers a few more times and it seems like the memory leak does not actually happen in iOS land. This seems to be an issue on Android only, perhaps in the JNI methods?
+		</comment>
+		<comment id='18' author='faifai21' date='2017-08-11T18:11:21Z'>
+		&lt;denchmark-link:https://github.com/asimshankar&gt;@asimshankar&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/andrewharp&gt;@andrewharp&lt;/denchmark-link&gt;
+ This memory leak is blocking us from shipping tensorflow on Android. Are there any updates for this? Is there anything I can do to help? I tried looking through the source code to find the memory leak, but I'm not well versed in c/c++.
+		</comment>
+		<comment id='19' author='faifai21' date='2017-12-20T08:07:07Z'>
+		It has been 14 days with no activity and the awaiting tensorflower label was assigned. Please update the label and/or status accordingly.
+		</comment>
+		<comment id='20' author='faifai21' date='2018-01-04T19:20:25Z'>
+		It has been 14 days with no activity and the awaiting tensorflower label was assigned. Please update the label and/or status accordingly.
+		</comment>
+		<comment id='21' author='faifai21' date='2018-01-23T23:09:34Z'>
+		A member of the TensorFlow organization has replied after the stat:awaiting tensorflower label was applied.
+		</comment>
+		<comment id='22' author='faifai21' date='2018-02-03T01:27:50Z'>
+		Sorry this fell through the cracks. Is that still a problem with the latest versions?
+Our current recommended platform for mobile is tflite, maybe that fits your needs better?
+		</comment>
+		<comment id='23' author='faifai21' date='2018-02-17T13:31:25Z'>
+		Nagging Awaiting Response: It has been 14 days with no activityand the awaiting response label was assigned. Is this still an issue?
+		</comment>
+		<comment id='24' author='faifai21' date='2018-03-04T13:04:35Z'>
+		Nagging Awaiting Response: It has been 14 days with no activityand the awaiting response label was assigned. Is this still an issue?
+		</comment>
+		<comment id='25' author='faifai21' date='2018-03-19T15:13:19Z'>
+		Nagging Awaiting Response: It has been 14 days with no activityand the awaiting response label was assigned. Is this still an issue?
+		</comment>
+		<comment id='26' author='faifai21' date='2018-03-20T18:49:12Z'>
+		Automatically closing due to lack of recent activity. Please update the issue when new information becomes available, and we will reopen the issue. Thanks!
+		</comment>
+		<comment id='27' author='faifai21' date='2018-03-28T06:22:43Z'>
+		&lt;denchmark-link:https://github.com/drpngx&gt;@drpngx&lt;/denchmark-link&gt;
+  I'm facing the exact same issue on version . As I keep performing inference on an Android device, the memory consumed by the app keeps increasing.
+
+
+
+No. of Inference runs
+Memory usage
+
+
+
+
+1
+5.7 Mb
+
+
+15
+206 Mb
+
+
+20
+242 Mb
+
+
+25
+757 Mb
+
+
+30
+922 Mb
+
+
+
+Is there a fix for this issue?
+		</comment>
+		<comment id='28' author='faifai21' date='2018-03-28T06:37:17Z'>
+		&lt;denchmark-link:https://github.com/deepaksuresh&gt;@deepaksuresh&lt;/denchmark-link&gt;
+ : There isn't any known fixes. Could you file a new issue with the details, particularly if there are any instructions to reproduce the problem? Can you share the model perhaps?
+		</comment>
+		<comment id='29' author='faifai21' date='2018-03-28T07:02:01Z'>
+		&lt;denchmark-link:https://github.com/asimshankar&gt;@asimshankar&lt;/denchmark-link&gt;
+ I'm running the model from a  file. It is 70 Mb, how can I share it with you?
+		</comment>
+		<comment id='30' author='faifai21' date='2018-03-28T07:11:00Z'>
+		You could upload it to some shared public storage and share from there. Though, before that, is there anything you can do to isolate the leak? For example, does a simple loop over the TensorFlowInferenceInterface object's method show this leak?
+		</comment>
+	</comments>
+</bug>

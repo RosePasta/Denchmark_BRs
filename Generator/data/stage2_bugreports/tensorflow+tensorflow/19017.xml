@@ -1,0 +1,352 @@
+<bug id='19017' author='sleepfin' open_date='2018-05-02T06:25:47Z' closed_time='2018-10-26T21:08:41Z'>
+	<summary>Strang behavior in memory copy with control dependencies.</summary>
+	<description>
+&lt;denchmark-h:h3&gt;System information&lt;/denchmark-h&gt;
+
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): I have costom code.
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): redhat-7.2
+TensorFlow installed from (source or binary): binary
+TensorFlow version (use command below): 1.4.0
+Python version: 2.7
+Bazel version (if compiling from source):
+GCC/Compiler version (if compiling from source):
+CUDA/cuDNN version: CUDA-8.0, cuDNN-6.0
+GPU model and memory: Nvidia - K80
+Exact command to reproduce:
+
+You can collect some of this information using our environment capture script:
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/tree/master/tools/tf_env_collect.sh&gt;https://github.com/tensorflow/tensorflow/tree/master/tools/tf_env_collect.sh&lt;/denchmark-link&gt;
+
+You can obtain the TensorFlow version with
+python -c "import tensorflow as tf; print(tf.GIT_VERSION, tf.VERSION)"
+&lt;denchmark-h:h3&gt;Describe the problem&lt;/denchmark-h&gt;
+
+There are two different ways to apply memory copy from CPU to GPU:0 in the following code:
+&lt;denchmark-code&gt;  with tf.control_dependencies([update_op]):
+    # Method-1 :
+    # with tf.device('/GPU:0'):
+    #   a_cpu_to_gpu = a_cpu.read_value()
+    # train_ops.append(vars[i].assign(a_cpu_to_gpu).op)
+
+    # Method-2 :
+    train_ops.append(vars[i].assign(a_cpu).op)
+&lt;/denchmark-code&gt;
+
+a_cpu is a variable in CPU device. vars[i] is a variable in GPU:0 device. The first one (Method-1) is to read the value in GPU:0 and then assign it to a_cpu_to_gpu. the second one (Method-2) is directly assign the variable in CPU to the variable in GPU:0.
+When I enable the trace_level, I find that the timeline of those two codes are different:
+Method-1
+&lt;denchmark-link:https://user-images.githubusercontent.com/7370869/39508070-8e8204a4-4e13-11e8-97e3-f166403f0bef.png&gt;&lt;/denchmark-link&gt;
+
+Method-2
+&lt;denchmark-link:https://user-images.githubusercontent.com/7370869/39507750-05f705d6-4e12-11e8-8aec-ff88db046e77.png&gt;&lt;/denchmark-link&gt;
+
+In Method-1, I think the read_value op a_cpu.read_value() only depends on the i-th update_op. So the MEMCPYHtoD (green bar) should be right after the the i-th update_op, which means right after the MEMCPYDtoH (purple bar). I don't understand why they appear in the end of the timeline.
+In Method-2, MEMCPYHtoD (green bar) appears at the beginning of the timeline. vars[i].assign(a_cpu).op depends on update_op, how can the memcpy be executed before the update_op ?
+I have no clue why it behaves like this, can anyone tell me why the memcpy behaves like that in Method-1 and Method-2 and what's the difference between them.
+Thanks.
+&lt;denchmark-h:h3&gt;Source code / logs&lt;/denchmark-h&gt;
+
+&lt;denchmark-code&gt;import tensorflow as tf
+import os
+
+from tensorflow.python.client import timeline
+slim = tf.contrib.slim
+
+train_ops = []
+
+optimizer = tf.train.GradientDescentOptimizer(learning_rate=0.1)
+
+net = tf.random_normal(shape=(32, 16, 16, 128))
+
+with tf.device('/GPU:0'):
+
+  for i in range(10):
+    net = slim.conv2d(net, 128, [11, 11], padding='SAME', scope='conv_%s' % i)
+
+  loss = tf.reduce_mean(net, name='loss_func')
+  grad = tf.gradients(loss, tf.global_variables(), gate_gradients=True, name='my_gradients')
+
+vars = tf.global_variables()
+num_vars = len(vars)
+
+for i in range(num_vars - 1, -1, -1):
+
+  with tf.device('/CPU:0'):
+    a_cpu = tf.get_variable('a_cpu_%s' % i, initializer=vars[i].initial_value)
+    update_op = optimizer.apply_gradients([(grad[i], a_cpu)], name='apply_%s' % i)
+
+  with tf.control_dependencies([update_op]):
+    # Method-1 :
+    # with tf.device('/GPU:0'):
+    #   a_cpu_to_gpu = a_cpu.read_value()
+    # train_ops.append(vars[i].assign(a_cpu_to_gpu).op)
+
+    # Method-2 :
+    train_ops.append(vars[i].assign(a_cpu).op)
+
+
+with tf.Session() as sess:
+  sess.run(tf.global_variables_initializer())
+  for i in range(10):
+    run_options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
+    run_metadata = tf.RunMetadata()
+    sess.run(train_ops, options=run_options, run_metadata=run_metadata)
+    trace_filename = os.path.join('/tmp/delete_me/trace', 'trace-global-step-%d.json' % i)
+    if not tf.gfile.Exists(os.path.dirname(trace_filename)):
+      os.makedirs(os.path.dirname(trace_filename))
+    trace = timeline.Timeline(step_stats=run_metadata.step_stats)
+    with tf.gfile.Open(trace_filename, 'w') as trace_file:
+      trace_file.write(trace.generate_chrome_trace_format(show_memory=False))
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='sleepfin' date='2018-05-02T09:26:35Z'>
+		I also tried another code which copy a_cpu from CPU to GPU:1 (not GPU:0)
+code:
+&lt;denchmark-code&gt;import tensorflow as tf
+import os
+
+from tensorflow.python.client import timeline
+slim = tf.contrib.slim
+
+train_ops = []
+
+optimizer = tf.train.GradientDescentOptimizer(learning_rate=0.1)
+
+net = tf.random_normal(shape=(32, 16, 16, 128))
+
+with tf.device('/GPU:0'):
+
+  for i in range(10):
+    net = slim.conv2d(net, 128, [11, 11], padding='SAME', scope='conv_%s' % i)
+
+  loss = tf.reduce_mean(net, name='loss_func')
+  grad = tf.gradients(loss, tf.global_variables(), gate_gradients=True, name='my_gradients')
+
+vars = tf.trainable_variables()
+num_vars = len(vars)
+
+for i in range(num_vars - 1, -1, -1):
+
+  with tf.device('/CPU:0'):
+    a_cpu = tf.get_variable('a_cpu_%s' % i, initializer=vars[i].initial_value)
+  update_op = optimizer.apply_gradients([(grad[i], a_cpu)], name='apply_%s' % i)
+
+  with tf.control_dependencies([update_op]):
+    # Method-1 :
+    # with tf.device('/GPU:0'):
+    #   a_cpu_to_gpu = a_cpu.read_value()
+    # train_op = vars[i].assign(a_cpu_to_gpu).op
+    # train_ops.append(train_op)
+
+    # Method-2 :
+    # train_ops.append(vars[i].assign(a_cpu).op)
+
+    # Method-3 :
+    with tf.device('/GPU:1'):
+      a_cpu_to_gpu = a_cpu.read_value()
+    train_ops.append(a_cpu_to_gpu.op)
+
+with tf.Session() as sess:
+  sess.run(tf.global_variables_initializer())
+  for i in range(10):
+    run_options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
+    run_metadata = tf.RunMetadata()
+    sess.run(train_ops, options=run_options, run_metadata=run_metadata)
+    trace_filename = os.path.join('/tmp/delete_me/trace', 'trace-global-step-%d.json' % i)
+    if not tf.gfile.Exists(os.path.dirname(trace_filename)):
+      os.makedirs(os.path.dirname(trace_filename))
+    trace = timeline.Timeline(step_stats=run_metadata.step_stats)
+    with tf.gfile.Open(trace_filename, 'w') as trace_file:
+      trace_file.write(trace.generate_chrome_trace_format(show_memory=False))
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-link:https://user-images.githubusercontent.com/7370869/39515871-ee9d8664-4e2d-11e8-9484-d3e6d6836760.png&gt;&lt;/denchmark-link&gt;
+
+In this way, MEMCPYHtoD (green bar) overlaps with compute_gradients.
+But in Method-2, MEMCPYHtoD (green bar) can not overlap with compute_gradients.
+It seems that MEMCPYHtoD (green bar) cannot overlap with the backward computation. But it can somehow overlap with forward computation (blue bars) in Method-1.
+If I change the with tf.device('/GPU:1'): to with tf.device('/GPU:0'):, the timeline is:
+&lt;denchmark-link:https://user-images.githubusercontent.com/7370869/39515848-d8956864-4e2d-11e8-9d5d-f39fc6148a74.png&gt;&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='2' author='sleepfin' date='2018-05-02T22:10:04Z'>
+		Control dependencies only affect operations created within the control dependencies block. Because a_cpu was created outside of that block, it can evaluate before update_op has executed. a_cpu_to_gpu is created within the block, so it's guaranteed to run after update_op
+		</comment>
+		<comment id='3' author='sleepfin' date='2018-05-03T01:17:55Z'>
+		&lt;denchmark-link:https://github.com/yaroslavvb&gt;@yaroslavvb&lt;/denchmark-link&gt;
+ Thanks for reply.
+So in Method-2,  evaluates before update_op has executed. Does that means old value of  (before updating the gradients to ) is assigned to  ? (That is not what I expected)
+And in Method-1, I can understand a_cpu_to_gpu should run after update_op, but what I can't understand is why all of the a_cpu_to_gpu run after the last update_op. What I expect is each a_cpu_to_gpu executes right after the corresponding update_op of a_cpu which means MEMCPYDtoH and MEMCPYHtoD shall execute alternately and sequentially.
+		</comment>
+		<comment id='4' author='sleepfin' date='2018-05-03T07:06:58Z'>
+		I have simplified the code to :
+&lt;denchmark-code&gt;import tensorflow as tf
+import os
+
+from tensorflow.python.client import timeline
+
+train_ops = []
+endpoints = []
+
+with tf.device('/GPU:0'):
+  a = tf.random_normal(shape=(2048, 2048), name='a')
+  b = tf.random_normal(shape=(2048, 2048), name='b')
+  for i in range(10):
+    a = tf.matmul(a, b, name='matmul_a_b_%s' % i)
+    endpoints.append(a)
+
+for i in range(len(endpoints)):
+  with tf.device('/CPU:0'):
+    memcpy_d2h = tf.identity(endpoints[i])
+  with tf.device('/GPU:0'):
+    memcpy_h2d = tf.identity(memcpy_d2h)
+  train_ops.append(memcpy_h2d.op)
+
+
+with tf.Session() as sess:
+  sess.run(tf.global_variables_initializer())
+  for i in range(10):
+    run_options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
+    run_metadata = tf.RunMetadata()
+    sess.run(train_ops, options=run_options, run_metadata=run_metadata)
+    trace_filename = os.path.join('/tmp/delete_me/trace', 'trace-%d.json' % i)
+    if not tf.gfile.Exists(os.path.dirname(trace_filename)):
+      os.makedirs(os.path.dirname(trace_filename))
+    trace = timeline.Timeline(step_stats=run_metadata.step_stats)
+    with tf.gfile.Open(trace_filename, 'w') as trace_file:
+      trace_file.write(trace.generate_chrome_trace_format(show_memory=False))
+&lt;/denchmark-code&gt;
+
+This code outputs the same timeline as Method-1 (all MEMCPYHtoD ops execute after the last MEMCPYDtoH)
+and also when I change the device of from GPU:0 to GPU:1
+&lt;denchmark-code&gt;  with tf.device('/GPU:1'):
+    memcpy_h2d = tf.identity(memcpy_d2h)
+&lt;/denchmark-code&gt;
+
+It outputs the same timeline as Method-3 (MEMCPYDtoH and MEMCPYHtoD execute alternately and sequentially.)
+In addition, I also reverse the device GPU and CPU like:
+&lt;denchmark-code&gt;with tf.device('/GPU:0'):
+  a = tf.random_normal(shape=(2048, 2048), name='a')
+  b = tf.random_normal(shape=(2048, 2048), name='b')
+  for i in range(10):
+    a = tf.matmul(a, b, name='matmul_a_b_%s' % i)
+    endpoints.append(a)
+
+for i in range(len(endpoints)):
+  with tf.device('/CPU:0'):
+    memcpy_d2h = tf.identity(endpoints[i])
+  with tf.device('/GPU:0'):
+    memcpy_h2d = tf.identity(memcpy_d2h)
+  train_ops.append(memcpy_h2d.op)
+&lt;/denchmark-code&gt;
+
+I have timeline:
+&lt;denchmark-link:https://user-images.githubusercontent.com/7370869/39563617-8fe18ff6-4ee3-11e8-9380-8c7f9049cdfc.png&gt;&lt;/denchmark-link&gt;
+
+In this case, MEMCPYDtoH and MEMCPYHtoD execute alternately and sequentially.
+What is reason of these differences?
+		</comment>
+		<comment id='5' author='sleepfin' date='2018-05-03T07:52:45Z'>
+		Well, I made some more experiments. If I change the size of a and b, I find that Matmul can somehow overlap with MEMCPYH2D
+When a and b are 512 x 512
+&lt;denchmark-code&gt;import tensorflow as tf
+import os
+
+from tensorflow.python.client import timeline
+
+train_ops = []
+endpoints = []
+
+with tf.device('/GPU:0'):
+  a = tf.random_normal(shape=(512, 512), name='a')
+  b = tf.random_normal(shape=(512, 512), name='b')
+  for i in range(10):
+    a = tf.matmul(a, b, name='matmul_a_b_%s' % i)
+    endpoints.append(a)
+
+for i in range(len(endpoints)):
+  with tf.device('/CPU:0'):
+    memcpy_d2h = tf.identity(endpoints[i])
+  with tf.device('/GPU:0'):
+    memcpy_h2d = tf.identity(memcpy_d2h)
+  train_ops.append(memcpy_h2d.op)
+
+
+with tf.Session() as sess:
+  sess.run(tf.global_variables_initializer())
+  for i in range(10):
+    run_options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
+    run_metadata = tf.RunMetadata()
+    sess.run(train_ops, options=run_options, run_metadata=run_metadata)
+    trace_filename = os.path.join('/tmp/delete_me/trace', 'trace-%d.json' % i)
+    if not tf.gfile.Exists(os.path.dirname(trace_filename)):
+      os.makedirs(os.path.dirname(trace_filename))
+    trace = timeline.Timeline(step_stats=run_metadata.step_stats)
+    with tf.gfile.Open(trace_filename, 'w') as trace_file:
+      trace_file.write(trace.generate_chrome_trace_format(show_memory=False))
+&lt;/denchmark-code&gt;
+
+Timeline is:
+&lt;denchmark-link:https://user-images.githubusercontent.com/7370869/39565097-54d615ca-4ee9-11e8-9066-b45e4cc7ffcf.png&gt;&lt;/denchmark-link&gt;
+
+When When a and b are 256 x 256:
+&lt;denchmark-code&gt;  a = tf.random_normal(shape=(256, 256), name='a')
+  b = tf.random_normal(shape=(256, 256), name='b')
+&lt;/denchmark-code&gt;
+
+Timeline is:
+&lt;denchmark-link:https://user-images.githubusercontent.com/7370869/39565157-8817f1a6-4ee9-11e8-9cf2-021d5edcdf65.png&gt;&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='6' author='sleepfin' date='2018-05-03T09:21:13Z'>
+		I notice that there are new environment variables  and  in latest TensorFlow
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/r1.8/tensorflow/core/common_runtime/gpu/gpu_device.cc#L332&gt;https://github.com/tensorflow/tensorflow/blob/r1.8/tensorflow/core/common_runtime/gpu/gpu_device.cc#L332&lt;/denchmark-link&gt;
+
+Is there anything to do with that ? (I am using TensorFlow-1.4)
+		</comment>
+		<comment id='7' author='sleepfin' date='2018-05-05T04:59:03Z'>
+		Anyone can help me :) @angersson &lt;denchmark-link:https://github.com/yaroslavvb&gt;@yaroslavvb&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='8' author='sleepfin' date='2018-05-05T06:53:31Z'>
+		It's not clear what you are seeing is a bug, can you isolate the problem further?
+		</comment>
+		<comment id='9' author='sleepfin' date='2018-05-06T04:35:34Z'>
+		&lt;denchmark-link:https://github.com/yaroslavvb&gt;@yaroslavvb&lt;/denchmark-link&gt;
+ Sorry for not being clear. My question is in Method-1, why MEMCPYH2D can not overlap with the backward computation while MEMCPYD2H can.
+&lt;denchmark-link:https://user-images.githubusercontent.com/7370869/39508070-8e8204a4-4e13-11e8-97e3-f166403f0bef.png&gt;&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='10' author='sleepfin' date='2018-05-07T21:51:37Z'>
+		(I marked &lt;denchmark-link:https://github.com/yaroslavvb&gt;@yaroslavvb&lt;/denchmark-link&gt;
+ as assignee since he's been looking at this already. Thanks!)
+		</comment>
+		<comment id='11' author='sleepfin' date='2018-05-14T05:52:21Z'>
+		Still waiting for reply :-)
+		</comment>
+		<comment id='12' author='sleepfin' date='2018-05-19T00:58:42Z'>
+		Still waiting for reply :-)
+		</comment>
+		<comment id='13' author='sleepfin' date='2018-08-06T01:45:27Z'>
+		&lt;denchmark-link:https://github.com/yaroslavvb&gt;@yaroslavvb&lt;/denchmark-link&gt;
+ @angersson anyone help? :)
+		</comment>
+		<comment id='14' author='sleepfin' date='2018-09-11T17:57:58Z'>
+		Sorry, I don't have context and I see a lot of discussion in this bug. Can you restate what is the actual issue that is still unresolved?
+Also, I see variables and control dependencies; does enabling resource variables (tf.enable_resource_variables() on nightly) make the issue go away?
+		</comment>
+		<comment id='15' author='sleepfin' date='2018-09-26T19:14:04Z'>
+		&lt;denchmark-link:https://github.com/sleepfin&gt;@sleepfin&lt;/denchmark-link&gt;
+ can you update the bug on what is the current issue? Did you check whether resource variables make this issue go away?
+		</comment>
+		<comment id='16' author='sleepfin' date='2018-10-26T12:47:03Z'>
+		It has been 29 days with no activity and the awaiting response label was assigned. Is this still an issue?
+		</comment>
+		<comment id='17' author='sleepfin' date='2018-10-26T21:08:41Z'>
+		Closing due to low activity
+		</comment>
+	</comments>
+</bug>

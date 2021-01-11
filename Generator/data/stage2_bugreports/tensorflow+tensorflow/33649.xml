@@ -1,0 +1,194 @@
+<bug id='33649' author='netw0rkf10w' open_date='2019-10-23T20:53:13Z' closed_time='2020-04-06T11:26:03Z'>
+	<summary>Simple custom metric caused tf.function retracing when training on multiple GPUs</summary>
+	<description>
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): Yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Linux Ubuntu 16.04
+Mobile device (e.g. iPhone 8, Pixel 2, Samsung Galaxy) if the issue happens on mobile device:
+TensorFlow installed from (source or binary): binary
+TensorFlow version (use command below): v2.0.0-rc2-26-g64c3d38 2.0.0
+Python version: 3.5.2
+CUDA/cuDNN version: 9.2
+GPU model and memory: GTX 1080 Ti
+
+Describe the current behavior
+Using the following custom metric (event without the commented part):
+&lt;denchmark-code&gt;import tensorflow as tf
+
+class MeanIoUIgnoreLabel(tf.keras.metrics.MeanIoU):
+    """Mean Intersection-over-Union with an ignored label
+    """
+    def __init__(self, num_classes, ignore_label=None, name='mIoU_ignore_label', **kwargs):
+      super(MeanIoUIgnoreLabel, self).__init__(num_classes, name=name, **kwargs)
+      self.ignore_label = ignore_label
+
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_pred = tf.argmax(y_pred, axis=-1)
+        # if self.ignore_label is not None:
+        #     if sample_weight is not None:
+        #         # sample_weight = tf.where(y_true == self.ignore_label, 0, sample_weight)
+        #         sample_weight = tf.where(tf.math.equal(y_true, self.ignore_label), 0, sample_weight)
+        #     else:
+        #         # sample_weight = y_true != self.ignore_label
+        #         sample_weight = tf.math.not_equal(y_true, self.ignore_label)
+        return super(MeanIoUIgnoreLabel, self).update_state(y_true, y_pred, sample_weight)   
+&lt;/denchmark-code&gt;
+
+I obtained the following warning:
+
+2019-10-23 22:27:58.600906: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamic library libcudnn.so.7
+WARNING:tensorflow:5 out of the last 9 calls to &lt;bound method MeanIoUIgnoreLabel.update_state of &lt;metrics.MeanIoUIgnoreLabel object at 0x7fc0ac1f86a0&gt;&gt; triggered tf.function retracing. Tracing is expensive and the excessive number of tracings is likely due to passing python objects instead of tensors. Also, tf.function has experimental_relax_shapes=True option that relaxes argument shapes that can avoid unnecessary retracing. Please refer to https://www.tensorflow.org/beta/tutorials/eager/tf_function#python_or_tensor_args and https://www.tensorflow.org/api_docs/python/tf/function for more details.
+
+I am using tf.distribute.MirroredStrategy() to train on multiple GPUs.
+I guess this is a bug?
+Thanks.
+	</description>
+	<comments>
+		<comment id='1' author='netw0rkf10w' date='2019-10-24T06:35:11Z'>
+		&lt;denchmark-link:https://github.com/netw0rkf10w&gt;@netw0rkf10w&lt;/denchmark-link&gt;
+, Please provide the complete standalone code to reproduce the reported issue. Thanks!
+		</comment>
+		<comment id='2' author='netw0rkf10w' date='2019-10-27T00:02:34Z'>
+		Hi &lt;denchmark-link:https://github.com/gadagashwini&gt;@gadagashwini&lt;/denchmark-link&gt;
+! Sorry for the delay, because this issue occurred randomly, I have been trying to investigate further to make sure it is reproducible.
+First of all, the code can be found in &lt;denchmark-link:https://colab.research.google.com/drive/1qpCxBeF-2GEjPkvbcQDITC7Gi_9X-oTc&gt;this Colab notebook&lt;/denchmark-link&gt;
+. Note, however, that .
+Below are some additional findings.
+In the code, I have a function distributed_training(datasets, model, optimizer, loss, metrics, strategy) that performs distributed training. The issue occurs only if the same metric objects are used in both the train_step and val_step functions. If I separate the metrics, for example:
+&lt;denchmark-code&gt;train_metrics = [MeanIoUIgnoreLabel(num_classes=3)]
+val_metrics = [MeanIoUIgnoreLabel(num_classes=3)]
+&lt;/denchmark-code&gt;
+
+then no issue.
+In addition, the issue occurs only for the custom metric that I defined:
+metrics = [MeanIoUIgnoreLabel(num_classes=3)]
+If
+metrics = [tf.keras.metrics.SparseCategoricalAccuracy()]
+then no issue.
+In conclusion, the issue occurs only if the following 3 things happen simultaneously:
+
+More than 1 GPU are used.
+The custom metric MeanIoUIgnoreLabel is part of the input argument metrics of the distributed_training() function.
+The same metrics object is used in both the train_step() and val_step() function. (I also tried to create a copy for val_step like this: val_metrics = metrics.copy() but it did not work, I guess metrics and metrics.copy() still share the same metric objects).
+
+Please let me know if you need additional information. Thanks.
+		</comment>
+		<comment id='3' author='netw0rkf10w' date='2019-11-06T03:13:01Z'>
+		I have encountered a similar problem when I use Keras custom metrics.
+info：
+
+tensorflow 2.0.0
+running on cpu
+warning log
+
+&lt;denchmark-code&gt;W1106 10:49:14.171694 4745115072 def_function.py:474] 6 out of the last 11 calls to &lt;function _make_execution_function.&lt;locals&gt;.distributed_function at 0x14a3f9d90&gt; triggered tf.function retracing. Tracing is expensive and the excessive number of tracings is likely due to passing python objects instead of tensors. Also, tf.function has experimental_relax_shapes=True option that relaxes argument shapes that can avoid unnecessary retracing. Please refer to https://www.tensorflow.org/beta/tutorials/eager/tf_function#python_or_tensor_args and https://www.tensorflow.org/api_docs/python/tf/function for more details.
+&lt;/denchmark-code&gt;
+
+
+custom code
+
+from tensorflow.keras.callbacks import Callback
+
+class Metrics(Callback):
+    def __init__(self, dev_data, classifier, dataloader):
+        self.best_f1_score = 0.0
+        self.dev_data = dev_data
+        self.classifier = classifier
+        self.predictor = Predictor(classifier, dataloader)
+        self.dataloader = dataloader
+
+    def on_epoch_end(self, epoch, logs=None):
+        print("start to evaluate....")
+        _, preds = self.predictor(self.dev_data)
+        y_trues, y_preds = [self.dataloader.label_vector(v["label"]) for v in self.dev_data], preds
+        f1 = f1_score(y_trues, y_preds, average="weighted")
+        print(classification_report(y_trues, y_preds,
+                                    target_names=self.dataloader.vocab.labels))
+        if f1 &gt; self.best_f1_score:
+            self.best_f1_score = f1
+            self.classifier.save_model()
+            print("best metrics, save model...")
+		</comment>
+		<comment id='4' author='netw0rkf10w' date='2019-11-10T00:23:30Z'>
+		Hi &lt;denchmark-link:https://github.com/ymodak&gt;@ymodak&lt;/denchmark-link&gt;
+. Any updates on this please? Thanks.
+		</comment>
+		<comment id='5' author='netw0rkf10w' date='2019-11-19T18:58:44Z'>
+		&lt;denchmark-link:https://github.com/SeanLee97&gt;@SeanLee97&lt;/denchmark-link&gt;
+ Would you be able to share standalone code for reproducing the issue?
+		</comment>
+		<comment id='6' author='netw0rkf10w' date='2020-02-02T00:46:53Z'>
+		Automatically closing due to lack of recent activity. Please update the issue when new information becomes available, and we will reopen the issue. Thanks!
+		</comment>
+		<comment id='7' author='netw0rkf10w' date='2020-02-02T00:46:55Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/33649&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/33649&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='8' author='netw0rkf10w' date='2020-02-02T09:31:04Z'>
+		&lt;denchmark-link:https://github.com/ymodak&gt;@ymodak&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/pavithrasv&gt;@pavithrasv&lt;/denchmark-link&gt;
+ The bug can be reproduced using &lt;denchmark-link:https://colab.research.google.com/drive/1qpCxBeF-2GEjPkvbcQDITC7Gi_9X-oTc&gt;this Colab notebook&lt;/denchmark-link&gt;
+. It's the same notebook as in the first message, but with 2 differences:
+
+I added a creation of 2 virtual GPUs to simulate multi-gpu training.
+I changed the TF version to tf-nightly to show that the bug still exists in the latest version.
+
+Simply running the notebook, one will obtain this kind of messages:
+
+WARNING:tensorflow:5 out of the last 9 calls to &lt;bound method MeanIoUIgnoreLabel.update_state of &lt;main.MeanIoUIgnoreLabel object at 0x7fa5403782e8&gt;&gt; triggered tf.function retracing. Tracing is expensive and the excessive number of tracings is likely due to passing python objects instead of tensors. Also, tf.function has experimental_relax_shapes=True option that relaxes argument shapes that can avoid unnecessary retracing. Please refer to https://www.tensorflow.org/tutorials/customization/performance#python_or_tensor_args and https://www.tensorflow.org/api_docs/python/tf/function for more details.
+
+Let me know if you guys need additional information.
+		</comment>
+		<comment id='9' author='netw0rkf10w' date='2020-03-09T06:22:37Z'>
+		i think
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/34025&gt;#34025&lt;/denchmark-link&gt;
+
+has the same problem
+		</comment>
+		<comment id='10' author='netw0rkf10w' date='2020-03-09T06:43:29Z'>
+		I may have found the "Problem"
+I implemented a simple function with a  statement to see when it is traced.
+similar to :
+&lt;denchmark-link:https://www.tensorflow.org/tutorials/customization/performance#tracing_and_polymorphism&gt;https://www.tensorflow.org/tutorials/customization/performance#tracing_and_polymorphism&lt;/denchmark-link&gt;
+
+and ran it on a multi gpu setup.
+Output is:
+&lt;denchmark-code&gt;Tracing with Tensor("inputs:0", dtype=float32) Tensor("inputs_1:0", shape=(None, 15, 3), dtype=float32)
+Tracing with Tensor("inputs:0", dtype=float32, device=/job:localhost/replica:0/task:0/device:GPU:0) Tensor("inputs_1:0", shape=(None, 15, 3), dtype=float32, device=/job:localhost/replica:0/task:0/device:GPU:0)
+
+Tracing with Tensor("inputs:0", dtype=float32, device=/job:localhost/replica:0/task:0/device:GPU:1) Tensor("inputs_1:0", shape=(None, 15, 3), dtype=float32, device=/job:localhost/replica:0/task:0/device:GPU:1)
+Tracing with Tensor("inputs:0", dtype=float32, device=/job:localhost/replica:0/task:0/device:GPU:2) Tensor("inputs_1:0", shape=(None, 15, 3), dtype=float32, device=/job:localhost/replica:0/task:0/device:GPU:2)
+Tracing with Tensor("inputs:0", dtype=float32, device=/job:localhost/replica:0/task:0/device:GPU:3) Tensor("inputs_1:0", shape=(None, 15, 3), dtype=float32, device=/job:localhost/replica:0/task:0/device:GPU:3)
+WARNING:tensorflow:5 out of the last 5 calls to &lt;function LocationToIndex.call at 0x7f151ab16620&gt; triggered tf.function retracing. Tracing is expensive and the excessive number of tracings is likely due to passing python objects instead of tensors. Also, tf.function has experimental_relax_shapes=True option that relaxes argument shapes that can avoid unnecessary retracing. Please refer to https://www.tensorflow.org/tutorials/customization/performance#python_or_tensor_args and https://www.tensorflow.org/api_docs/python/tf/function for more details.
+&lt;/denchmark-code&gt;
+
+so the graph is traced on every used cpu/gpu one time, thats why the warning is shown
+the warning code counts how often a trace is made... and warns if a trace happens multiple times
+a simple solution would be:
+count how often a trace PER Device is made
+only warn if trace is made on same Device multiple times
+		</comment>
+		<comment id='11' author='netw0rkf10w' date='2020-04-06T03:46:37Z'>
+		&lt;denchmark-link:https://github.com/netw0rkf10w&gt;@netw0rkf10w&lt;/denchmark-link&gt;
+  I just ran the notebook you linked, and I don't see those warnings. Can you check if you're still seeing them?
+(Note that you should install tf-nightly-gpu instead of tf-nightly if you're planning to GPUs - but this is orthogonal point).
+		</comment>
+		<comment id='12' author='netw0rkf10w' date='2020-04-06T11:26:03Z'>
+		&lt;denchmark-link:https://github.com/bela127&gt;@bela127&lt;/denchmark-link&gt;
+ Nice finding, thanks.
+&lt;denchmark-link:https://github.com/guptapriya&gt;@guptapriya&lt;/denchmark-link&gt;
+ Thanks. It seems that the bug has been fixed in the latest . Let me close this issue.
+		</comment>
+		<comment id='13' author='netw0rkf10w' date='2020-04-06T11:26:05Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/33649&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/33649&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

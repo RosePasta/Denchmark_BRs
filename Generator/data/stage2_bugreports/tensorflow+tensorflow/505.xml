@@ -1,0 +1,163 @@
+<bug id='505' author='tomasmcz' open_date='2015-12-14T03:46:15Z' closed_time='2015-12-17T02:28:45Z'>
+	<summary>Momentum and Adagrad don't work with reshape and embeddings</summary>
+	<description>
+Momentum and Adagrad optimizers do not work when I use tf.reshape like this:
+embeddings = tf.Variable(                                                                                                  
+    tf.random_uniform([50000, 50], -1.0, 1.0))
+
+embed = tf.reshape(                                                                                                        
+        tf.nn.embedding_lookup(embeddings, input_op),                                                                          
+        [-1, em_layer_size])
+
+# a few dense layers and a softmax would follow here
+The code above works with SGD and AdamOptimizer. With Momentum or Adagrad it produces this error:
+&lt;denchmark-code&gt;    optimizer = tf.train.MomentumOptimizer(0.01, 0.9).minimize(loss)
+  File "/home/tom/tf-env/local/lib/python2.7/site-packages/tensorflow/python/training/optimizer.py", line 188, in minimize
+    name=name)
+  File "/home/tom/tf-env/local/lib/python2.7/site-packages/tensorflow/python/training/optimizer.py", line 289, in apply_gradients
+    update_ops.append(self._apply_sparse(grad, var))
+  File "/home/tom/tf-env/local/lib/python2.7/site-packages/tensorflow/python/training/momentum.py", line 70, in _apply_sparse
+    self._momentum_tensor, use_locking=self._use_locking).op
+  File "/home/tom/tf-env/local/lib/python2.7/site-packages/tensorflow/python/training/gen_training_ops.py", line 237, in sparse_apply_momentum
+    name=name)
+  File "/home/tom/tf-env/local/lib/python2.7/site-packages/tensorflow/python/ops/op_def_library.py", line 664, in apply_op
+    op_def=op_def)
+  File "/home/tom/tf-env/local/lib/python2.7/site-packages/tensorflow/python/framework/ops.py", line 1836, in create_op
+    set_shapes_for_outputs(ret)
+  File "/home/tom/tf-env/local/lib/python2.7/site-packages/tensorflow/python/framework/ops.py", line 1476, in set_shapes_for_outputs
+    shapes = shape_func(op)
+  File "/home/tom/tf-env/local/lib/python2.7/site-packages/tensorflow/python/training/training_ops.py", line 130, in _SparseApplyMomentumShape
+    tensor_shape.TensorShape([None]).concatenate(accum_shape[1:]))
+  File "/home/tom/tf-env/local/lib/python2.7/site-packages/tensorflow/python/framework/tensor_shape.py", line 527, in merge_with
+    self.assert_same_rank(other)
+  File "/home/tom/tf-env/local/lib/python2.7/site-packages/tensorflow/python/framework/tensor_shape.py", line 570, in assert_same_rank
+    "Shapes %s and %s must have the same rank" % (self, other))
+ValueError: Shapes TensorShape([Dimension(None), Dimension(None), Dimension(None)]) and TensorShape([Dimension(None), Dimension(50)]) must have the same rank
+&lt;/denchmark-code&gt;
+
+This might be connected to &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/464&gt;#464&lt;/denchmark-link&gt;
+, the error is similar and also appears with Momentum and Adagrad.
+When I replace the tf.reshape with following code, the error disappears:
+_emb = []                                                                                                                 
+for x in tf.split(1, 4, input_op):                                                                          
+    _emb.append(tf.nn.embedding_lookup(embeddings, tf.squeeze(x)))                                                        
+embed = tf.concat(1, _emb) 
+	</description>
+	<comments>
+		<comment id='1' author='tomasmcz' date='2015-12-14T22:00:56Z'>
+		I'll try to track down this issue. Tomas, would you be able to write a self-contained example that fails with this error (including a definition of the input, any size constants, and the momentum optimizer itself)?
+		</comment>
+		<comment id='2' author='tomasmcz' date='2015-12-15T03:52:23Z'>
+		Indeed, the graph where I had the bug &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/464&gt;#464&lt;/denchmark-link&gt;
+ was also using this mix of embedding layer and reshape. So I might have misinterpreted, and there is actually two bugs: one with "tf.reshape" and Momentum and Adagrad, and the other with "tf.nce_loss" and RMSProp... I will try to check further...
+		</comment>
+		<comment id='3' author='tomasmcz' date='2015-12-15T06:26:45Z'>
+		Here is a small self-contained example that demonstrates the issue:
+&lt;denchmark-code&gt;import collections
+import numpy as np
+import tensorflow as tf
+import logging
+import codecs
+import json
+import itertools
+import time
+
+def device_for_node(n):
+    if n.type == "MatMul":
+        return "/gpu:1"
+    else:
+        return "/cpu:0"
+
+minibatch_size = 128
+hidden_size = 64
+embedding_size = 256
+input_layer_size = 3
+vocab_size_input = 32
+vocab_size_output = 64
+nce_num_sampled = 16
+learning_rate = 0.1
+learning_momentum = 0.9
+
+dummy_input = np.zeros((minibatch_size, input_layer_size), dtype = np.int32)
+dummy_target = np.zeros((minibatch_size, 1), dtype = np.int32)
+
+input_layer_flattened_size = input_layer_size * embedding_size
+
+graph = tf.Graph()
+
+with graph.as_default():
+    with graph.device(device_for_node):
+        input_layer = tf.placeholder(tf.int32, shape = (minibatch_size, input_layer_size), name = "input_layer")       
+        ref_input = tf.placeholder(tf.int32, shape = (minibatch_size, 1), name = "ref_input")
+
+        # Parameters
+
+        input_embeddings = tf.Variable(tf.random_normal([vocab_size_input, embedding_size]), name = "i_embeddings")
+
+        Wh_i = tf.Variable(tf.random_normal((input_layer_flattened_size, hidden_size), stddev = 0.2), name = "Wh_i")
+        bh_i = tf.Variable(tf.random_normal((hidden_size,), stddev = 0.2), name = "bh_i")
+
+        Wh_o = tf.Variable(tf.random_normal((vocab_size_output, hidden_size), stddev = 0.2), name = "Wh_o")
+        bh_o = tf.Variable(tf.random_normal((vocab_size_output,), stddev = 0.2), name = "bh_o")
+
+        # Layers
+
+        i_embedded = tf.nn.embedding_lookup(input_embeddings, input_layer)
+        i_embedded_flattened = tf.reshape(i_embedded, 
+                        (
+                         (minibatch_size if minibatch_size is not None else -1), 
+                         input_layer_flattened_size ) 
+                        )
+
+        h = tf.tanh(tf.matmul(i_embedded_flattened, Wh_i) + bh_i)
+        nce_loss = tf.reduce_mean(tf.nn.nce_loss(Wh_o, bh_o, h, ref_input, nce_num_sampled, 
+                                                     num_classes = vocab_size_output, name = "nce"))
+        optimizer = tf.train.MomentumOptimizer(learning_rate, learning_momentum).minimize(nce_loss)
+
+        init_op = tf.initialize_all_variables()
+
+
+with tf.Session(graph=graph) as session:
+
+    feed_dict = {input_layer : dummy_input, ref_input : dummy_target}
+    _, loss_val = session.run([optimizer, nce_loss], feed_dict=feed_dict)
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='4' author='tomasmcz' date='2015-12-15T10:53:47Z'>
+		This is the smallest example I was able to write. Embeddings seem to be an important part of the problem.
+#!/usr/bin/env python
+
+import tensorflow as tf
+
+input_op = tf.placeholder(tf.int32, shape=(7, 3))
+target_op = tf.placeholder(tf.float32, shape=(7))
+
+embeddings = tf.Variable(tf.random_uniform((13, 5), -1.0, 1.0))
+emb = tf.nn.embedding_lookup(embeddings, input_op)
+
+# This does not work with Momentum:
+reshaped = tf.reshape(emb, (-1, 15))
+
+# This works with Momentum:
+#_emb = []
+#for x in tf.split(1, 3, input_op):
+#    _emb.append(tf.nn.embedding_lookup(embeddings, tf.squeeze(x)))
+#reshaped = tf.concat(1, _emb)
+
+W = tf.Variable(tf.random_uniform([15, 1], -1.0, 1.0))
+loss = tf.nn.sigmoid_cross_entropy_with_logits(tf.matmul(reshaped, W), target_op)
+
+#optimizer = tf.train.GradientDescentOptimizer(learning_rate=0.01).minimize(loss)
+optimizer = tf.train.MomentumOptimizer(0.01, 0.9).minimize(loss)
+#optimizer = tf.train.AdagradOptimizer(0.01).minimize(loss)
+#optimizer = tf.train.AdamOptimizer().minimize(loss)
+		</comment>
+		<comment id='5' author='tomasmcz' date='2015-12-16T01:32:24Z'>
+		On further investigation, this looks like a bug in tf.gather()'s gradient, when the indices are &gt;1-dimensional. I'm working on a fix, and it should be available shortly.
+		</comment>
+		<comment id='6' author='tomasmcz' date='2015-12-17T03:46:13Z'>
+		Nice. Thank you.
+		</comment>
+	</comments>
+</bug>

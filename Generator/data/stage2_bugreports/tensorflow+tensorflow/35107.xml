@@ -1,0 +1,616 @@
+<bug id='35107' author='CNOCycle' open_date='2019-12-14T02:37:17Z' closed_time='2020-04-02T18:39:33Z'>
+	<summary>tf.keras.layers.BatchNormalization() may not work in tf=2.0 and eager model is disable</summary>
+	<description>
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): Yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Linux Ubuntu 16.04 in Docker
+TensorFlow installed from (source or binary): pip install
+TensorFlow version (use command below): v2.0.0-rc2-26-g64c3d38
+Python version: 3.5
+CUDA/cuDNN version: 10.0 / 7
+GPU model and memory: GTX 1080Ti / 11175MiB
+
+Describe the current behavior
+Hi authors and developers,
+I am developing our project in tf=2.0.0 and eager_mode is disable.
+The main reason is tf=1.x will not be maintained but third party libraries have not been ready for tf=2.0 yet.
+This issues is a separate issues from &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/35050#issuecomment-565395512&gt;#35050&lt;/denchmark-link&gt;
+
+This potential issue is somethine wrong if users do custom training with level API which includes tf.keras.layers.BatchNormalization() in tf=2.0 and eager model is disable.
+I summary the testcaset as the following:
+#%%
+import tensorflow as tf
+tf.compat.v1.disable_eager_execution()
+#tf.compat.v1.disable_v2_behavior()
+
+import numpy as np
+
+batch_size = 100
+
+def download_data():
+
+    # get raw data
+    (trainX, trainY), (testX, testY) = tf.keras.datasets.cifar10.load_data()
+    trainX = trainX.astype(np.float32)
+    testX  = testX.astype(np.float32)
+
+    # ont-hot
+    trainY = tf.keras.utils.to_categorical(trainY, 10)
+    testY  = tf.keras.utils.to_categorical(testY , 10)
+
+    # get validation sets
+    training_size = 45000
+    validX = trainX[training_size:,:]
+    validY = trainY[training_size:,:]
+
+    trainX = trainX[:training_size,:]
+    trainY = trainY[:training_size,:]
+
+    return trainX, trainY, validX, validY, testX, testY
+
+def data_pipeline(dataX, dataY):
+
+        dataset = tf.data.Dataset.from_tensor_slices( (dataX, dataY) )
+        dataset = dataset.shuffle(batch_size * 8)
+        dataset = dataset.repeat()
+        dataset = dataset.batch(batch_size)
+        dataset = dataset.prefetch(tf.data.experimental.AUTOTUNE)
+        return dataset
+
+class custom_model():
+    def __init__(self):
+
+        def Acc():
+            acc = tf.keras.metrics.categorical_accuracy(label_ref, clf_out)
+            return tf.math.reduce_mean(acc)
+
+        def c_loss():
+            loss = tf.keras.losses.categorical_crossentropy(label_ref, clf_out)
+            loss = tf.math.reduce_mean(loss)
+            return loss
+
+        # create model
+        clf_input = tf.keras.layers.Input(shape=(32,32,3), name="model/input")
+        model = tf.keras.applications.resnet_v2.ResNet50V2(include_top=True, weights=None, input_tensor=clf_input, pooling='max', classes=10)
+        #model = tf.keras.applications.vgg16.VGG16(include_top=True, weights=None, input_tensor=clf_input, pooling='max', classes=10)
+        model.compile(loss='categorical_crossentropy', optimizer='SGD', metrics=['accuracy'])
+
+        label_ref = tf.keras.layers.Input(shape=(10,) , name='label_ref')
+        clf_out = model(clf_input)
+
+        # using tf.keras.optimizers.Nadam would get error
+        #optimizer = tf.keras.optimizers.Nadam(lr=0.0005)
+        optimizer = tf.compat.v1.train.AdamOptimizer(learning_rate=0.01)
+        self.train_op = optimizer.minimize(c_loss(), var_list=[model.trainable_variables])
+
+        self.clf_model = model
+        self.clf_input = clf_input
+        self.label_ref = label_ref
+        self.op_acc = Acc()
+        self.c_loss = c_loss()
+
+if __name__ == '__main__':
+
+    # set GPU
+    import os
+    if os.environ.get("CUDA_VISIBLE_DEVICES") is None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+    # reset tf session
+    tf.compat.v1.keras.backend.clear_session()
+    gpu_options = tf.compat.v1.GPUOptions(allow_growth=True)
+    sess = tf.compat.v1.Session(config=tf.compat.v1.ConfigProto(gpu_options=gpu_options))
+    tf.compat.v1.keras.backend.set_session(sess) 
+
+    # prepare data
+    trainX, trainY, validX, validY, testX, testY = download_data()
+    train_gen = data_pipeline(trainX, trainY)
+    valid_gen = data_pipeline(validX, validY)
+    test_gen = data_pipeline(testX, testY)
+
+    # build targeted model
+    model = tf.keras.applications.resnet_v2.ResNet50V2(include_top=True, weights=None, input_shape=(32,32,3), pooling='max', classes=10)
+    #model = tf.keras.applications.vgg16.VGG16(include_top=True, weights=None, input_shape=(32,32,3), pooling=None, classes=10)
+    model.compile(loss='categorical_crossentropy', optimizer='SGD', metrics=['accuracy'])
+
+    # fit and evalutate
+    model.fit(train_gen,
+            steps_per_epoch = trainY.shape[0] // batch_size,
+            validation_data = valid_gen,
+            validation_steps= validY.shape[0] // batch_size,
+            epochs=5,
+            verbose=2)
+    model.evaluate(testX, testY, verbose=2, batch_size=batch_size)
+
+    # create a new model
+    print('Make sure that we create a new model.')
+    model = custom_model()
+    sess.run(tf.compat.v1.global_variables_initializer())
+    model.clf_model.evaluate(testX, testY, verbose=2, batch_size=batch_size)
+
+    # train model
+    num_epoch = 5
+    total_len = trainY.shape[0] // batch_size
+    tf_iter = tf.compat.v1.data.make_initializable_iterator(train_gen)
+    tf_next = tf_iter.get_next()
+    sess.run(tf_iter.initializer)
+    for epoch in range(num_epoch):
+        c_loss, acc = 0.0, 0.0
+        for ii in range(total_len):
+            X, Y = sess.run(tf_next)
+            [b_c_loss, b_acc, _] = sess.run([model.c_loss, model.op_acc, model.train_op],
+                                                feed_dict={ model.clf_input: X,
+                                                            model.label_ref: Y,
+                                                            tf.keras.backend.learning_phase(): 1})
+            c_loss = c_loss + b_c_loss
+            acc = acc + b_acc
+        
+        c_loss = c_loss / total_len
+        acc = acc / total_len
+        print('[Training]Epoch: {:d}/{:d} - loss: {:.3f} - acc: {:.3f}'.format(epoch+1, num_epoch, c_loss, acc) )
+
+    print('Show loss and accuracy with keras API')
+    model.clf_model.evaluate(trainX, trainY, verbose=2, batch_size=batch_size)
+    model.clf_model.evaluate(validX, validY, verbose=2, batch_size=batch_size)
+    model.clf_model.evaluate(testX, testY, verbose=2, batch_size=batch_size)
+
+    print('Show loss and accuracy with low level API')
+    # evaluate
+    num_epoch = 1
+    total_len = validY.shape[0] // batch_size
+    tf_iter = tf.compat.v1.data.make_initializable_iterator(valid_gen)
+    tf_next = tf_iter.get_next()
+    sess.run(tf_iter.initializer)
+    for epoch in range(num_epoch):
+        c_loss_t, acc_t, c_loss_f, acc_f = 0.0, 0.0, 0.0, 0.0
+        for ii in range(total_len):
+            X, Y = sess.run(tf_next)
+            [b_c_loss, b_acc] = sess.run([model.c_loss, model.op_acc],
+                                        feed_dict={ model.clf_input: X,
+                                                    model.label_ref: Y,
+                                                    tf.keras.backend.learning_phase(): 1})
+            c_loss_t = c_loss_t + b_c_loss
+            acc_t = acc_t + b_acc
+
+            [b_c_loss, b_acc] = sess.run([model.c_loss, model.op_acc],
+                                        feed_dict={ model.clf_input: X,
+                                                    model.label_ref: Y,
+                                                    tf.keras.backend.learning_phase(): 0})
+            c_loss_f = c_loss_f + b_c_loss
+            acc_f = acc_f + b_acc
+
+        c_loss_t = c_loss_t / total_len
+        c_loss_f = c_loss_f / total_len
+        acc_t = acc_t / total_len
+        acc_f = acc_f / total_len
+        print('[Validation][learning_phase=1] Epoch: {:d}/{:d} - loss: {:.3f} - acc: {:.3f}'.format(epoch+1, num_epoch, c_loss_t, acc_t) )
+        print('[Validation][learning_phase=0] Epoch: {:d}/{:d} - loss: {:.3f} - acc: {:.3f}'.format(epoch+1, num_epoch, c_loss_f, acc_f) )
+
+    # evaluate
+    num_epoch = 1
+    total_len = testY.shape[0] // batch_size
+    tf_iter = tf.compat.v1.data.make_initializable_iterator(test_gen)
+    tf_next = tf_iter.get_next()
+    sess.run(tf_iter.initializer)
+    for epoch in range(num_epoch):
+        c_loss_t, acc_t, c_loss_f, acc_f = 0.0, 0.0, 0.0, 0.0
+        for ii in range(total_len):
+            X, Y = sess.run(tf_next)
+            [b_c_loss, b_acc] = sess.run([model.c_loss, model.op_acc],
+                                        feed_dict={ model.clf_input: X,
+                                                    model.label_ref: Y,
+                                                    tf.keras.backend.learning_phase(): 1})
+            c_loss_t = c_loss_t + b_c_loss
+            acc_t = acc_t + b_acc
+
+            [b_c_loss, b_acc] = sess.run([model.c_loss, model.op_acc],
+                                        feed_dict={ model.clf_input: X,
+                                                    model.label_ref: Y,
+                                                    tf.keras.backend.learning_phase(): 0})
+            c_loss_f = c_loss_f + b_c_loss
+            acc_f = acc_f + b_acc
+
+        c_loss_t = c_loss_t / total_len
+        c_loss_f = c_loss_f / total_len
+        acc_t = acc_t / total_len
+        acc_f = acc_f / total_len
+        print('[Testing][learning_phase=1] Epoch: {:d}/{:d} - loss: {:.3f} - acc: {:.3f}'.format(epoch+1, num_epoch, c_loss_t, acc_t) )
+        print('[Testing][learning_phase=0] Epoch: {:d}/{:d} - loss: {:.3f} - acc: {:.3f}'.format(epoch+1, num_epoch, c_loss_f, acc_f) )
+The first part of testing case is training model with high leval API and the result is as expected.
+&lt;denchmark-code&gt;450/450 - 39s - loss: 1.9658 - accuracy: 0.2993 - val_loss: 1.7215 - val_accuracy: 0.3738
+Epoch 2/5
+450/450 - 28s - loss: 1.5722 - accuracy: 0.4334 - val_loss: 1.5897 - val_accuracy: 0.4152
+Epoch 3/5
+450/450 - 27s - loss: 1.3876 - accuracy: 0.4993 - val_loss: 1.4867 - val_accuracy: 0.4770
+Epoch 4/5
+450/450 - 28s - loss: 1.2564 - accuracy: 0.5477 - val_loss: 1.3498 - val_accuracy: 0.5060
+Epoch 5/5
+450/450 - 27s - loss: 1.1488 - accuracy: 0.5888 - val_loss: 1.3380 - val_accuracy: 0.5232
+10000/10000 - 3s - loss: 1.3523 - accuracy: 0.5289
+&lt;/denchmark-code&gt;
+
+I got a strange loss and the ourput can be seen the following:
+&lt;denchmark-code&gt;Make sure that we create a new model.
+10000/10000 - 3s - loss: 10.2004 - accuracy: 0.1048
+[Training]Epoch: 1/5 - loss: 2.288 - acc: 0.268
+[Training]Epoch: 2/5 - loss: 1.513 - acc: 0.448
+[Training]Epoch: 3/5 - loss: 1.285 - acc: 0.537
+[Training]Epoch: 4/5 - loss: 1.426 - acc: 0.487
+[Training]Epoch: 5/5 - loss: 1.306 - acc: 0.535
+Show loss and accuracy with keras API
+45000/45000 - 9s - loss: nan - accuracy: 0.1002
+5000/5000 - 1s - loss: nan - accuracy: 0.0986
+10000/10000 - 2s - loss: nan - accuracy: 0.1000
+Show loss and accuracy with low level API
+[Validation][learning_phase=1] Epoch: 1/1 - loss: 1.163 - acc: 0.585
+[Validation][learning_phase=0] Epoch: 1/1 - loss: nan - acc: 0.099
+[Testing][learning_phase=1] Epoch: 1/1 - loss: 1.179 - acc: 0.587
+[Testing][learning_phase=0] Epoch: 1/1 - loss: nan - acc: 0.100
+&lt;/denchmark-code&gt;
+
+Obviously, after training custom model with low level API, the result would be wrong when setting tf.keras.backend.learning_phase(): 0
+Also, the result from keras API is wrong too.
+tf.keras.backend.learning_phase(): 0 may affect the behavior of tf.keras.layers.BatchNormalization() but I'm not sure whether this is root cause.
+I have tried a small custom model without tf.keras.layers.BatchNormalization() for MNIST dataset and the result is normal.
+The testcase for MNIST as shown in the following:
+import tensorflow as tf
+tf.compat.v1.disable_eager_execution()
+#tf.compat.v1.disable_v2_behavior()
+
+import numpy as np
+
+batch_size = 100
+
+def download_data():
+
+    # get raw data
+    (trainX, trainY), (testX, testY) = tf.keras.datasets.mnist.load_data()
+    trainX = trainX.astype(np.float32)
+    testX  = testX.astype(np.float32)
+
+    # ont-hot
+    trainY = tf.keras.utils.to_categorical(trainY, 10)
+    testY  = tf.keras.utils.to_categorical(testY , 10)
+
+    # get validation sets
+    training_size = 55000
+    validX = trainX[training_size:,:]
+    validY = trainY[training_size:,:]
+
+    trainX = trainX[:training_size,:]
+    trainY = trainY[:training_size,:]
+
+    # expand dimesion
+    trainX = np.expand_dims(trainX, axis=3)
+    validX = np.expand_dims(validX, axis=3)
+    testX  = np.expand_dims(testX , axis=3)
+
+    return trainX, trainY, validX, validY, testX, testY
+
+def data_pipeline(dataX, dataY):
+
+        dataset = tf.data.Dataset.from_tensor_slices( (dataX, dataY) )
+        dataset = dataset.shuffle(batch_size * 8)
+        dataset = dataset.repeat()
+        dataset = dataset.batch(batch_size)
+        dataset = dataset.prefetch(tf.data.experimental.AUTOTUNE)
+        return dataset
+
+class custom_model():
+    def __init__(self):
+
+        def Acc():
+            acc = tf.keras.metrics.categorical_accuracy(label_ref, clf_out)
+            return tf.math.reduce_mean(acc)
+
+        def c_loss():
+            loss = tf.keras.losses.categorical_crossentropy(label_ref, clf_out)
+            loss = tf.math.reduce_mean(loss)
+            return loss
+
+        # declare variables
+        self.init_op = tf.compat.v1.keras.initializers.he_normal()
+        model_layers = [ tf.keras.layers.Conv2D(16, (3, 3), padding="same", activation="relu", kernel_initializer=self.init_op, name="clf/c1"),
+                         tf.keras.layers.Conv2D(32, (3, 3), padding="same", activation="relu", kernel_initializer=self.init_op, name="clf/c2"),
+                         tf.keras.layers.MaxPooling2D(pool_size=(2, 2), name="clf/p1"),
+                         tf.keras.layers.Conv2D(32, (3, 3), padding="same", activation="relu", kernel_initializer=self.init_op, name="clf/c3"),
+                         tf.keras.layers.Conv2D(64, (3, 3), padding="same", activation="relu", kernel_initializer=self.init_op, name="clf/c4"),
+                         tf.keras.layers.MaxPooling2D(pool_size=(2, 2), name="clf/p2"),
+                         tf.keras.layers.Flatten(name="clf/f1"),
+                         tf.keras.layers.Dense(256, activation="relu", kernel_initializer=self.init_op, name="clf/d1"),
+                         tf.keras.layers.Dense(10 , activation=None  , kernel_initializer=self.init_op, name="clf/d2"),
+                         tf.keras.layers.Activation('softmax', name="clf/a1")
+                        ]
+
+        # clf_model
+        clf_input = tf.keras.layers.Input(shape=(28,28,1 ), name="model/input")
+        clf_out   = clf_input
+        for ii in model_layers:
+            clf_out = ii(clf_out)
+        clf_model = tf.keras.models.Model(inputs=clf_input, outputs=clf_out, name='clf_model')
+        clf_model.compile(loss='categorical_crossentropy', optimizer='Nadam', metrics=['accuracy'])
+
+
+        label_ref = tf.keras.layers.Input(shape=(10,) , name='label_ref')
+        clf_out = clf_model(clf_input)
+
+        # using tf.keras.optimizers.Nadam would get error
+        #optimizer = tf.keras.optimizers.Nadam(lr=0.0005)
+        optimizer = tf.compat.v1.train.AdamOptimizer(learning_rate=0.01)
+        self.train_op = optimizer.minimize(c_loss(), var_list=[clf_model.trainable_variables])
+
+        self.clf_model = clf_model
+        self.clf_input = clf_input
+        self.label_ref = label_ref
+        self.op_acc = Acc()
+        self.c_loss = c_loss()
+
+if __name__ == '__main__':
+
+    # set GPU
+    import os
+    if os.environ.get("CUDA_VISIBLE_DEVICES") is None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+    # reset tf session
+    tf.compat.v1.keras.backend.clear_session()
+    gpu_options = tf.compat.v1.GPUOptions(allow_growth=True)
+    sess = tf.compat.v1.Session(config=tf.compat.v1.ConfigProto(gpu_options=gpu_options))
+    tf.compat.v1.keras.backend.set_session(sess) 
+
+    # prepare data
+    trainX, trainY, validX, validY, testX, testY = download_data()
+    train_gen = data_pipeline(trainX, trainY)
+    valid_gen = data_pipeline(validX, validY)
+    test_gen = data_pipeline(testX, testY)
+
+    # create a new model
+    print('Make sure that we create a new model.')
+    model = custom_model()
+    sess.run(tf.compat.v1.global_variables_initializer())
+    model.clf_model.evaluate(testX, testY, verbose=2, batch_size=batch_size)
+
+    # train model
+    num_epoch = 5
+    total_len = trainY.shape[0] // batch_size
+    tf_iter = tf.compat.v1.data.make_initializable_iterator(train_gen)
+    tf_next = tf_iter.get_next()
+    sess.run(tf_iter.initializer)
+    for epoch in range(num_epoch):
+        c_loss, acc = 0.0, 0.0
+        for ii in range(total_len):
+            X, Y = sess.run(tf_next)
+            [b_c_loss, b_acc, _] = sess.run([model.c_loss, model.op_acc, model.train_op],
+                                                feed_dict={ model.clf_input: X,
+                                                            model.label_ref: Y,
+                                                            tf.keras.backend.learning_phase(): 1})
+            c_loss = c_loss + b_c_loss
+            acc = acc + b_acc
+        
+        c_loss = c_loss / total_len
+        acc = acc / total_len
+        print('[Training]Epoch: {:d}/{:d} - loss: {:.3f} - acc: {:.3f}'.format(epoch+1, num_epoch, c_loss, acc) )
+
+    print('Show loss and accuracy with keras API')
+    model.clf_model.evaluate(trainX, trainY, verbose=2, batch_size=batch_size)
+    model.clf_model.evaluate(validX, validY, verbose=2, batch_size=batch_size)
+    model.clf_model.evaluate(testX, testY, verbose=2, batch_size=batch_size)
+
+    print('Show loss and accuracy with low level API')
+    # evaluate
+    num_epoch = 1
+    total_len = validY.shape[0] // batch_size
+    tf_iter = tf.compat.v1.data.make_initializable_iterator(valid_gen)
+    tf_next = tf_iter.get_next()
+    sess.run(tf_iter.initializer)
+    for epoch in range(num_epoch):
+        c_loss_t, acc_t, c_loss_f, acc_f = 0.0, 0.0, 0.0, 0.0
+        for ii in range(total_len):
+            X, Y = sess.run(tf_next)
+            [b_c_loss, b_acc] = sess.run([model.c_loss, model.op_acc],
+                                        feed_dict={ model.clf_input: X,
+                                                    model.label_ref: Y,
+                                                    tf.keras.backend.learning_phase(): 1})
+            c_loss_t = c_loss_t + b_c_loss
+            acc_t = acc_t + b_acc
+
+            [b_c_loss, b_acc] = sess.run([model.c_loss, model.op_acc],
+                                        feed_dict={ model.clf_input: X,
+                                                    model.label_ref: Y,
+                                                    tf.keras.backend.learning_phase(): 0})
+            c_loss_f = c_loss_f + b_c_loss
+            acc_f = acc_f + b_acc
+
+        c_loss_t = c_loss_t / total_len
+        c_loss_f = c_loss_f / total_len
+        acc_t = acc_t / total_len
+        acc_f = acc_f / total_len
+        print('[Validation][learning_phase=1] Epoch: {:d}/{:d} - loss: {:.3f} - acc: {:.3f}'.format(epoch+1, num_epoch, c_loss_t, acc_t) )
+        print('[Validation][learning_phase=0] Epoch: {:d}/{:d} - loss: {:.3f} - acc: {:.3f}'.format(epoch+1, num_epoch, c_loss_f, acc_f) )
+
+    # evaluate
+    num_epoch = 1
+    total_len = testY.shape[0] // batch_size
+    tf_iter = tf.compat.v1.data.make_initializable_iterator(test_gen)
+    tf_next = tf_iter.get_next()
+    sess.run(tf_iter.initializer)
+    for epoch in range(num_epoch):
+        c_loss_t, acc_t, c_loss_f, acc_f = 0.0, 0.0, 0.0, 0.0
+        for ii in range(total_len):
+            X, Y = sess.run(tf_next)
+            [b_c_loss, b_acc] = sess.run([model.c_loss, model.op_acc],
+                                        feed_dict={ model.clf_input: X,
+                                                    model.label_ref: Y,
+                                                    tf.keras.backend.learning_phase(): 1})
+            c_loss_t = c_loss_t + b_c_loss
+            acc_t = acc_t + b_acc
+
+            [b_c_loss, b_acc] = sess.run([model.c_loss, model.op_acc],
+                                        feed_dict={ model.clf_input: X,
+                                                    model.label_ref: Y,
+                                                    tf.keras.backend.learning_phase(): 0})
+            c_loss_f = c_loss_f + b_c_loss
+            acc_f = acc_f + b_acc
+
+        c_loss_t = c_loss_t / total_len
+        c_loss_f = c_loss_f / total_len
+        acc_t = acc_t / total_len
+        acc_f = acc_f / total_len
+        print('[Testing][learning_phase=1] Epoch: {:d}/{:d} - loss: {:.3f} - acc: {:.3f}'.format(epoch+1, num_epoch, c_loss_t, acc_t) )
+        print('[Testing][learning_phase=0] Epoch: {:d}/{:d} - loss: {:.3f} - acc: {:.3f}'.format(epoch+1, num_epoch, c_loss_f, acc_f) )
+Definitely, we got a very normal output:
+&lt;denchmark-code&gt;Make sure that we create a new model.
+10000/10000 - 1s - loss: 398.0696 - acc: 0.1151
+[Training]Epoch: 1/5 - loss: 11.997 - acc: 0.558
+[Training]Epoch: 2/5 - loss: 0.474 - acc: 0.849
+[Training]Epoch: 3/5 - loss: 0.282 - acc: 0.914
+[Training]Epoch: 4/5 - loss: 0.213 - acc: 0.935
+[Training]Epoch: 5/5 - loss: 0.181 - acc: 0.945
+Show loss and accuracy with keras API
+55000/55000 - 1s - loss: 0.1555 - acc: 0.9535
+5000/5000 - 0s - loss: 0.1501 - acc: 0.9584
+10000/10000 - 0s - loss: 0.1687 - acc: 0.9539
+Show loss and accuracy with low level API
+[Validation][learning_phase=1] Epoch: 1/1 - loss: 0.150 - acc: 0.958
+[Validation][learning_phase=0] Epoch: 1/1 - loss: 0.150 - acc: 0.958
+[Testing][learning_phase=1] Epoch: 1/1 - loss: 0.169 - acc: 0.954
+[Testing][learning_phase=0] Epoch: 1/1 - loss: 0.169 - acc: 0.954
+&lt;/denchmark-code&gt;
+
+Describe the expected behavior
+It should work properly.
+Code to reproduce the issue
+Please see the section of Describe the current behavior
+Other info / logs
+skip ...
+	</description>
+	<comments>
+		<comment id='1' author='CNOCycle' date='2019-12-16T09:01:44Z'>
+		I have tried on colab with TF version 2.0  and was able to reproduce the issue.Please, find the gist &lt;denchmark-link:https://colab.sandbox.google.com/gist/ravikyram/bf147df257b9103cd0b58604cb0b70c9/untitled481.ipynb&gt;here&lt;/denchmark-link&gt;
+. Thanks!
+		</comment>
+		<comment id='2' author='CNOCycle' date='2019-12-16T20:37:01Z'>
+		&lt;denchmark-link:https://github.com/CNOCycle&gt;@CNOCycle&lt;/denchmark-link&gt;
+ Similar issue &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/32477&gt;#32477&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='3' author='CNOCycle' date='2020-02-17T16:01:31Z'>
+		any update for this issue?
+		</comment>
+		<comment id='4' author='CNOCycle' date='2020-02-27T18:57:02Z'>
+		In general, if you want to maintain v1 behavior, it's best to use the v1 apis as well:
+&lt;denchmark-code&gt;import tensorflow.compat.v1 as tf
+&lt;/denchmark-code&gt;
+
+In this case, the behavior of the trainable arg of BatchNorm is slightly different in v1 versus v2, so it may be that the trainable arg or learning phase is not set correctly above. The docstring for BatchNorm details some of the differences further: &lt;denchmark-link:https://www.tensorflow.org/api_docs/python/tf/keras/layers/BatchNormalization#used-in-the-notebooks&gt;https://www.tensorflow.org/api_docs/python/tf/keras/layers/BatchNormalization#used-in-the-notebooks&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='5' author='CNOCycle' date='2020-02-28T03:37:41Z'>
+		&lt;denchmark-link:https://github.com/karmel&gt;@karmel&lt;/denchmark-link&gt;
+ , thanks your reply.
+After applying your suggestion, all things run correctly.
+The following result is produced in docker image tensorflow/tensorflow:2.1.0-gpu-py3
+&lt;denchmark-code&gt;10000/10000 - 1s - loss: 689.0110 - accuracy: 0.1010
+[Training]Epoch: 1/5 - loss: 11.044 - acc: 0.718
+[Training]Epoch: 2/5 - loss: 0.312 - acc: 0.897
+[Training]Epoch: 3/5 - loss: 0.232 - acc: 0.924
+[Training]Epoch: 4/5 - loss: 0.203 - acc: 0.933
+[Training]Epoch: 5/5 - loss: 0.192 - acc: 0.939
+Show loss and accuracy with keras API
+55000/55000 - 1s - loss: 0.2015 - accuracy: 0.9365
+5000/5000 - 0s - loss: 0.1974 - accuracy: 0.9390
+10000/10000 - 0s - loss: 0.2321 - accuracy: 0.9289
+Show loss and accuracy with low level API
+[Validation][learning_phase=1] Epoch: 1/1 - loss: 0.197 - acc: 0.939
+[Validation][learning_phase=0] Epoch: 1/1 - loss: 0.197 - acc: 0.939
+[Testing][learning_phase=1] Epoch: 1/1 - loss: 0.232 - acc: 0.929
+[Testing][learning_phase=0] Epoch: 1/1 - loss: 0.232 - acc: 0.929
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='6' author='CNOCycle' date='2020-03-03T18:09:25Z'>
+		Closing this out since I understand it to be resolved, but please let me know if I'm mistaken. Thanks!
+		</comment>
+		<comment id='7' author='CNOCycle' date='2020-03-03T18:09:28Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/35107&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/35107&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='8' author='CNOCycle' date='2020-03-15T12:59:47Z'>
+		Unfortunately, I forget to check a model with BatchNorm.
+For this case, the API is still broken. I did the test on tf-nightly-gpu:2.2.0.dev20200314
+The following output shows that loss is nan if users use low level API
+&lt;denchmark-code&gt;Train on 450 steps, validate on 50 steps
+Epoch 1/5
+450/450 - 26s - loss: 1.9441 - accuracy: 0.3058 - val_loss: 1.7556 - val_accuracy: 0.3694
+Epoch 2/5
+450/450 - 25s - loss: 1.5582 - accuracy: 0.4386 - val_loss: 1.6236 - val_accuracy: 0.4176
+Epoch 3/5
+450/450 - 25s - loss: 1.3817 - accuracy: 0.5054 - val_loss: 1.4167 - val_accuracy: 0.4940
+Epoch 4/5
+450/450 - 25s - loss: 1.2448 - accuracy: 0.5544 - val_loss: 1.3870 - val_accuracy: 0.5090
+Epoch 5/5
+450/450 - 25s - loss: 1.1224 - accuracy: 0.5992 - val_loss: 1.4285 - val_accuracy: 0.4988
+Make sure that we create a new model.
+[Training]Epoch: 1/5 - loss: 2.415 - acc: 0.234
+[Training]Epoch: 2/5 - loss: 1.648 - acc: 0.401
+[Training]Epoch: 3/5 - loss: 1.427 - acc: 0.483
+[Training]Epoch: 4/5 - loss: 1.279 - acc: 0.541
+[Training]Epoch: 5/5 - loss: 1.134 - acc: 0.596
+Show loss and accuracy with keras API
+Show loss and accuracy with low level API
+[Validation][learning_phase=1] Epoch: 1/1 - loss: 1.082 - acc: 0.614
+[Validation][learning_phase=0] Epoch: 1/1 - loss: nan - acc: 0.095
+[Testing][learning_phase=1] Epoch: 1/1 - loss: 1.119 - acc: 0.600
+[Testing][learning_phase=0] Epoch: 1/1 - loss: nan - acc: 0.094
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='9' author='CNOCycle' date='2020-03-16T19:42:21Z'>
+		Okay, will take a look
+		</comment>
+		<comment id='10' author='CNOCycle' date='2020-03-17T06:28:20Z'>
+		Me too
+Maybe related to &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/36700&gt;this&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='11' author='CNOCycle' date='2020-03-21T03:53:53Z'>
+		This can be fixed by &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/36366#issuecomment-601985968&gt;this&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='12' author='CNOCycle' date='2020-03-25T15:47:45Z'>
+		&lt;denchmark-link:https://github.com/raghavab1992&gt;@raghavab1992&lt;/denchmark-link&gt;
+ suggested that replace  with .
+This suggestion is mention by &lt;denchmark-link:https://github.com/liuxingbaoyu&gt;@liuxingbaoyu&lt;/denchmark-link&gt;
+, too .
+Unfortunately, this method did not work.
+I also force ask BN layer to use V1 instead of V2. But the loss is still nan if users run low level API.
+		</comment>
+		<comment id='13' author='CNOCycle' date='2020-03-25T16:00:04Z'>
+		&lt;denchmark-link:https://github.com/CNOCycle&gt;@CNOCycle&lt;/denchmark-link&gt;
+ Yes, I also think there may be other problems, so I am waiting for tf official.
+		</comment>
+		<comment id='14' author='CNOCycle' date='2020-04-02T18:38:20Z'>
+		Hi &lt;denchmark-link:https://github.com/CNOCycle&gt;@CNOCycle&lt;/denchmark-link&gt;
+, really sorry about the delay! I've finally had a chance to take a look at this.
+As far as I can tell, it's actually totally unrelated from the other referenced issues (about which layers are passed to keras applications). Instead, it seems like internal changes we've made to the implementation of learning_phase over time may have broken some usages of learning phase when constructing tf.compat.v1 sessions and running them.
+Unfortunately, this is far enough from how we recommend people use Keras in TF2 that our team doesn't have the bandwidth to fix this. And, if we were to try fixing this it would have to wait until 2.3
+You may be able to set learning phase explicitly and have it work by using keras.backend.set_learning_phase/keras.backend.learning_phase_scope
+(I'm not sure on that front). You may also be able to pass in training explicitly to the layers that use learning phase.
+But, our overall recommendation would be: If you can't upgrade to 2.x style code and it's crucial for you to keep using sessions directly with keras layers, you should probably just use TensorFlow 1.x.
+		</comment>
+		<comment id='15' author='CNOCycle' date='2020-04-02T18:39:33Z'>
+		(Closing because we don't have the bandwidth to fix this)
+		</comment>
+		<comment id='16' author='CNOCycle' date='2020-04-02T18:39:35Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/35107&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/35107&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

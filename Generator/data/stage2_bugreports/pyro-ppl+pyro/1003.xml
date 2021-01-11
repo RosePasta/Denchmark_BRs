@@ -1,0 +1,107 @@
+<bug id='1003' author='fritzo' open_date='2018-04-11T01:30:52Z' closed_time='2018-04-12T23:57:52Z'>
+	<summary>poutine.block is thwarted by _DIM_ALLOCATOR global state</summary>
+	<description>
+&lt;denchmark-h:h2&gt;Desired behavior&lt;/denchmark-h&gt;
+
+Any submodel can be run inside a Pyro model by using poutine.block. These submodels should have no side effects.
+&lt;denchmark-h:h2&gt;Actual behavior&lt;/denchmark-h&gt;
+
+Submodels may modify the . This is problematic in composite ADVI where two ADVI strategies gather different traces which allocate duplicate dimensions for a shared iarange. See &lt;denchmark-link:https://github.com/pyro-ppl/pyro/pull/1002&gt;#1002&lt;/denchmark-link&gt;
+ .
+	</description>
+	<comments>
+		<comment id='1' author='fritzo' date='2018-04-11T01:32:53Z'>
+		&lt;denchmark-link:https://github.com/eb8680&gt;@eb8680&lt;/denchmark-link&gt;
+ I've gotten myself into a mess of side effects here. Can you help me get out?
+		</comment>
+		<comment id='2' author='fritzo' date='2018-04-11T02:01:14Z'>
+		Hmm it turns out our issue was unrelated, but we saw tests failing due to _DIM_ALLOCATOR global state that had been left dirty by previous failing tests. Not sure whether this issue is really a bug...
+		</comment>
+		<comment id='3' author='fritzo' date='2018-04-11T04:27:59Z'>
+		
+we saw tests failing due to _DIM_ALLOCATOR global state that had been left dirty by previous failing tests.
+
+Strange, this should be handled by iarange.__exit__.  I thought I knew what was causing this but I think I was wrong, I'll investigate further.
+		</comment>
+		<comment id='4' author='fritzo' date='2018-04-11T04:48:11Z'>
+		To give more context: _DIM_ALLOCATOR was left in a dirty state after an error occurred inside the iarange.__enter__() method. Here is the stack trace that led to the dirty state:
+
+______________________________________________ test_discrete_parallel[ADVIMultivariateNormal] ______________________________________________
+
+continuous_class = &lt;class 'pyro.infer.advi.ADVIMultivariateNormal'&gt;
+
+    @pytest.mark.parametrize("continuous_class", [ADVIMultivariateNormal, ADVIDiagonalNormal])
+    def test_discrete_parallel(continuous_class):
+        K = 2
+        data = torch.tensor([0., 1., 10., 11., 12.])
+
+        def model(data):
+            weights = pyro.sample('weights', dist.Dirichlet(0.5 * torch.ones(K)))
+            locs = pyro.sample('locs', dist.Normal(0, 10).reshape([K]))
+            scale = pyro.sample('scale', dist.LogNormal(0, 1))
+
+            with pyro.iarange('data'):
+                weights = weights.expand(torch.Size((len(data),)) + weights.shape)
+                assignment = pyro.sample('assignment', dist.Categorical(weights))
+                pyro.sample('obs', dist.Normal(locs[assignment], scale), obs=data)
+
+        advi = ADVIMaster(model)
+        advi.add(ADVIDiscreteParallel(poutine.block(model, expose=["assignment"])))
+        advi.add(continuous_class(poutine.block(model, hide=["assignment"])))
+        advi.setup_prototype(data)
+
+        elbo = ELBO.make(enum_discrete=True)
+&gt;       loss = elbo.loss_and_grads(advi.model, advi.guide, data)
+
+tests/infer/test_advi.py:125:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+pyro/infer/traceenum_elbo.py:113: in loss_and_grads
+    for model_trace, guide_trace in self._get_traces(model, guide, *args, **kwargs):
+pyro/infer/traceenum_elbo.py:61: in _get_traces
+    for guide_trace in iter_discrete_traces("flat", guide, *args, **kwargs):
+pyro/infer/enum.py:48: in iter_discrete_traces
+    yield traced_fn.get_trace(*args, **kwargs)
+pyro/poutine/trace_poutine.py:182: in get_trace
+    self(*args, **kwargs)
+pyro/poutine/trace_poutine.py:170: in __call__
+    ret = super(TracePoutine, self).__call__(*args, **kwargs)
+pyro/poutine/poutine.py:147: in __call__
+    return self.fn(*args, **kwargs)
+pyro/poutine/__init__.py:218: in _fn
+    return ftr(*args, **kwargs)
+pyro/poutine/trace_poutine.py:170: in __call__
+    ret = super(TracePoutine, self).__call__(*args, **kwargs)
+pyro/poutine/poutine.py:147: in __call__
+    return self.fn(*args, **kwargs)
+pyro/poutine/poutine.py:147: in __call__
+    return self.fn(*args, **kwargs)
+pyro/poutine/poutine.py:147: in __call__
+    return self.fn(*args, **kwargs)
+pyro/poutine/poutine.py:147: in __call__
+    return self.fn(*args, **kwargs)
+pyro/infer/advi.py:74: in guide
+    part.guide(*args, **kwargs)
+pyro/infer/advi.py:417: in guide
+    stack.enter_context(iaranges[frame.name])
+../../../miniconda2/envs/pytorch-dev/lib/python2.7/site-packages/contextlib2.py:380: in enter_context
+    result = _cm_type.__enter__(cm)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = &lt;pyro.iarange object at 0x107be9210&gt;
+
+    def __enter__(self):
+        self._wrapped = am_i_wrapped()
+        self.dim = _DIM_ALLOCATOR.allocate(self.name, self.dim)
+        if self._wrapped:
+&gt;           self._scale_poutine = poutine.ScaleMessenger(self.size / self.subsample_size)
+E           ZeroDivisionError: division by zero
+
+pyro/__init__.py:251: ZeroDivisionError
+
+
+		</comment>
+		<comment id='5' author='fritzo' date='2018-04-11T07:36:32Z'>
+		Seems like the solution is to wrap the rest of iarange.__enter__ in a try/except and call _DIM_ALLOCATOR.free before propagating the exception further.
+		</comment>
+	</comments>
+</bug>

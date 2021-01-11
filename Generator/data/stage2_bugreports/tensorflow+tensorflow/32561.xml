@@ -1,0 +1,106 @@
+<bug id='32561' author='james-chuang' open_date='2019-09-16T19:52:04Z' closed_time='2019-10-22T04:36:45Z'>
+	<summary>[TF2.0] Cannot place the graph after loading weights trained with multiple GPUs and tf.distribute.MirroredStrategy</summary>
+	<description>
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): Yes
+OS Platform and Distribution: CentOS Linux 7.2.1511
+TensorFlow installed from: binary (pip)
+TensorFlow version: 2.0.0.dev20190915
+Python version: 3.6.8
+CUDA/cuDNN version: CUDA 10.0.130 / cuDNN 7.6.0
+GPU model and memory: 2x Nvidia Tesla V100-SXM2-16GB
+
+Describe the current behavior
+I am using tensorflow 2 on a cluster which limits the GPU hours per job. Therefore, I want to be able to load model weights and resume training the model from a checkpoint. The model in question is a tf.keras model compiled with tf.keras.optimizers.SGD as optimizer, with momentum. When attempting to resume training after loading weights that were trained with multiple GPUs and tf.distribute.MirroredStrategy, tensorflow crashes with the following error:
+&lt;denchmark-code&gt;tensorflow.python.framework.errors_impl.InvalidArgumentError: Cannot place the graph because a reference or resource edge connects colocation groups with incompatible assigned devices: /job:localhost/replica:0/task:0/device:GPU:0 vs /job:localhost/replica:0/task:0/device:GPU:1. The edge src node is sgd_sgd_update_update_0_resourceapplykerasmomentum_accum , and the dst node is SGD/SGD/update/update_1/ResourceApplyKerasMomentum [Op:__inference_distributed_function_1355]
+&lt;/denchmark-code&gt;
+
+The error does not occur when the model has been pre-trained on CPU, or with only one GPU.
+Describe the expected behavior
+The model should be able to resume training after loading weights trained on multiple GPUs.
+Code to reproduce the issue
+A minimal reproducible example is below. With access to at least 2 GPUs, begin training the model with initial_run=True. Interrupt training after a few epochs have completed, then re-run the script with initial_run=False. The model will attempt to load the previously trained weights and resume training from the last completed epoch, leading to the error.
+import tensorflow as tf
+
+initial_run = True
+
+batch_size = 1000
+
+(train_images, train_labels), (test_images, test_labels) = tf.keras.datasets.fashion_mnist.load_data()
+train_images = train_images / 255.0
+train_dataset = tf.data.Dataset.from_tensor_slices((train_images, train_labels))
+train_dataset = train_dataset.batch(batch_size).repeat()
+
+strategy = tf.distribute.MirroredStrategy()
+
+with strategy.scope():
+    model = tf.keras.Sequential([
+        tf.keras.layers.Flatten(input_shape=(28, 28)),
+        tf.keras.layers.Dense(128, activation='relu'),
+        tf.keras.layers.Dense(10, activation='softmax')
+    ])
+
+    model.compile(
+            optimizer=tf.keras.optimizers.SGD(momentum=0.9),
+            loss='sparse_categorical_crossentropy',
+            metrics=['accuracy'])
+
+if not initial_run:
+    model.load_weights("latest_weights")
+
+model.fit(
+        train_dataset,
+        steps_per_epoch=len(train_images) / batch_size,
+        epochs=1000,
+        initial_epoch=int(model.optimizer.iterations.numpy() // (len(train_images) / batch_size)),
+        callbacks=[
+            tf.keras.callbacks.ModelCheckpoint(
+                filepath="latest_weights",
+                save_weights_only=True)])
+
+A log of the output from attempting to load weights and resume training is available here: &lt;denchmark-link:https://pastebin.com/raw/Dmn2Jt0i&gt;https://pastebin.com/raw/Dmn2Jt0i&lt;/denchmark-link&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='james-chuang' date='2019-09-17T23:32:45Z'>
+		So, I figured out that it works if model.load_weights is called within the scope of strategy.scope(). If this is not done, the weights of the optimizer (model.optimizer.weights) are loaded as tf.Variable instead of MirroredVariable, leading to the error. I am not sure if this is the intended behavior, as the layer weights of the model get loaded as MirroredVariable even when load_weights is called outside of strategy.scope(). If this is intended, feel free to close this issue.
+		</comment>
+		<comment id='2' author='james-chuang' date='2019-09-19T13:31:23Z'>
+		This behaviour is also same in case of TPU strategy.
+		</comment>
+		<comment id='3' author='james-chuang' date='2019-09-19T17:22:29Z'>
+		Additionally, if using less than two GPUs, then optimizer weights are only loaded if load_weights is called outside of strategy.scope(). This seems undesired, since the structure of the code needed to load identical model weights differs based on hardware configuration.
+		</comment>
+		<comment id='4' author='james-chuang' date='2019-10-21T01:57:34Z'>
+		Thank you for filing the issue. Your analysis in &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/32561#issuecomment-532441133&gt;#32561 (comment)&lt;/denchmark-link&gt;
+ is correct - load_weights should happen inside the strategy.scope because it ends up creating optimizer variables at that point.
+We have recently addressed this in &lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/e7fb9e52029a0711b3bd9799ce70428cef918e86#diff-39c47d5e727df3ac37c8c60f072a1e68&gt;e7fb9e5#diff-39c47d5e727df3ac37c8c60f072a1e68&lt;/denchmark-link&gt;
+. With this change, now if you try to create optimizer variables in a scope different than the model's variables, it will give a more informative error like:
+"Trying to create optimizer slot variable under the scope for "
+"tf.distribute.Strategy ({}), which is different from the scope "
+"used for the original variable ({}). Make sure the slot "
+"variables are created under the same strategy scope. This may "
+"happen if you're restoring from a checkpoint outside the scope"
+I have tested it with your code above using TPUStrategy, and I believe the same thing should apply to MirroredStrategy as well.
+We evaluated different alternatives - whether we should make it work for load weights outside the scope, but it seemed it would be better to give a clearer error message and ask the weights loading to be moved inside the scope.
+I am not sure I understand what you mentioned in &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/32561#issuecomment-533228611&gt;#32561 (comment)&lt;/denchmark-link&gt;
+ though. Can you elaborate?
+		</comment>
+		<comment id='5' author='james-chuang' date='2019-10-21T18:37:11Z'>
+		Thanks for the response.
+The issue I ran into: I trained a model using MirroredStrategy with 2 GPUs, and saved the model weights. Then, with access to only a single GPU (or only CPU), I tried to load the saved weights using load_weights inside strategy.scope() as discussed above. However, the weights could only be loaded when load_weights was called outside of strategy.scope().
+		</comment>
+		<comment id='6' author='james-chuang' date='2019-10-22T04:36:45Z'>
+		At load time, if you only have a single GPU or CPU, what strategy are you using at that time? Also can you file another issue for this, along with code / instructions to repro? thank you.
+I will close this particular issue in the meantime.
+		</comment>
+		<comment id='7' author='james-chuang' date='2019-10-22T04:36:47Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/32561&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/32561&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,133 @@
+<bug id='6256' author='yaroslavvb' open_date='2016-12-11T23:57:28Z' closed_time='2017-06-20T23:04:15Z'>
+	<summary>grpc worker-&amp;gt;client fetch tops out at 120 MB/s</summary>
+	<description>
+Fetching data as numpy arrays is slow for grpc sessions. Evaluating 128MB variable repeatedly from Session("grpc://localhost..") only gets me 116 MB/s, compared to 5150MB/s for Session()
+&lt;denchmark-link:https://gist.github.com/yaroslavvb/59bc8d3d635e1027306486cc418b26aa&gt;https://gist.github.com/yaroslavvb/59bc8d3d635e1027306486cc418b26aa&lt;/denchmark-link&gt;
+
+&lt;denchmark-code&gt;python client_transfer_benchmark.py --profile
+5150.04 MB per second
+116.70 MB per second
+
+&lt;/denchmark-code&gt;
+
+Attached are CPU profiles for worker and for client. Worker uses 2x CPU and both of them are spending majority of the time in in gRPC code, specifically doing  (reported as &lt;denchmark-link:https://github.com/gperftools/gperftools/issues/1&gt;__nss_hosts_lookup&lt;/denchmark-link&gt;
+).
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/files/644905/profile.client.pdf&gt;profile.client.pdf&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/files/644906/profile.worker.pdf&gt;profile.worker.pdf&lt;/denchmark-link&gt;
+
+This is related but slightly different from &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/6116&gt;#6116&lt;/denchmark-link&gt;
+ -- that issue looks at worker-&gt;worker transfer which hits 520 MB/second for the same message size (degrading below 100 MB/second for larger messages)
+&lt;denchmark-link:https://gist.github.com/yaroslavvb/e196107b5e0afc834652bd3153030c42&gt;https://gist.github.com/yaroslavvb/e196107b5e0afc834652bd3153030c42&lt;/denchmark-link&gt;
+
+&lt;denchmark-code&gt;python benchmark_grpc_recv.py --data_mb=128
+Local rate:       15214.63 MB/s
+Distributed rate: 569.27 MB/s
+
+
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='yaroslavvb' date='2016-12-12T00:30:06Z'>
+		&lt;denchmark-link:https://github.com/mrry&gt;@mrry&lt;/denchmark-link&gt;
+ do you want to comment on potential fixes in the future, or workarounds for now?
+		</comment>
+		<comment id='2' author='yaroslavvb' date='2016-12-12T04:03:09Z'>
+		We're aware of the inefficiencies in the client-to-and-from-master path when using the distributed runtime, and have plans to cut down on the serialization overhead, especially in the common case where the client and master (and often worker) are colocated in the same process.
+&lt;denchmark-link:https://github.com/yaroslavvb&gt;@yaroslavvb&lt;/denchmark-link&gt;
+ Can you share more about what your use case is for fetching large values from the distributed runtime? We haven't spent much time optimizing this until now because the common case in distributed execution involves running a training op that returns nothing (or perhaps some small progress indicator values). It would be good to understand your use case so we can prioritize the various steps we can take to improve performance here!
+		</comment>
+		<comment id='3' author='yaroslavvb' date='2016-12-12T09:17:00Z'>
+		&lt;denchmark-link:https://github.com/mrry&gt;@mrry&lt;/denchmark-link&gt;
+ Hi, I'm also using distributed training on one server because it's easier to implement and extend.
+When using a large network (e.g. Inception-resnet-2) or batchsize, the traffic between session will be very heavy.
+		</comment>
+		<comment id='4' author='yaroslavvb' date='2016-12-12T16:03:44Z'>
+		&lt;denchmark-link:https://github.com/shiyemin&gt;@shiyemin&lt;/denchmark-link&gt;
+ Just to clarify, are you fetching or feeding large values in your  calls? If not, it's unlikely that the client to/from master traffic will be heavy... just fetching loss values or summaries. If you are still finding yourself bottlenecked on this, feel free to share your code so we can track it down.
+(Note that worker-to-worker traffic is a separate issue, which merits attention.)
+		</comment>
+		<comment id='5' author='yaroslavvb' date='2016-12-12T17:54:54Z'>
+		&lt;denchmark-link:https://github.com/mrry&gt;@mrry&lt;/denchmark-link&gt;
+ Use-case is training AI agents on OpenAI Universe. You have a stochastic agent like &lt;denchmark-link:https://github.com/openai/universe-starter-agent&gt;this one&lt;/denchmark-link&gt;
+ interacting with an environment external to TensorFlow, so all of the training observations go through . (technically the bulk of data transfer is feed rather than fetch, but they have similar speed)
+		</comment>
+		<comment id='6' author='yaroslavvb' date='2016-12-12T20:20:38Z'>
+		&lt;denchmark-link:https://github.com/yaroslavvb&gt;@yaroslavvb&lt;/denchmark-link&gt;
+ Great, thanks! So, just to be clear, is the overhead in  (client-&gt;worker) or does this model also  (worker-&gt;client) a large amount of data?
+		</comment>
+		<comment id='7' author='yaroslavvb' date='2016-12-12T21:42:37Z'>
+		Mainly feeding. For Universe you feed images of screen into your model -&gt; run training/prediction step -&gt; fetch keyboard commands, so feeding passes an order of magnitude more data.
+Updated the benchmark above to test the feeding direction for direct and local grpc sessions:
+&lt;denchmark-code&gt;python client_transfer_benchmark.py --direction=p2t --profile
+1577.86 MB per second
+ 143.93 MB per second
+
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='8' author='yaroslavvb' date='2016-12-16T04:29:18Z'>
+		&lt;denchmark-link:https://github.com/mrry&gt;@mrry&lt;/denchmark-link&gt;
+ great, I think fast LocalMaster should cover the main use-cases (since you could always feed to local-master and use worker-&gt;worker communication). How can I run the microbenchmark?
+		</comment>
+		<comment id='9' author='yaroslavvb' date='2016-12-16T22:25:32Z'>
+		There are still quite a few redundant copies to remove in the local case, but it's a start :). Here's a link to the benchmark:
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/7f65a77b86b15876bc019f85fc7031981e191306/tensorflow/python/client/session_benchmark.py&gt;https://github.com/tensorflow/tensorflow/blob/7f65a77b86b15876bc019f85fc7031981e191306/tensorflow/python/client/session_benchmark.py&lt;/denchmark-link&gt;
+
+You should be able to run it directly if you have the PIP package installed. If you have other cases that you'd like to track, feel free to send a PR!
+		</comment>
+		<comment id='10' author='yaroslavvb' date='2017-01-04T23:29:45Z'>
+		With these changes I'm seeing about 2x improvement in transfer speed:
+python client_transfer_benchmark.py --direction=p2t --profile
+262.49 MB per second
+python client_transfer_benchmark.py --direction=t2p --profile
+308.64 MB per second
+		</comment>
+		<comment id='11' author='yaroslavvb' date='2017-01-05T00:05:42Z'>
+		Glad to hear it's moving in the right direction :). Hold on tight because there's another change coming (hopefully in the next push) that should improve feed throughput by a decent amount.
+		</comment>
+		<comment id='12' author='yaroslavvb' date='2017-01-05T19:51:09Z'>
+		Is &lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/bf00bcc5fc75d9bd1d61c67cc6c2fc55708a26ea&gt;bf00bcc&lt;/denchmark-link&gt;
+ the change you had in mind? I don't see any change with that commit on my benchmark, is this new in-memory wrapper activated by default?
+git_version="b'0.12.1-1591-g4433079'"
+python client_transfer_benchmark.py --profile
+3203.52 MB per second
+280.34 MB per second
+		</comment>
+		<comment id='13' author='yaroslavvb' date='2017-01-05T20:24:36Z'>
+		Most of the improvement from that change will be for the common case where client, master, and worker are in the same address space (like in session_benchmark.py). If I've understood the code correctly (since you have a tf.Session(server.target)) it should also speed up feeds like this one in Universe's A3C implementation:
+&lt;denchmark-link:https://github.com/openai/universe-starter-agent/blob/ea74a5104ffa19c81562f65000ac56be78e0e0ac/a3c.py#L276&gt;https://github.com/openai/universe-starter-agent/blob/ea74a5104ffa19c81562f65000ac56be78e0e0ac/a3c.py#L276&lt;/denchmark-link&gt;
+
+We haven't tried hard (yet) to optimize the case where the client and master are in different processes, although it may be possible to slip in an implementation that avoids a copy when serializing fed tensors into a gRPC call.
+		</comment>
+		<comment id='14' author='yaroslavvb' date='2017-01-05T20:39:27Z'>
+		Ah, good catch, I was doing out-of-process transfer, updated &lt;denchmark-link:https://gist.github.com/yaroslavvb/59bc8d3d635e1027306486cc418b26aa&gt;client_transfer_benchmark.py&lt;/denchmark-link&gt;
+, now I'm seeing &gt;700MB, nice!
+&lt;denchmark-code&gt;python client_transfer_benchmark.py  --profile
+(local) 3177.19 MB per second
+(grpc) 718.74 MB per second
+
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='15' author='yaroslavvb' date='2017-01-14T08:18:50Z'>
+		So I tried after compiling latest version (with XLA) and my benchmark got a bit slower
+python client_transfer_benchmark.py --direction=p2t --profile
+600 MB/s (down from 728)
+python client_transfer_benchmark.py --direction=t2p --profile
+1308 MB/s (down from 1879)
+		</comment>
+		<comment id='16' author='yaroslavvb' date='2017-03-28T17:45:57Z'>
+		&lt;denchmark-link:https://github.com/alextp&gt;@alextp&lt;/denchmark-link&gt;
+ 's work on eliminating numpy copies (ie ndarray_tensor_bridge.cc in &lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/5e2cef7155fea04469578e48123ec6925e998c2f&gt;5e2cef7&lt;/denchmark-link&gt;
+ ) could potentially help speed up these local server situations (ie, currently we feed numpy arrays obtained from ALE/Mujoco at each train step, and networks are tiny)
+		</comment>
+		<comment id='17' author='yaroslavvb' date='2017-06-16T21:18:26Z'>
+		Ping -- is anyone still looking at this issue or should we close it?
+		</comment>
+		<comment id='18' author='yaroslavvb' date='2017-06-20T23:04:15Z'>
+		After many rounds of optimization, the headline number is certainly no longer true, so let's close this issue for now. I think we've got a gRPC version upgrade pending that should increase the throughput some more. Feel free to open a new issue if you're still running into throughput woes!
+		</comment>
+	</comments>
+</bug>

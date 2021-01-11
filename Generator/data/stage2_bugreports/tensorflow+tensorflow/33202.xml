@@ -1,0 +1,427 @@
+<bug id='33202' author='mimxrt' open_date='2019-10-10T10:50:37Z' closed_time='2019-11-13T09:13:07Z'>
+	<summary>[TF-1.0] RecursionError: maximum recursion depth exceeded</summary>
+	<description>
+&lt;denchmark-h:h3&gt;System information&lt;/denchmark-h&gt;
+
+
+Have I written custom code: Yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Linux Ubuntu 18.04.2 LTS (Docker)
+TensorFlow installed from (source or binary): Binary, conda
+TensorFlow version (use command below): unknown 1.14.0
+Python version: Python 3.7.3
+CUDA/cuDNN version: CUDA=10.0, CUDNN=7.4.1.5-1
+GPU model and memory: Quadro RTX 6000 major: 7 minor: 5 memoryClockRate(GHz): 1.77
+
+&lt;denchmark-h:h3&gt;Describe the problem&lt;/denchmark-h&gt;
+
+The code below produces a RecursionError in TF-1.0 presumably because of the large Dataset. The error does not occur for much smaller values in the n_files variable. The error does also not occur in TF-2.0!
+Describe the expected behavior
+No error, working model.fit()
+Code to reproduce the issue
+&lt;denchmark-code&gt;import numpy as np
+import tensorflow as tf
+
+# TF-2.0
+# gpus = tf.config.experimental.list_physical_devices('GPU')
+# for gpu in gpus:
+#     tf.config.experimental.set_memory_growth(gpu, True)
+# #tf.debugging.set_log_device_placement(True)
+
+# TF-1.0
+tf.compat.v1.enable_eager_execution()
+config = tf.compat.v1.ConfigProto()
+config.gpu_options.allow_growth = True
+#config.log_device_placement = True
+sess = tf.compat.v1.Session(config=config)
+tf.compat.v1.keras.backend.set_session(sess)
+
+assert tf.executing_eagerly()
+
+batch_size = 256
+num_tsteps = 144
+num_features = 130
+num_units = 88
+
+n_files = 3320
+#n_files = 10
+num_epochs = 1000
+
+seq_len_max_trunc = batch_size * num_tsteps
+flen = 3728
+
+X = np.random.rand(flen + 1, num_features + 2)
+n_label0 = int((flen + 1) * 0.2)
+Y = np.concatenate((
+    np.zeros((n_label0, 1)), # label 0
+    np.ones((flen - n_label0 + 1, 1)), # label 1
+), axis=0)
+ds_out = tf.data.Dataset.from_tensor_slices((X, Y))
+ds_ser = ds_out.map(lambda *x: 
+   tf.reshape(tf.py_function(lambda *v: 
+       tf.train.Example(features=tf.train.Features(feature={
+           "features": tf.train.Feature(float_list=tf.train.FloatList(value=v[0].numpy())),
+           "label": tf.train.Feature(float_list=tf.train.FloatList(value=v[1].numpy())),
+       })).SerializeToString(), x, tf.string
+   ), ()), num_parallel_calls=tf.data.experimental.AUTOTUNE
+)
+writer = tf.data.experimental.TFRecordWriter("temp.tfrecord")
+writer.write(ds_ser)
+
+files = ["temp.tfrecord"] * n_files
+
+model = tf.keras.Sequential([
+    tf.keras.layers.InputLayer(input_shape=(num_tsteps, num_features), batch_size=batch_size),
+    #tf.keras.layers.Masking(mask_value=0.0, input_shape=(num_tsteps, num_features)),
+    tf.keras.layers.LSTM(num_units,  batch_input_shape=(batch_size, num_tsteps, num_features), return_sequences=True, stateful=False),
+    tf.keras.layers.TimeDistributed(tf.keras.layers.Dense(1)),
+    tf.keras.layers.Activation('sigmoid'),
+])
+model.compile(optimizer='adam',
+              loss='binary_crossentropy',
+              metrics=['accuracy'])
+
+
+def _prep_ds_file(file):
+    _ds = tf.data.TFRecordDataset(file)
+    _ds = _ds.map(lambda x: tf.io.parse_single_example(x, {
+        "features": tf.io.FixedLenFeature([132], tf.float32),
+        "label": tf.io.FixedLenFeature([1], tf.float32),
+    }), num_parallel_calls=tf.data.experimental.AUTOTUNE)
+        
+    _ds = _ds.flat_map(lambda v: tf.data.Dataset.from_tensors((v["features"][2:], v["label"])))
+
+    _trunc = min(seq_len_max_trunc, ((flen + 1) // num_tsteps) * num_tsteps)
+    _ds = _ds.take(_trunc)
+
+    _c_pad = (batch_size - ((flen + 1) // num_tsteps)) * num_tsteps
+    if _c_pad &gt;= 0:
+        assert _c_pad + ((flen + 1) // num_tsteps * num_tsteps) == seq_len_max_trunc
+        _ds_pad = tf.data.Dataset.from_tensors((
+            tf.constant(0.0, shape=[num_features,]),
+            tf.constant(0.0, shape=[1,])))
+        _ds_pad = _ds_pad.repeat(_c_pad)
+        _ds = _ds.concatenate(_ds_pad) # pad to correct size
+
+    _ds = _ds.window(size=num_tsteps, shift=None, stride=1, drop_remainder=True)
+    _ds = _ds.flat_map(lambda x, y: tf.data.Dataset.zip((x.batch(num_tsteps), y.batch(num_tsteps))))
+
+    _ds = _ds.batch(batch_size, drop_remainder=True)
+    
+    return _ds
+
+
+ds_fs = tf.data.Dataset.list_files(files, shuffle=True, seed=1)
+fs_train = ds_fs.take(int(n_files * 0.7))
+fs_val = ds_fs.skip(int(n_files * 0.7)).take(int(n_files * 0.1))
+
+ds_train = [_prep_ds_file(f) for f in fs_train.take(1)][0]
+for f in fs_train.skip(1):
+    ds_train = ds_train.concatenate(_prep_ds_file(f))
+ds_train = ds_train.prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
+
+ds_val = [_prep_ds_file(f) for f in fs_val.take(1)][0]
+for f in fs_val.skip(1):
+    ds_val = ds_val.concatenate(_prep_ds_file(f))
+ds_val = ds_val.prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
+
+cbs = [
+    tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=10, restore_best_weights=True),
+]
+model.fit(ds_train, epochs=num_epochs, verbose=1, shuffle=False,
+          validation_data=ds_val, validation_steps=None, callbacks=cbs)
+&lt;/denchmark-code&gt;
+
+Other info / logs
+&lt;denchmark-code&gt;WARNING: Logging before flag parsing goes to stderr.
+W1010 10:35:45.397222 140253093480256 deprecation.py:323] From /ws/miniconda3/lib/python3.7/site-packages/tensorflow/python/data/util/random_seed.py:58: add_dispatch_support.&lt;locals&gt;.wrapper (from tensorflow.python.ops.array_ops) is deprecated and will be removed in a future version.
+Instructions for updating:
+Use tf.where in 2.0, which has the same broadcast rule as np.where
+
+
+RecursionErrorTraceback (most recent call last)
+&lt;ipython-input-1-c18884a831b5&gt; in &lt;module&gt;
+    109 ]
+    110 model.fit(ds_train, epochs=num_epochs, verbose=1, shuffle=False,
+--&gt; 111           validation_data=ds_val, validation_steps=None, callbacks=cbs)
+
+/ws/miniconda3/lib/python3.7/site-packages/tensorflow/python/keras/engine/training.py in fit(self, x, y, batch_size, epochs, verbose, callbacks, validation_split, validation_data, shuffle, class_weight, sample_weight, initial_epoch, steps_per_epoch, validation_steps, validation_freq, max_queue_size, workers, use_multiprocessing, **kwargs)
+    692           workers=0,
+    693           shuffle=shuffle,
+--&gt; 694           initial_epoch=initial_epoch)
+    695 
+    696     # Case 3: Symbolic tensors or Numpy array-like.
+
+/ws/miniconda3/lib/python3.7/site-packages/tensorflow/python/keras/engine/training.py in fit_generator(self, generator, steps_per_epoch, epochs, verbose, callbacks, validation_data, validation_steps, validation_freq, class_weight, max_queue_size, workers, use_multiprocessing, shuffle, initial_epoch)
+   1431         shuffle=shuffle,
+   1432         initial_epoch=initial_epoch,
+-&gt; 1433         steps_name='steps_per_epoch')
+   1434 
+   1435   def evaluate_generator(self,
+
+/ws/miniconda3/lib/python3.7/site-packages/tensorflow/python/keras/engine/training_generator.py in model_iteration(model, data, steps_per_epoch, epochs, verbose, callbacks, validation_data, validation_steps, validation_freq, class_weight, max_queue_size, workers, use_multiprocessing, shuffle, initial_epoch, mode, batch_size, steps_name, **kwargs)
+    142       batch_size=batch_size,
+    143       epochs=epochs - initial_epoch,
+--&gt; 144       shuffle=shuffle)
+    145 
+    146   do_validation = validation_data is not None
+
+/ws/miniconda3/lib/python3.7/site-packages/tensorflow/python/keras/engine/training_generator.py in convert_to_generator_like(data, batch_size, steps_per_epoch, epochs, shuffle)
+    475     return data, steps_per_epoch
+    476   if isinstance(data, dataset_ops.DatasetV2):
+--&gt; 477     return dataset_ops.make_one_shot_iterator(data), steps_per_epoch
+    478 
+    479   # Create generator from NumPy or EagerTensor Input.
+
+/ws/miniconda3/lib/python3.7/site-packages/tensorflow/python/data/ops/dataset_ops.py in make_one_shot_iterator(dataset)
+   1940     # Call the defined `_make_one_shot_iterator()` if there is one, because some
+   1941     # datasets (e.g. for prefetching) override its behavior.
+-&gt; 1942     return dataset._make_one_shot_iterator()  # pylint: disable=protected-access
+   1943   except AttributeError:
+   1944     return DatasetV1Adapter(dataset)._make_one_shot_iterator()  # pylint: disable=protected-access
+
+/ws/miniconda3/lib/python3.7/site-packages/tensorflow/python/data/ops/dataset_ops.py in _make_one_shot_iterator(self)
+   1525   def _make_one_shot_iterator(self):  # pylint: disable=missing-docstring
+   1526     if context.executing_eagerly():
+-&gt; 1527       return iterator_ops.IteratorV2(self)
+   1528 
+   1529     _ensure_same_dataset_graph(self)
+
+/ws/miniconda3/lib/python3.7/site-packages/tensorflow/python/data/ops/iterator_ops.py in __init__(self, dataset)
+    562     with ops.device("/cpu:0"):
+    563       # pylint: disable=protected-access
+--&gt; 564       dataset = dataset._apply_options()
+    565       ds_variant = dataset._variant_tensor
+    566       self._structure = dataset._element_structure
+
+/ws/miniconda3/lib/python3.7/site-packages/tensorflow/python/data/ops/dataset_ops.py in _apply_options(self)
+    230 
+    231     dataset = self
+--&gt; 232     options = self.options()
+    233     if options.experimental_threading is not None:
+    234       t_options = options.experimental_threading
+
+/ws/miniconda3/lib/python3.7/site-packages/tensorflow/python/data/ops/dataset_ops.py in options(self)
+   1888 
+   1889   def options(self):
+-&gt; 1890     return self._dataset.options()
+   1891 
+   1892   @property
+
+/ws/miniconda3/lib/python3.7/site-packages/tensorflow/python/data/ops/dataset_ops.py in options(self)
+    221     options = Options()
+    222     for input_dataset in self._inputs():
+--&gt; 223       input_options = input_dataset.options()
+    224       if input_options is not None:
+    225         options = options.merge(input_options)
+
+... last 2 frames repeated, from the frame below ...
+
+/ws/miniconda3/lib/python3.7/site-packages/tensorflow/python/data/ops/dataset_ops.py in options(self)
+   1888 
+   1889   def options(self):
+-&gt; 1890     return self._dataset.options()
+   1891 
+   1892   @property
+
+RecursionError: maximum recursion depth exceeded
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='mimxrt' date='2019-10-11T10:21:47Z'>
+		Issue replicating for TF-1.14, kindly find the &lt;denchmark-link:https://colab.sandbox.google.com/gist/oanush/6e7a780b53967f33cd9bb97f16442e44/33202.ipynb&gt;gist&lt;/denchmark-link&gt;
+ of colab.Thanks!
+		</comment>
+		<comment id='2' author='mimxrt' date='2019-10-17T22:28:38Z'>
+		&lt;denchmark-link:https://github.com/mimxrt&gt;@mimxrt&lt;/denchmark-link&gt;
+ I think this is something related to size of validation dataset that is not enough for validating the loss. Please check these resources &lt;denchmark-link:https://stackoverflow.com/questions/49035200/keras-early-stopping-callback-error-val-loss-metric-not-available&gt;1&lt;/denchmark-link&gt;
+ and &lt;denchmark-link:https://github.com/keras-team/keras/issues/3657&gt;2&lt;/denchmark-link&gt;
+.
+Please check your data pipeline to find the root-cause. Thanks!
+		</comment>
+		<comment id='3' author='mimxrt' date='2019-10-21T08:35:38Z'>
+		&lt;denchmark-link:https://github.com/jvishnuvardhan&gt;@jvishnuvardhan&lt;/denchmark-link&gt;
+ Thank you for your comment. I provided a demonstration example in my initial comment that includes the data pipeline for your reference. As you can see the example contains 3320 time series files of length 3728 and the batch size is 256. The training dataset is a split of 70% and the validation dataset a split of 10%.
+Be that as is may, you can try to remove the last line of the example and see that the same error occurs even without the validation data and early stopping:
+Replace
+&lt;denchmark-code&gt;model.fit(ds_train, epochs=num_epochs, verbose=1, shuffle=False,
+          validation_data=ds_val, validation_steps=None, callbacks=cbs)
+&lt;/denchmark-code&gt;
+
+with
+&lt;denchmark-code&gt;model.fit(ds_train, epochs=num_epochs, verbose=1, shuffle=False,
+          validation_data=None, validation_steps=None, callbacks=None)
+&lt;/denchmark-code&gt;
+
+In addition to the validation dataset not having any impact, it seems the training itself is entirely unrelated to the error. I created a more condensed example that illustrates that this error is caused by the data pipeline itself as there is no training happening---the dataset is merely iterated:
+&lt;denchmark-code&gt;import numpy as np
+import tensorflow as tf
+
+tf.compat.v1.enable_eager_execution()
+
+assert tf.executing_eagerly()
+
+batch_size = 256
+num_tsteps = 144
+num_features = 130
+
+n_files = 3320
+flen = 3728
+
+def generate_data():
+    X = np.random.rand(flen + 1, num_features + 2)
+    n_label0 = int((flen + 1) * 0.2)
+    Y = np.concatenate((
+        np.zeros((n_label0, 1)), # label 0
+        np.ones((flen - n_label0 + 1, 1)), # label 1
+    ), axis=0)
+    ds_out = tf.data.Dataset.from_tensor_slices((X, Y))
+    ds_ser = ds_out.map(lambda *x: 
+       tf.reshape(tf.py_function(lambda *v: 
+           tf.train.Example(features=tf.train.Features(feature={
+               "features": tf.train.Feature(float_list=tf.train.FloatList(value=v[0].numpy())),
+               "label": tf.train.Feature(float_list=tf.train.FloatList(value=v[1].numpy())),
+           })).SerializeToString(), x, tf.string
+       ), ()), num_parallel_calls=tf.data.experimental.AUTOTUNE
+    )
+
+    writer = tf.data.experimental.TFRecordWriter("temp.tfrecord")
+    writer.write(ds_ser)
+
+
+generate_data()
+files = ["temp.tfrecord"] * n_files
+
+
+def _prep_ds_file(file):
+    _ds = tf.data.TFRecordDataset(file)
+    _ds = _ds.map(lambda x: tf.io.parse_single_example(x, {
+        "features": tf.io.FixedLenFeature([132], tf.float32),
+        "label": tf.io.FixedLenFeature([1], tf.float32),
+    }), num_parallel_calls=tf.data.experimental.AUTOTUNE)
+        
+    _ds = _ds.flat_map(lambda v: tf.data.Dataset.from_tensors((v["features"][2:], v["label"])))
+    
+    return _ds
+
+
+ds_fs = tf.data.Dataset.list_files(files, shuffle=True, seed=1)
+fs_train = ds_fs.take(int(n_files * 0.7))
+
+ds_train = [_prep_ds_file(f) for f in fs_train.take(1)][0]
+for f in fs_train.skip(1):
+    ds_train = ds_train.concatenate(_prep_ds_file(f))
+ds_train = ds_train.prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
+
+
+for e in ds_train.take(batch_size):
+    print("The training dataset contains at least {} elements.".format(batch_size))
+
+for i, e in enumerate(ds_train):
+    print(i)
+    if e &gt; batch_size:
+        break
+&lt;/denchmark-code&gt;
+
+Result:
+&lt;denchmark-code&gt;WARNING: Logging before flag parsing goes to stderr.
+W1021 08:13:08.382446 140048215897920 deprecation.py:323] From /ws/miniconda3/lib/python3.7/site-packages/tensorflow/python/data/util/random_seed.py:58: add_dispatch_support.&lt;locals&gt;.wrapper (from tensorflow.python.ops.array_ops) is deprecated and will be removed in a future version.
+Instructions for updating:
+Use tf.where in 2.0, which has the same broadcast rule as np.where
+
+
+RecursionErrorTraceback (most recent call last)
+&lt;ipython-input-1-1fba291fe9fa&gt; in &lt;module&gt;
+     59 
+     60 
+---&gt; 61 for e in ds_train.take(batch_size):
+     62     print("The training dataset contains at least {} elements.".format(batch_size))
+     63 
+
+/ws/miniconda3/lib/python3.7/site-packages/tensorflow/python/data/ops/dataset_ops.py in __iter__(self)
+   1895 
+   1896   def __iter__(self):
+-&gt; 1897     return iter(self._dataset)
+   1898 
+   1899 
+
+/ws/miniconda3/lib/python3.7/site-packages/tensorflow/python/data/ops/dataset_ops.py in __iter__(self)
+    285       RuntimeError: If eager execution is not enabled.
+    286     """
+--&gt; 287     return iterator_ops.IteratorV2(self)
+    288 
+    289   @abc.abstractproperty
+
+/ws/miniconda3/lib/python3.7/site-packages/tensorflow/python/data/ops/iterator_ops.py in __init__(self, dataset)
+    562     with ops.device("/cpu:0"):
+    563       # pylint: disable=protected-access
+--&gt; 564       dataset = dataset._apply_options()
+    565       ds_variant = dataset._variant_tensor
+    566       self._structure = dataset._element_structure
+
+/ws/miniconda3/lib/python3.7/site-packages/tensorflow/python/data/ops/dataset_ops.py in _apply_options(self)
+    230 
+    231     dataset = self
+--&gt; 232     options = self.options()
+    233     if options.experimental_threading is not None:
+    234       t_options = options.experimental_threading
+
+/ws/miniconda3/lib/python3.7/site-packages/tensorflow/python/data/ops/dataset_ops.py in options(self)
+    221     options = Options()
+    222     for input_dataset in self._inputs():
+--&gt; 223       input_options = input_dataset.options()
+    224       if input_options is not None:
+    225         options = options.merge(input_options)
+
+/ws/miniconda3/lib/python3.7/site-packages/tensorflow/python/data/ops/dataset_ops.py in options(self)
+   1888 
+   1889   def options(self):
+-&gt; 1890     return self._dataset.options()
+   1891 
+   1892   @property
+
+... last 2 frames repeated, from the frame below ...
+
+/ws/miniconda3/lib/python3.7/site-packages/tensorflow/python/data/ops/dataset_ops.py in options(self)
+    221     options = Options()
+    222     for input_dataset in self._inputs():
+--&gt; 223       input_options = input_dataset.options()
+    224       if input_options is not None:
+    225         options = options.merge(input_options)
+
+RecursionError: maximum recursion depth exceeded while calling a Python object
+&lt;/denchmark-code&gt;
+
+Can you confirm this result?
+		</comment>
+		<comment id='4' author='mimxrt' date='2019-11-12T10:28:38Z'>
+		Please, can anyone confirm this finding? What can I do to help resolve this? Thanks!
+		</comment>
+		<comment id='5' author='mimxrt' date='2019-11-12T18:25:44Z'>
+		I suspect the issue is that your input pipeline graph is too large which results in Python recusion depth exception. This issue is not unique to tf.data graphs and applies generally to TensorFlow graphs.
+I believe you should be able to overcome your issue by avoiding reliance on concatenate and instead of:
+&lt;denchmark-code&gt;ds_train = [_prep_ds_file(f) for f in fs_train.take(1)][0]
+for f in fs_train.skip(1):
+    ds_train = ds_train.concatenate(_prep_ds_file(f))
+ds_train = ds_train.prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
+&lt;/denchmark-code&gt;
+
+do:
+&lt;denchmark-code&gt;ds_train = fs_train.flat_map(_prep_ds_file)
+ds_train = ds_train.prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='6' author='mimxrt' date='2019-11-13T09:13:06Z'>
+		Thank you &lt;denchmark-link:https://github.com/jsimsa&gt;@jsimsa&lt;/denchmark-link&gt;
+, I can confirm the error is resolved by this change. So, can I assume the implementation in TF-2.0 is fundamentally different? Because running the exact same code snippet in TF-2.0 does work just fine. Anyway, closing this issue as the error is fixed by your solution. Thanks again!
+		</comment>
+		<comment id='7' author='mimxrt' date='2019-11-13T09:13:09Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/33202&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/33202&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

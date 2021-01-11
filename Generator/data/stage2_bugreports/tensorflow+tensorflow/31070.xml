@@ -1,0 +1,678 @@
+<bug id='31070' author='Thormidable' open_date='2019-07-26T11:12:58Z' closed_time='2019-08-01T23:14:16Z'>
+	<summary>Issue using tf.keras ModelCheckpoint when distributing under MultiWorkerMirroredStrategy</summary>
+	<description>
+Please make sure that this is a bug. As per our GitHub Policy, we only address code/doc bugs, performance issues, feature requests and build/installation issues on GitHub. tag:bug_template
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow):
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Windows 10
+Mobile device (e.g. iPhone 8, Pixel 2, Samsung Galaxy) if the issue happens on mobile device:
+TensorFlow installed from (source or binary): binary
+TensorFlow version (use command below): tf-gpu 2.0.0b1
+Python version: 3.6.3
+Bazel version (if compiling from source):
+GCC/Compiler version (if compiling from source):
+CUDA/cuDNN version: 10 / 7.4.1
+GPU model and memory: 2 x GV100 32GB
+
+You can collect some of this information using our environment capture
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/tree/master/tools/tf_env_collect.sh&gt;script&lt;/denchmark-link&gt;
+
+You can also obtain the TensorFlow version with: 1. TF 1.0:  2. TF 2.0: 
+Describe the current behavior
+Raises an error when using tf.keras.callbacks.ModelCheckpoint in the callbacks_list when training using keras under the MultiWorkerMirroredStrategy distribution strategy on a single machine.
+Error is:
+&lt;denchmark-code&gt;tensorflow.python.framework.errors_impl.NotFoundError: No registered 'VarHandleOp' OpKernel for GPU devices compatible with node {{node VarHandleOp}}
+	 (OpKernel was found, but attributes didn't match) Requested Attributes: container="", dtype=DT_INT32, shape=[], shared_name="cd2c89b7-88b7-44c8-ad83-06c2a9158347"
+&lt;/denchmark-code&gt;
+
+Describe the expected behavior
+should save a checkpoint model file and not crash
+Code to reproduce the issue
+run script called - run_distributed_training_minimal_example.py
+&lt;denchmark-code&gt;import json
+import subprocess
+
+import os
+
+
+def create_TF_config(name, id):
+    return {
+        'cluster': {
+            'worker': ['localhost:9999']
+            ,'chief': ['localhost:9997']
+        },
+        'task': {'type': name, 'index': id}
+    }
+
+
+def set_TF_CONFIG(id, name='worker'):
+    os.environ['TF_CONFIG'] = json.dumps(create_TF_config(name, id))
+
+
+def start_processes(cluster_def, key, device=None):
+    process_list = []
+    if key in cluster_def:
+        for i, _ in enumerate(cluster_def[key]):
+            if device is not None:
+                os.environ["CUDA_VISIBLE_DEVICES"] = str(device)
+                device +=1
+            else:
+                os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
+            process_list.append(subprocess.Popen(['python', 'distributed_training_minimal_example.py', '--job-name='+key, '--job-id=' + str(i)]))
+    return process_list, device
+
+
+if __name__ == "__main__":
+    cluster_def = create_TF_config("","")['cluster']
+
+    process_list = []
+    #this_list, device = start_processes(cluster_def, 'chief')
+    device=0
+    for key in ['chief','worker', 'ps']:
+        this_list, device = start_processes(cluster_def, key, device)
+        process_list.extend(this_list)
+
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+    os.environ['TF_CONFIG'] = "{}"
+
+    for p in process_list:
+        p.wait()
+&lt;/denchmark-code&gt;
+
+distributed worker script called - distributed_training_minimal_example.py
+&lt;denchmark-code&gt;from run_distributed_training_minimal_example import create_TF_config, set_TF_CONFIG
+
+use_custom_check_point = False
+
+def parse_arguments():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--job-name',
+                        type=str,
+                        default="worker",
+                        help='type of job this process is running')
+    parser.add_argument('--job-id',
+                        type=int,
+                        default=0,
+                        help='id of this job type for this process to run')
+    return parser.parse_args()
+
+args = parse_arguments()
+
+tf_config = create_TF_config("", "")
+cluster_def = tf_config['cluster']
+set_TF_CONFIG(args.job_id, args.job_name)
+
+is_chief = args.job_name == 'chief'
+print('is_chief:'+str(is_chief))
+batchSize = len(cluster_def['worker'])
+
+import tensorflow as tf
+strategy = tf.distribute.experimental.MultiWorkerMirroredStrategy()
+
+with strategy.scope():
+
+    def create_simple_model():
+        return tf.keras.Sequential([
+            tf.keras.layers.Conv2D(32, 3, activation='relu', padding='same',kernel_regularizer=tf.keras.regularizers.l2(0.04), input_shape = (128, 128, 1)),
+            tf.keras.layers.Conv2D(1, 3, activation='relu', padding='same',kernel_regularizer = tf.keras.regularizers.l2(0.04)),
+            tf.keras.layers.Dense(1, activation='softmax')
+        ])
+
+
+    def localised_cross_entropy(y_true, y_pred, ratio=1.0):
+        positive_error = ratio * y_true * tf.keras.backend.log(0.0000001 + y_pred)
+        negative_error = (1 - y_true) * tf.keras.backend.log(1.0000001 - y_pred)
+        errors = positive_error + negative_error
+        return tf.keras.backend.mean(errors)
+
+    def localised_cross_entropy_loss(y_true, y_pred, ratio=1.0):
+        return -localised_cross_entropy(y_true, y_pred, ratio)
+
+    def create_data():
+        import numpy as np
+        data_set = []
+        for i in range(20):
+            ip = np.random.random([128, 128, 1]).astype(np.float32)
+            op = np.random.randint(0, 2, [128, 128, 1]).astype(np.float32)
+            data_set.append((ip, op))
+        return data_set
+
+    model = create_simple_model()
+    model.summary()
+
+    trainingData = create_data()
+    model.compile('adam', loss=localised_cross_entropy_loss, metrics=[localised_cross_entropy])
+
+    split = int(len(trainingData)*0.8)
+    trainData, valData = trainingData[:split], trainingData[split:]
+
+    def create_RAM_generator(data):
+        while True:
+            for i in data:
+                yield i
+
+    def tensorflow_generator_training(data_getter, batchSize=None):
+        import tensorflow as tf
+
+        def __getter_generator():
+            while True:
+                item = next(data_getter)
+                yield item
+
+        shapes = ((None, None, 1), (None, None, 1))
+        dataset = tf.data.Dataset.from_generator(generator=__getter_generator, output_types=(tf.float32, tf.float32),output_shapes=shapes)
+        if batchSize is not None:
+            dataset = dataset.batch(batchSize)
+        return dataset
+
+    def generatorise(data):
+        train_gen = create_RAM_generator(data)
+        train_gen = tensorflow_generator_training(train_gen, batchSize=batchSize)
+        return train_gen
+
+    train_gen = generatorise(trainData)
+    val_gen = generatorise(valData)
+
+if not use_custom_check_point:
+    callbacks_list = [tf.keras.callbacks.ModelCheckpoint('tmp.hdf5')]
+else:
+    from tensorflow.keras.callbacks import Callback
+
+
+    class CustomModelCheckpointCallback(Callback):
+        def __init__(self, path, model, is_chief_task):
+            super(CustomModelCheckpointCallback, self).__init__()
+            self.model = model
+            self.path = path
+            self.is_chief = is_chief_task
+
+        def on_epoch_end(self, epoch, logs=None):
+            if self.is_chief:
+                self.model.save(self.path)
+    callbacks_list = [CustomModelCheckpointCallback('tmp.hdf5', model, is_chief)]
+
+model.fit(train_gen, epochs=3, shuffle=False, callbacks=callbacks_list, validation_data=val_gen, steps_per_epoch=len(trainData), validation_steps=len(valData))
+&lt;/denchmark-code&gt;
+
+running first script will cause the issue.
+setting use_custom_check_point to True in the second script will remove the error.
+Other info / logs
+Include any logs or source code that would be helpful to diagnose the problem. If including tracebacks, please include the full traceback. Large logs and files should be attached.
+&lt;denchmark-code&gt;F:\ffa_dev\deep-learning-dev-dist\env\Scripts\python.exe F:/ffa_dev/deep-learning-dev-dist/run_distributed_training_minimal_example.py
+is_chief:False
+is_chief:True
+2019-07-26 12:00:27.116726: I tensorflow/stream_executor/platform/default/dso_loader.cc:42] Successfully opened dynamic library nvcuda.dll
+2019-07-26 12:00:27.117037: I tensorflow/stream_executor/platform/default/dso_loader.cc:42] Successfully opened dynamic library nvcuda.dll
+2019-07-26 12:00:27.421095: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1640] Found device 0 with properties: 
+name: Quadro GV100 major: 7 minor: 0 memoryClockRate(GHz): 1.627
+pciBusID: 0000:9e:00.0
+2019-07-26 12:00:27.421633: I tensorflow/stream_executor/platform/default/dlopen_checker_stub.cc:25] GPU libraries are statically linked, skip dlopen check.
+2019-07-26 12:00:27.425381: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1763] Adding visible gpu devices: 0
+2019-07-26 12:00:27.426214: I tensorflow/core/platform/cpu_feature_guard.cc:142] Your CPU supports instructions that this TensorFlow binary was not compiled to use: AVX2
+2019-07-26 12:00:27.443567: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1640] Found device 0 with properties: 
+name: Quadro GV100 major: 7 minor: 0 memoryClockRate(GHz): 1.627
+pciBusID: 0000:9e:00.0
+2019-07-26 12:00:27.443960: I tensorflow/stream_executor/platform/default/dlopen_checker_stub.cc:25] GPU libraries are statically linked, skip dlopen check.
+2019-07-26 12:00:27.448508: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1763] Adding visible gpu devices: 0
+2019-07-26 12:00:27.497949: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1640] Found device 0 with properties: 
+name: Quadro GV100 major: 7 minor: 0 memoryClockRate(GHz): 1.627
+pciBusID: 0000:5b:00.0
+2019-07-26 12:00:27.498407: I tensorflow/stream_executor/platform/default/dlopen_checker_stub.cc:25] GPU libraries are statically linked, skip dlopen check.
+2019-07-26 12:00:27.502742: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1763] Adding visible gpu devices: 0
+2019-07-26 12:00:27.503686: I tensorflow/core/platform/cpu_feature_guard.cc:142] Your CPU supports instructions that this TensorFlow binary was not compiled to use: AVX2
+2019-07-26 12:00:27.519979: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1640] Found device 0 with properties: 
+name: Quadro GV100 major: 7 minor: 0 memoryClockRate(GHz): 1.627
+pciBusID: 0000:5b:00.0
+2019-07-26 12:00:27.520543: I tensorflow/stream_executor/platform/default/dlopen_checker_stub.cc:25] GPU libraries are statically linked, skip dlopen check.
+2019-07-26 12:00:27.523778: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1763] Adding visible gpu devices: 0
+2019-07-26 12:00:28.548291: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1181] Device interconnect StreamExecutor with strength 1 edge matrix:
+2019-07-26 12:00:28.548686: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1187]      0 
+2019-07-26 12:00:28.548929: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1200] 0:   N 
+2019-07-26 12:00:28.554809: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1326] Created TensorFlow device (/job:localhost/replica:0/task:0/device:GPU:0 with 25826 MB memory) -&gt; physical GPU (device: 0, name: Quadro GV100, pci bus id: 0000:9e:00.0, compute capability: 7.0)
+2019-07-26 12:00:28.569853: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1640] Found device 0 with properties: 
+name: Quadro GV100 major: 7 minor: 0 memoryClockRate(GHz): 1.627
+pciBusID: 0000:9e:00.0
+2019-07-26 12:00:28.570305: I tensorflow/stream_executor/platform/default/dlopen_checker_stub.cc:25] GPU libraries are statically linked, skip dlopen check.
+2019-07-26 12:00:28.573342: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1763] Adding visible gpu devices: 0
+2019-07-26 12:00:28.573626: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1181] Device interconnect StreamExecutor with strength 1 edge matrix:
+2019-07-26 12:00:28.573956: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1187]      0 
+2019-07-26 12:00:28.574136: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1200] 0:   N 
+2019-07-26 12:00:28.576977: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1326] Created TensorFlow device (/job:worker/replica:0/task:0/device:GPU:0 with 25826 MB memory) -&gt; physical GPU (device: 0, name: Quadro GV100, pci bus id: 0000:9e:00.0, compute capability: 7.0)
+2019-07-26 12:00:28.581376: I tensorflow/core/distributed_runtime/rpc/grpc_channel.cc:250] Initialize GrpcChannelCache for job chief -&gt; {0 -&gt; localhost:9997}
+2019-07-26 12:00:28.581735: I tensorflow/core/distributed_runtime/rpc/grpc_channel.cc:250] Initialize GrpcChannelCache for job worker -&gt; {0 -&gt; localhost:9999}
+2019-07-26 12:00:28.599655: I tensorflow/core/distributed_runtime/rpc/grpc_server_lib.cc:365] Started server with target: grpc://localhost:9999
+2019-07-26 12:00:28.602463: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1640] Found device 0 with properties: 
+name: Quadro GV100 major: 7 minor: 0 memoryClockRate(GHz): 1.627
+pciBusID: 0000:9e:00.0
+2019-07-26 12:00:28.603395: I tensorflow/stream_executor/platform/default/dlopen_checker_stub.cc:25] GPU libraries are statically linked, skip dlopen check.
+2019-07-26 12:00:28.607136: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1763] Adding visible gpu devices: 0
+2019-07-26 12:00:28.607483: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1181] Device interconnect StreamExecutor with strength 1 edge matrix:
+2019-07-26 12:00:28.607841: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1187]      0 
+2019-07-26 12:00:28.608102: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1200] 0:   N 
+2019-07-26 12:00:28.611206: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1326] Created TensorFlow device (/device:GPU:0 with 25826 MB memory) -&gt; physical GPU (device: 0, name: Quadro GV100, pci bus id: 0000:9e:00.0, compute capability: 7.0)
+WARNING: Logging before flag parsing goes to stderr.
+W0726 12:00:28.611904 51176 cross_device_ops.py:1164] Some requested devices in `tf.distribute.Strategy` are not visible to TensorFlow: /job:worker/replica:0/task:0/device:GPU:0
+2019-07-26 12:00:28.613309: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1181] Device interconnect StreamExecutor with strength 1 edge matrix:
+2019-07-26 12:00:28.613666: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1187]      0 
+2019-07-26 12:00:28.613873: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1200] 0:   N 
+2019-07-26 12:00:28.618119: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1326] Created TensorFlow device (/job:localhost/replica:0/task:0/device:GPU:0 with 25826 MB memory) -&gt; physical GPU (device: 0, name: Quadro GV100, pci bus id: 0000:5b:00.0, compute capability: 7.0)
+2019-07-26 12:00:28.634094: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1640] Found device 0 with properties: 
+name: Quadro GV100 major: 7 minor: 0 memoryClockRate(GHz): 1.627
+pciBusID: 0000:5b:00.0
+2019-07-26 12:00:28.634513: I tensorflow/stream_executor/platform/default/dlopen_checker_stub.cc:25] GPU libraries are statically linked, skip dlopen check.
+2019-07-26 12:00:28.637145: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1763] Adding visible gpu devices: 0
+2019-07-26 12:00:28.637447: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1181] Device interconnect StreamExecutor with strength 1 edge matrix:
+2019-07-26 12:00:28.637741: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1187]      0 
+2019-07-26 12:00:28.637928: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1200] 0:   N 
+2019-07-26 12:00:28.640533: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1326] Created TensorFlow device (/job:chief/replica:0/task:0/device:GPU:0 with 25826 MB memory) -&gt; physical GPU (device: 0, name: Quadro GV100, pci bus id: 0000:5b:00.0, compute capability: 7.0)
+2019-07-26 12:00:28.646908: I tensorflow/core/distributed_runtime/rpc/grpc_channel.cc:250] Initialize GrpcChannelCache for job chief -&gt; {0 -&gt; localhost:9997}
+2019-07-26 12:00:28.647352: I tensorflow/core/distributed_runtime/rpc/grpc_channel.cc:250] Initialize GrpcChannelCache for job worker -&gt; {0 -&gt; localhost:9999}
+2019-07-26 12:00:28.666115: I tensorflow/core/distributed_runtime/rpc/grpc_server_lib.cc:365] Started server with target: grpc://localhost:9997
+2019-07-26 12:00:28.668862: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1640] Found device 0 with properties: 
+name: Quadro GV100 major: 7 minor: 0 memoryClockRate(GHz): 1.627
+pciBusID: 0000:5b:00.0
+2019-07-26 12:00:28.669380: I tensorflow/stream_executor/platform/default/dlopen_checker_stub.cc:25] GPU libraries are statically linked, skip dlopen check.
+2019-07-26 12:00:28.672907: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1763] Adding visible gpu devices: 0
+2019-07-26 12:00:28.673317: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1181] Device interconnect StreamExecutor with strength 1 edge matrix:
+2019-07-26 12:00:28.673744: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1187]      0 
+2019-07-26 12:00:28.673983: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1200] 0:   N 
+2019-07-26 12:00:28.677930: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1326] Created TensorFlow device (/device:GPU:0 with 25826 MB memory) -&gt; physical GPU (device: 0, name: Quadro GV100, pci bus id: 0000:5b:00.0, compute capability: 7.0)
+WARNING: Logging before flag parsing goes to stderr.
+W0726 12:00:28.675424 29652 cross_device_ops.py:1164] Some requested devices in `tf.distribute.Strategy` are not visible to TensorFlow: /job:chief/replica:0/task:0/device:GPU:0
+Model: "sequential"
+_________________________________________________________________
+Layer (type)                 Output Shape              Param #   
+=================================================================
+Model: "sequential"
+_________________________________________________________________
+Layer (type)                 Output Shape              Param #   
+=================================================================
+conv2d (Conv2D)              (None, 128, 128, 32)      320       
+_________________________________________________________________
+conv2d_1 (Conv2D)            (None, 128, 128, 1)       289       
+_________________________________________________________________
+conv2d (Conv2D)              (None, 128, 128, 32)      320       
+_________________________________________________________________
+dense (Dense)                (None, 128, 128, 1)       2         
+=================================================================
+conv2d_1 (Conv2D)            (None, 128, 128, 1)       289       
+_________________________________________________________________
+dense (Dense)                (None, 128, 128, 1)       2         
+=================================================================
+Total params: 611
+Trainable params: 611
+Non-trainable params: 0
+_________________________________________________________________
+Total params: 611
+Trainable params: 611
+Non-trainable params: 0
+_________________________________________________________________
+W0726 12:00:30.992845 51176 deprecation.py:323] From F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\data\ops\dataset_ops.py:505: py_func (from tensorflow.python.ops.script_ops) is deprecated and will be removed in a future version.
+Instructions for updating:
+tf.py_func is deprecated in TF V2. Instead, there are two
+    options available in V2.
+    - tf.py_function takes a python function which manipulates tf eager
+    tensors instead of numpy arrays. It's easy to convert a tf eager tensor to
+    an ndarray (just call tensor.numpy()) but having access to eager tensors
+    means `tf.py_function`s can use accelerators such as GPUs as well as
+    being differentiable using a gradient tape.
+    - tf.numpy_function maintains the semantics of the deprecated tf.py_func
+    (it is not differentiable, and manipulates numpy arrays). It drops the
+    stateful argument making all functions stateful.
+    
+W0726 12:00:30.992845 29652 deprecation.py:323] From F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\data\ops\dataset_ops.py:505: py_func (from tensorflow.python.ops.script_ops) is deprecated and will be removed in a future version.
+Instructions for updating:
+tf.py_func is deprecated in TF V2. Instead, there are two
+    options available in V2.
+    - tf.py_function takes a python function which manipulates tf eager
+    tensors instead of numpy arrays. It's easy to convert a tf eager tensor to
+    an ndarray (just call tensor.numpy()) but having access to eager tensors
+    means `tf.py_function`s can use accelerators such as GPUs as well as
+    being differentiable using a gradient tape.
+    - tf.numpy_function maintains the semantics of the deprecated tf.py_func
+    (it is not differentiable, and manipulates numpy arrays). It drops the
+    stateful argument making all functions stateful.
+    
+W0726 12:00:31.031976 51176 distribute_coordinator.py:825] `eval_fn` is not passed in. The `worker_fn` will be used if an "evaluator" task exists in the cluster.
+W0726 12:00:31.031976 51176 distribute_coordinator.py:829] `eval_strategy` is not passed in. No distribution strategy will be used for evaluation.
+W0726 12:00:31.031976 29652 distribute_coordinator.py:825] `eval_fn` is not passed in. The `worker_fn` will be used if an "evaluator" task exists in the cluster.
+W0726 12:00:31.031976 29652 distribute_coordinator.py:829] `eval_strategy` is not passed in. No distribution strategy will be used for evaluation.
+2019-07-26 12:00:31.036410: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1640] Found device 0 with properties: 
+name: Quadro GV100 major: 7 minor: 0 memoryClockRate(GHz): 1.627
+pciBusID: 0000:92019-e07-:26 12:00.0
+00:31.2019-07-26 12:00:310.033668290: I tensor70: I flow/tensocorre/cflow/ommsotren_rauntime/gpm_execuu/gtorpu_/devpice.cc:16latfo4rm/0] defaultF/dlopeound dn_checkeevir_sce t0 wub.cc:25]ith pro perGPU libraries atiere sstati: 
+namcale: ly liQuadro nked, skiGV100 p dmajlor:open check.
+ 7 minor: 0 memoryClockRate(GHz): 1.627
+pciBusID: 0000:5b:00.0
+2019-07-26 12:00:31.038318: I tensorflow/stream_executor/platform/default/dlopen_checker_stub.cc:25] GPU libraries are statically linked, skip dlopen check.
+2019-07-26 12:00:31.042495: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1763] Adding visible gpu devices: 2019-07-26 12:00:310
+.042772: I tensorflow/core/comm2019-07-26 12:on00:31.0429_runtime/gp9u/g2pu_: I devictene.cc:1763] sAorfdding visiblelow/co gpru deevi/ces: 0commo
+n_runtime/gpu/gpu_device.cc:1181] Device inte201rconnect9-0 StreamE7x-26 12ecutor wi:th 00:31.0437stren11: Igth 1  edge matritenx:
+sor2flo0w/cor19-07e/c-26 1o2:00:31mmon_ru.n044108time/:gpu /gpIu_device.cc: tensorflow/core/1c181ommon]_runtime/gpu /gpDevicu_devicee.c interconnect StreamExecutor c:1w1ith strength 1 8edge matrix:7
+]20 19-07-     0 
+2620 112:00:319-07-.20449886 12:00:31.:045 066I tensorflow/core:/co mmon_runtimIe/g tepnsorfu/gpu_devlow/cice.ccore/comm:on_1run187time/g]   p   0 
+u/g2019-pu_de0v7-26 1ice.cc2:00:31.0:456921200] 0: I: te   N 
+nsorflow/core/common_runtime/gpu/gpu_device.cc:1200] 0:   N 
+2019-07-26 12:00:31.050217: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1326] Created TensorFlow device (/device:GPU:0 with 25826 MB memory) -&gt; physical GPU (device: 0, name: Quadro GV100, pci bus id: 0000:9e:00.0, compute capability: 7.0)
+W0726 12:00:31.044387 51176 cross_device_ops.py:1164] Some requested devices in `tf.distribute.Strategy` are not visible to TensorFlow: /job:worker/replica:0/task:0/device:GPU:0
+2019-07-26 12:00:31.051178: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1326] Created TensorFlow device (/device:GPU:0 with 25826 MB memory) -&gt; physical GPU (device: 0, name: Quadro GV100, pci bus id: 0000:5b:00.0, compute capability: 7.0)
+2019-07-26 12:00:31.054114: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1640] Found device 0 with properties: 
+name: Quadro GV100 major: 7 minor: 0 memoryClockRate(GHz): 1.627
+pciBusID: 0000:9e:00.0
+2019-07-26 12:00:31.054942: I tensorflow/stream_executor/pW0726 12:00:31.054794 29652 cross_device_ops.py:1164] Some requested devices in `tf.distribute.Strategy` are not visible to TensorFlow: /job:chief/replica:0/task:0/device:GPU:0
+latform/default/dlopen_checker_stub.cc:25] GPU libraries are statically linked, skip dlopen check.
+2019-07-26 12:00:31.057696: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1640] Found device 0 with properties: 
+name: Quadro GV100 major: 7 minor: 0 memoryClockRate(GHz): 1.627
+pciBusID: 0000:5b:00.0
+2019-07-26 12:00:31.058142: I tensorflow/stream_executor/platform/default/dlopen_checker_stub.cc:25] GPU libraries are statically linked, skip dlopen check.
+2019-07-26 12:00:31.058764: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1763] Adding visible gpu devices: 0
+2019-07-26 12:00:31.059078: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1181] Device interconnect StreamExecutor with strength 1 edge matrix:
+2019-07-26 12:00:31.059395: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1187]      0 
+2019-07-26 12:00:31.059590: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1200] 0:   N 
+2019-07-26 12:00:31.062322: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1763] Adding visible gpu devices: 0
+2019-07-26 12:00:31.062664: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1181] Device interconnect StreamExecutor with strength 1 edge matrix:
+2019-07-26 12:00:31.063059: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1187]      0 
+2019-07-26 12:00:31.063278: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1200] 0:   N 
+2019-07-26 12:00:31.063637: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1326] Created TensorFlow device (/device:GPU:0 with 25826 MB memory) -&gt; physical GPU (device: 0, name: Quadro GV100, pci bus id: 0000:9e:00.0, compute capability: 7.0)
+W0726 12:00:31.062981 51176 cross_device_ops.py:1164] Some requested devices in `tf.distribute.Strategy` are not visible to TensorFlow: /job:worker/replica:0/task:0/device:GPU:0
+2019-07-26 12:00:31.066050: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1326] Created TensorFlow device (/device:GPU:0 with 25826 MB memory) -&gt; physical GPU (device: 0, name: Quadro GV100, pci bus id: 0000:5b:00.0, compute capability: 7.0)
+W0726 12:00:31.065107 29652 cross_device_ops.py:1164] Some requested devices in `tf.distribute.Strategy` are not visible to TensorFlow: /job:chief/replica:0/task:0/device:GPU:0
+2019-07-26 12:00:31.075080: W tensorflow/core/grappler/optimizers/data/auto_shard.cc:334] Cannot find shardable dataset, adding a shard node at the end of the dataset instead. This may have performance implications.
+2019-07-26 12:00:31.076454: W tensorflow/core/grappler/optimizers/data/auto_shard.cc:334] Cannot find shardable dataset, adding a shard node at the end of the dataset instead. This may have performance implications.
+2019-2019-07-26 12:00:31.126357: W tensorflow/core/grapp07-26 1ler2/op:00timizers/:d31.126335: W tensorfatal/auow/core/tgo_srappler/hard.cc:optim334i] Cannotzers/data/auto_shard fi.ccn:33d shardable4] C datasaet,n adnot fidnd ing a shashardabler d ndodeataset, add at theing a  sheardn nod ode at the end of the daftas the det insteaatadset. This  insteamay haved. This may have  performance implicapertions.f
+ormance implications.
+Train on 16 steps, validate on 4 steps
+Train on 16 steps, validate on 4 steps
+Traceback (most recent call last):
+  File "distributed_training_minimal_example.py", line 113, in &lt;module&gt;
+Traceback (most recent call last):
+  File "distributed_training_minimal_example.py", line 113, in &lt;module&gt;
+    model.fit(train_gen, epochs=3, shuffle=False, callbacks=callbacks_list, validation_data=val_gen, steps_per_epoch=len(trainData), validation_steps=len(valData))
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\keras\engine\training.py", line 643, in fit
+    model.fit(train_gen, epochs=3, shuffle=False, callbacks=callbacks_list, validation_data=val_gen, steps_per_epoch=len(trainData), validation_steps=len(valData))
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\keras\engine\training.py", line 643, in fit
+    use_multiprocessing=use_multiprocessing)
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\keras\engine\training_distributed.py", line 776, in wrapper
+    use_multiprocessing=use_multiprocessing)
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\keras\engine\training_distributed.py", line 776, in wrapper
+    mode=dc.CoordinatorMode.INDEPENDENT_WORKER)
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\distribute\distribute_coordinator.py", line 853, in run_distribute_coordinator
+    mode=dc.CoordinatorMode.INDEPENDENT_WORKER)
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\distribute\distribute_coordinator.py", line 853, in run_distribute_coordinator
+    task_id, session_config, rpc_layer)
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\distribute\distribute_coordinator.py", line 360, in _run_single_worker
+    task_id, session_config, rpc_layer)
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\distribute\distribute_coordinator.py", line 360, in _run_single_worker
+    return worker_fn(strategy)
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\keras\engine\training_distributed.py", line 771, in _worker_fn
+    return worker_fn(strategy)
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\keras\engine\training_distributed.py", line 771, in _worker_fn
+    return fn(instance, model, **kwargs)
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\keras\engine\training_distributed.py", line 681, in fit
+    return fn(instance, model, **kwargs)
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\keras\engine\training_distributed.py", line 681, in fit
+    steps_name='steps_per_epoch')
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\keras\engine\training_arrays.py", line 252, in model_iteration
+    steps_name='steps_per_epoch')
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\keras\engine\training_arrays.py", line 252, in model_iteration
+    callbacks._call_begin_hook(mode)
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\keras\callbacks.py", line 246, in _call_begin_hook
+    callbacks._call_begin_hook(mode)
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\keras\callbacks.py", line 246, in _call_begin_hook
+    self.on_train_begin()
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\keras\callbacks.py", line 362, in on_train_begin
+    self.on_train_begin()
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\keras\callbacks.py", line 362, in on_train_begin
+    callback.on_train_begin(logs)
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\keras\callbacks.py", line 905, in on_train_begin
+    callback.on_train_begin(logs)
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\keras\callbacks.py", line 905, in on_train_begin
+    self.model, self.filepath))
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\keras\distribute\multi_worker_training_state.py", line 60, in __init__
+    self.model, self.filepath))
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\keras\distribute\multi_worker_training_state.py", line 60, in __init__
+    initial_value=CKPT_SAVED_EPOCH_UNUSED_VALUE, name='ckpt_saved_epoch')
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\ops\variables.py", line 262, in __call__
+    initial_value=CKPT_SAVED_EPOCH_UNUSED_VALUE, name='ckpt_saved_epoch')
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\ops\variables.py", line 262, in __call__
+    return cls._variable_v2_call(*args, **kwargs)
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\ops\variables.py", line 256, in _variable_v2_call
+    return cls._variable_v2_call(*args, **kwargs)
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\ops\variables.py", line 256, in _variable_v2_call
+    shape=shape)
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\ops\variables.py", line 60, in getter
+    shape=shape)
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\ops\variables.py", line 60, in getter
+    return captured_getter(captured_previous, **kwargs)
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\distribute\distribute_lib.py", line 1250, in creator_with_resource_vars
+    return captured_getter(captured_previous, **kwargs)
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\distribute\distribute_lib.py", line 1250, in creator_with_resource_vars
+    return self._create_variable(*args, **kwargs)
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\distribute\collective_all_reduce_strategy.py", line 368, in _create_variable
+    return self._create_variable(*args, **kwargs)
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\distribute\collective_all_reduce_strategy.py", line 368, in _create_variable
+    _real_mirrored_creator, *args, **kwargs)
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\distribute\mirrored_strategy.py", line 251, in _create_mirrored_variable
+    _real_mirrored_creator, *args, **kwargs)
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\distribute\mirrored_strategy.py", line 251, in _create_mirrored_variable
+    value_list = real_mirrored_creator(devices, *args, **kwargs)
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\distribute\collective_all_reduce_strategy.py", line 355, in _real_mirrored_creator
+    value_list = real_mirrored_creator(devices, *args, **kwargs)
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\distribute\collective_all_reduce_strategy.py", line 355, in _real_mirrored_creator
+    v = next_creator(*args, **kwargs)
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\ops\variables.py", line 237, in &lt;lambda&gt;
+    previous_getter = lambda **kws: default_variable_creator_v2(None, **kws)
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\ops\variable_scope.py", line 2551, in default_variable_creator_v2
+    v = next_creator(*args, **kwargs)
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\ops\variables.py", line 237, in &lt;lambda&gt;
+    previous_getter = lambda **kws: default_variable_creator_v2(None, **kws)
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\ops\variable_scope.py", line 2551, in default_variable_creator_v2
+    shape=shape)
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\ops\variables.py", line 264, in __call__
+    return super(VariableMetaclass, cls).__call__(*args, **kwargs)
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\ops\resource_variable_ops.py", line 464, in __init__
+    shape=shape)
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\ops\variables.py", line 264, in __call__
+    shape=shape)
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\ops\resource_variable_ops.py", line 618, in _init_from_args
+    return super(VariableMetaclass, cls).__call__(*args, **kwargs)
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\ops\resource_variable_ops.py", line 464, in __init__
+    graph_mode=self._in_graph_mode)
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\ops\resource_variable_ops.py", line 225, in eager_safe_variable_handle
+    shape=shape)
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\ops\resource_variable_ops.py", line 618, in _init_from_args
+    shape, dtype, shared_name, name, graph_mode, initial_value)
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\ops\resource_variable_ops.py", line 141, in variable_handle_from_shape_and_dtype
+    container=container)
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\ops\gen_resource_variable_ops.py", line 1612, in var_handle_op
+    graph_mode=self._in_graph_mode)
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\ops\resource_variable_ops.py", line 225, in eager_safe_variable_handle
+    shape, dtype, shared_name, name, graph_mode, initial_value)
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\ops\resource_variable_ops.py", line 141, in variable_handle_from_shape_and_dtype
+    container=container)
+  File "F:\ffa_dev\deep-learning-dev-dist\env\lib\site-packages\tensorflow\python\ops\gen_resource_variable_ops.py", line 1612, in var_handle_op
+    _six.raise_from(_core._status_to_exception(e.code, message), None)
+  File "&lt;string&gt;", line 3, in raise_from
+tensorflow.python.framework.errors_impl.NotFoundError: No registered 'VarHandleOp' OpKernel for GPU devices compatible with node {{node VarHandleOp}}
+	 (OpKernel was found, but attributes didn't match) Requested Attributes: container="", dtype=DT_INT32, shape=[], shared_name="cd2c89b7-88b7-44c8-ad83-06c2a9158347"
+	.  Registered:  device='CPU'
+  device='GPU'; dtype in [DT_HALF]
+  device='GPU'; dtype in [DT_FLOAT]
+  device='GPU'; dtype in [DT_DOUBLE]
+  device='GPU'; dtype in [DT_BOOL]
+  device='GPU'; dtype in [DT_COMPLEX64]
+  device='GPU'; dtype in [DT_COMPLEX128]
+  device='GPU'; dtype in [DT_INT64]
+  device='GPU'; dtype in [DT_VARIANT]
+ [Op:VarHandleOp] name: ckpt_saved_epoch/
+    _six.raise_from(_core._status_to_exception(e.code, message), None)
+  File "&lt;string&gt;", line 3, in raise_from
+tensorflow.python.framework.errors_impl.NotFoundError: No registered 'VarHandleOp' OpKernel for GPU devices compatible with node {{node VarHandleOp}}
+	 (OpKernel was found, but attributes didn't match) Requested Attributes: container="", dtype=DT_INT32, shape=[], shared_name="cd2c89b7-88b7-44c8-ad83-06c2a9158347"
+	.  Registered:  device='CPU'
+  device='GPU'; dtype in [DT_HALF]
+  device='GPU'; dtype in [DT_FLOAT]
+  device='GPU'; dtype in [DT_DOUBLE]
+  device='GPU'; dtype in [DT_BOOL]
+  device='GPU'; dtype in [DT_COMPLEX64]
+  device='GPU'; dtype in [DT_COMPLEX128]
+  device='GPU'; dtype in [DT_INT64]
+  device='GPU'; dtype in [DT_VARIANT]
+ [Op:VarHandleOp] name: ckpt_saved_epoch/
+2019-07-26 12:00:31.325341: W tensorflow/core/common_runtime/eager/context.cc:232] Unable to destroy server_ object, so releasing instead. Servers don't support clean shutdown.
+2019-07-26 12:00:31.339402: W tensorflow/core/common_runtime/eager/context.cc:232] Unable to destroy server_ object, so releasing instead. Servers don't support clean shutdown.
+
+Process finished with exit code 0
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='Thormidable' date='2019-07-28T00:44:21Z'>
+		I am experiencing the same issue.
+		</comment>
+		<comment id='2' author='Thormidable' date='2019-08-01T20:03:43Z'>
+		I am also experiencing the same issue.
+		</comment>
+		<comment id='3' author='Thormidable' date='2019-08-01T21:25:41Z'>
+		&lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/6345ad553be2c23e09d7c3193533994eb522f635&gt;6345ad5&lt;/denchmark-link&gt;
+
+This should be a fix, but not included in beta1 release
+		</comment>
+		<comment id='4' author='Thormidable' date='2019-08-01T23:14:16Z'>
+		Correct, &lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/6345ad553be2c23e09d7c3193533994eb522f635&gt;6345ad5&lt;/denchmark-link&gt;
+ is the fix for this issue and should be available in the next release. Thanks for reporting the issue.
+		</comment>
+		<comment id='5' author='Thormidable' date='2019-08-01T23:14:18Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=31070&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=31070&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='6' author='Thormidable' date='2019-08-01T23:15:58Z'>
+		I tried following 2 solutions
+1.I applied &lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/6345ad553be2c23e09d7c3193533994eb522f635&gt;6345ad5&lt;/denchmark-link&gt;
+
+to my tensorflow installed code
+2. I install latest nightly dev build
+both gave me following error, seems though previous commit change data type to int64, somewhere else still expects int32
+&lt;denchmark-code&gt;2019-08-01 22:41:51.971726: W tensorflow/core/framework/op_kernel.cc:1546] OP_REQUIRES failed at collective_ops.cc:354 : Internal: RecvBufResponse returned 8 bytes where to_tensor expected 4
+Traceback (most recent call last):
+  File "example_tf2.py", line 124, in &lt;module&gt;
+    steps_per_epoch = parallel_steps)
+  File "/usr/local/lib/python2.7/dist-packages/tensorflow/python/keras/engine/training.py", line 643, in fit
+    use_multiprocessing=use_multiprocessing)
+  File "/usr/local/lib/python2.7/dist-packages/tensorflow/python/keras/engine/training_distributed.py", line 776, in wrapper
+    mode=dc.CoordinatorMode.INDEPENDENT_WORKER)
+  File "/usr/local/lib/python2.7/dist-packages/tensorflow/python/distribute/distribute_coordinator.py", line 853, in run_distribute_coordinator
+    task_id, session_config, rpc_layer)
+  File "/usr/local/lib/python2.7/dist-packages/tensorflow/python/distribute/distribute_coordinator.py", line 360, in _run_single_worker
+    return worker_fn(strategy)
+  File "/usr/local/lib/python2.7/dist-packages/tensorflow/python/keras/engine/training_distributed.py", line 771, in _worker_fn
+    return fn(instance, model, **kwargs)
+  File "/usr/local/lib/python2.7/dist-packages/tensorflow/python/keras/engine/training_distributed.py", line 681, in fit
+    steps_name='steps_per_epoch')
+  File "/usr/local/lib/python2.7/dist-packages/tensorflow/python/keras/engine/training_arrays.py", line 294, in model_iteration
+    batch_outs = f(actual_inputs)
+  File "/usr/local/lib/python2.7/dist-packages/tensorflow/python/keras/distribute/distributed_training_utils.py", line 813, in execution_function
+    return [out.numpy() for out in distributed_function(input_fn)]
+  File "/usr/local/lib/python2.7/dist-packages/tensorflow/python/eager/def_function.py", line 416, in __call__
+    self._initialize(args, kwds, add_initializers_to=initializer_map)
+  File "/usr/local/lib/python2.7/dist-packages/tensorflow/python/eager/def_function.py", line 359, in _initialize
+    *args, **kwds))
+  File "/usr/local/lib/python2.7/dist-packages/tensorflow/python/eager/function.py", line 1360, in _get_concrete_function_internal_garbage_collected
+    graph_function, _, _ = self._maybe_define_function(args, kwargs)
+  File "/usr/local/lib/python2.7/dist-packages/tensorflow/python/eager/function.py", line 1648, in _maybe_define_function
+    graph_function = self._create_graph_function(args, kwargs)
+  File "/usr/local/lib/python2.7/dist-packages/tensorflow/python/eager/function.py", line 1541, in _create_graph_function
+    capture_by_value=self._capture_by_value),
+  File "/usr/local/lib/python2.7/dist-packages/tensorflow/python/framework/func_graph.py", line 716, in func_graph_from_py_func
+    func_outputs = python_func(*func_args, **func_kwargs)
+  File "/usr/local/lib/python2.7/dist-packages/tensorflow/python/eager/def_function.py", line 309, in wrapped_fn
+    return weak_wrapped_fn().__wrapped__(*args, **kwds)
+  File "/usr/local/lib/python2.7/dist-packages/tensorflow/python/framework/func_graph.py", line 706, in wrapper
+    raise e.ag_error_metadata.to_exception(type(e))
+tensorflow.python.autograph.impl.api.StagingError: in converted code:
+
+    /usr/local/lib/python2.7/dist-packages/tensorflow/python/keras/distribute/distributed_training_utils.py:804 distributed_function  *
+        outputs = strategy.experimental_run_v2(
+    /usr/local/lib/python2.7/dist-packages/tensorflow/python/distribute/distribute_lib.py:708 experimental_run_v2
+        return self._extended.call_for_each_replica(fn, args=args, kwargs=kwargs)
+    /usr/local/lib/python2.7/dist-packages/tensorflow/python/distribute/distribute_lib.py:1710 call_for_each_replica
+        return self._call_for_each_replica(fn, args, kwargs)
+    /usr/local/lib/python2.7/dist-packages/tensorflow/python/distribute/mirrored_strategy.py:708 _call_for_each_replica
+        fn, args, kwargs)
+    /usr/local/lib/python2.7/dist-packages/tensorflow/python/distribute/mirrored_strategy.py:195 _call_for_each_replica
+        coord.join(threads)
+    /usr/local/lib/python2.7/dist-packages/tensorflow/python/training/coordinator.py:389 join
+        six.reraise(*self._exc_info_to_raise)
+    /usr/local/lib/python2.7/dist-packages/tensorflow/python/training/coordinator.py:297 stop_on_exception
+        yield
+    /usr/local/lib/python2.7/dist-packages/tensorflow/python/distribute/mirrored_strategy.py:926 run
+        self.main_result = self.main_fn(*self.main_args, **self.main_kwargs)
+    /usr/local/lib/python2.7/dist-packages/tensorflow/python/keras/engine/training.py:908 train_on_batch
+        output_loss_metrics=self._output_loss_metrics)
+    /usr/local/lib/python2.7/dist-packages/tensorflow/python/keras/engine/training_eager.py:307 train_on_batch
+        output_loss_metrics=output_loss_metrics))
+    /usr/local/lib/python2.7/dist-packages/tensorflow/python/keras/engine/training_eager.py:260 _process_single_batch
+        model.trainable_weights))
+    /usr/local/lib/python2.7/dist-packages/tensorflow/python/keras/optimizer_v2/optimizer_v2.py:434 apply_gradients
+        self._create_hypers()
+    /usr/local/lib/python2.7/dist-packages/tensorflow/python/keras/optimizer_v2/optimizer_v2.py:608 _create_hypers
+        aggregation=tf_variables.VariableAggregation.ONLY_FIRST_REPLICA)
+    /usr/local/lib/python2.7/dist-packages/tensorflow/python/keras/optimizer_v2/optimizer_v2.py:770 add_weight
+        aggregation=aggregation)
+    /usr/local/lib/python2.7/dist-packages/tensorflow/python/training/tracking/base.py:713 _add_variable_with_custom_getter
+        **kwargs_for_getter)
+    /usr/local/lib/python2.7/dist-packages/tensorflow/python/keras/engine/base_layer_utils.py:154 make_variable
+        shape=variable_shape if variable_shape else None)
+    /usr/local/lib/python2.7/dist-packages/tensorflow/python/ops/variables.py:260 __call__
+        return cls._variable_v1_call(*args, **kwargs)
+    /usr/local/lib/python2.7/dist-packages/tensorflow/python/ops/variables.py:221 _variable_v1_call
+        shape=shape)
+    /usr/local/lib/python2.7/dist-packages/tensorflow/python/ops/variables.py:60 getter
+        return captured_getter(captured_previous, **kwargs)
+    /usr/local/lib/python2.7/dist-packages/tensorflow/python/distribute/shared_variable_creator.py:69 create_new_variable
+        v = next_creator(*args, **kwargs)
+    /usr/local/lib/python2.7/dist-packages/tensorflow/python/ops/variables.py:60 getter
+        return captured_getter(captured_previous, **kwargs)
+    /usr/local/lib/python2.7/dist-packages/tensorflow/python/distribute/distribute_lib.py:1250 creator_with_resource_vars
+        return self._create_variable(*args, **kwargs)
+    /usr/local/lib/python2.7/dist-packages/tensorflow/python/distribute/collective_all_reduce_strategy.py:368 _create_variable
+        _real_mirrored_creator, *args, **kwargs)
+    /usr/local/lib/python2.7/dist-packages/tensorflow/python/distribute/mirrored_strategy.py:251 _create_mirrored_variable
+        value_list = real_mirrored_creator(devices, *args, **kwargs)
+    /usr/local/lib/python2.7/dist-packages/tensorflow/python/distribute/collective_all_reduce_strategy.py:355 _real_mirrored_creator
+        v = next_creator(*args, **kwargs)
+    /usr/local/lib/python2.7/dist-packages/tensorflow/python/ops/variables.py:60 getter
+        return captured_getter(captured_previous, **kwargs)
+    /usr/local/lib/python2.7/dist-packages/tensorflow/python/eager/def_function.py:347 variable_capturing_scope
+        lifted_initializer_graph=lifted_initializer_graph, **kwds)
+    /usr/local/lib/python2.7/dist-packages/tensorflow/python/ops/variables.py:264 __call__
+        return super(VariableMetaclass, cls).__call__(*args, **kwargs)
+    /usr/local/lib/python2.7/dist-packages/tensorflow/python/eager/def_function.py:139 __init__
+        initial_value() if init_from_fn else initial_value,
+    /usr/local/lib/python2.7/dist-packages/tensorflow/python/distribute/collective_all_reduce_strategy.py:330 _overridden_initial_value_fn
+        group_key, collective_instance_key)
+    /usr/local/lib/python2.7/dist-packages/tensorflow/python/ops/collective_ops.py:161 broadcast_recv
+        instance_key=instance_key)
+    /usr/local/lib/python2.7/dist-packages/tensorflow/python/ops/gen_collective_ops.py:66 collective_bcast_recv
+        _six.raise_from(_core._status_to_exception(e.code, message), None)
+    /root/.local/lib/python2.7/site-packages/six.py:737 raise_from
+        raise value
+
+    InternalError: RecvBufResponse returned 8 bytes where to_tensor expected 4 [Op:CollectiveBcastRecv]
+
+
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='7' author='Thormidable' date='2019-08-01T23:17:22Z'>
+		&lt;denchmark-link:https://github.com/jtang7&gt;@jtang7&lt;/denchmark-link&gt;
+, would you mind opening an issue with the steps to repro? Thanks.
+		</comment>
+	</comments>
+</bug>

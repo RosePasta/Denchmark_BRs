@@ -1,0 +1,252 @@
+<bug id='1141' author='vwxyzjn' open_date='2020-07-06T22:51:42Z' closed_time='2020-07-07T21:59:47Z'>
+	<summary>Issues with gym video logging</summary>
+	<description>
+wandb --version &amp;&amp; python --version &amp;&amp; uname
+wandb, version 0.9.1
+Python 3.7.4
+Linux
+&lt;denchmark-h:h3&gt;Description&lt;/denchmark-h&gt;
+
+There are two issues with the current support for gym logging.
+1) Inconsistent slider steps for the video panel: The media slider does not allow to use a custom x-axix, resulting in drastic different scale of x-axis for value-based methods vs policy gradient methods. Here are some examples:
+&lt;denchmark-h:h3&gt;The video panel of DQN&lt;/denchmark-h&gt;
+
+&lt;denchmark-link:https://user-images.githubusercontent.com/5555347/86656931-d6aeff00-bfb5-11ea-8785-6db6a47b9fd8.png&gt;&lt;/denchmark-link&gt;
+
+&lt;denchmark-h:h3&gt;The video panel of PPO (PPO does less gradient update and therefore step is lower&lt;/denchmark-h&gt;
+
+&lt;denchmark-link:https://user-images.githubusercontent.com/5555347/86657001-e4fd1b00-bfb5-11ea-837d-5a99a61d156d.png&gt;&lt;/denchmark-link&gt;
+
+As we can see, the slider step for the video panel is drastically different even though both scripts ran for 10M timesteps and there are roughly 17 videos for both scripts.
+2) Bugs of video logging with SubprocVecEnv
+ is a common module from  (&lt;denchmark-link:https://github.com/openai/baselines/blob/master/baselines/common/vec_env/subproc_vec_env.py&gt;https://github.com/openai/baselines/blob/master/baselines/common/vec_env/subproc_vec_env.py&lt;/denchmark-link&gt;
+), which allows the use of subprocesses to speed up sampling collection from parallelized gym environments. However, this causes issues for wandb video logging.
+&lt;denchmark-h:h3&gt;Not using SubprocVecEnv&lt;/denchmark-h&gt;
+
+&lt;denchmark-link:https://app.wandb.ai/cleanrl/cleanRL/runs/gayxplrt/overview?workspace=user-costa-huang&gt;https://app.wandb.ai/cleanrl/cleanRL/runs/gayxplrt/overview?workspace=user-costa-huang&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://user-images.githubusercontent.com/5555347/86670353-8ab68700-bfc2-11ea-8b05-851736065924.png&gt;&lt;/denchmark-link&gt;
+
+&lt;denchmark-h:h3&gt;Using SubprocVecEnv&lt;/denchmark-h&gt;
+
+&lt;denchmark-link:https://app.wandb.ai/cleanrl/cleanRL/runs/rmqlq8m4/overview?workspace=user-costa-huang&gt;https://app.wandb.ai/cleanrl/cleanRL/runs/rmqlq8m4/overview?workspace=user-costa-huang&lt;/denchmark-link&gt;
+
+When using the , not only the steps of the slider becomes incorrect. 
+&lt;denchmark-link:https://user-images.githubusercontent.com/5555347/86670459-a6ba2880-bfc2-11ea-8c8a-f6215e8aaa9f.png&gt;&lt;/denchmark-link&gt;
+
+&lt;denchmark-h:h3&gt;What I Did&lt;/denchmark-h&gt;
+
+# subprocessenv.py
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.distributions.categorical import Categorical
+from torch.utils.tensorboard import SummaryWriter
+
+import argparse
+from distutils.util import strtobool
+import numpy as np
+import gym
+from gym.wrappers import TimeLimit, Monitor
+import pybullet_envs
+from gym.spaces import Discrete, Box, MultiBinary, MultiDiscrete, Space
+import time
+import random
+import os
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecEnvWrapper
+
+import matplotlib
+matplotlib.use('Agg')
+import seaborn as sns
+import matplotlib.pyplot as plt
+import pandas as pd
+from PIL import Image
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='PPO agent')
+
+    parser.add_argument('--use-subprocess', type=lambda x:bool(strtobool(x)), default=False, nargs='?', const=True,
+                        help='weather to use `SubprocVecEnv`')
+
+
+    # Common arguments
+    parser.add_argument('--exp-name', type=str, default=os.path.basename(__file__).rstrip(".py"),
+                        help='the name of this experiment')
+    parser.add_argument('--gym-id', type=str, default="BreakoutNoFrameskip-v4",
+                        help='the id of the gym environment')
+    parser.add_argument('--learning-rate', type=float, default=2.5e-4,
+                        help='the learning rate of the optimizer')
+    parser.add_argument('--seed', type=int, default=1,
+                        help='seed of the experiment')
+    parser.add_argument('--total-timesteps', type=int, default=20000000,
+                        help='total timesteps of the experiments')
+    parser.add_argument('--torch-deterministic', type=lambda x:bool(strtobool(x)), default=True, nargs='?', const=True,
+                        help='if toggled, `torch.backends.cudnn.deterministic=False`')
+    parser.add_argument('--cuda', type=lambda x:bool(strtobool(x)), default=True, nargs='?', const=True,
+                        help='if toggled, cuda will not be enabled by default')
+    parser.add_argument('--prod-mode', type=lambda x:bool(strtobool(x)), default=False, nargs='?', const=True,
+                        help='run the script in production mode and use wandb to log outputs')
+    parser.add_argument('--capture-video', type=lambda x:bool(strtobool(x)), default=False, nargs='?', const=True,
+                        help='weather to capture videos of the agent performances (check out `videos` folder)')
+    parser.add_argument('--wandb-project-name', type=str, default="cleanRL",
+                        help="the wandb's project name")
+    parser.add_argument('--wandb-entity', type=str, default=None,
+                        help="the entity (team) of wandb's project")
+
+    # Algorithm specific arguments
+    parser.add_argument('--n-minibatch', type=int, default=4,
+                        help='the number of mini batch')
+    parser.add_argument('--num-envs', type=int, default=8,
+                        help='the number of parallel game environment')
+    parser.add_argument('--num-steps', type=int, default=128,
+                        help='the number of steps per game environment')
+    args = parser.parse_args()
+    if not args.seed:
+        args.seed = int(time.time())
+
+args.batch_size = int(args.num_envs * args.num_steps)
+args.minibatch_size = int(args.batch_size // args.n_minibatch)
+
+class VecPyTorch(VecEnvWrapper):
+    def __init__(self, venv, device):
+        super(VecPyTorch, self).__init__(venv)
+        self.device = device
+
+    def reset(self):
+        obs = self.venv.reset()
+        obs = torch.from_numpy(obs).float().to(self.device)
+        return obs
+
+    def step_async(self, actions):
+        actions = actions.cpu().numpy()
+        self.venv.step_async(actions)
+
+    def step_wait(self):
+        obs, reward, done, info = self.venv.step_wait()
+        obs = torch.from_numpy(obs).float().to(self.device)
+        reward = torch.from_numpy(reward).unsqueeze(dim=1).float()
+        return obs, reward, done, info
+
+# TRY NOT TO MODIFY: setup the environment
+experiment_name = f"{args.gym_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+writer = SummaryWriter(f"runs/{experiment_name}")
+writer.add_text('hyperparameters', "|param|value|\n|-|-|\n%s" % (
+        '\n'.join([f"|{key}|{value}|" for key, value in vars(args).items()])))
+if args.prod_mode:
+    import wandb
+    wandb.init(project=args.wandb_project_name, entity=args.wandb_entity, sync_tensorboard=True, config=vars(args), name=experiment_name, monitor_gym=True, save_code=True)
+    writer = SummaryWriter(f"/tmp/{experiment_name}")
+
+# TRY NOT TO MODIFY: seeding
+device = torch.device('cuda' if torch.cuda.is_available() and args.cuda else 'cpu')
+random.seed(args.seed)
+np.random.seed(args.seed)
+torch.manual_seed(args.seed)
+torch.backends.cudnn.deterministic = args.torch_deterministic
+def make_env(gym_id, seed, idx):
+    def thunk():
+        env = gym.make(gym_id)
+        env = gym.wrappers.RecordEpisodeStatistics(env)
+        if args.capture_video:
+            if idx == 0:
+                env = Monitor(env, f'videos/{experiment_name}', video_callable=lambda episode_id: episode_id%10==0)
+        env.seed(seed)
+        env.action_space.seed(seed)
+        env.observation_space.seed(seed)
+        return env
+    return thunk
+if args.prod_mode and args.use_subprocess:
+    envs = VecPyTorch(
+        SubprocVecEnv([make_env(args.gym_id, args.seed+i, i) for i in range(args.num_envs)], "fork"),
+        device
+    )
+else:
+    envs = VecPyTorch(DummyVecEnv([make_env(args.gym_id, args.seed+i, i) for i in range(args.num_envs)]), device)
+assert isinstance(envs.action_space, Discrete), "only discrete action space is supported"
+
+
+# ALGO Logic: Storage for epoch data
+obs = torch.zeros((args.num_steps, args.num_envs) + envs.observation_space.shape).to(device)
+actions = torch.zeros((args.num_steps, args.num_envs) + envs.action_space.shape).to(device)
+logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
+rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
+dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
+values = torch.zeros((args.num_steps, args.num_envs)).to(device)
+
+# TRY NOT TO MODIFY: start the game
+global_step = 0
+# Note how `next_obs` and `next_done` are used; their usage is equivalent to
+# https://github.com/ikostrikov/pytorch-a2c-ppo-acktr-gail/blob/84a7582477fb0d5c82ad6d850fe476829dddd2e1/a2c_ppo_acktr/storage.py#L60
+next_obs = envs.reset()
+next_done = torch.zeros(args.num_envs).to(device)
+num_updates = args.total_timesteps // args.batch_size
+for update in range(1, num_updates+1):
+
+    # TRY NOT TO MODIFY: prepare the execution of the game.
+    for step in range(0, args.num_steps):
+        global_step += 1 * args.num_envs
+
+        # TRY NOT TO MODIFY: execute the game and log data.
+        next_obs, rs, ds, infos = envs.step(torch.randint(0, envs.action_space.n, (envs.num_envs,)))
+        rewards[step], next_done = rs.view(-1), torch.Tensor(ds).to(device)
+
+        for info in infos:
+            if 'episode' in info.keys():
+                print(f"global_step={global_step}, episode_reward={info['episode']['r']}")
+                writer.add_scalar("charts/episode_reward", info['episode']['r'], global_step)
+                break
+envs.close()
+writer.close()
+for seed in {1..1}
+do
+    (sleep 0.3 &amp;&amp; nohup xvfb-run -a python subprocessenv.py \
+    --gym-id BreakoutNoFrameskip-v4 \
+    --total-timesteps 1000000 \
+    --wandb-project-name cleanrl \
+    --use-subprocess True \
+    --prod-mode \
+    --capture-video \
+    --seed $seed
+    ) &gt;&amp; /dev/null &amp;
+done
+
+for seed in {1..1}
+do
+    (sleep 0.3 &amp;&amp; nohup xvfb-run -a python subprocessenv.py \
+    --gym-id BreakoutNoFrameskip-v4 \
+    --total-timesteps 1000000 \
+    --wandb-project-name cleanrl \
+    --use-subprocess False \
+    --prod-mode \
+    --capture-video \
+    --seed $seed
+    ) &gt;&amp; /dev/null &amp;
+done
+&lt;denchmark-h:h3&gt;Proposed solutoin&lt;/denchmark-h&gt;
+
+It seems to me that the most straight forward approach is to allow the use of custom x-axis for the steps of the slider, which is related to issue &lt;denchmark-link:https://github.com/wandb/client/issues/1093&gt;#1093&lt;/denchmark-link&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='vwxyzjn' date='2020-07-06T22:51:45Z'>
+		Issue-Label Bot is automatically applying the label bug to this issue, with a confidence of 0.70. Please mark this comment with 👍 or 👎 to give our bot feedback!
+Links: &lt;denchmark-link:https://github.com/marketplace/issue-label-bot&gt;app homepage&lt;/denchmark-link&gt;
+, &lt;denchmark-link:https://mlbot.net/data/wandb/client&gt;dashboard&lt;/denchmark-link&gt;
+ and &lt;denchmark-link:https://github.com/hamelsmu/MLapp&gt;code&lt;/denchmark-link&gt;
+ for this bot.
+		</comment>
+		<comment id='2' author='vwxyzjn' date='2020-07-07T00:42:10Z'>
+		Hi Costa, thanks for the awesome detailed bug report, and solid suggestion on the solution here.
+		</comment>
+		<comment id='3' author='vwxyzjn' date='2020-07-07T01:03:53Z'>
+		&lt;denchmark-link:https://github.com/cvphelps&gt;@cvphelps&lt;/denchmark-link&gt;
+ Thanks for the kind words. I am still trying to work on my project on Open RL Benchmark (&lt;denchmark-link:https://app.wandb.ai/cleanrl/cleanrl.benchmark/reports/benchmark--Vmlldzo0MDcxOA&gt;https://app.wandb.ai/cleanrl/cleanrl.benchmark/reports/benchmark--Vmlldzo0MDcxOA&lt;/denchmark-link&gt;
+). I hope I will have a major release soon so that I could submit it for potentially being featured in the wandb gallery :)
+		</comment>
+		<comment id='4' author='vwxyzjn' date='2020-07-07T21:59:44Z'>
+		Great, thanks again. Closing this as a duplicate of this ticket: &lt;denchmark-link:https://github.com/wandb/client/issues/1093&gt;#1093&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,251 @@
+<bug id='26800' author='monklof' open_date='2019-03-17T09:35:26Z' closed_time='2019-04-17T01:33:31Z'>
+	<summary>saved_model_cli tensorrt convert bug: saved_model_main_op collection and it's related operation was mistakenly pruned.</summary>
+	<description>
+Hi, guys,
+Tensorflow serving has released 1.13.0 recently, which adds a support for TF-TRT, and I'm trying to introduce it into our production enviroment.
+There is a good introduction for this feature: &lt;denchmark-link:https://medium.com/tensorflow/optimizing-tensorflow-serving-performance-with-nvidia-tensorrt-6d8a2347869a&gt;https://medium.com/tensorflow/optimizing-tensorflow-serving-performance-with-nvidia-tensorrt-6d8a2347869a&lt;/denchmark-link&gt;
+
+According to the post, I have to convert the SavedModel into a TRT-optimized one first with the help of saved_model_cli, and then serve it in Tensorflow Serving.
+It all goes well with the example the post provides, but it failed in my case. After I converted my own model and served it in Tensorflow Serving, the server threw 'Failed precondition: Table not initialized.' error. I searched the related source code and finally figured out what happened.
+There is an index_to_string subgraph in my model, which is mainly composed of a HashTableV2 Operation and a InitializeTableV2 Operation. There's also a collection named 'saved_model_main_op' which finally points to the InitializeTableV2 Operation. When TensorFlow Serving loads the SavedModel, it tries to initialize the HashTable via executing the operations in saved_model_main_op collection. But after saved_model_cli converted the graph into a TensorRT-Optimized one, The 'saved_model_main_op' collection and its related Operation has been pruned. As a result, tf serving failed to initialize the table.
+This is the partial graph before conversion:
+&lt;denchmark-link:https://raw.githubusercontent.com/monklof/assets/master/original-graph-tb.png&gt;&lt;/denchmark-link&gt;
+
+After conversion:
+&lt;denchmark-link:https://raw.githubusercontent.com/monklof/assets/master/table_not_initialized_bug.png&gt;&lt;/denchmark-link&gt;
+
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): CentOS 7.5
+Mobile device (e.g. iPhone 8, Pixel 2, Samsung Galaxy) if the issue happens on mobile device:
+TensorFlow installed from (source or binary): source
+TensorFlow version (use command below): 1.13.1
+Python version: 2.7
+Bazel version (if compiling from source): 0.19.2
+GCC/Compiler version (if compiling from source): 4.8.5
+CUDA/cuDNN version: Cuda 9.0; cuDNN 7.3
+GPU model and memory: Tesla V100, 16G
+
+Describe the current behavior
+as mentioned above.
+Describe the expected behavior
+The saved_model_main_op collection and it's related op should be preserved after conversion.
+Code to reproduce the issue
+This is the code for exporting SavedModel:
+# -*- coding: utf-8 -*-
+
+import os.path
+
+# This is a placeholder for a Google-internal import.
+
+import tensorflow as tf
+import tensorflow.contrib.slim as slim
+from nets import resnet_v2
+from preprocessing import  vgg_preprocessing as vgg
+
+tf.app.flags.DEFINE_string('checkpoint_dir', '/opt/zhoulinyuan/inception_v4',
+                           """Directory where to read training checkpoints.""")
+tf.app.flags.DEFINE_string('output_dir', '/tmp/inception_v4_porn_output',
+                           """Directory where to export inference model.""")
+tf.app.flags.DEFINE_integer('model_version', 4,
+                            """Version number of the model.""")
+tf.app.flags.DEFINE_integer('image_size', 224,
+                            """Needs to provide same value as in training.""")
+FLAGS = tf.app.flags.FLAGS
+
+NUM_CLASSES = 3
+NUM_TOP_CLASSES = 3
+
+def export():
+  # Create index-&gt;synset mapping
+  synsets = []
+
+  with tf.Graph().as_default():
+    # Build inference model.
+    # Please refer to Tensorflow inception model for details.
+
+    # Input transformation.
+    serialized_tf_example = tf.placeholder(tf.string, name='tf_example')
+    feature_configs = {
+        'image/encoded': tf.FixedLenFeature(
+            shape=[], dtype=tf.string),
+    }
+    tf_example = tf.parse_example(serialized_tf_example, feature_configs)
+    jpegs = tf_example['image/encoded']
+    images = tf.map_fn(preprocess_image, jpegs, dtype=tf.float32)
+
+    # Run inference.
+    # logits, _ = inception_model.inference(images, NUM_CLASSES + 1)
+
+    # Run inference.
+    with slim.arg_scope(resnet_v2.resnet_arg_scope()):
+      logits, _ = resnet_v2.resnet_v2_50(images, NUM_CLASSES, is_training=False)
+    logits = tf.nn.softmax(logits)
+
+    # Transform output to topK result.
+    values, indices = tf.nn.top_k(logits, NUM_TOP_CLASSES)
+
+    class_descriptions = ['0_xx', '1_yy', '2_zz']
+    class_tensor = tf.constant(class_descriptions)
+
+    table = tf.contrib.lookup.index_to_string_table_from_tensor(class_tensor)
+    classes = table.lookup(tf.to_int64(indices))
+
+    saver = tf.train.Saver()
+    with tf.Session() as sess:
+      # Restore variables from training checkpoints.
+      saver.restore(sess, FLAGS.checkpoint_dir)
+      
+      # keys = sess.graph.get_all_collection_keys()
+      sess.graph.clear_collection('resnet_v2_50/_end_points')
+
+      # Export inference model.
+      output_path = os.path.join(
+          tf.compat.as_bytes(FLAGS.output_dir),
+          tf.compat.as_bytes(str(FLAGS.model_version)))
+      print 'Exporting trained model to', output_path
+      builder = tf.saved_model.builder.SavedModelBuilder(output_path)
+
+      # Build the signature_def_map.
+      classify_inputs_tensor_info = tf.saved_model.utils.build_tensor_info(
+          serialized_tf_example)
+      classes_output_tensor_info = tf.saved_model.utils.build_tensor_info(
+          classes)
+      scores_output_tensor_info = tf.saved_model.utils.build_tensor_info(values)
+
+      classification_signature = (
+          tf.saved_model.signature_def_utils.build_signature_def(
+              inputs={
+                  tf.saved_model.signature_constants.CLASSIFY_INPUTS:
+                      classify_inputs_tensor_info
+              },
+              outputs={
+                  tf.saved_model.signature_constants.CLASSIFY_OUTPUT_CLASSES:
+                      classes_output_tensor_info,
+                  tf.saved_model.signature_constants.CLASSIFY_OUTPUT_SCORES:
+                      scores_output_tensor_info
+              },
+              method_name=tf.saved_model.signature_constants.
+              CLASSIFY_METHOD_NAME))
+
+      predict_inputs_tensor_info = tf.saved_model.utils.build_tensor_info(jpegs)
+      prediction_signature = (
+          tf.saved_model.signature_def_utils.build_signature_def(
+              inputs={'images': predict_inputs_tensor_info},
+              outputs={
+                  'classes': classes_output_tensor_info,
+                  'scores': scores_output_tensor_info
+              },
+              method_name=tf.saved_model.signature_constants.PREDICT_METHOD_NAME
+          ))
+
+      legacy_init_op = tf.group(
+          tf.tables_initializer(), name='legacy_init_op')
+      builder.add_meta_graph_and_variables(
+          sess, [tf.saved_model.tag_constants.SERVING],
+          signature_def_map={
+              'predict_images':
+                  prediction_signature,
+              tf.saved_model.signature_constants.
+              DEFAULT_SERVING_SIGNATURE_DEF_KEY:
+                  classification_signature,
+          },
+          legacy_init_op=legacy_init_op)
+
+      builder.save()
+      print 'Successfully exported model to %s' % FLAGS.output_dir
+
+
+def preprocess_image(image_buffer):
+  """Preprocess JPEG encoded bytes to 3D float Tensor."""
+
+  # Decode the string as an RGB JPEG.
+  # Note that the resulting image contains an unknown height and width
+  # that is set dynamically by decode_jpeg. In other words, the height
+  # and width of image is unknown at compile-time.
+  image = tf.image.decode_jpeg(image_buffer, channels=3)
+  # image = vgg._aspect_preserving_resize(image, vgg._RESIZE_SIDE_MAX)
+  image = vgg._aspect_preserving_resize(image, vgg._RESIZE_SIDE_MIN)
+  image = vgg._central_crop([image], FLAGS.image_size, FLAGS.image_size)[0]
+  image.set_shape([FLAGS.image_size, FLAGS.image_size, 3])
+  image = tf.to_float(image)
+  image = vgg._mean_image_subtraction(image, [vgg._R_MEAN, vgg._G_MEAN, vgg._B_MEAN])
+  return image
+
+
+def main(unused_argv=None):
+  export()
+
+
+if __name__ == '__main__':
+  tf.app.run()
+the conversion command:
+&lt;denchmark-code&gt;python /usr/lib/python2.7/site-packages/tensorflow/python/tools/saved_model_cli.py convert --dir /INPUTPATH/ --output_dir /OUTPATH/ --tag_set serve  tensorrt --max_workspace_size_bytes 1073741824 --max_batch_size 224 --precision_mode FP32 --is_dynamic_op True  --minimum_segment_size 10
+&lt;/denchmark-code&gt;
+
+Other info / logs
+$ tensorflow_model_server --port=8413 --rest_api_port=8414 --model_name=resnet --model_base_path=/workdir/tmp/trttest_pb6/
+2019-03-14 23:14:17.626533: I tensorflow_serving/model_servers/server.cc:82] Building single TensorFlow model file config:  model_name: resnet model_base_path: /workdir/tmp/trttest_pb6/
+2019-03-14 23:14:17.626858: I tensorflow_serving/model_servers/server_core.cc:461] Adding/updating models.
+2019-03-14 23:14:17.626876: I tensorflow_serving/model_servers/server_core.cc:558]  (Re-)adding model: resnet
+2019-03-14 23:14:17.727170: I tensorflow_serving/core/basic_manager.cc:739] Successfully reserved resources to load servable {name: resnet version: 1}
+2019-03-14 23:14:17.727195: I tensorflow_serving/core/loader_harness.cc:66] Approving load for servable version {name: resnet version: 1}
+2019-03-14 23:14:17.727208: I tensorflow_serving/core/loader_harness.cc:74] Loading servable version {name: resnet version: 1}
+2019-03-14 23:14:17.727228: I external/org_tensorflow/tensorflow/contrib/session_bundle/bundle_shim.cc:363] Attempting to load native SavedModelBundle in bundle-shim from: /workdir/tmp/trttest_pb6/1
+2019-03-14 23:14:17.727242: I external/org_tensorflow/tensorflow/cc/saved_model/reader.cc:31] Reading SavedModel from: /workdir/tmp/trttest_pb6/1
+2019-03-14 23:14:17.878579: I external/org_tensorflow/tensorflow/cc/saved_model/reader.cc:54] Reading meta graph with tags { serve }
+2019-03-14 23:14:18.977544: I external/org_tensorflow/tensorflow/core/common_runtime/gpu/gpu_device.cc:1433] Found device 0 with properties: name: Tesla V100-PCIE-16GB major: 7 minor: 0 memoryClockRate(GHz): 1.38 pciBusID: 0000:05:00.0 totalMemory: 15.78GiB freeMemory: 15.36GiB
+2019-03-14 23:14:18.977591: I external/org_tensorflow/tensorflow/core/common_runtime/gpu/gpu_device.cc:1512] Adding visible gpu devices: 0
+2019-03-14 23:14:19.762198: I external/org_tensorflow/tensorflow/core/common_runtime/gpu/gpu_device.cc:984] Device interconnect StreamExecutor with strength 1 edge matrix:
+2019-03-14 23:14:19.762240: I external/org_tensorflow/tensorflow/core/common_runtime/gpu/gpu_device.cc:990]      0
+2019-03-14 23:14:19.762248: I external/org_tensorflow/tensorflow/core/common_runtime/gpu/gpu_device.cc:1003] 0:   N
+2019-03-14 23:14:19.762739: I external/org_tensorflow/tensorflow/core/common_runtime/gpu/gpu_device.cc:1115] Created TensorFlow device (/job:localhost/replica:0/task:0/device:GPU:0 with 14843 MB memory) -&gt; physical GPU (device: 0, name: Tesla V100-PCIE-16GB, pci bus id: 0000:05:00.0, compute capability: 7.0)
+2019-03-14 23:14:20.050500: I external/org_tensorflow/tensorflow/cc/saved_model/loader.cc:182] Restoring SavedModel bundle.
+2019-03-14 23:14:20.050589: I external/org_tensorflow/tensorflow/cc/saved_model/loader.cc:192] The specified SavedModel has no variables; no checkpoints were restored. File does not exist: /workdir/tmp/trttest_pb6/1/variables/variables.index
+2019-03-14 23:14:20.050607: I external/org_tensorflow/tensorflow/cc/saved_model/loader.cc:285] SavedModel load for tags { serve }; Status: success. Took 2323360 microseconds.
+2019-03-14 23:14:20.050644: I tensorflow_serving/servables/tensorflow/saved_model_warmup.cc:101] No warmup data file found at /workdir/tmp/trttest_pb6/1/assets.extra/tf_serving_warmup_requests
+2019-03-14 23:14:20.050759: I tensorflow_serving/core/loader_harness.cc:86] Successfully loaded servable version {name: resnet version: 1}
+2019-03-14 23:14:20.081590: I tensorflow_serving/model_servers/server.cc:313] Running gRPC ModelServer at 0.0.0.0:8413 ...
+[warn] getaddrinfo: address family for nodename not supported
+2019-03-14 23:14:20.090390: I tensorflow_serving/model_servers/server.cc:333] Exporting HTTP/REST API at:localhost:8414 ...
+[evhttp_server.cc : 237] RAW: Entering the event loop ...
+2019-03-14 23:14:29.297322: I external/org_tensorflow/tensorflow/contrib/tensorrt/kernels/trt_engine_op.cc:496] Building a new TensorRT engine for map/while/TRTEngineOp_1 with batch size 224
+2019-03-14 23:14:29.541322: W external/org_tensorflow/tensorflow/contrib/tensorrt/log/trt_logger.cc:34] DefaultLogger Tensor DataType is determined at build time for tensors not marked as input or output.
+2019-03-14 23:14:29.541399: W external/org_tensorflow/tensorflow/contrib/tensorrt/log/trt_logger.cc:34] DefaultLogger Tensor DataType is determined at build time for tensors not marked as input or output.
+2019-03-14 23:14:29.541421: W external/org_tensorflow/tensorflow/contrib/tensorrt/log/trt_logger.cc:34] DefaultLogger Tensor DataType is determined at build time for tensors not marked as input or output.
+2019-03-14 23:14:31.924073: I external/org_tensorflow/tensorflow/contrib/tensorrt/kernels/trt_engine_op.cc:496] Building a new TensorRT engine for TRTEngineOp_0 with batch size 224
+2019-03-14 23:14:47.935236: W external/org_tensorflow/tensorflow/core/framework/op_kernel.cc:1401] OP_REQUIRES failed at lookup_table_op.cc:809 : Failed precondition: Table not initialized.
+My Solution
+I have fixed this bug in my way, and it works in my case, but I'm not sure if it is the correct way to do so. Also, I'd like to contribute to tensorflow, but there are so many versions and branches of tensorflow, which one should I send a Pull-Request to?
+The Patch: &lt;denchmark-link:https://github.com/monklof/tensorflow/pull/1/files&gt;https://github.com/monklof/tensorflow/pull/1/files&lt;/denchmark-link&gt;
+
+Thanks for checking this issue, I'm looking forward to hearing from you soon.
+	</description>
+	<comments>
+		<comment id='1' author='monklof' date='2019-03-19T22:05:17Z'>
+		Hi &lt;denchmark-link:https://github.com/smit-hinsu&gt;@smit-hinsu&lt;/denchmark-link&gt;
+, would you please help to take a look? Thanks
+		</comment>
+		<comment id='2' author='monklof' date='2019-03-21T00:49:30Z'>
+		Thanks for the detailed report and also proposing a solution!
+Pull requests should be sent to the  branch. You can refer to guidelines  for contributing code to TensorFlow at &lt;denchmark-link:https://www.tensorflow.org/community/contribute/code&gt;https://www.tensorflow.org/community/contribute/code&lt;/denchmark-link&gt;
+. Let us know if you have any other questions!
+		</comment>
+		<comment id='3' author='monklof' date='2019-03-21T07:23:05Z'>
+		&lt;denchmark-link:https://github.com/smit-hinsu&gt;@smit-hinsu&lt;/denchmark-link&gt;
+ thanks for the review, I'll update the Pull request later.
+		</comment>
+		<comment id='4' author='monklof' date='2019-03-24T08:36:27Z'>
+		&lt;denchmark-link:https://github.com/smit-hinsu&gt;@smit-hinsu&lt;/denchmark-link&gt;
+ Hi, I've updated the pull request.
+		</comment>
+		<comment id='5' author='monklof' date='2019-04-17T01:33:33Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=26800&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=26800&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,310 @@
+<bug id='32058' author='bionicles' open_date='2019-08-28T18:18:48Z' closed_time='2020-02-28T18:32:56Z'>
+	<summary>user can't add_loss w/ input dependence in custom layers in eager mode? (or docs unclear)</summary>
+	<description>
+System information
+
+TensorFlow version (you are using): 2.0
+Are you willing to contribute it (Yes/No): Yes
+
+Describe the feature and the current behavior/state.
+Thanks for making tensorflow.
+I want to make custom layers which handle their own losses to write less code
+(ex, layerwise reconstruction + kl divergence losses in stacked autoencoders)
+The &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/a2e398f299e62559118f3e59bd8ef11925cdc449/tensorflow/python/keras/engine/base_layer.py#L1083&gt;docs&lt;/denchmark-link&gt;
+ indicate this isn't possible in eager mode, which sucks because Eager is default in 2.0...
+I like tf.function / graph mode but frankly it's a different dialect of TF which forces users to waste time translating code into "graph dialect" ... so i want to use Eager, even if performance is worse, it's better than debugging tf.function.
+without modular custom losses, users must write complicated/annoying training loops to apply correct loss function to correct combination of inputs and outputs from a model (and models return arrays so ordering gets complicated... can we name model outputs?)
+would it be possible to permit TF users to define module-specific input-dependent losses for custom layers in Eager mode?
+Will this change the current api? How?
+users could add custom input-dependent losses to custom layers.
+thus, users can dramatically simplify training loops
+Who will benefit with this feature?
+2.0 keras users with custom layers that use custom losses
+Any Other info.
+I want to make these "coder" bricks into Layers which handle reconstruction + KL divergences in a modular way
+&lt;denchmark-code&gt;def get_sensor_and_actuator(agent, in_spec):
+    if in_spec.rank is 3:
+        sensor = use_image_sensor(agent)
+        actuator = use_image_actuator(agent)
+    elif in_spec.rank is 2 and in_spec.shape[1] is None:
+        sensor = use_ragged_sensor(agent, in_spec)
+        actuator = use_ragged_actuator(agent, in_spec)
+    else:
+        sensor = use_resizer(agent.code_spec.shape)
+        actuator = use_resizer(in_spec.shape)
+    return sensor, actuator
+
+
+def use_coder(agent, in_spec):
+    log('use_coder', in_spec, color="blue")
+    normalizer = norm = use_norm()
+
+    if in_spec.rank is 3:
+        h, w = get_hw(in_spec.shape)
+        hw = [h, w]
+
+        def resize_then_norm(x):
+            x = tf.image.resize(x, hw)
+            return norm(x)
+        normalizer = resize_then_norm
+
+    coordinator = L.Lambda(concat_coords)
+    sensor, actuator = get_sensor_and_actuator(agent, in_spec)
+
+    def call(x):
+        normie = normalizer(x)
+        normie_w_coords = coordinator(normie)
+        code = sensor(normie_w_coords)
+        reconstruction = actuator(code)
+        return normie, code, reconstruction
+    return call
+&lt;/denchmark-code&gt;
+
+alas, since i can't use input-dependent modular losses, I need to
+
+design my model to return a bunch of extra outputs
+keep track of the order of those outputs. which one is a code? which one is a reconstruction?
+unpack the outputs of the model to organize codes, reconstructions, normalized inputs, and "actual" desired outputs
+organize pairs of these normalized inputs and reconstructions
+loop over the pairs and apply a loss function
+append error terms to a list of losses.
+
+Is there some reason we cannot add a loss function to the layers themselves and avoid all this BS?
+this would REALLY simplify modular agents... please advise!
+	</description>
+	<comments>
+		<comment id='1' author='bionicles' date='2019-08-28T18:41:34Z'>
+		this would be sweet because then you could do more with less code:
+&lt;denchmark-code&gt;class Coder(Layer):
+    def __init__(self, in_spec, out_spec):
+          super(Coder, self).__init__()
+          self.norm = InstanceNormalization()
+          self.sensor = Dense(out_spec.size)
+          self.actuator = Dense(in_spec.size)
+
+     def call(self, x):
+            normie = self.norm(x)
+            code = self.sensor(normie)
+            reconstruction = self.actuator(code)
+            self.add_loss(MSLE(normie, reconstruction))
+            return code
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='2' author='bionicles' date='2019-08-28T18:50:37Z'>
+		the difference between this:
+&lt;denchmark-code&gt;def build_task_model(G, agent):
+    outs = [get_out(G, agent, id, task_model=True)
+            for id in list(G.predecessors("sink"))]
+    in_nodes = [G.node[id] for id in list(G.successors('source'))]
+    reconstructions = [n['reconstruction'] for n in in_nodes]
+    normies = [n['normie'] for n in in_nodes]
+    outputs = normies + reconstructions + outs
+    inputs = [n['input'] for n in in_nodes]
+    n = ['normie'] * len(normies)
+    r = ['reconstruction'] * len(reconstructions)
+    o = ['action'] * len(outs)
+    roles = n + r + o
+    return K.Model(inputs, outputs), roles
+
+    ...inside training loop:
+                normies, reconstructions, out = self.unpack(
+                    self.task.roles, outputs)
+                    reconstruction_errors = self.compute_errors(
+                        normies, reconstructions)
+                    [losses.append(e) for e in reconstruction_errors]
+
+    @staticmethod
+    def unpack(roles, outputs):
+        unpacked = AttrDict()
+        for n, (role, output) in enumerate(zip(roles, outputs)):
+            if role not in unpacked.keys():
+                unpacked[role] = [output]
+            else:
+                unpacked[role].append(output)
+        return (unpacked.normie,
+                unpacked.reconstruction,
+                unpacked.action[0])
+
+    def compute_errors(self, y_true_list, y_pred_list):
+        errors = []
+        for n, (y_true, y_pred) in enumerate(zip(y_true_list, y_pred_list)):
+            errors.append(self.regresser_loss(y_true, y_pred))
+        return errors
+&lt;/denchmark-code&gt;
+
+and this
+&lt;denchmark-code&gt;def build_inner_model(G, agent):
+    outs = [get_out(G, agent, id) for id in list(G.predecessors("sink"))]
+    inputs = [G.node[id]['input'] for id in list(G.successors('source'))]
+    return K.Model(inputs, outs)
+
+losses = model.losses + [self.loss_fn(y_true, y_pred]
+&lt;/denchmark-code&gt;
+
+¯\_(ツ)_/¯
+		</comment>
+		<comment id='3' author='bionicles' date='2019-08-30T18:42:04Z'>
+		bump &lt;denchmark-link:https://github.com/ymodak&gt;@ymodak&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/oanush&gt;@oanush&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/fchollet&gt;@fchollet&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/dynamicwebpaige&gt;@dynamicwebpaige&lt;/denchmark-link&gt;
+ is this a docs issue or a feature request?
+TLDR: to simplify code, I want to make a "coder" layer which computes the reconstruction loss in the call method; but i'm using Eager, and the docs indicate this is impossible ...
+here's what I want to do:
+&lt;denchmark-code&gt;class Coder(Layer):
+    def __init__(self, in_spec, out_spec):
+          super(Coder, self).__init__()
+          self.norm = InstanceNormalization()
+          self.sensor = Dense(out_spec.size)
+          self.actuator = Dense(in_spec.size)
+
+     def call(self, x):
+            normie = self.norm(x)
+            code = self.sensor(normie)
+            reconstruction = self.actuator(code)
+            **self.add_loss(MSLE(normie, reconstruction))**  # &lt;--- does this work?
+            return code
+&lt;/denchmark-code&gt;
+
+note: i'm using the functional method to build a keras model. The goal of the coder is to learn a latent representation of the inputs. It's much more complicated to put this loss in the training loop
+ref:
+&lt;denchmark-link:https://www.tensorflow.org/beta/guide/keras/custom_layers_and_models#layers_recursively_collect_losses_created_during_the_forward_pass&gt;https://www.tensorflow.org/beta/guide/keras/custom_layers_and_models#layers_recursively_collect_losses_created_during_the_forward_pass&lt;/denchmark-link&gt;
+
+
+&lt;denchmark-link:https://www.tensorflow.org/versions/r2.0/api_docs/python/tf/keras/layers/Layer#add_loss&gt;https://www.tensorflow.org/versions/r2.0/api_docs/python/tf/keras/layers/Layer#add_loss&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='4' author='bionicles' date='2019-09-08T15:18:51Z'>
+		&lt;denchmark-code&gt;import tensorflow as tf
+
+from nature import Resizer, ConcatCoords2D, AllAttention, Norm
+from tools import concat_coords
+
+K = tf.keras
+L = K.layers
+
+L1 = 1e-3
+L2 = 1e-3
+
+class Predictor(L.Layer):
+    """generates inputs and returns a surprise value"""
+
+    def __init__(self, agent, in_spec):
+        super(Predictor, self).__init__()
+        self.batch_size = agent.batch_size
+        self.out_spec = agent.code_spec
+        self.in_spec = in_spec
+
+    def build(self, shape):
+        self.regularize = L.ActivityRegularization(l1=L1, l2=L2)
+        self.resizer = Resizer(self.out_spec.shape)
+        self.coordinator = ConcatCoords2D()
+        self.attention = AllAttention(self.batch_size)
+        self.subtract = L.Subtract()
+        self.noise_norm = Norm()
+        self.x_norm = Norm()
+        self.built = True
+
+    @tf.function
+    def call(self, x):
+        noise = tf.random.normal(tf.shape(x))
+        noise = self.coordinator(noise)
+        noise = self.noise_norm(noise)
+        p = self.attention(noise)
+        x = self.coordinator(x)
+        p = tf.reshape(p, tf.shape(x))
+        x = self.x_norm(x)
+        surprise = self.subtract([x, p])
+        **self.add_loss(surprise)  
+        # self.add_loss(K.losses.MSLE(x, p))
+        # surprise = self.regularize(surprise) 
+        # both fail here, in both eager and tf.function** 
+        return self.resizer(surprise)
+
+    def compute_output_shape(self, shape):
+        return self.out_spec
+&lt;/denchmark-code&gt;
+
+cc &lt;denchmark-link:https://github.com/omalleyt12&gt;@omalleyt12&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/ymodak&gt;@ymodak&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/oanush&gt;@oanush&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/fchollet&gt;@fchollet&lt;/denchmark-link&gt;
+
+trying this custom layer for predictive coding, but it gives errors like:
+
+TypeError: An op outside of the function building code is being passed
+a "Graph" tensor. It is possible to have Graph tensors
+leak out of the function building context by including a
+tf.init_scope in your function building code.
+For example, the following function will fail:
+@tf.function
+def has_init_scope():
+my_constant = tf.constant(1.)
+with tf.init_scope():
+added = my_constant * 2
+The graph tensor has name: dense_1/ActivityRegularizer/add_1:0
+^^^ if training loop is eager
+
+with @tf.function on training loop:
+
+InaccessibleTensorError: The tensor 'Tensor("resizer/dense/ActivityRegularizer/Cast:0", shape=(), dtype=float32)' 
+cannot be accessed here: it is defined in another function or code block. Use return values, 
+explicit Python locals or TensorFlow collections to access it. 
+Defined in: FuncGraph(name=call, id=139631001707744);
+accessed from: FuncGraph(name=reduce_reduce_body, id=139631001171336).
+
+
+here is the training loop:
+&lt;denchmark-code&gt;    @tf.function
+    def run_data_session(self, data, model, loss_fn):
+        for step, (image, label) in data.enumerate():
+            with tf.GradientTape() as tape:
+                loss = loss_fn(label, model(image))
+            gradients = tape.gradient(
+                **[loss] + model.losses**, model.trainable_variables)
+            self.optimizer.apply_gradients(
+                zip(gradients, model.trainable_variables))
+            tf.print(step, loss)
+&lt;/denchmark-code&gt;
+
+model.losses triggers these errors, if we don't attempt to get those losses, then it works
+		</comment>
+		<comment id='5' author='bionicles' date='2019-09-08T15:34:55Z'>
+		hey, it works if tf.function is on the training loop and not on the predictor call
+		</comment>
+		<comment id='6' author='bionicles' date='2019-10-04T10:39:15Z'>
+		I'm hitting similar things but using tfp as well so not sure if there is a good pattern to avoid this.
+		</comment>
+		<comment id='7' author='bionicles' date='2019-10-17T20:59:12Z'>
+		If I'm not mistaken, this also means that this tutorial does not run in eager mode: &lt;denchmark-link:https://www.tensorflow.org/tutorials/generative/deepdream&gt;https://www.tensorflow.org/tutorials/generative/deepdream&lt;/denchmark-link&gt;
+
+(Hits InaccessibleTensorErrors as well)
+		</comment>
+		<comment id='8' author='bionicles' date='2019-12-03T13:11:39Z'>
+		Having the same issue, it seems related to &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/32477&gt;#32477&lt;/denchmark-link&gt;
+, any news on this?
+		</comment>
+		<comment id='9' author='bionicles' date='2020-02-28T18:32:56Z'>
+		&lt;denchmark-link:https://github.com/bionicles&gt;@bionicles&lt;/denchmark-link&gt;
+ Thanks for the issue!
+Yes, this is supported, the issue is indeed the tf.function wrapping the Layer.call. You can remove this, as Model.fit runs inside a tf.function anyway, and for custom training loops it's more performant to wrap your whole training step or training loop in a tf.function
+We're in the process of updating documentation, this is one "gotcha" we should document better
+		</comment>
+		<comment id='10' author='bionicles' date='2020-02-28T18:32:58Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/32058&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/32058&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='11' author='bionicles' date='2020-03-27T14:03:24Z'>
+		Trying to briefly summarize this issue, which I also ran into:
+
+Layer.add_loss(...) does not work in eager mode
+it works in graph mode, but not if Layer.call is decorated with tf.function
+
+Should we consider this a satisfying state of things? Having code that runs in graph mode but fails in eager mode is problematic for a number of reasons. E.g., it makes debugging and testing complicated  (you cannot even call Layer.call in a unit test since it fails in eager mode and cannot be decorated with tf.function).
+		</comment>
+	</comments>
+</bug>

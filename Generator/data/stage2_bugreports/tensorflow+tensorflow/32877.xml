@@ -1,0 +1,246 @@
+<bug id='32877' author='jackd' open_date='2019-09-27T13:49:03Z' closed_time='2019-12-27T18:22:34Z'>
+	<summary>matmul / matvec / einsum bug when dim exceeds 2**16</summary>
+	<description>
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): Yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Linux Ubuntu 16.04
+TensorFlow installed from (source or binary): binary
+TensorFlow version (use command below): git: v1.12.1-9365-gff401a6 tf: 1.15.0-dev20190821
+Python version: 3.6.8
+CUDA/cuDNN version: 10.0 / 6.0.21  (also tested on 10.1 / 7.1.4 / GTX-10708GB
+GPU model and memory: Quadro  2GB
+
+
+GPU float32 implementations of ,  and  all fail when applied to tensors with a  (though not necessarily the summation dimension). Could be related to &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/31022&gt;this&lt;/denchmark-link&gt;
+.
+Of particular note:
+
+The example below shows the bug as a result of summing over a dimension of size 2 and inputs of typical size (even ones), so is not a case of overflow of the individual entries.
+The issue does not appear when using tf.float64 or cpu implementation.
+Results are not deterministic - at least, not when the large dimension is 2 ** 16 + 1 or more and using tf.linalg.matvec implementation, thoguh they do appear stable on at 2 ** 16. The tf.linalg.matvec implementation seems to 'converge' to the the hacky tf.matmul version, thoguh that converged value is different to the einsum value.
+The issue does not appear in this example when running in graph mode, though I believe it still does occur in other circumstances. The more complicated example I extracted this from is not resolved by running in graph mode, but I cannot produce a simpler example that exhibits failure in graph mode. This may be because of the non-determinism discussed above.
+
+Describe the expected behavior
+Consistency of implementation between CPU/GPU, correct values.
+Code to reproduce the issue
+import numpy as np
+import tensorflow as tf
+
+np.random.seed(123)
+
+
+def matvec_prim_np(a, b):
+    """numpy implementation of tf.linalg.matvec(a, b, transpose_a=True)."""
+    return np.sum(a * np.expand_dims(b, axis=-1), axis=-2)
+
+
+def matvec_einsum_np(a, b):
+    return np.einsum('ijk,ij-&gt;ik', a, b)
+
+
+def matvec_linalg(a, b):
+    return tf.linalg.matvec(a, b, transpose_a=True)
+
+
+def matvec_matmul(a, b):
+    return tf.squeeze(tf.linalg.matmul(a,
+                                       tf.expand_dims(b, axis=-1),
+                                       transpose_a=True),
+                      axis=-1)
+
+
+def matvec_prim(a, b):
+    return tf.reduce_sum(a * tf.expand_dims(b, axis=-1), axis=-2)
+
+
+def matvec_einsum(a, b):
+    a = tf.convert_to_tensor(a)
+    b = tf.convert_to_tensor(b)
+    return tf.einsum('ijk,ij-&gt;ik', a, b)
+
+
+def max_err(x, y):
+    if hasattr(x, 'numpy'):
+        x = x.numpy()
+    if hasattr(y, 'numpy'):
+        y = y.numpy()
+    return np.max(np.abs(x - y))
+
+
+def report(N, values='ones', dtype=np.float64, device='/gpu:0'):
+    shapes = (N, 2, 2), (N, 2)
+    if values == 'ones':
+        a, b = (np.ones(s, dtype=dtype) for s in shapes)
+    elif values == 'uniform':
+        a, b = (np.random.uniform(size=s).astype(dtype=dtype) for s in shapes)
+    elif values == 'normal':
+        a, b = (np.random.normal(size=s).astype(dtype=dtype) for s in shapes)
+    else:
+        raise ValueError('values must be "one", "uniform" or "normal", '
+                         'got {}'.format(values))
+    a_extents = np.min(a), np.max(a)
+    b_extents = np.min(b), np.max(b)
+    base = matvec_prim_np(a, b)
+    names = ['matvec_einsum_np']
+    vals = [matvec_einsum_np(a, b)]
+    fns = (matvec_prim, matvec_linalg, matvec_matmul, matvec_einsum)
+    a = tf.constant(a, dtype=dtype)
+    b = tf.constant(b, dtype=dtype)
+    # call each function twice to demonstrate non-determinism of linalg.matvec
+    with tf.device(device):
+        tf_vals = tuple(fn(a, b) for fn in fns) + tuple(fn(a, b) for fn in fns)
+    names.extend(fn.__name__ for fn in fns)
+    names.extend(fn.__name__ for fn in fns)
+    if tf.executing_eagerly():
+        tf_vals = [v.numpy() for v in tf_vals]
+    else:
+        with tf.Session() as sess:
+            tf_vals = sess.run(tf_vals)
+    vals.extend(tf_vals)
+
+    print('##### {} - {} - {} - {} ####'.format(N, dtype.__name__, values,
+                                                device))
+    print('a extents: {}'.format(a_extents))
+    print('b extents: {}'.format(b_extents))
+    for name, value in zip(names, vals):
+        print('{:20s}: {}'.format(name, max_err(base, value)))
+
+
+works = 65535
+just_too_big = 65536
+even_bigger = 65537
+dtype = np.float64
+
+tf.compat.v1.enable_eager_execution()
+for device in '/cpu:0', '/gpu:0':
+    for dtype in (np.float64, np.float32):
+        for N in works, just_too_big, even_bigger:
+            for values in ('ones', 'uniform', 'normal'):
+                report(N, dtype=dtype, values=values, device=device)
+Other info / logs
+All results in the above are good except for N &gt;= 65536, dtype=tf.float32 and device='/gpu:0'. Those logs are below.
+&lt;denchmark-code&gt;##### 65535 - float32 - normal - /gpu:0 ####
+a extents: (-4.471484, 4.361648)
+b extents: (-5.123302, 4.7598076)
+matvec_einsum_np    : 0.0
+matvec_prim         : 0.0
+matvec_linalg       : 0.0
+matvec_matmul       : 0.0
+matvec_einsum       : 0.0
+matvec_prim         : 0.0
+matvec_linalg       : 0.0
+matvec_matmul       : 0.0
+matvec_einsum       : 0.0
+##### 65536 - float32 - ones - /gpu:0 ####
+a extents: (1.0, 1.0)
+b extents: (1.0, 1.0)
+matvec_einsum_np    : 0.0
+matvec_prim         : 0.0
+matvec_linalg       : 1.0
+matvec_matmul       : 2.0
+matvec_einsum       : 1.0
+matvec_prim         : 0.0
+matvec_linalg       : 1.0
+matvec_matmul       : 2.0
+matvec_einsum       : 1.0
+##### 65536 - float32 - uniform - /gpu:0 ####
+a extents: (1.0896997e-06, 0.9999953)
+b extents: (1.2711744e-06, 0.99999875)
+matvec_einsum_np    : 0.0
+matvec_prim         : 0.0
+matvec_linalg       : 0.24248471856117249
+matvec_matmul       : 0.3159205913543701
+matvec_einsum       : 0.4631575047969818
+matvec_prim         : 0.0
+matvec_linalg       : 0.24248471856117249
+matvec_matmul       : 0.3159205913543701
+matvec_einsum       : 0.4631575047969818
+##### 65536 - float32 - normal - /gpu:0 ####
+a extents: (-4.715384, 4.746153)
+b extents: (-4.523676, 4.59162)
+matvec_einsum_np    : 0.0
+matvec_prim         : 0.0
+matvec_linalg       : 0.6585559248924255
+matvec_matmul       : 0.709877073764801
+matvec_einsum       : 0.4629881978034973
+matvec_prim         : 0.0
+matvec_linalg       : 0.6585559248924255
+matvec_matmul       : 0.709877073764801
+matvec_einsum       : 0.4629881978034973
+##### 65537 - float32 - ones - /gpu:0 ####
+a extents: (1.0, 1.0)
+b extents: (1.0, 1.0)
+matvec_einsum_np    : 0.0
+matvec_prim         : 0.0
+matvec_linalg       : 4.812917232513428
+matvec_matmul       : 2.0
+matvec_einsum       : 1.0
+matvec_prim         : 0.0
+matvec_linalg       : 2.0
+matvec_matmul       : 2.0
+matvec_einsum       : 1.0
+##### 65537 - float32 - uniform - /gpu:0 ####
+a extents: (6.188006e-07, 0.9999941)
+b extents: (5.5208016e-06, 0.9999933)
+matvec_einsum_np    : 0.0
+matvec_prim         : 0.0
+matvec_linalg       : 2.9982364177703857
+matvec_matmul       : 0.4082830250263214
+matvec_einsum       : 0.40019217133522034
+matvec_prim         : 0.0
+matvec_linalg       : 0.4082830250263214
+matvec_matmul       : 0.4082830250263214
+matvec_einsum       : 0.40019217133522034
+##### 65537 - float32 - normal - /gpu:0 ####
+a extents: (-5.1086445, 4.5197787)
+b extents: (-4.8438015, 3.928705)
+matvec_einsum_np    : 0.0
+matvec_prim         : 0.0
+matvec_linalg       : 4.819068908691406      &lt;----------- same function, same inputs
+matvec_matmul       : 2.1483089923858643
+matvec_einsum       : 2.5970025062561035
+matvec_prim         : 0.0
+matvec_linalg       : 2.1483089923858643     &lt;----------- same function, same inputs
+matvec_matmul       : 2.1483089923858643
+matvec_einsum       : 2.5970025062561035
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='jackd' date='2019-09-30T09:36:12Z'>
+		I have tried on colab with TF version 1.15.0-rc1 and was able to reproduce the issue.Please, find the gist &lt;denchmark-link:https://colab.sandbox.google.com/gist/ravikyram/4025781d3a84432fc1badf78bf23fe98/untitled235.ipynb&gt;here&lt;/denchmark-link&gt;
+. Thanks!
+		</comment>
+		<comment id='2' author='jackd' date='2019-10-08T23:39:58Z'>
+		Related to &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/31166&gt;#31166&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='3' author='jackd' date='2019-10-09T14:45:16Z'>
+		&lt;denchmark-link:https://github.com/reedwm&gt;@reedwm&lt;/denchmark-link&gt;
+, could you help to take a look? Thanks.
+		</comment>
+		<comment id='4' author='jackd' date='2019-10-30T23:32:05Z'>
+		This does not occurring when CUDA 10.1 is used (which requires building TF from source), so I'm guessing this is a CUDA 10.0 bug. This will be fixed when we switch the builds to CUDA 10.1.
+		</comment>
+		<comment id='5' author='jackd' date='2019-10-31T21:44:11Z'>
+		Confirmed that this is fixed when built with CUDA 10.1
+For convenience, here's a wheel of tensorflow 1.15.0 that was built with CUDA 10.1, cuDNN 7.6.3. Built with compute compatability 6.1, 7.0, 7.5.  Built inside a docker container running nvidia/cuda:10.1-cudnn7-devel-ubuntu18.04
+&lt;denchmark-link:https://drive.google.com/open?id=1D4QGZql-ZDu6uYLKJljNJAV3zclmVmdV&gt;https://drive.google.com/open?id=1D4QGZql-ZDu6uYLKJljNJAV3zclmVmdV&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='6' author='jackd' date='2019-12-27T18:22:34Z'>
+		
+Confirmed that this is fixed when built with CUDA 10.1
+
+Closing as per this comment.  Please reopen if there is something for us to do here.
+		</comment>
+		<comment id='7' author='jackd' date='2019-12-27T18:22:36Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/32877&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/32877&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,166 @@
+<bug id='1763' author='jhspaybar' open_date='2016-04-04T04:35:07Z' closed_time='2018-02-24T00:31:56Z'>
+	<summary>image processing functions should not convert dtypes unless necessary (e.g. resize/crop/transpose/rotate, ...)</summary>
+	<description>
+&lt;denchmark-h:h3&gt;Environment info&lt;/denchmark-h&gt;
+
+Operating System: OSX
+If installed from binary pip package, provide:
+
+package: tensorflow
+version: 0.7.1
+
+&lt;denchmark-h:h3&gt;Steps to reproduce&lt;/denchmark-h&gt;
+
+Perform a resize action on a decoded jpeg before passing it to convert_image_dtype with a target of float32.  The values will still be in the range 0-255 rather than 0-1.
+This line works as expected
+tf.image.convert_image_dtype(tf.image.decode_jpeg(value, channels=3), tf.float32)
+This line doesn't(values in the tensor are still 0-255 rather than 0-1)
+tf.image.convert_image_dtype(tf.resize_images(tf.image.decode_jpeg(value, channels=3), x, y), tf.float32)
+&lt;denchmark-h:h3&gt;What have you tried?&lt;/denchmark-h&gt;
+
+
+Changing the order as described above works.
+
+	</description>
+	<comments>
+		<comment id='1' author='jhspaybar' date='2016-04-05T01:20:57Z'>
+		Yes, this is a bug. Either a Python wrapper or the op kernel for the different resize methods should perform conversion if necessary.
+		</comment>
+		<comment id='2' author='jhspaybar' date='2016-04-06T00:44:33Z'>
+		I might take a shot at this then, should I be fixing this on the python side of things, or should I be patching the c++ code instead?
+		</comment>
+		<comment id='3' author='jhspaybar' date='2016-04-11T00:30:32Z'>
+		jhspaybar, I believe that you should fix this on the python side of things.
+		</comment>
+		<comment id='4' author='jhspaybar' date='2017-03-22T17:58:36Z'>
+		IMO, the bug here is not actually that it doesn't scale the range. The bug is that range scaling depends on the input type. I will go out on a limb and say that a lot of people get bit by this, and there are a lot of subpar models out there as a result. Some models are able to train around the lack of rescaling, some suffer an accuracy loss, especially if some kind of range-dependent mean centering and stddev normalization is introduced later in the chain.
+Here's a scenario we encountered: a preliminary version of our data augmentation code used nearest neighbor interpolation, which does not convert dtype when resampling. We would resample, crop, do a few other things, and then feed everything into convert_image_dtype(). At that time we actually inspected the output of convert_image_dtype() and verified it was doing the scaling.
+Then, one of our researchers changed to bilinear resizing earlier in the chain (which does convert dtype to float32, but does not rescale to [0-1.0)). This led to convert_image_dtype() being essentially a no-op, and much head scratching regarding why our model wasn't performing as well as it should.
+Long rage, opaque magic like this is bad design.
+Given that backward compat is an issue, at this point I think the most robust solution seems to be to permanently deprecate convert_image_dtype() and recommend that people use cast() and saturate_cast() instead, and handle range rescaling separately.
+		</comment>
+		<comment id='5' author='jhspaybar' date='2017-03-22T18:38:08Z'>
+		In the presence of HDR images, scaling unconditionally to 0-1 for float inputs is not a good idea. What would you scale by? If a previous transformation incidentally left you with float data not in the range 0-1 (say, because you increased brightness by 10%), would you divide by 255? By the max?
+I disagree that this is a bug. Dealing with types in image processing is always annoying, especially in the presence of int8/uint8 anywhere in the pipeline. convert_image_dtype is a conversion function, not a scaling function. It converts between images encoded as fixed point images stored as integers and images encoded as floating point. It says as much in the docstring.
+There is, however, a bug in rescale_image, which should return the same dtype it ingested (preferred), or convert the dtype appropriately. This is different from the behavior of other image processing ops, who take care to return the same dtype they got. Sadly, here we do have the backwards compatibility problem, but I would say that this function should be deprecated in favor of a safe alternative. We could start by emitting a warning if it gets non-float input.
+		</comment>
+		<comment id='6' author='jhspaybar' date='2017-03-22T18:58:22Z'>
+		But by the same argument, to make the behavior predictable and non-magical, you now have to guarantee transparency into types all the way along the chain. I don't see how that'd be feasible from API design standpoint, short of requiring dtype specifications for all ops so that they assert if they see the type they didn't expect. That seems onerous.
+As things are today, any op that converts image dtype without range rescaling will silently mess up the assumption that convert_image_dtype() will do your rescaling for you. And they all can't really do range rescaling automatically upon dtype conversion, because they don't know they are processing image data per se.
+Besides, how many people deal with HDR vs just plain JPEG? I bet not very many. And it's incredibly easy right now for the majority of TF users to get screwed by this. I bet most people don't even know about this unintended, but likely behavior, hence my extended comment above.
+I guess another, easier recommendation for folks who care about correctness of their computations would be to convert to float32 right after decode_*() op. But that will further slow down data augmentation, which is already quite a bit slower than e.g. Torch/PyTorch.
+		</comment>
+		<comment id='7' author='jhspaybar' date='2017-03-27T17:55:18Z'>
+		We have made a choice to consider image data encoded as integer types to be fixed-point data. As you say, you could go the other way. Both have issues: Mostly, our image pipelines work in float, which is slower. On the other hand, if we computed things in uint8 (or int16, or int32) we'd be dealing with overflows and underflows in the middle of processing pipelines, and you'd probably see a lot more poor results because of that.
+The fundamental problem is that some ops take the image values at face value (resize_image) when converting dtypes, while most don't (HSV2RGB, etc.). We cannot change much about the behavior because of compatibility constraints, but we can add an argument to resize_image to make it not convert to float and work in its input dtype only (there's no reason for it to convert to float).
+		</comment>
+		<comment id='8' author='jhspaybar' date='2017-03-27T18:40:28Z'>
+		That sounds much better than the present situation, especially if the new parameter is prominently mentioned in the documentation.
+Arguably, changing the dtype during rescaling (as well as in the composite op tf.image.crop_and_resize()) is the most aggravating problem with the status quo, because short of casting back to uint8_t again there's no way to avoid float for the parts of the pipeline that, strictly speaking, do not need float. For performance reasons, resize is typically done right after decode.
+At a high level, I don't want to use any float32 until I have to be in float32, i.e. in our case until after we do resize, crop, and flip (and, when implemented, rotate and shear as well -- these need not convert to float either). It certainly would be great if I could maintain compact uint8_t representation for as long as I can.
+IMO this problem is more important than it might appear. I can tell you that for us inability to do data augmentation quickly enough nearly killed TF as a viable option. Our more demanding training pipelines currently use PyTorch for data augmentation, a solution which, as an engineer, makes me cringe, but hey, it runs at nearly twice the speed doing the same thing.
+There are a number of open issues in the issue tracker to that end, and being more frugal with cycles could help speed things up.
+		</comment>
+		<comment id='9' author='jhspaybar' date='2017-03-27T19:05:27Z'>
+		I have changed the title of this to reflect that. I think this is an excellent feature request. The constraints are that we cannot change existing behavior, but adding a maintain_dtype=False arg and prominent documentation would be good.
+		</comment>
+		<comment id='10' author='jhspaybar' date='2017-06-16T20:55:10Z'>
+		&lt;denchmark-link:https://github.com/martinwicke&gt;@martinwicke&lt;/denchmark-link&gt;
+ Have your thoughts evolved?
+		</comment>
+		<comment id='11' author='jhspaybar' date='2017-06-16T21:06:31Z'>
+		No, still a good idea, and still a lot of work, and in some cases, hard to get right.
+		</comment>
+		<comment id='12' author='jhspaybar' date='2017-07-16T07:16:38Z'>
+		This is really confusing, it appears that convert_image_dtype converts individual values from [0,255] to [0,1] range ONLY if the original type is int8 which unfortunately if the tensor is resized prior does not works because now the values are [0.0,255.0] ?
+Is this interpretation correct?
+I think convert_image_dtype documentation needs to be more explicit about this, I encountered this bug/issue when using a VGG model created by someone else which expected values in range (0,1).
+		</comment>
+		<comment id='13' author='jhspaybar' date='2017-07-24T15:27:23Z'>
+		I believe convert_image_dtype scales the values iff it converts between an integer type to a float type. Integer types are assumed to be fixed point numbers, so (int8)(255) == (float)(1.0). It also expects float values to contain "normalized" images which contain numbers in the range [0,1).
+So yes, if your original contains float values in the [0.0, 255.0) range, you have to rescale.
+If there's a deficiency in the documentation, it would be good to make this more explicit.
+		</comment>
+		<comment id='14' author='jhspaybar' date='2017-09-26T09:48:18Z'>
+		I've suffered the consequences of this unexpected value scaling during image type conversion also.
+I believe a better function name is urged. Maybe we could consider name it as convert_image_dtype_with_scaling .
+		</comment>
+		<comment id='15' author='jhspaybar' date='2017-09-26T16:00:10Z'>
+		The docstring says:
+Images that are represented using floating point values are expected to have
+values in the range [0,1). Image data stored in integer data types are
+expected to have values in the range [0,MAX], where MAX is the largest
+positive representable number for the data type.
+This op converts between data types, scaling the values appropriately before
+casting.
+If you have suggestions on how it could be improved, I'd welcome a PR.
+		</comment>
+		<comment id='16' author='jhspaybar' date='2017-09-26T16:01:14Z'>
+		Note that we cannot rename the function because that would break compatibility. We could make an alias, but in my opinion that would just add more confusion.
+		</comment>
+		<comment id='17' author='jhspaybar' date='2017-09-27T01:59:13Z'>
+		I understand that the current docs has already tell the truth of it. I would suggest adding a optional parameter named normalize=False. Then, by default, convert_image_dtype_with_scaling  won't do the magic that is not in its name. And people can still expect to use this feature if they set normalize=True. I understand your point that there are image processing related hypothesis here about the float type. But I don't think it's a good idea to assume everyone agrees on that.
+		</comment>
+		<comment id='18' author='jhspaybar' date='2017-09-27T03:04:29Z'>
+		We could introduce a new parameter (though not with a behavior changing
+default), but wouldn't you simply use a regular cast if that's the behavior
+you want? The purpose of this function is to manage conversion between the
+common representations of image values. And those are fixed point encoded
+values stored in integers and floating point values as described in the
+docstring.
+
+Every library dealing with images has to agree internally on a standard,
+and this is the one in TensorFlow (and btw., other libraries such as OpenGL
+have as well, including the conversion rules).
+
+I understand that there may be images in other representations out there
+(in particular, floating point images with a 0..255 range), these need to
+be scaled before they will work with TensorFlow functions.
+		</comment>
+		<comment id='19' author='jhspaybar' date='2017-09-27T03:25:24Z'>
+		So, assuming I decode a jpeg image from the raw file stream, the first function I can think of about image type conversion is convert_image_dtype. I don't think people will think of cast in the first place since it's too general.
+I still think it's the name that hints people this is only about dtype which I think should be amended by parameters.
+About the common standard in TensorFlow, I agree with your point.
+As you have mentioned, there are different standards with different scale. My point here is that Float32 conversion and unit8 conversion at least should have the same behaviour. Both scaled or both not scaled.
+		</comment>
+		<comment id='20' author='jhspaybar' date='2017-09-27T04:07:16Z'>
+		Your image from decode is likely uint8. If you need float, you should use
+convert_image_dtype. If you use cast, you'll get a float image scaled
+0..255, which isn't what you want, it won't work with a lot of TensorFlow's
+image processing functions.
+
+Note that you can of course also leave the image as uint8, especially for
+operations such as cropping and transpose there's no harm in doing that in
+uint8.
+		</comment>
+		<comment id='21' author='jhspaybar' date='2017-09-27T05:37:52Z'>
+		Yes, just like you said, the ambiguity lies in that my image from decode may or may not be uint8, which will cause a problem when considering the scaling issues.
+		</comment>
+		<comment id='22' author='jhspaybar' date='2017-09-27T05:59:28Z'>
+		But at least decode_jpeg will always return uint8. You should.always know
+the dtype of.your input, as far as I know. How do you end up with an image
+for which this is unknown?
+		</comment>
+		<comment id='23' author='jhspaybar' date='2017-09-27T08:56:11Z'>
+		During optimization of our computing graph, we accidentally put an tf.float32 placeholder before the  conversion. I wouldn't say it's unknown. It definitely could be avoided in our side.
+		</comment>
+		<comment id='24' author='jhspaybar' date='2017-10-23T12:32:07Z'>
+		Same issue.
+&lt;denchmark-link:https://github.com/martinwicke&gt;@martinwicke&lt;/denchmark-link&gt;
+ Do you have a plan to fix the issue? I think it's better to add a  argument for .  Would you mind me make a PR for that?
+		</comment>
+		<comment id='25' author='jhspaybar' date='2017-10-23T15:29:30Z'>
+		What would be the behavior of that argument? The target range? The input range? Do you need both?
+I agree that It is not ideal that range and dtype are coupled. I am however wary of introducing additional complexity here. How would an additional argument have helped here?
+		</comment>
+		<comment id='26' author='jhspaybar' date='2018-02-22T13:09:20Z'>
+		Nagging Awaiting Response: It has been 14 days with no activityand the awaiting response label was assigned. Is this still an issue?
+		</comment>
+		<comment id='27' author='jhspaybar' date='2018-02-24T00:31:55Z'>
+		I'll close this issue. Please reopen if you have a concrete suggestion for improving the API.
+		</comment>
+		<comment id='28' author='jhspaybar' date='2019-03-07T20:19:12Z'>
+		I just ran into this issue, which is a very long-standing bug that presents even these days (TF 1.13.x and 2.0). I strongly suggest it should be fixed (with some breaking changes in behavior) at TF 2.0, and the issue remain open. I will come up with a suggestion for improving API soon.
+		</comment>
+	</comments>
+</bug>

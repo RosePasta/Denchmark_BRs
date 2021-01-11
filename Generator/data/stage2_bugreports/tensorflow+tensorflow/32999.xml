@@ -1,0 +1,733 @@
+<bug id='32999' author='mattc-eostar' open_date='2019-10-02T19:09:09Z' closed_time='2019-10-24T20:56:20Z'>
+	<summary>Error converting NMT sequence to sequence example to .tflite model</summary>
+	<description>
+I am following this example:
+&lt;denchmark-link:https://www.tensorflow.org/tutorials/text/nmt_with_attention&gt;https://www.tensorflow.org/tutorials/text/nmt_with_attention&lt;/denchmark-link&gt;
+
+It is working as it should be and saving checkpoints.
+I want to now convert this to a TF Lite model following this example:
+&lt;denchmark-link:https://www.tensorflow.org/lite/convert/python_api#converting_a_savedmodel&gt;https://www.tensorflow.org/lite/convert/python_api#converting_a_savedmodel&lt;/denchmark-link&gt;
+_
+or
+&lt;denchmark-link:https://www.tensorflow.org/lite/convert/python_api#converting_a_concrete_function&gt;https://www.tensorflow.org/lite/convert/python_api#converting_a_concrete_function&lt;/denchmark-link&gt;
+_
+Here is what I am running to save and them convert:
+tflite_input_tensor = tf.constant(1., shape=[64, 39])
+tflite_target_tensor = tf.constant(1., shape=[64, 7])
+tflite_enc_hidden_tensor = tf.constant(1., shape=[64, 1024])
+export_dir = "saved_models"
+checkpoint.f = train_step
+to_save = checkpoint.f.get_concrete_function(tflite_input_tensor, tflite_target_tensor, tflite_enc_hidden_tensor)
+tf.saved_model.save(checkpoint, export_dir, to_save)
+
+converter = tf.lite.TFLiteConverter.from_concrete_functions([to_save])
+tflite_model = converter.convert()
+But I am getting this error:
+&lt;denchmark-code&gt;~/anaconda3/envs/main/lib/python3.6/site-packages/tensorflow_core/python/keras/engine/base_layer.py in __call__(self, inputs, *args, **kwargs)
+    845                     outputs = base_layer_utils.mark_as_return(outputs, acd)
+    846                 else:
+--&gt; 847                   outputs = call_fn(cast_inputs, *args, **kwargs)
+    848 
+    849             except errors.OperatorNotAllowedInGraphError as e:
+
+~/anaconda3/envs/main/lib/python3.6/site-packages/tensorflow_core/python/autograph/impl/api.py in wrapper(*args, **kwargs)
+    290   def wrapper(*args, **kwargs):
+    291     with ag_ctx.ControlStatusCtx(status=ag_ctx.Status.DISABLED):
+--&gt; 292       return func(*args, **kwargs)
+    293 
+    294   if inspect.isfunction(func) or inspect.ismethod(func):
+
+TypeError: call() missing 2 required positional arguments: 'hidden' and 'enc_output'
+&lt;/denchmark-code&gt;
+
+Trained with:
+@tf.function
+def train_step(inp, targ, enc_hidden):
+    loss = 0
+
+    with tf.GradientTape() as tape:
+        enc_output, enc_hidden = encoder(inp, enc_hidden)
+
+        dec_hidden = enc_hidden
+
+        dec_input = tf.expand_dims([targ_lang.word_index['&lt;start&gt;']] * BATCH_SIZE, 1)
+
+        # Teacher forcing - feeding the target as the next input
+        for t in range(1, targ.shape[1]):
+            # passing enc_output to the decoder
+            predictions, dec_hidden, _ = decoder(dec_input, dec_hidden, enc_output)
+
+            loss += loss_function(targ[:, t], predictions)
+            
+            # using teacher forcing
+            dec_input = tf.expand_dims(targ[:, t], 1)
+
+    batch_loss = (loss / int(targ.shape[1]))
+
+    variables = encoder.trainable_variables + decoder.trainable_variables
+
+    gradients = tape.gradient(loss, variables)
+
+    optimizer.apply_gradients(zip(gradients, variables))
+
+    return batch_loss
+
+EPOCHS = 3
+
+for epoch in range(EPOCHS):
+    start = time.time()
+
+    enc_hidden = encoder.initialize_hidden_state()
+    total_loss = 0
+
+    for (batch, (inp, targ)) in enumerate(dataset.take(steps_per_epoch)):
+        batch_loss = train_step(inp, targ, enc_hidden)
+        total_loss += batch_loss
+
+        if batch % 100 == 0:
+            print('Epoch {} Batch {} Loss {:.4f}'.format(epoch + 1,
+                                                         batch,
+                                                         batch_loss.numpy()))
+    # saving (checkpoint) the model every 2 epochs
+    if (epoch + 1) % 1 == 0:
+        checkpoint.save(file_prefix = checkpoint_prefix)
+
+    print('Epoch {} Loss {:.4f}'.format(epoch + 1, total_loss / steps_per_epoch))
+    print('Time taken for 1 epoch {} sec\n'.format(time.time() - start))
+Somehow the parameters for the Decoder call is not being passed in?
+class Decoder(tf.keras.Model):
+    def __init__(self, vocab_size, embedding_dim, dec_units, batch_sz):
+        super(Decoder, self).__init__()
+        self.batch_sz = batch_sz
+        self.dec_units = dec_units
+        self.embedding = tf.keras.layers.Embedding(vocab_size, embedding_dim)
+        self.rnn = tf.keras.layers.GRU(self.dec_units,
+                                       return_sequences=True,
+                                       return_state=True,
+                                       recurrent_initializer='glorot_uniform',
+                                       unroll=True)
+        
+        self.fc = tf.keras.layers.Dense(vocab_size)
+
+        # used for attention
+        self.attention = BahdanauAttention(self.dec_units)
+
+    def call(self, x, hidden, enc_output):
+        # enc_output shape == (batch_size, max_length, hidden_size)
+        context_vector, attention_weights = self.attention(hidden, enc_output)
+
+        # x shape after passing through embedding == (batch_size, 1, embedding_dim)
+        x = self.embedding(x)
+
+        # x shape after concatenation == (batch_size, 1, embedding_dim + hidden_size)
+        x = tf.concat([tf.expand_dims(context_vector, 1), x], axis=-1)
+
+        # passing the concatenated vector to the GRU
+        output, state = self.rnn(x)
+
+        # output shape == (batch_size * 1, hidden_size)
+        output = tf.reshape(output, (-1, output.shape[2]))
+
+        # output shape == (batch_size, vocab)
+        x = self.fc(output)
+
+        return x, state, attention_weights
+I understand there may be some trouble converting the GRU layers, but I will tackle that next. This seems to blow up before it even can check if GRU is able to be converted.
+	</description>
+	<comments>
+		<comment id='1' author='mattc-eostar' date='2019-10-02T19:23:11Z'>
+		Was able to get around it by passing the params as a list and then extract the variables x, hidden, enc_output = x in the call function of the decoder...
+		</comment>
+		<comment id='2' author='mattc-eostar' date='2019-10-02T19:32:13Z'>
+		Now it cannot convert a tensor, but not sure what this tensor is coming from:
+&lt;denchmark-code&gt;---------------------------------------------------------------------------
+ValueError                                Traceback (most recent call last)
+&lt;ipython-input-40-52d8f9c25fc5&gt; in &lt;module&gt;()
+      7 
+      8 converter = tf.lite.TFLiteConverter.from_concrete_functions([to_save])
+----&gt; 9 tflite_model = converter.convert()
+
+~/anaconda3/envs/main/lib/python3.6/site-packages/tensorflow_core/lite/python/lite.py in convert(self)
+    403 
+    404     frozen_func = _convert_to_constants.convert_variables_to_constants_v2(
+--&gt; 405         self._funcs[0], lower_control_flow=False)
+    406     input_tensors = [
+    407         tensor for tensor in frozen_func.inputs
+
+~/anaconda3/envs/main/lib/python3.6/site-packages/tensorflow_core/python/framework/convert_to_constants.py in convert_variables_to_constants_v2(func, lower_control_flow)
+    409 
+    410   # Get mapping from node name to variable value.
+--&gt; 411   tensor_data = _get_tensor_data(func)
+    412 
+    413   # Get mapping from function name to argument types.
+
+~/anaconda3/envs/main/lib/python3.6/site-packages/tensorflow_core/python/framework/convert_to_constants.py in _get_tensor_data(func)
+    193       data = map_index_to_variable[idx].numpy()
+    194     else:
+--&gt; 195       data = val_tensor.numpy()
+    196     tensor_data[tensor_name] = {
+    197         "data": data,
+
+~/anaconda3/envs/main/lib/python3.6/site-packages/tensorflow_core/python/framework/ops.py in numpy(self)
+    931       ValueError: if the type of this Tensor is not representable in numpy.
+    932     """
+--&gt; 933     maybe_arr = self._numpy()  # pylint: disable=protected-access
+    934     return maybe_arr.copy() if isinstance(maybe_arr, np.ndarray) else maybe_arr
+    935 
+
+ValueError: Cannot convert a Tensor of dtype resource to a NumPy array.
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='3' author='mattc-eostar' date='2019-10-07T22:23:34Z'>
+		Could you try using TFLiteConverter.from_saved_model API instead?
+Which version of Tensorflow are you using?
+		</comment>
+		<comment id='4' author='mattc-eostar' date='2019-10-15T23:00:57Z'>
+		Hi &lt;denchmark-link:https://github.com/mattc-eostar&gt;@mattc-eostar&lt;/denchmark-link&gt;
+,
+Did you find a way around the error? I am facing the same error on TF-2.0.0 and 2.1.0-dev20191015 (nightly). Same error with tf.lite.TFLiteConverter.from_saved_model
+Also, the first warning doesn't make any sense to me since the model since the output should have the shape (-1, 4)
+&lt;denchmark-code&gt;In [1]: converter = tf.lite.TFLiteConverter.from_saved_model("exported_models/1571172405/")
+2019-10-15 15:53:25.321143: W tensorflow/core/graph/graph_constructor.cc:772] Node 'StatefulPartitionedCall' has 1 outputs but the _output_shapes attribute specifies shapes for 6 outputs. Output shapes may be inaccurate.
+
+In [2]: tflite_model = converter.convert()
+2019-10-15 15:53:28.820835: I tensorflow/core/grappler/devices.cc:60] Number of eligible GPUs (core count &gt;= 8, compute capability &gt;= 0.0): 0 (Note: TensorFlow was not compiled with CUDA support)
+2019-10-15 15:53:28.820954: I tensorflow/core/grappler/clusters/single_machine.cc:356] Starting new session
+2019-10-15 15:53:28.828875: I tensorflow/core/grappler/optimizers/meta_optimizer.cc:812] Optimization results for grappler item: graph_to_optimize
+2019-10-15 15:53:28.828893: I tensorflow/core/grappler/optimizers/meta_optimizer.cc:814]   function_optimizer: Graph size after: 105 nodes (95), 191 edges (181), time = 4.658ms.
+2019-10-15 15:53:28.828899: I tensorflow/core/grappler/optimizers/meta_optimizer.cc:814]   function_optimizer: function_optimizer did nothing. time = 0.158ms.
+---------------------------------------------------------------------------
+InvalidArgumentError                      Traceback (most recent call last)
+&lt;ipython-input-43-c548bab089a8&gt; in &lt;module&gt;
+----&gt; 1 tflite_model = converter.convert()
+
+~/.virtualenvs/tf2-serving/lib/python3.6/site-packages/tensorflow_core/lite/python/lite.py in convert(self)
+    407
+    408     frozen_func = _convert_to_constants.convert_variables_to_constants_v2(
+--&gt; 409         self._funcs[0], lower_control_flow=False)
+    410     input_tensors = [
+    411         tensor for tensor in frozen_func.inputs
+
+~/.virtualenvs/tf2-serving/lib/python3.6/site-packages/tensorflow_core/python/framework/convert_to_constants.py in convert_variables_to_constants_v2(func, lower_control_flow)
+    435
+    436   # Get mapping from node name to variable value.
+--&gt; 437   tensor_data = _get_tensor_data(func)
+    438
+    439   # Get mapping from function name to argument types.
+
+~/.virtualenvs/tf2-serving/lib/python3.6/site-packages/tensorflow_core/python/framework/convert_to_constants.py in _get_tensor_data(func)
+    207       data = map_index_to_variable[idx].numpy()
+    208     else:
+--&gt; 209       data = val_tensor.numpy()
+    210     tensor_data[tensor_name] = {
+    211         "data": data,
+
+~/.virtualenvs/tf2-serving/lib/python3.6/site-packages/tensorflow_core/python/framework/ops.py in numpy(self)
+    941       ValueError: if the type of this Tensor is not representable in numpy.
+    942     """
+--&gt; 943     maybe_arr = self._numpy()  # pylint: disable=protected-access
+    944     return maybe_arr.copy() if isinstance(maybe_arr, np.ndarray) else maybe_arr
+    945
+
+~/.virtualenvs/tf2-serving/lib/python3.6/site-packages/tensorflow_core/python/framework/ops.py in _numpy(self)
+    918       return self._numpy_internal()
+    919     except core._NotOkStatusException as e:
+--&gt; 920       six.raise_from(core._status_to_exception(e.code, e.message), None)
+    921
+    922   @property
+
+~/.pyenv/versions/3.6.7/lib/python3.6/site-packages/six.py in raise_from(value, from_value)
+
+InvalidArgumentError: Cannot convert a Tensor of dtype resource to a NumPy array.
+&lt;/denchmark-code&gt;
+
+Model signature
+&lt;denchmark-code&gt;In [1]: !saved_model_cli show --dir exported_models/1571172405/ --tag_set serve --signature_def serving_default
+The given SavedModel SignatureDef contains the following input(s):
+  inputs['keras_layer_input'] tensor_info:
+      dtype: DT_STRING
+      shape: (-1)
+      name: serving_default_keras_layer_input:0
+The given SavedModel SignatureDef contains the following output(s):
+  outputs['dense_1'] tensor_info:
+      dtype: DT_FLOAT
+      shape: (-1, 4)
+      name: StatefulPartitionedCall_2:0
+Method name is: tensorflow/serving/predict
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='5' author='mattc-eostar' date='2019-10-21T13:47:50Z'>
+		&lt;denchmark-link:https://github.com/haozha111&gt;@haozha111&lt;/denchmark-link&gt;
+
+
+Could you try using TFLiteConverter.from_saved_model API instead?
+Which version of Tensorflow are you using?
+
+2.0.0
+		</comment>
+		<comment id='6' author='mattc-eostar' date='2019-10-21T15:20:45Z'>
+		&lt;denchmark-link:https://github.com/haozha111&gt;@haozha111&lt;/denchmark-link&gt;
+
+Tf: 2.0.0
+Numpy: 1.16.4
+Here is the error if I run:
+tflite_input_shape = tf.TensorSpec([64, 39], tf.int32)
+tflite_target_shape = tf.TensorSpec([64, 7], tf.float32)
+tflite_enc_hidden_shape = tf.TensorSpec([64, 1024], tf.float32)
+export_dir = "saved_models"
+checkpoint.f = train_step
+to_save = checkpoint.f.get_concrete_function(tflite_input_shape, tflite_target_shape, tflite_enc_hidden_shape)
+tf.saved_model.save(checkpoint, export_dir, to_save)
+&lt;denchmark-code&gt;---------------------------------------------------------------------------
+AttributeError                            Traceback (most recent call last)
+&lt;ipython-input-37-c4f1fc30b8c5&gt; in &lt;module&gt;()
+      5 checkpoint.f = train_step
+      6 to_save = checkpoint.f.get_concrete_function(tflite_input_shape, tflite_target_shape, tflite_enc_hidden_shape)
+----&gt; 7 tf.saved_model.save(checkpoint, export_dir, to_save)
+      8 
+      9 # converter = tf.lite.TFLiteConverter.from_concrete_functions([to_save])
+
+~/anaconda3/envs/main/lib/python3.6/site-packages/tensorflow_core/python/saved_model/save.py in save(obj, export_dir, signatures, options)
+    881   # Note we run this twice since, while constructing the view the first time
+    882   # there can be side effects of creating variables.
+--&gt; 883   _ = _SaveableView(checkpoint_graph_view)
+    884   saveable_view = _SaveableView(checkpoint_graph_view)
+    885 
+
+~/anaconda3/envs/main/lib/python3.6/site-packages/tensorflow_core/python/saved_model/save.py in __init__(self, checkpoint_view)
+    162     self.checkpoint_view = checkpoint_view
+    163     trackable_objects, node_ids, slot_variables = (
+--&gt; 164         self.checkpoint_view.objects_ids_and_slot_variables())
+    165     self.nodes = trackable_objects
+    166     self.node_ids = node_ids
+
+~/anaconda3/envs/main/lib/python3.6/site-packages/tensorflow_core/python/training/tracking/graph_view.py in objects_ids_and_slot_variables(self)
+    413       A tuple of (trackable objects, object -&gt; node id, slot variables)
+    414     """
+--&gt; 415     trackable_objects, path_to_root = self._breadth_first_traversal()
+    416     object_names = object_identity.ObjectIdentityDictionary()
+    417     for obj, path in path_to_root.items():
+
+~/anaconda3/envs/main/lib/python3.6/site-packages/tensorflow_core/python/training/tracking/graph_view.py in _breadth_first_traversal(self)
+    197             % (current_trackable,))
+    198       bfs_sorted.append(current_trackable)
+--&gt; 199       for name, dependency in self.list_dependencies(current_trackable):
+    200         if dependency not in path_to_root:
+    201           path_to_root[dependency] = (
+
+~/anaconda3/envs/main/lib/python3.6/site-packages/tensorflow_core/python/saved_model/save.py in list_dependencies(self, obj)
+    106   def list_dependencies(self, obj):
+    107     """Overrides a parent method to include `add_object` objects."""
+--&gt; 108     extra_dependencies = self.list_extra_dependencies(obj)
+    109     extra_dependencies.update(self._extra_dependencies.get(obj, {}))
+    110 
+
+~/anaconda3/envs/main/lib/python3.6/site-packages/tensorflow_core/python/saved_model/save.py in list_extra_dependencies(self, obj)
+    133   def list_extra_dependencies(self, obj):
+    134     return obj._list_extra_dependencies_for_serialization(  # pylint: disable=protected-access
+--&gt; 135         self._serialization_cache)
+    136 
+    137   def list_functions(self, obj):
+
+~/anaconda3/envs/main/lib/python3.6/site-packages/tensorflow_core/python/keras/engine/base_layer.py in _list_extra_dependencies_for_serialization(self, serialization_cache)
+   2416   def _list_extra_dependencies_for_serialization(self, serialization_cache):
+   2417     return (self._trackable_saved_model_saver
+-&gt; 2418             .list_extra_dependencies_for_serialization(serialization_cache))
+   2419 
+   2420   def _list_functions_for_serialization(self, serialization_cache):
+
+~/anaconda3/envs/main/lib/python3.6/site-packages/tensorflow_core/python/keras/saving/saved_model/base_serialization.py in list_extra_dependencies_for_serialization(self, serialization_cache)
+     76       of attributes are listed in the `saved_model._LayerAttributes` class.
+     77     """
+---&gt; 78     return self.objects_to_serialize(serialization_cache)
+     79 
+     80   def list_functions_for_serialization(self, serialization_cache):
+
+~/anaconda3/envs/main/lib/python3.6/site-packages/tensorflow_core/python/keras/saving/saved_model/layer_serialization.py in objects_to_serialize(self, serialization_cache)
+     73   def objects_to_serialize(self, serialization_cache):
+     74     return (self._get_serialized_attributes(
+---&gt; 75         serialization_cache).objects_to_serialize)
+     76 
+     77   def functions_to_serialize(self, serialization_cache):
+
+~/anaconda3/envs/main/lib/python3.6/site-packages/tensorflow_core/python/keras/saving/saved_model/layer_serialization.py in _get_serialized_attributes(self, serialization_cache)
+     92 
+     93     object_dict, function_dict = self._get_serialized_attributes_internal(
+---&gt; 94         serialization_cache)
+     95 
+     96     serialized_attr.set_and_validate_objects(object_dict)
+
+~/anaconda3/envs/main/lib/python3.6/site-packages/tensorflow_core/python/keras/saving/saved_model/model_serialization.py in _get_serialized_attributes_internal(self, serialization_cache)
+     51     objects, functions = (
+     52         super(ModelSavedModelSaver, self)._get_serialized_attributes_internal(
+---&gt; 53             serialization_cache))
+     54     functions['_default_save_signature'] = default_signature
+     55     return objects, functions
+
+~/anaconda3/envs/main/lib/python3.6/site-packages/tensorflow_core/python/keras/saving/saved_model/layer_serialization.py in _get_serialized_attributes_internal(self, serialization_cache)
+    101     """Returns dictionary of serialized attributes."""
+    102     objects = save_impl.wrap_layer_objects(self.obj, serialization_cache)
+--&gt; 103     functions = save_impl.wrap_layer_functions(self.obj, serialization_cache)
+    104     # Attribute validator requires that the default save signature is added to
+    105     # function dict, even if the value is None.
+
+~/anaconda3/envs/main/lib/python3.6/site-packages/tensorflow_core/python/keras/saving/saved_model/save_impl.py in wrap_layer_functions(layer, serialization_cache)
+    164   call_fn_with_losses = call_collection.add_function(
+    165       _wrap_call_and_conditional_losses(layer),
+--&gt; 166       '{}_layer_call_and_return_conditional_losses'.format(layer.name))
+    167   call_fn = call_collection.add_function(
+    168       _extract_outputs_from_fn(layer, call_fn_with_losses),
+
+~/anaconda3/envs/main/lib/python3.6/site-packages/tensorflow_core/python/keras/saving/saved_model/save_impl.py in add_function(self, call_fn, name)
+    492       # Manually add traces for layers that have keyword arguments and have
+    493       # a fully defined input signature.
+--&gt; 494       self.add_trace(*self._input_signature)
+    495     return fn
+    496 
+
+~/anaconda3/envs/main/lib/python3.6/site-packages/tensorflow_core/python/keras/saving/saved_model/save_impl.py in add_trace(self, *args, **kwargs)
+    411             fn.get_concrete_function(*args, **kwargs)
+    412 
+--&gt; 413         trace_with_training(True)
+    414         trace_with_training(False)
+    415       else:
+
+~/anaconda3/envs/main/lib/python3.6/site-packages/tensorflow_core/python/keras/saving/saved_model/save_impl.py in trace_with_training(value, fn)
+    409           utils.set_training_arg(value, self._training_arg_index, args, kwargs)
+    410           with K.learning_phase_scope(value):
+--&gt; 411             fn.get_concrete_function(*args, **kwargs)
+    412 
+    413         trace_with_training(True)
+
+~/anaconda3/envs/main/lib/python3.6/site-packages/tensorflow_core/python/keras/saving/saved_model/save_impl.py in get_concrete_function(self, *args, **kwargs)
+    536     if not self.call_collection.tracing:
+    537       self.call_collection.add_trace(*args, **kwargs)
+--&gt; 538     return super(LayerCall, self).get_concrete_function(*args, **kwargs)
+    539 
+    540 
+
+~/anaconda3/envs/main/lib/python3.6/site-packages/tensorflow_core/python/eager/def_function.py in get_concrete_function(self, *args, **kwargs)
+    774       if self._stateful_fn is None:
+    775         initializer_map = object_identity.ObjectIdentityDictionary()
+--&gt; 776         self._initialize(args, kwargs, add_initializers_to=initializer_map)
+    777         self._initialize_uninitialized_variables(initializer_map)
+    778 
+
+~/anaconda3/envs/main/lib/python3.6/site-packages/tensorflow_core/python/eager/def_function.py in _initialize(self, args, kwds, add_initializers_to)
+    406     self._concrete_stateful_fn = (
+    407         self._stateful_fn._get_concrete_function_internal_garbage_collected(  # pylint: disable=protected-access
+--&gt; 408             *args, **kwds))
+    409 
+    410     def invalid_creator_scope(*unused_args, **unused_kwds):
+
+~/anaconda3/envs/main/lib/python3.6/site-packages/tensorflow_core/python/eager/function.py in _get_concrete_function_internal_garbage_collected(self, *args, **kwargs)
+   1846     if self.input_signature:
+   1847       args, kwargs = None, None
+-&gt; 1848     graph_function, _, _ = self._maybe_define_function(args, kwargs)
+   1849     return graph_function
+   1850 
+
+~/anaconda3/envs/main/lib/python3.6/site-packages/tensorflow_core/python/eager/function.py in _maybe_define_function(self, args, kwargs)
+   2148         graph_function = self._function_cache.primary.get(cache_key, None)
+   2149         if graph_function is None:
+-&gt; 2150           graph_function = self._create_graph_function(args, kwargs)
+   2151           self._function_cache.primary[cache_key] = graph_function
+   2152         return graph_function, args, kwargs
+
+~/anaconda3/envs/main/lib/python3.6/site-packages/tensorflow_core/python/eager/function.py in _create_graph_function(self, args, kwargs, override_flat_arg_shapes)
+   2039             arg_names=arg_names,
+   2040             override_flat_arg_shapes=override_flat_arg_shapes,
+-&gt; 2041             capture_by_value=self._capture_by_value),
+   2042         self._function_attributes,
+   2043         # Tell the ConcreteFunction to clean up its graph once it goes out of
+
+~/anaconda3/envs/main/lib/python3.6/site-packages/tensorflow_core/python/framework/func_graph.py in func_graph_from_py_func(name, python_func, args, kwargs, signature, func_graph, autograph, autograph_options, add_control_dependencies, arg_names, op_return_value, collections, capture_by_value, override_flat_arg_shapes)
+    913                                           converted_func)
+    914 
+--&gt; 915       func_outputs = python_func(*func_args, **func_kwargs)
+    916 
+    917       # invariant: `func_outputs` contains only Tensors, CompositeTensors,
+
+~/anaconda3/envs/main/lib/python3.6/site-packages/tensorflow_core/python/eager/def_function.py in wrapped_fn(*args, **kwds)
+    356         # __wrapped__ allows AutoGraph to swap in a converted function. We give
+    357         # the function a weak reference to itself to avoid a reference cycle.
+--&gt; 358         return weak_wrapped_fn().__wrapped__(*args, **kwds)
+    359     weak_wrapped_fn = weakref.ref(wrapped_fn)
+    360 
+
+~/anaconda3/envs/main/lib/python3.6/site-packages/tensorflow_core/python/keras/saving/saved_model/save_impl.py in wrapper(*args, **kwargs)
+    513         layer, inputs=inputs, build_graph=False, training=training,
+    514         saving=True):
+--&gt; 515       ret = method(*args, **kwargs)
+    516     _restore_layer_losses(original_losses)
+    517     return ret
+
+~/anaconda3/envs/main/lib/python3.6/site-packages/tensorflow_core/python/keras/saving/saved_model/save_impl.py in wrap_with_training_arg(*args, **kwargs)
+    473         kwargs = kwargs.copy()
+    474         utils.remove_training_arg(self._training_arg_index, args, kwargs)
+--&gt; 475         return call_fn(*args, **kwargs)
+    476 
+    477       return tf_decorator.make_decorator(
+
+~/anaconda3/envs/main/lib/python3.6/site-packages/tensorflow_core/python/keras/saving/saved_model/save_impl.py in call_and_return_conditional_losses(inputs, *args, **kwargs)
+    555   layer_call = _get_layer_call_method(layer)
+    556   def call_and_return_conditional_losses(inputs, *args, **kwargs):
+--&gt; 557     return layer_call(inputs, *args, **kwargs), layer.get_losses_for(inputs)
+    558   return _create_call_fn_decorator(layer, call_and_return_conditional_losses)
+    559 
+
+&lt;ipython-input-21-981e13bed43a&gt; in call(self, x, hidden)
+     12     def call(self, x, hidden):
+     13         x = self.embedding(x)
+---&gt; 14         output, state = self.rnn(x, initial_state = hidden)
+     15         return output, state
+     16 
+
+~/anaconda3/envs/main/lib/python3.6/site-packages/tensorflow_core/python/keras/layers/recurrent.py in __call__(self, inputs, initial_state, constants, **kwargs)
+    632       additional_inputs += initial_state
+    633       self.state_spec = nest.map_structure(
+--&gt; 634           lambda s: InputSpec(shape=K.int_shape(s)), initial_state)
+    635       additional_specs += self.state_spec
+    636     if constants is not None:
+
+~/anaconda3/envs/main/lib/python3.6/site-packages/tensorflow_core/python/util/nest.py in map_structure(func, *structure, **kwargs)
+    533 
+    534   return pack_sequence_as(
+--&gt; 535       structure[0], [func(*x) for x in entries],
+    536       expand_composites=expand_composites)
+    537 
+
+~/anaconda3/envs/main/lib/python3.6/site-packages/tensorflow_core/python/util/nest.py in &lt;listcomp&gt;(.0)
+    533 
+    534   return pack_sequence_as(
+--&gt; 535       structure[0], [func(*x) for x in entries],
+    536       expand_composites=expand_composites)
+    537 
+
+~/anaconda3/envs/main/lib/python3.6/site-packages/tensorflow_core/python/keras/layers/recurrent.py in &lt;lambda&gt;(s)
+    632       additional_inputs += initial_state
+    633       self.state_spec = nest.map_structure(
+--&gt; 634           lambda s: InputSpec(shape=K.int_shape(s)), initial_state)
+    635       additional_specs += self.state_spec
+    636     if constants is not None:
+
+~/anaconda3/envs/main/lib/python3.6/site-packages/tensorflow_core/python/keras/backend.py in int_shape(x)
+   1183   """
+   1184   try:
+-&gt; 1185     shape = x.shape
+   1186     if not isinstance(shape, tuple):
+   1187       shape = tuple(shape.as_list())
+
+AttributeError: 'bool' object has no attribute 'shape'
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='7' author='mattc-eostar' date='2019-10-21T16:56:51Z'>
+		I have a feeling that the model is not exported to saved model correctly. From the last error message you post, this is an error coming from the tf python saved model API.
+Could you provide a self-contained python script + any model file so that I can give it a try on my machine? It's hard to reason about it without running it myself.
+Thanks!
+		</comment>
+		<comment id='8' author='mattc-eostar' date='2019-10-21T17:57:59Z'>
+		&lt;denchmark-link:https://github.com/haozha111&gt;@haozha111&lt;/denchmark-link&gt;
+
+Script and model files can be found here:
+&lt;denchmark-link:https://drive.google.com/open?id=1TezJfFBduy35uKdxPu7QlN_ukug1JYLG&gt;https://drive.google.com/open?id=1TezJfFBduy35uKdxPu7QlN_ukug1JYLG&lt;/denchmark-link&gt;
+
+It looks like it could create the SavedModel format (correctly, I think), but still not able to convert into TFLite
+		</comment>
+		<comment id='9' author='mattc-eostar' date='2019-10-21T18:04:56Z'>
+		Python==3.6.5
+Numpy==1.16.4
+Tensorflow==2.0.0
+		</comment>
+		<comment id='10' author='mattc-eostar' date='2019-10-21T23:35:24Z'>
+		Hi Matthew,
+I took a look on your saved model, it has a metagraph named 'serving_default' but I think it's actually the training graph, not the inference graph.
+This is probably because you export the saved model using those lines:
+checkpoint.f = train_step
+to_save = checkpoint.f.get_concrete_function(tflite_input_shape, tflite_target_shape, tflite_enc_hidden_shape)
+tf.saved_model.save(checkpoint, export_dir, to_save)
+(I also visualize your saved model, and I saw those gradient ops that doesn't need during inference).
+As a first step, I think we need to first create a saved model that contains the correct inference graph. I will take a look into this issue soon.
+However, solving that saved model issue alone will not fix the entire problem. Since you are using keras.layers.GRU in both your encoder and decoder, unfortunately currently TOCO can't convert  these ops to TF Lite, because it has control flow ops (While) and some other ops TF Lite doesn't support (mainly TensorList ops). We are working on a new TFLite converter to address this issue. That being said, before that new converter is released(hopefully soon), I don't see any easy ways to convert this NMT model into TF Lite, at least in a less painful way.
+		</comment>
+		<comment id='11' author='mattc-eostar' date='2019-10-22T13:17:11Z'>
+		Thank you so much for looking into this! I have a few follow-up questions and comments.
+
+I took a look on your saved model, it has a metagraph named 'serving_default' but I think it's actually the training graph, not the inference graph.
+
+Is it supposed to do this by default? I have been following the documentation on saving, but maybe I missed something.
+
+unfortunately currently TOCO can't convert these ops to TF Lite, because it has control flow ops (While) and some other ops TF Lite doesn't support (mainly TensorList ops). We are working on a new TFLite converter to address this issue
+
+I may be mistaken, but isn't TOCO getting the ax soon in favor of the TFLiteConverter Pyhton API? Based on the latest TFLite documentation, it states that RNNs can be converted successfully: &lt;denchmark-link:https://www.tensorflow.org/lite/convert/rnn#currently_supported&gt;https://www.tensorflow.org/lite/convert/rnn#currently_supported&lt;/denchmark-link&gt;
+
+keras.layers.RNN(cell, unroll=True) is the drop-in replacement for tf.compat.v1.nn.static_rnn and then I could use the tf.keras.layers.GRUCell in place of the tf.compat.v1.nn.rnn_cell.GRUCell. But the keras.layers.GRU(unroll=True) should be equivalent to the previously mentioned composition based on what I saw in the source code. I am not specifying sequence length so this should work, should it not?
+So that raises the question: is their documentation saying this should work?
+		</comment>
+		<comment id='12' author='mattc-eostar' date='2019-10-22T15:30:04Z'>
+		For those looking to do NMT in TFLite, a transformer approach may work for you. It only uses Embeddings, Dense, and Attention layers. I am going to diverge from this and try to see if that can be converted to TFLite and report back if it works with decent accuracy for my use case.
+&lt;denchmark-link:https://www.tensorflow.org/tutorials/text/transformer&gt;https://www.tensorflow.org/tutorials/text/transformer&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='13' author='mattc-eostar' date='2019-10-22T20:31:49Z'>
+		&lt;denchmark-link:https://github.com/haozha111&gt;@haozha111&lt;/denchmark-link&gt;
+
+I ran into an issue converting that as well, which is tracked here:
+That notebook gave me an idea though to build the concrete function for inferencing only as mentioned in an earlier post on this issue. I can successfully convert the NMT model into a TFLite model and invoke it on dummy data.
+First, make sure unroll = True and input_length is set on the GRU layers in the encoder and decoder.
+Bear with me here... still haven't found the best solution..
+This doesn't work and gives an InaccessibleTensorException. I guess concrete functions do not like loops and you cannot convert to numpy with .numpy() within it. But, I want to be able to build the entire output in one call and not need much intervention on the device once the model is converted.
+@tf.function
+def eval_step(enc_input):
+    results = []
+    
+    hidden = [tf.zeros((1, units))]
+    enc_out, enc_hidden = encoder(enc_input, hidden)
+
+    dec_hidden = enc_hidden
+    dec_input = tf.expand_dims([targ_lang.word_index['&lt;start&gt;']], 0)
+
+
+
+    for t in tf.range(max_length_targ):
+        predictions, dec_hidden, _ = decoder([dec_input,dec_hidden,enc_out])
+
+        predicted_id = tf.argmax(predictions[0], output_type=tf.int32)
+
+        results.append(predicted_id)
+
+        if tf.equal(predicted_id,tf.constant(2)): # &lt;end&gt; index
+            break
+
+        # the predicted ID is fed back into the model
+        dec_input = tf.expand_dims([predicted_id], 0)
+    
+    return tf.convert_to_tensor(results.values(),dtype=np.int32)
+This works...unrolling the loop...
+@tf.function
+def eval_step(enc_input):
+    hidden = [tf.zeros((1, units))]
+    enc_out, enc_hidden = encoder(enc_input, hidden)
+
+    dec_hidden = enc_hidden
+    dec_input = tf.expand_dims([targ_lang.word_index['&lt;start&gt;']], 0)
+    
+    predictions, dec_hidden, _ = decoder([dec_input,dec_hidden,enc_out])
+    predicted_id_1 = tf.argmax(predictions[0], output_type=tf.int32)
+    dec_input = tf.expand_dims([predicted_id_1], 0)
+    
+    predictions, dec_hidden, _ = decoder([dec_input,dec_hidden,enc_out])
+    predicted_id_2 = tf.argmax(predictions[0], output_type=tf.int32)
+    dec_input = tf.expand_dims([predicted_id_2], 0)
+    
+    predictions, dec_hidden, _ = decoder([dec_input,dec_hidden,enc_out])
+    predicted_id_3 = tf.argmax(predictions[0], output_type=tf.int32)
+    dec_input = tf.expand_dims([predicted_id_3], 0)
+    
+    predictions, dec_hidden, _ = decoder([dec_input,dec_hidden,enc_out])
+    predicted_id_4 = tf.argmax(predictions[0], output_type=tf.int32)
+    dec_input = tf.expand_dims([predicted_id_4], 0)
+    
+    return tf.convert_to_tensor([predicted_id_1,predicted_id_2,predicted_id_3,predicted_id_4])
+This also works, but may not achieve what I need since it does not behave the same way. This would run the encoder on each call, but the notebook describes this only necessary at the beginning of the translation.
+@tf.function
+def eval_step(enc_input, dec_input):
+    enc_output, enc_hidden = encoder(enc_input)
+    dec_hidden = enc_hidden
+
+    predictions, dec_hidden, _ = decoder([dec_input, dec_hidden, enc_output])
+
+    return predictions
+Then the conversion:
+tflite_enc_input_shape = tf.TensorSpec([None,list(dataset.take(1))[0][0].shape[1]], tf.int32)
+# tflite_dec_input_shape = tf.TensorSpec([None, 1], tf.int32)
+checkpoint.f = eval_step
+to_save = checkpoint.f.get_concrete_function(tflite_enc_input_shape)
+
+tf.random.set_seed(1234)
+
+converter = tf.lite.TFLiteConverter.from_concrete_functions([to_save])
+tflite_model = converter.convert()
+
+interpreter = tf.lite.Interpreter(model_content=tflite_model)
+interpreter.allocate_tensors()
+
+# Get input and output tensors.
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
+
+enc_input_shape = input_details[0]['shape']
+enc_input_data = np.array(np.random.randint(39,size=enc_input_shape), dtype=np.int32)
+
+interpreter.set_tensor(input_details[0]['index'], enc_input_data)
+# interpreter.set_tensor(input_details[1]['index'], dec_input_data)
+
+interpreter.invoke()
+tflite_results = interpreter.get_tensor(output_details[0]['index'])
+Any input on how I can use loops within a concrete function to step through the sequence would be very helpful!
+		</comment>
+		<comment id='14' author='mattc-eostar' date='2019-10-22T23:16:30Z'>
+		
+Thank you so much for looking into this! I have a few follow-up questions and comments.
+
+I took a look on your saved model, it has a metagraph named 'serving_default' but I think it's actually the training graph, not the inference graph.
+
+
+For this saving issue, I'm taking a deeper look now and will post my findings if I found something working.
+
+Is it supposed to do this by default? I have been following the documentation on saving, but maybe I missed something.
+
+unfortunately currently TOCO can't convert these ops to TF Lite, because it has control flow ops (While) and some other ops TF Lite doesn't support (mainly TensorList ops). We are working on a new TFLite converter to address this issue
+
+
+Yes, that documentation is correct. If you unroll the RNN we can always convert it to tflite, no problem.(but it seems that you forgot to unroll your encoder RNN? Generally, if the RNN is unrolled and no sequence length is specified, there will be no control flow ops inside the model, so it should be handled by TOCO correctly. (But note that we are going to launch a new converter soon, which will provide a uniformed way to convert all kinds of RNNs).
+
+I may be mistaken, but isn't TOCO getting the ax soon in favor of the TFLiteConverter Pyhton API? Based on the latest TFLite documentation, it states that RNNs can be converted successfully: https://www.tensorflow.org/lite/convert/rnn#currently_supported
+keras.layers.RNN(cell, unroll=True) is the drop-in replacement for tf.compat.v1.nn.static_rnn and then I could use the tf.keras.layers.GRUCell in place of the tf.compat.v1.nn.rnn_cell.GRUCell. But the keras.layers.GRU(unroll=True) should be equivalent to the previously mentioned composition based on what I saw in the source code. I am not specifying sequence length so this should work, should it not?
+So that raises the question: is their documentation saying this should work?
+
+		</comment>
+		<comment id='15' author='mattc-eostar' date='2019-10-24T20:56:20Z'>
+		For anyone following, I found a way to get this working by splitting up the encoder and decoder into two tflite models for the time being and then managing the loop that decodes the sequence externally.
+@tf.function
+def eval_step_enc(enc_input):
+    enc_out, enc_hidden = encoder(enc_input, [tf.zeros((1, units))])
+    
+    return enc_out, enc_hidden
+
+@tf.function
+def eval_step_dec(dec_input, enc_out, dec_hidden):
+    predictions, dec_hidden, _ = decoder([dec_input,dec_hidden,enc_out])
+    scores = tf.exp(predictions) / tf.reduce_sum(tf.exp(predictions), axis=1)
+    dec_input = tf.expand_dims(tf.argmax(predictions, axis=1, output_type=tf.int32), 1)
+    
+    return dec_input, enc_out, dec_hidden, scores
+
+# ...standard TFLite conversion code
+I am guessing this is due to the fact certain control flow operations are not supported in TFLite that would allow a concrete function with a loop to convert properly. This will do for now. I am getting great accuracy and have this running in a native Android app on sample data.
+Thank you for the help and looking forward to the new updated as we round out the year!
+		</comment>
+		<comment id='16' author='mattc-eostar' date='2019-10-24T20:56:22Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/32999&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/32999&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='17' author='mattc-eostar' date='2019-10-24T21:09:28Z'>
+		Glad to hear that it's working for you.
+I think with the new converter coming out soon, it's probably easier to combine the encoder/decoder into the single graph and also wrap loop inside of the model. The new converter will be great at handling the control flow ops. Please be patient about it and stay tuned. Thanks!
+		</comment>
+		<comment id='18' author='mattc-eostar' date='2019-10-25T13:12:23Z'>
+		Looking forward to it!
+		</comment>
+		<comment id='19' author='mattc-eostar' date='2020-08-13T10:13:04Z'>
+		@maatc-eostar,Hi,I am doing the similar thing and following the example:&lt;denchmark-link:https://tensorflow.google/tutorials/text/image_captioning,and&gt;https://tensorflow.google/tutorials/text/image_captioning,and&lt;/denchmark-link&gt;
+ I also want to convert the model to tfLite.I find your model is similiar with my model.Can you give me your code for referance?(Also the Android code,thanks!&lt;denchmark-link:mailto:davidblackinga@gamil.com&gt;davidblackinga@gamil.com&lt;/denchmark-link&gt;
+)
+		</comment>
+	</comments>
+</bug>

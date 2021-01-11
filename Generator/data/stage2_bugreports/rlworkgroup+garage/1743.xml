@@ -1,0 +1,199 @@
+<bug id='1743' author='st2yang' open_date='2020-07-09T15:00:02Z' closed_time='2020-08-03T22:38:10Z'>
+	<summary>RaySampler is broken for some algorithms</summary>
+	<description>
+Hi,
+(1)
+I am trying to reduce the required samples per epoch to make the epoch going faster. It seems that garage has a default TotalEnvSteps (to let each worker finish 128 periods?). I thought I can change something in runner or worker but failed to find it.
+(2)
+I need to do this because I made each step in my custom env to be an action primitive (each step runs multiple steps of set_action) by adapting Fetch Robot Env. Thus data sample is much slower than the original. In this case, do you have suggestions about other parameters to change? For example, reduce min_buffer_size?
+(3)
+Can I also ask how to boost data sample? In default setting, I observed that CPU is not fully utilized. Would increasing n_workers (to be beyond the number of physical cores) help?
+Thanks,
+st2yang
+	</description>
+	<comments>
+		<comment id='1' author='st2yang' date='2020-07-09T15:29:56Z'>
+		This question is probably best answered by &lt;denchmark-link:https://github.com/krzentner&gt;@krzentner&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='2' author='st2yang' date='2020-07-09T21:05:08Z'>
+		Hi Yang,
+Currently, the number of TotalEnvSteps collected per epoch is the batch_size argument to runner.train rounded up to the nearest number of complete trajectories. A trajectory is complete if the environment reports done (i.e. termination) or it contains max_path_length steps. So, if you set max_path_length to 50, then set batch_size to 128, and the environment contains no terminal states, you will always get three (math.ceil(128/50)) trajectories.
+If you want to get fewer , you currently need to decrease  (and maybe ). I don't know what you mean by "finish 128 periods." Note that currently the sampler always collects full trajectories (although I'm working on PR &lt;denchmark-link:https://github.com/rlworkgroup/garage/pull/1626&gt;#1626&lt;/denchmark-link&gt;
+ which allows changing that).
+CPU utilization depends on what sampler you're using. To use multiple CPUs, you need to be using RaySampler, and using enough environment steps per epoch that at least one trajectory per worker is required.
+You might also find reading the code of &lt;denchmark-link:https://github.com/rlworkgroup/garage/blob/master/src/garage/sampler/local_sampler.py#L114&gt;LocalSampler&lt;/denchmark-link&gt;
+ informative. (Note that , and that this code varies a little from the equivalent parallel code in ).
+Does that answer your question?
+		</comment>
+		<comment id='3' author='st2yang' date='2020-07-09T21:47:30Z'>
+		Hi &lt;denchmark-link:https://github.com/krzentner&gt;@krzentner&lt;/denchmark-link&gt;
+ ,
+Thanks for your explanation. But I am still confused about TotalEnvSteps, and it seems to be not consistent with my observation. Let's take &lt;denchmark-link:https://github.com/rlworkgroup/garage/blob/master/examples/tf/her_ddpg_fetchreach.py&gt;her_ddpg_fetchreach&lt;/denchmark-link&gt;
+ for example. Based on your explanation
+(1) trajectory=100/100=1, which might mean each worker collects one trajectory.
+(2) FetchRotot is TimeLimit env and max_episode_steps=50, which means one trajectory allows 50 steps at most
+(3) then TotalEnvSteps for one epoch is num_workers * 1 * 50 ? My CPU has 4 physical cores.
+(4) but what I observed is 2000, how to explain?
+In terms of data sampling, if I just have one cpu, there's no way to boost sampling?
+Thanks,
+st2yang
+		</comment>
+		<comment id='4' author='st2yang' date='2020-07-09T21:53:09Z'>
+		&lt;denchmark-link:https://github.com/st2yang&gt;@st2yang&lt;/denchmark-link&gt;
+ what is your CPU load average during sampling? At some point, you will be CPU-bound and adding more envs will make sampling slower.
+You can enable vectorization (more than one environment per CPU core) by using &lt;denchmark-link:https://github.com/rlworkgroup/garage/blob/master/src/garage/sampler/vec_worker.py&gt;VecWorker&lt;/denchmark-link&gt;
+.
+		</comment>
+		<comment id='5' author='st2yang' date='2020-07-09T22:13:46Z'>
+		&lt;denchmark-link:https://github.com/ryanjulian&gt;@ryanjulian&lt;/denchmark-link&gt;
+ I think it's 30% at most. I tried several RL packages, in my humble opinion (since I am a very new user of RL packages), it has several techniques to boost sampling: multiple workers, vec env, mpi. So the default setting of garage is to have one env for each workers? The only improvement I can make is to have VecWorker?
+		</comment>
+		<comment id='6' author='st2yang' date='2020-07-09T22:33:35Z'>
+		MPI and multiple workers are two different ways of accomplishing the same objective: they both seek to parallelize sampling across multiple CPUs by creating a new process on each CPU and running the sampler inside of it. An MPI-style API seeks to somewhat hide this fact behind abstractions like parallel_for while a Worker API makes it quite explicit by making the Workers a first-class construct in the program itself.
+Garage uses a Worker API. You have to tell it how many workers you want explicitly by configuring your program, rather than inserting some magical calls to MPI into your program and then starting it with mpirun.
+Vectorization (VecEnv, VecWorker, VecEnvWrapper (in gym), etc.) runs multiple instances of the simulation library on a single CPU. They rely on the idea that the overhead of sampling from the policy (e.g. by feeding forward a neural network) is high, so it's more efficient to sample a bunch of actions, use each of them to run a single step in several simulations. In all cases I'm aware of, stepping of the simulations themselves is still serial, because Python lacks true parallelism.
+Garage allows you to mix-and-match these approaches by choosing a sampler and a worker, or implementing your own if you'd like. You can parallelize sampling across multiple CPUs (using MultiprocessingSampler or RaySampler) or even CPUs/machines across a network (using RaySampler), and you can vectorize sampling within single worker (i.e. CPU) by using VecWorker.
+I've personally used these samplers to completely consume a machine with 72 cores, 256GB of RAM, and 4 GPUs, so I'm pretty confident that they can max out your 4-core machine.
+		</comment>
+		<comment id='7' author='st2yang' date='2020-07-09T22:58:12Z'>
+		In garage, the default worker is DefaultWorker which is non-vectorized, and the default sampler is usually chosen by the algorithm (you can check the value of your_algo.sampler_cls). In many cases, the default sampler_cls is LocalSampler which doesn't do any parallelization across CPUs at all -- in fact it just runs sampling in the main process (equivalent to a for loop in the algorithm. Some other algorithms choose RaySampler (which uses as many DefaultWorkers as you have CPUs instead).
+The default configurations usually use LocalSampler and DefaultWorker, because we believe it is irresponsible for a program to consume resources if you haven't given it permission to consume them. This is the same reason your parallelized compiler will only run on 1 CPU unless you pass the -j option with the number of CPUs it's allowed to use. To stay true to this, we default to consuming as few resources as possible and give you the tools to make your RL algorithms take up as many or as few resources as you'd like.
+You will find this "tools and configuration rather than defaults and inflexible hard-coding" philosophy throughout garage.
+I agree that we should document this much better and make the choosing of a default sampler more consistent (I'm not sure algorithms should have a sampler_cls field, for instance). I apologize it's so unclear right now.
+We actually have no fewer than 4 documentation pages scheduled to be written this month which are supposed to discuss this topic in depth:
+&lt;denchmark-link:https://github.com/rlworkgroup/garage/issues/1679&gt;#1679&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://github.com/rlworkgroup/garage/issues/1538&gt;#1538&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://github.com/rlworkgroup/garage/issues/1670&gt;#1670&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://github.com/rlworkgroup/garage/issues/1539&gt;#1539&lt;/denchmark-link&gt;
+
+If you'd like to collect what you've learned into a short docs PR starting a draft of one of these, we'd be very grateful :).
+		</comment>
+		<comment id='8' author='st2yang' date='2020-07-10T00:16:25Z'>
+		Oh, another possibly related issue that might be increasing the number of TotalEnvSteps per epoch might be the cycles_per_epoch parameter, which many off-policy algorithms use. Basically, this parameter makes every epoch "act like" cycles_per_epoch epochs in a row.
+If you're using an off-policy algorithm, and you want to decrease TotalEnvSteps / epoch, you should set this parameter to 1.
+		</comment>
+		<comment id='9' author='st2yang' date='2020-07-10T03:51:54Z'>
+		&lt;denchmark-link:https://github.com/krzentner&gt;@krzentner&lt;/denchmark-link&gt;
+ You mean , right? In &lt;denchmark-link:https://github.com/rlworkgroup/garage/blob/master/src/garage/tf/algos/ddpg.py#L289&gt;DDPG&lt;/denchmark-link&gt;
+, it obtains trajectory for  cycles, and the default value is 20. Then this might make sense.
+Another thing I don't quite understand is min_buffer_size  and buffer_batch_size. It wouldn't start training and logging performance until min_buffer_size  is met. So I tried to reduce min_buffer_size  and buffer_batch_size a lot (~100), but the training then seems to get stuck at epoch 0. Is this possible?
+		</comment>
+		<comment id='10' author='st2yang' date='2020-07-10T03:53:17Z'>
+		&lt;denchmark-link:https://github.com/ryanjulian&gt;@ryanjulian&lt;/denchmark-link&gt;
+ Thanks a lot for your detailed explanation. I'll try to play with these settings. If I have a sufficient understanding then, I'd be happy to make contributions.
+		</comment>
+		<comment id='11' author='st2yang' date='2020-07-10T04:14:59Z'>
+		to get maximum utilization of your processors, you can use a setup like this in your launcher file:
+# etc...
+from garage.sampler import RaySampler, VecWorker
+
+
+@wrap_experiment(snapshot_mode='last')
+def her_ddpg_fetchreach(ctxt=None, seed=1):
+
+    with LocalRunner(snapshot_config=ctxt) as runner:
+        env = GarageEnv(gym.make('FetchReach-v1'))
+
+       # etc...
+
+        ddpg = DDPG(
+            env_spec=env.spec,
+            # etc...
+        )
+
+        runner.setup(algo=ddpg, env=env, sampler_cls=RaySampler, worker_class=VecWorker)
+        runner.train(n_epochs=50, batch_size=100)
+
+
+her_ddpg_fetchreach()
+you may need to tune the n_envs parameter of VecWorker to get maximum utilization.
+for additional options, see:
+&lt;denchmark-link:https://garage.readthedocs.io/en/latest/_autoapi/garage/experiment/index.html#garage.experiment.LocalRunner.setup&gt;https://garage.readthedocs.io/en/latest/_autoapi/garage/experiment/index.html#garage.experiment.LocalRunner.setup&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://garage.readthedocs.io/en/latest/_autoapi/garage/sampler/index.html#garage.sampler.VecWorker&gt;https://garage.readthedocs.io/en/latest/_autoapi/garage/sampler/index.html#garage.sampler.VecWorker&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='12' author='st2yang' date='2020-07-10T16:44:07Z'>
+		&lt;denchmark-link:https://github.com/ryanjulian&gt;@ryanjulian&lt;/denchmark-link&gt;
+ I tried, and  works. Using  results in some errors, I tried in both her_ddpg and ddpg_pendulum. Not sure if it's bugs or my miss using. I'll take a deeper look later.
+		</comment>
+		<comment id='13' author='st2yang' date='2020-07-10T17:00:46Z'>
+		&lt;denchmark-link:https://github.com/st2yang&gt;@st2yang&lt;/denchmark-link&gt;
+ we'd love if you posted your RayWorker error here so we could take a look! Some bugs only appear in the wild.
+		</comment>
+		<comment id='14' author='st2yang' date='2020-07-13T15:40:16Z'>
+		&lt;denchmark-link:https://github.com/ryanjulian&gt;@ryanjulian&lt;/denchmark-link&gt;
+ I first tried , and ray_sampler.py indeed helps to boost sampling a lot. I thought ray_sampler should be independent of algorithms, but testing tells that some algorithms might cause conflicts when using ray_sampler.
+When I run examples/tf/ddpg_pendulum.py with ray_sampler, it throws key error as follows. And there're similar issues for examples/tf/dqn_pong.py.
+
+File "rl_develop.py", line 71, in 
+ddpg_pendulum(seed=1)
+File "/homes/yangyang/.local/lib/python3.6/site-packages/garage/experiment/experiment.py", line 553, in call
+result = self.function(ctxt, **kwargs)
+File "rl_develop.py", line 68, in ddpg_pendulum
+runner.train(n_epochs=500, batch_size=100)
+File "/homes/yangyang/.local/lib/python3.6/site-packages/garage/experiment/local_runner.py", line 485, in train
+average_return = self._algo.train(self)
+File "/homes/yangyang/.local/lib/python3.6/site-packages/garage/tf/algos/ddpg.py", line 299, in train
+runner.step_path)
+File "/homes/yangyang/.local/lib/python3.6/site-packages/garage/tf/algos/ddpg.py", line 322, in train_once
+paths = samples_to_tensors(paths)
+File "/homes/yangyang/.local/lib/python3.6/site-packages/garage/np/_functions.py", line 23, in samples_to_tensors
+path['success_count'] / path['running_length'] for path in paths
+File "/homes/yangyang/.local/lib/python3.6/site-packages/garage/np/_functions.py", line 23, in 
+path['success_count'] / path['running_length'] for path in paths
+KeyError: 'success_count'
+
+As for examples/tf/her_ddpg_fetchreach.py, I think the alg might not handle dictionary observation properly?
+
+Traceback (most recent call last):
+File "rl_develop.py", line 76, in 
+her_ddpg_fetchreach()
+File "/homes/yangyang/.local/lib/python3.6/site-packages/garage/experiment/experiment.py", line 553, in call
+result = self.function(ctxt, **kwargs)
+File "rl_develop.py", line 73, in her_ddpg_fetchreach
+runner.train(n_epochs=50, batch_size=100)
+File "/homes/yangyang/.local/lib/python3.6/site-packages/garage/experiment/local_runner.py", line 485, in train
+average_return = self._algo.train(self)
+File "/homes/yangyang/.local/lib/python3.6/site-packages/garage/tf/algos/ddpg.py", line 295, in train
+runner.step_path = runner.obtain_samples(runner.step_itr)
+File "/homes/yangyang/.local/lib/python3.6/site-packages/garage/experiment/local_runner.py", line 339, in obtain_samples
+env_update=env_update)
+File "/homes/yangyang/.local/lib/python3.6/site-packages/garage/sampler/ray_sampler.py", line 164, in obtain_samples
+ready_worker_id, trajectory_batch = ray.get(result)
+File "/homes/yangyang/.local/lib/python3.6/site-packages/ray/worker.py", line 1474, in get
+raise value.as_instanceof_cause()
+ray.exceptions.RayTaskError(TypeError): ray::SamplerWorker.rollout() (pid=1216, ip=137.203.141.233)
+File "python/ray/_raylet.pyx", line 446, in ray._raylet.execute_task
+File "python/ray/_raylet.pyx", line 400, in ray._raylet.execute_task.function_executor
+File "/homes/yangyang/.local/lib/python3.6/site-packages/garage/sampler/ray_sampler.py", line 299, in rollout
+return (self.worker_id, self.inner_worker.rollout())
+File "/homes/yangyang/.local/lib/python3.6/site-packages/garage/tf/samplers/worker.py", line 137, in rollout
+return self._inner_worker.rollout()
+File "/homes/yangyang/.local/lib/python3.6/site-packages/garage/sampler/default_worker.py", line 179, in rollout
+while not self.step_rollout():
+File "/homes/yangyang/.local/lib/python3.6/site-packages/garage/sampler/default_worker.py", line 118, in step_rollout
+a, agent_info = self.agent.get_action(self._prev_obs)
+File "/homes/yangyang/.local/lib/python3.6/site-packages/garage/tf/policies/continuous_mlp_policy.py", line 124, in get_action
+action = self._f_prob([observation])
+File "/homes/yangyang/miniconda3/envs/mujoco-gym/lib/python3.6/site-packages/tensorflow/python/client/session.py", line 1233, in _generic_run
+return self.run(fetches, feed_dict=feed_dict, **kwargs)
+File "/homes/yangyang/miniconda3/envs/mujoco-gym/lib/python3.6/site-packages/tensorflow/python/client/session.py", line 958, in run
+run_metadata_ptr)
+File "/homes/yangyang/miniconda3/envs/mujoco-gym/lib/python3.6/site-packages/tensorflow/python/client/session.py", line 1150, in _run
+np_val = np.asarray(subfeed_val, dtype=subfeed_dtype)
+File "/homes/yangyang/miniconda3/envs/mujoco-gym/lib/python3.6/site-packages/numpy/core/_asarray.py", line 85, in asarray
+return array(a, dtype, copy=False, order=order)
+TypeError: float() argument must be a string or a number, not 'dict'
+
+		</comment>
+		<comment id='15' author='st2yang' date='2020-08-03T22:38:10Z'>
+		I ran all of the non MT and Metalearning examples using the RaySampler on master currently, and was unable to reproduce issues with any algorithms besides HER-ddpg-fetch-reach, which is actively being fixed by &lt;denchmark-link:https://github.com/rlworkgroup/garage/pull/1812&gt;#1812&lt;/denchmark-link&gt;
+. Perhaps we've perturbed any other bugs out of existence with regards to the ray sampler, or this is an issue with the dependencies installed when the bugs were first found. I'm going to close this for now.
+		</comment>
+	</comments>
+</bug>

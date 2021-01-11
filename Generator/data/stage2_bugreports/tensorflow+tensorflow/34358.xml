@@ -1,0 +1,173 @@
+<bug id='34358' author='s4sarath' open_date='2019-11-17T14:46:21Z' closed_time='2020-06-25T12:52:18Z'>
+	<summary>Dynamic Batch size ( Bucketing ) for GPU in MirrorStrategy in TF 2.0 and avoid NaN .</summary>
+	<description>
+Tensorflow - version 2
+Hi All, I am trying to do bucketing my tensorflow datasets, so that I can change my batch size (dynamic batch size) based on different sequence length, so that I can exploit GPU performance better. I am using strategy = tf.distribute.MirroredStrategy() .
+Assume I am having 8 GPUs n_gpus=8, according to mirror strategy if we are having a batch size of 16 batch_size=16, it will distribute 2 ( batch_size / n_gpus )  batch datasets to each of the GPUs. Now, assume batch_size is dynamic and changing in each iteration over the dataset iterator. In order to make it distributed, whenever  batch_size is not a multiple of n_gpus, I will pad it and make it to the nearest possible multiple of n_gpus. (If batch_size = 6, I will pad with 2 rows of zeros to make it 8 ).  Everything works well in CPUs. But when I am using iterator = strategy.experimental_distribute_dataset(input_data), things becomes difficult. I am providing the code .
+&lt;denchmark-code&gt;import tensorflow as tf
+import numpy as np
+
+def create_dummy_squad_data(max_seq_length,n,vocab_size=30000):
+    np.random.seed(1)
+    input_ids   = np.random.randint(1, vocab_size-1, (n,max_seq_length))
+    input_mask  = np.random.randint(0, 2, (n,max_seq_length))
+    token_type_ids   = np.random.randint(1, 2, (n,max_seq_length))
+    start_labels = np.random.randint(1, max_seq_length-1, (n))
+    end_labels = np.random.randint(1, max_seq_length-1, (n))
+
+    return (input_ids, input_mask, token_type_ids, start_labels, end_labels)
+
+
+def map_to_dict(input_ids, input_mask, token_type_ids, start_labels, end_labels):
+    inputs = {}
+    inputs['input_ids']   = input_ids
+    inputs['input_mask']  = input_mask
+    inputs['segment_ids'] = token_type_ids
+
+    labels = {}
+    labels['start_positions'] = start_labels
+    labels['end_positions'] = end_labels
+
+    return inputs, labels
+
+def pad_batch(inputs, labels, batch_multiple=8):
+    batch_size = tf.shape(inputs['input_ids'])[0]
+    mod = batch_size % batch_multiple
+    has_mod = tf.cast(tf.cast(mod, tf.bool), tf.int32)
+    batch_padding = batch_multiple * has_mod - mod
+
+    inputs_padded = {}
+    for k, feature in inputs.items():
+        rank = len(feature.shape)
+        paddings = [[0, 0] for _ in range(rank)]
+        paddings[0][1] = batch_padding
+        padded_feature = tf.pad(feature, paddings)
+        inputs_padded[k] = padded_feature
+
+    labels_padded = {}
+    for k, feature in labels.items():
+        rank = len(feature.shape)
+        paddings = [[0, 0] for _ in range(rank)]
+        paddings[0][1] = batch_padding
+        padded_feature = tf.pad(feature, paddings)
+        labels_padded[k] = padded_feature
+    return inputs_padded, labels_padded
+
+#### Main code starts from here (CPU code)
+input_ids, input_mask, token_type_ids, start_labels, end_labels = create_dummy_squad_data(5, 100)
+d = tf.data.Dataset.from_tensor_slices((input_ids, input_mask, token_type_ids, start_labels, end_labels))
+d = d.map(map_to_dict)
+
+batch_size_per_gpu = 1
+num_gpus       = 8
+
+batch_size = batch_size_per_gpu * num_gpus
+
+d = d.batch(batch_size)
+d = d.map(pad_batch)
+for item in d:
+    pass
+&lt;/denchmark-code&gt;
+
+Last batch of item is having batch_size = 4 ( if we dont pad ). As I am using padding, things are good
+&lt;denchmark-h:h2&gt;Sample output ( item[0]['input_ids'] )&lt;/denchmark-h&gt;
+
+&lt;denchmark-code&gt;&lt;tf.Tensor: id=1801, shape=(8, 5), dtype=int64, numpy=
+array([[29865,  5139,  4322,  7079, 24896],
+       [ 2548,  1583,  7529, 14554, 21480],
+       [20593,  2560, 27139, 26397, 28367],
+       [25292, 23995, 26283,  4891, 28905],
+       [    0,     0,     0,     0,     0],
+       [    0,     0,     0,     0,     0],
+       [    0,     0,     0,     0,     0],
+       [    0,     0,     0,     0,     0]])&gt;
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h4&gt;Code in GPU ( This is what I want )&lt;/denchmark-h&gt;
+
+&lt;denchmark-code&gt;    with strategy.scope():
+        iterator = strategy.experimental_distribute_dataset(d)
+    all_batch_data = [] #### was curious to know how things work
+    with strategy.scope():
+        for batch_data in iterator:
+            all_batch_data.append(batch_data)
+            print("Batch  Data shape per gpus", batch_data[0]['input_ids'].values[0].shape)
+&lt;/denchmark-code&gt;
+
+As you see below, GPU [0,1,2,3] takes each 4 elements and padded it individually ( which was not I expected ). and GPU[4,5,6,7], not receiving anything. At the time of modeling, the last 4 GPUs, returns nan as loss, and when I am using strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses, axis=None), it becomes nan . Here, per_replica_losses is losses from 8 GPUs. First 4 is having values, but last 4 is nan.
+&lt;denchmark-h:h2&gt;Sample output ( batch_data[0]['input_ids'])&lt;/denchmark-h&gt;
+
+&lt;denchmark-code&gt;'input_ids': PerReplica:{
+    0 /job:localhost/replica:0/task:0/device:GPU:0: &lt;tf.Tensor: id=123188, shape=(8, 5), dtype=int64, numpy=
+  array([[29865,  5139,  4322,  7079, 24896],
+         [    0,     0,     0,     0,     0],
+         [    0,     0,     0,     0,     0],
+         [    0,     0,     0,     0,     0],
+         [    0,     0,     0,     0,     0],
+         [    0,     0,     0,     0,     0],
+         [    0,     0,     0,     0,     0],
+         [    0,     0,     0,     0,     0]])&gt;,
+    1 /job:localhost/replica:0/task:0/device:GPU:1: &lt;tf.Tensor: id=123194, shape=(8, 5), dtype=int64, numpy=
+  array([[ 2548,  1583,  7529, 14554, 21480],
+         [    0,     0,     0,     0,     0],
+         [    0,     0,     0,     0,     0],
+         [    0,     0,     0,     0,     0],
+         [    0,     0,     0,     0,     0],
+         [    0,     0,     0,     0,     0],
+         [    0,     0,     0,     0,     0],
+         [    0,     0,     0,     0,     0]])&gt;,
+    2 /job:localhost/replica:0/task:0/device:GPU:2: &lt;tf.Tensor: id=123200, shape=(8, 5), dtype=int64, numpy=
+  array([[20593,  2560, 27139, 26397, 28367],
+         [    0,     0,     0,     0,     0],
+         [    0,     0,     0,     0,     0],
+         [    0,     0,     0,     0,     0],
+         [    0,     0,     0,     0,     0],
+         [    0,     0,     0,     0,     0],
+         [    0,     0,     0,     0,     0],
+         [    0,     0,     0,     0,     0]])&gt;,
+    3 /job:localhost/replica:0/task:0/device:GPU:3: &lt;tf.Tensor: id=123206, shape=(8, 5), dtype=int64, numpy=
+  array([[25292, 23995, 26283,  4891, 28905],
+         [    0,     0,     0,     0,     0],
+         [    0,     0,     0,     0,     0],
+         [    0,     0,     0,     0,     0],
+         [    0,     0,     0,     0,     0],
+         [    0,     0,     0,     0,     0],
+         [    0,     0,     0,     0,     0],
+         [    0,     0,     0,     0,     0]])&gt;,
+    4 /job:localhost/replica:0/task:0/device:GPU:4: &lt;tf.Tensor: id=123214, shape=(0, 5), dtype=int64, numpy=array([], shape=(0, 5), dtype=int64)&gt;,
+    5 /job:localhost/replica:0/task:0/device:GPU:5: &lt;tf.Tensor: id=123230, shape=(0, 5), dtype=int64, numpy=array([], shape=(0, 5), dtype=int64)&gt;,
+    6 /job:localhost/replica:0/task:0/device:GPU:6: &lt;tf.Tensor: id=123246, shape=(0, 5), dtype=int64, numpy=array([], shape=(0, 5), dtype=int64)&gt;,
+    7 /job:localhost/replica:0/task:0/device:GPU:7: &lt;tf.Tensor: id=123262, shape=(0, 5), dtype=int64, numpy=array([], shape=(0, 5), dtype=int64)&gt;
+  }}
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h2&gt;Expected behaviour&lt;/denchmark-h&gt;
+
+If I am not using pad_batch, when batch_size = 8, each GPU gets 1 dataset each and things are good. But, as I am having dynamic batch size, all batch sizes are not multiple of n_gpus=8. Now, when i am trying to make sure that, batch_size is multiple of n_gpus, things get messed up.
+If the last batch is 4, we pad 4 zeros to make it 8. and I expect it will be distribute to each GPU ( 1 dataset each ) and last 4 GPUs get zero padded rows each, so that they wont return  and things are good. But, how could I achieve it. &lt;denchmark-link:https://github.com/guptapriya&gt;@guptapriya&lt;/denchmark-link&gt;
+
+Might be an extension of &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/29975&gt;#29975&lt;/denchmark-link&gt;
+ .
+Sorry if I confuse you with long explanation .
+	</description>
+	<comments>
+		<comment id='1' author='s4sarath' date='2020-04-14T18:22:35Z'>
+		You don't need to pad your dataset. TF can handle a partial batch for MirroredStrategy (MultiWorkerMirroredStrategy is working in progress).
+I'm curious how you achieve dynamic batch size though. Are you creating one dataset per bucket?
+		</comment>
+		<comment id='2' author='s4sarath' date='2020-04-14T19:27:42Z'>
+		FYI I was told that the partial batch support was a recent development. Could you try 2.2 or nightly?
+		</comment>
+		<comment id='3' author='s4sarath' date='2020-06-25T12:52:18Z'>
+		&lt;denchmark-link:https://github.com/s4sarath&gt;@s4sarath&lt;/denchmark-link&gt;
+   Closing this issue as we don't have enough information to reproduce it. Please update the issue when new information becomes available, and we will reopen the issue. Thanks!
+		</comment>
+		<comment id='4' author='s4sarath' date='2020-06-25T12:52:19Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/34358&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/34358&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,156 @@
+<bug id='18731' author='DickJC123' open_date='2020-07-16T02:00:27Z' closed_time='2020-07-19T21:14:48Z'>
+	<summary>test_numpy_default_dtype::test_default_float_dtype is not flagging true_divide op issues</summary>
+	<description>
+&lt;denchmark-h:h2&gt;Description&lt;/denchmark-h&gt;
+
+test_default_float_dtype tests (among other things) the true_divide op's ability to divide an int array by an int scalar to produce either a float32 or float64 output array based on the setting of is_np_default_dtype.  However, the test overlooks a backend error that is created during the test, which can surface during a test teardown of a future test.  This is not only confusing, but also points to issues with the true_divide op itself.
+The simplest way to expose this issue is with:
+&lt;denchmark-code&gt;MXNET_ENGINE_TYPE=NaiveEngine pytest --verbose -s tests/python/unittest/test_numpy_default_dtype.py::test_default_float_dtype
+&lt;/denchmark-code&gt;
+
+Alternatively, one can add the line mxnet.nd.waitall() to the end of test_default_float_dtype, at which point the MXNET_ENGINE_TYPE setting is not needed.  In both cases, the error is:
+&lt;denchmark-code&gt;...
+E           mxnet.base.MXNetError: Traceback (most recent call last):
+E             File "include/mxnet/././tensor_blob.h", line 256
+E           MXNetError: Check failed: mshadow: :DataType&lt;DType&gt;::kFlag == type_flag_: TBlob.get_with_shape: data type do not match specified type.Expected: double v.s. given float
+
+python/mxnet/_ffi/_ctypes/function.py:115: MXNetError
+&lt;/denchmark-code&gt;
+
+So basically the test incorrectly feels that the output is of the expected type, when in fact the backend engine's execution of the function fails (with a type mismatch).  I ran into this problem when my in-development PR &lt;denchmark-link:https://github.com/apache/incubator-mxnet/pull/18694&gt;#18694&lt;/denchmark-link&gt;
+ began to include a mxnet.nd.waitall() call between unittests for enhanced test isolation.
+In order to make progress with my PR, I investigated the issues with true_divide, and have a fixing commit &lt;denchmark-link:https://github.com/apache/incubator-mxnet/commit/65f16d8638747aa0e2a4bfe911ddeef675c56b9c&gt;65f16d8&lt;/denchmark-link&gt;
+ as part of that PR.  I'd appreciate a review of these changes, or an alternate fix proposed.  Thanks &lt;denchmark-link:https://github.com/haojin2&gt;@haojin2&lt;/denchmark-link&gt;
+ , &lt;denchmark-link:https://github.com/reminisce&gt;@reminisce&lt;/denchmark-link&gt;
+ or &lt;denchmark-link:https://github.com/JiangZhaoh&gt;@JiangZhaoh&lt;/denchmark-link&gt;
+ .
+Basically, the fix addresses two issues:
+First, the output dtype of true_divide is a based on a parameter set by the main python thread and accessed within C++ by mxnet::common::GetDefaultDtype().  While this can be either float32 or float64, the backend implementation has a hard-coded cast of the output tensor pointer to float:
+
+
+
+incubator-mxnet/src/operator/numpy/np_true_divide-inl.h
+
+
+        Lines 66 to 72
+      in
+      e2366e9
+
+
+
+
+
+
+ MXNET_INT_TYPE_SWITCH(inputs[0].type_flag_, DType, { 
+
+
+
+ MXNET_ASSIGN_REQ_SWITCH(req[0], Req, { 
+
+
+
+     Kernel&lt;op_with_req&lt;OP, Req&gt;, xpu&gt;::Launch( 
+
+
+
+       s, data.Size(), out.dptr&lt;float&gt;(), data.dptr&lt;DType&gt;(), 
+
+
+
+ static_cast&lt;float&gt;(alpha)); 
+
+
+
+   }); 
+
+
+
+ }); 
+
+
+
+
+
+Also, before performing the above execution, the worker thread performs the check: 
+
+
+incubator-mxnet/src/operator/numpy/np_true_divide-inl.h
+
+
+        Lines 62 to 65
+      in
+      e2366e9
+
+
+
+
+
+
+ CHECK_EQ(outputs[0].type_flag_, mxnet::common::GetDefaultDtype()) 
+
+
+
+   &lt;&lt; "true_divide only supports float32 and float64" 
+
+
+
+ " output when input's dtype is " 
+
+
+
+   &lt;&lt; type_string(inputs[0].type_flag_); 
+
+
+
+
+
+I think it's totally appropriate for the InferType function to call mxnet::common::GetDefaultDtype(), as this is performed by the main python thread and synchronized to changes in the default dtype.  However, once the output type is determined, I don't think it's appropriate for the backend thread to once-again check the actual output type against the current value of GetDefaultDtype().  That would be a race.  The backend thread should merely execute the op based on the output TBlob's dtype, assuming it's supported.
+Both issues are addressed by the commit referenced above.
+See "To Reproduce" below for a small program that should pass on any proposed alternative fix.
+Finally, I'll acknowledge that the implementation of true_divide(int_array, int_array), potentially with broadcast, has similar issues, but the implementation is trickier and best left to our numpy module developers.
+&lt;denchmark-h:h3&gt;Error Message&lt;/denchmark-h&gt;
+
+see above.
+&lt;denchmark-h:h2&gt;To Reproduce&lt;/denchmark-h&gt;
+
+&lt;denchmark-code&gt;import mxnet as mx
+import numpy as _np
+from mxnet import numpy as np
+
+@mx.use_np_default_dtype
+def test_true_divide(a,b, synchronize=False):
+    x = np.true_divide(a,b)
+    if synchronize:
+        # Make sure the backend, which presently calls mxnet::common::GetDefaultDtype(), is done.
+        mx.nd.waitall()
+    return x
+
+
+# divide int array with int scalar to produce float64 array
+for synchronize in [True, False]:
+    out = test_true_divide(mx.nd.array([1,], dtype='int'), 9, synchronize=synchronize)
+    print('true_divide output value (of type {}) = {:.15f}'.format(out.dtype, out.asnumpy()[0]))
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h3&gt;Steps to reproduce&lt;/denchmark-h&gt;
+
+
+copy-paste above code to a file test_true_divide.py
+python test_true_divide.py
+
+&lt;denchmark-h:h2&gt;What have you tried to solve it?&lt;/denchmark-h&gt;
+
+
+Commit included in referenced in-development PR.
+
+
+&lt;denchmark-h:h2&gt;Environment&lt;/denchmark-h&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='DickJC123' date='2020-07-19T21:14:48Z'>
+		fixed by &lt;denchmark-link:https://github.com/apache/incubator-mxnet/pull/18694&gt;#18694&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

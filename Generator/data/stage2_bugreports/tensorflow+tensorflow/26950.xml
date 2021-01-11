@@ -1,0 +1,470 @@
+<bug id='26950' author='aaryapatel007' open_date='2019-03-20T17:26:31Z' closed_time='2019-03-26T00:51:17Z'>
+	<summary>FailedPreconditionError when training on TPU</summary>
+	<description>
+Please make sure that this is a bug. As per our GitHub Policy, we only address code/doc bugs, performance issues, feature requests and build/installation issues on GitHub. tag:bug_template
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow):YES
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04):Google Colab
+Mobile device (e.g. iPhone 8, Pixel 2, Samsung Galaxy) if the issue happens on mobile device:
+TensorFlow installed from (source or binary):
+TensorFlow version (use command below):1.13.1
+Python version:3.6
+Bazel version (if compiling from source):
+GCC/Compiler version (if compiling from source):
+CUDA/cuDNN version:
+GPU model and memory:
+
+You can collect some of this information using our environment capture &lt;denchmark-link:https://github.com/tensorflow/tensorflow/tree/master/tools/tf_env_collect.sh&gt;script&lt;/denchmark-link&gt;
+
+You can also obtain the TensorFlow version with
+python -c "import tensorflow as tf; print(tf.GIT_VERSION, tf.VERSION)"
+Describe the current behavior
+I want to train my model using AdaBound optimizer but the model after compilation is throwing error using the TPU.
+Code to reproduce the issue
+Provide a reproducible test case that is the bare minimum necessary to generate the problem.
+&lt;denchmark-code&gt;import re
+class AdaBoundOptimizer(tf.train.Optimizer):
+    """Optimizer that implements the AdaBound algorithm.
+    See [Luo et al., 2019](https://openreview.net/forum?id=Bkg3g2R9FX)
+    ([pdf](https://openreview.net/pdf?id=Bkg3g2R9FX)).
+    """
+
+    def __init__(self,
+                 learning_rate=0.001,
+                 final_lr=0.1,
+                 beta1=0.9,
+                 beta2=0.999,
+                 gamma=1e-3,
+                 epsilon=1e-8,
+                 amsbound=False,
+                 decay=0.,
+                 weight_decay=0.,
+                 exclude_from_weight_decay=None,
+                 use_locking=False, name="AdaBound"):
+        super(AdaBoundOptimizer, self).__init__(use_locking, name)
+
+        if final_lr &lt;= 0.:
+            raise ValueError("Invalid final learning rate : {}".format(final_lr))
+        if not 0. &lt;= beta1 &lt; 1.:
+            raise ValueError("Invalid beta1 value : {}".format(beta1))
+        if not 0. &lt;= beta2 &lt; 1.:
+            raise ValueError("Invalid beta2 value : {}".format(beta2))
+        if not 0. &lt;= gamma &lt; 1.:
+            raise ValueError("Invalid gamma value : {}".format(gamma))
+        if epsilon &lt;= 0.:
+            raise ValueError("Invalid epsilon value : {}".format(epsilon))
+
+        self._lr = learning_rate
+        self._beta1 = beta1
+        self._beta2 = beta2
+        self._final_lr = final_lr
+        self._gamma = gamma
+        self._epsilon = epsilon
+        self._amsbound = amsbound
+        self._decay = decay
+        self._weight_decay = weight_decay
+        self._exclude_from_weight_decay = exclude_from_weight_decay
+
+        self._base_lr = learning_rate
+
+    def apply_gradients(self, grads_and_vars, global_step=None, name=None):
+        lr = self._lr
+        t = tf.cast(global_step, dtype=tf.float32)
+
+        if self._decay &gt; 0.:
+            lr *= (1. / (1. + self._decay * t))
+
+        t += 1
+
+        bias_correction1 = 1. - (self._beta1 ** t)
+        bias_correction2 = 1. - (self._beta2 ** t)
+        step_size = (lr * tf.sqrt(bias_correction2) / bias_correction1)
+
+        # Applies bounds on actual learning rate
+        # lr_scheduler cannot affect final_lr, this is a workaround to apply lr decay
+        final_lr = self._final_lr * lr / self._base_lr
+        lower_bound = final_lr * (1. - 1. / (self._gamma * t + 1.))
+        upper_bound = final_lr * (1. + 1. / (self._gamma * t))
+
+        assignments = []
+        for grad, param in grads_and_vars:
+            if grad is None and param is None:
+                continue
+
+            param_name = self._get_variable_name(param.name)
+
+            m = tf.get_variable(
+                name=param_name + "/adabound_m",
+                shape=param.shape.as_list(),
+                dtype=tf.float32,
+                trainable=False,
+                initializer=tf.zeros_initializer())
+            v = tf.get_variable(
+                name=param_name + "/adabound_v",
+                shape=param.shape.as_list(),
+                dtype=tf.float32,
+                trainable=False,
+                initializer=tf.zeros_initializer())
+            if self._amsbound:
+                v_hat = tf.get_variable(
+                    name=param_name + "/adabound_v_hat",
+                    shape=param.shape.as_list(),
+                    dtype=tf.float32,
+                    trainable=False,
+                    initializer=tf.zeros_initializer())
+
+            m_t = (
+                    tf.multiply(self._beta1, m) + tf.multiply(1. - self._beta1, grad))
+            v_t = (
+                    tf.multiply(self._beta2, v) + tf.multiply(1. - self._beta2, tf.square(grad)))
+
+            if self._amsbound:
+                # Maintains the maximum of all 2nd moment running avg. till now
+                v_hat_t = tf.maximum(v_hat, v_t)
+
+                # Use the max. for normalizing running avg. of gradient
+                denom = (tf.sqrt(v_hat_t) + self._epsilon)
+            else:
+                denom = (tf.sqrt(v_t) + self._epsilon)
+
+            step_size_p = step_size * tf.ones_like(denom)
+            step_size_p_bound = step_size_p / denom
+
+            lr_t = m_t * tf.clip_by_value(t=step_size_p_bound,
+                                          clip_value_min=lower_bound,
+                                          clip_value_max=upper_bound)
+            p_t = param - lr_t
+
+            if self._do_use_weight_decay(param_name):
+                p_t += self._weight_decay * param
+
+            update_list = [param.assign(p_t), m.assign(m_t), v.assign(v_t)]
+            if self._amsbound:
+                update_list.append(v_hat.assign(v_hat_t))
+
+            assignments.extend(update_list)
+
+        # update the global step
+        assignments.append(global_step.assign_add(1))
+
+        return tf.group(*assignments, name=name)
+
+    def _do_use_weight_decay(self, param_name):
+        """Whether to use L2 weight decay for `param_name`."""
+        if not self._weight_decay:
+            return False
+        if self._exclude_from_weight_decay:
+            for r in self.exclude_from_weight_decay:
+                if re.search(r, param_name) is not None:
+                    return False
+        return True
+
+    @staticmethod
+    def _get_variable_name(param_name):
+        """Get the variable name from the tensor name."""
+        m = re.match("^(.*):\\d+$", param_name)
+        if m is not None:
+            param_name = m.group(1)
+        return param_name
+
+
+tf.logging.set_verbosity(tf.logging.INFO)
+tpu_model = tf.contrib.tpu.keras_to_tpu_model(
+      res_model,
+      strategy=tf.contrib.tpu.TPUDistributionStrategy(
+          tf.contrib.cluster_resolver.TPUClusterResolver(tpu='grpc://' + os.environ['COLAB_TPU_ADDR'])
+      )
+  )
+tpu_model.compile(optimizer=AdaBoundOptimizer(learning_rate=0.0001, final_lr=0.1, beta1=0.9, beta2=0.999, amsbound=False), loss=tf.keras.losses.binary_crossentropy, metrics=['acc'])
+ 
+&lt;/denchmark-code&gt;
+
+Other info / logs
+Include any logs or source code that would be helpful to diagnose the problem. If including tracebacks, please include the full traceback. Large logs and files should be attached.
+&lt;denchmark-code&gt;labeled_files size : 220025
+test_files size : 57458
+
+FOLD: 0
+Train: 
+{0: 104725, 1: 71292}
+Val: 
+{0: 26182, 1: 17824}
+INFO:tensorflow:Querying Tensorflow master (grpc://10.111.5.58:8470) for TPU system metadata.
+INFO:tensorflow:Found TPU system:
+INFO:tensorflow:*** Num TPU Cores: 8
+INFO:tensorflow:*** Num TPU Workers: 1
+INFO:tensorflow:*** Num TPU Cores Per Worker: 8
+INFO:tensorflow:*** Available Device: _DeviceAttributes(/job:worker/replica:0/task:0/device:CPU:0, CPU, -1, 6439601644184290312)
+INFO:tensorflow:*** Available Device: _DeviceAttributes(/job:worker/replica:0/task:0/device:XLA_CPU:0, XLA_CPU, 17179869184, 5999939926878101922)
+INFO:tensorflow:*** Available Device: _DeviceAttributes(/job:worker/replica:0/task:0/device:TPU:0, TPU, 17179869184, 2915973256505920338)
+INFO:tensorflow:*** Available Device: _DeviceAttributes(/job:worker/replica:0/task:0/device:TPU:1, TPU, 17179869184, 302180528578565888)
+INFO:tensorflow:*** Available Device: _DeviceAttributes(/job:worker/replica:0/task:0/device:TPU:2, TPU, 17179869184, 7907037798004119455)
+INFO:tensorflow:*** Available Device: _DeviceAttributes(/job:worker/replica:0/task:0/device:TPU:3, TPU, 17179869184, 8233517434947874609)
+INFO:tensorflow:*** Available Device: _DeviceAttributes(/job:worker/replica:0/task:0/device:TPU:4, TPU, 17179869184, 16859822429318257159)
+INFO:tensorflow:*** Available Device: _DeviceAttributes(/job:worker/replica:0/task:0/device:TPU:5, TPU, 17179869184, 11771514073813576570)
+INFO:tensorflow:*** Available Device: _DeviceAttributes(/job:worker/replica:0/task:0/device:TPU:6, TPU, 17179869184, 8064934956870564867)
+INFO:tensorflow:*** Available Device: _DeviceAttributes(/job:worker/replica:0/task:0/device:TPU:7, TPU, 17179869184, 14384107720867386803)
+INFO:tensorflow:*** Available Device: _DeviceAttributes(/job:worker/replica:0/task:0/device:TPU_SYSTEM:0, TPU_SYSTEM, 17179869184, 13575223746004231404)
+WARNING:tensorflow:tpu_model (from tensorflow.contrib.tpu.python.tpu.keras_support) is experimental and may change or be removed at any time, and without warning.
+Epoch 1/10
+INFO:tensorflow:New input shapes; (re-)compiling: mode=train (# of cores 8), [TensorSpec(shape=(128,), dtype=tf.int32, name='core_id0'), TensorSpec(shape=(128, 96, 96, 3), dtype=tf.float32, name='input_10'), TensorSpec(shape=(128, 1), dtype=tf.float32, name='dense_1_target_10')]
+INFO:tensorflow:Overriding default placeholder.
+INFO:tensorflow:Remapping placeholder for input_1
+INFO:tensorflow:Started compiling
+INFO:tensorflow:Finished compiling. Time elapsed: 12.17287826538086 secs
+INFO:tensorflow:Setting weights on TPU model.
+---------------------------------------------------------------------------
+FailedPreconditionError                   Traceback (most recent call last)
+/usr/local/lib/python3.6/dist-packages/tensorflow/python/client/session.py in _do_call(self, fn, *args)
+   1333     try:
+-&gt; 1334       return fn(*args)
+   1335     except errors.OpError as e:
+
+/usr/local/lib/python3.6/dist-packages/tensorflow/python/client/session.py in _run_fn(feed_dict, fetch_list, target_list, options, run_metadata)
+   1318       return self._call_tf_sessionrun(
+-&gt; 1319           options, feed_dict, fetch_list, target_list, run_metadata)
+   1320 
+
+/usr/local/lib/python3.6/dist-packages/tensorflow/python/client/session.py in _call_tf_sessionrun(self, options, feed_dict, fetch_list, target_list, run_metadata)
+   1406         self._session, options, feed_dict, fetch_list, target_list,
+-&gt; 1407         run_metadata)
+   1408 
+
+FailedPreconditionError: Combined status information from 9 operations:
+
+Status code: Failed precondition [9x]
+  Error while reading resource variable tpu_140680564147536//dense_1/kernel/adabound_m from Container: worker. This could mean that the variable was uninitialized. Not found: Resource worker/tpu_140680564147536//dense_1/kernel/adabound_m/N10tensorflow3VarE does not exist.
+  	 [[{{node tpu_140680564147536//dense_1/kernel/adabound_m}}]] [1x]
+  Error while reading resource variable tpu_140680564147536//dense_1/kernel/adabound_m from Container: worker. This could mean that the variable was uninitialized. Not found: Resource worker/tpu_140680564147536//dense_1/kernel/adabound_m/N10tensorflow3VarE does not exist.
+  	 [[{{node tpu_140680564147536//dense_1/kernel/adabound_m}}]]
+  	 [[{{node TPUReplicateMetadata}}]] [1x]
+  Error while reading resource variable tpu_140680564147536//dense_1/kernel/adabound_m from Container: worker. This could mean that the variable was uninitialized. Not found: Resource worker/tpu_140680564147536//dense_1/kernel/adabound_m/N10tensorflow3VarE does not exist.
+  	 [[{{node tpu_140680564147536//dense_1/kernel/adabound_m}}]]
+  	 [[{{node cluster/_variable_copy/_80}}]] [7x]
+(0 successful operations.)
+
+During handling of the above exception, another exception occurred:
+
+FailedPreconditionError                   Traceback (most recent call last)
+&lt;ipython-input-37-fe905384dbd9&gt; in &lt;module&gt;()
+     75 
+     76   history = tpu_model.fit_generator(data_gen(train,id_label_map,train_batch_size,do_train_augmentations),steps_per_epoch=train_steps,epochs = 10,
+---&gt; 77                                    validation_data = data_gen(val,id_label_map,val_batch_size,do_inference_aug),validation_steps = val_steps,callbacks = callbacks)
+     78 
+     79 
+
+/usr/local/lib/python3.6/dist-packages/tensorflow/python/keras/engine/training.py in fit_generator(self, generator, steps_per_epoch, epochs, verbose, callbacks, validation_data, validation_steps, class_weight, max_queue_size, workers, use_multiprocessing, shuffle, initial_epoch)
+   1424         use_multiprocessing=use_multiprocessing,
+   1425         shuffle=shuffle,
+-&gt; 1426         initial_epoch=initial_epoch)
+   1427 
+   1428   def evaluate_generator(self,
+
+/usr/local/lib/python3.6/dist-packages/tensorflow/python/keras/engine/training_generator.py in model_iteration(model, data, steps_per_epoch, epochs, verbose, callbacks, validation_data, validation_steps, class_weight, max_queue_size, workers, use_multiprocessing, shuffle, initial_epoch, mode, batch_size, **kwargs)
+    189       progbar.on_batch_begin(step, batch_logs)
+    190 
+--&gt; 191       batch_outs = batch_function(*batch_data)
+    192       if not isinstance(batch_outs, list):
+    193         batch_outs = [batch_outs]
+
+/usr/local/lib/python3.6/dist-packages/tensorflow/python/keras/engine/training.py in train_on_batch(self, x, y, sample_weight, class_weight, reset_metrics)
+   1189       else:
+   1190         self._make_fit_function()
+-&gt; 1191         outputs = self._fit_function(ins)  # pylint: disable=not-callable
+   1192 
+   1193     if reset_metrics:
+
+/usr/local/lib/python3.6/dist-packages/tensorflow/contrib/tpu/python/tpu/keras_support.py in __call__(***failed resolving arguments***)
+   1267         tpu_model_ops.infeed_op, tpu_model_ops.execute_op,
+   1268         tpu_model_ops.outfeed_op
+-&gt; 1269     ], infeed_dict)
+   1270     return self._process_outputs(outfeed_outputs)
+   1271 
+
+/usr/local/lib/python3.6/dist-packages/tensorflow/python/client/session.py in run(self, fetches, feed_dict, options, run_metadata)
+    927     try:
+    928       result = self._run(None, fetches, feed_dict, options_ptr,
+--&gt; 929                          run_metadata_ptr)
+    930       if run_metadata:
+    931         proto_data = tf_session.TF_GetBuffer(run_metadata_ptr)
+
+/usr/local/lib/python3.6/dist-packages/tensorflow/python/client/session.py in _run(self, handle, fetches, feed_dict, options, run_metadata)
+   1150     if final_fetches or final_targets or (handle and feed_dict_tensor):
+   1151       results = self._do_run(handle, final_targets, final_fetches,
+-&gt; 1152                              feed_dict_tensor, options, run_metadata)
+   1153     else:
+   1154       results = []
+
+/usr/local/lib/python3.6/dist-packages/tensorflow/python/client/session.py in _do_run(self, handle, target_list, fetch_list, feed_dict, options, run_metadata)
+   1326     if handle is None:
+   1327       return self._do_call(_run_fn, feeds, fetches, targets, options,
+-&gt; 1328                            run_metadata)
+   1329     else:
+   1330       return self._do_call(_prun_fn, handle, feeds, fetches)
+
+/usr/local/lib/python3.6/dist-packages/tensorflow/python/client/session.py in _do_call(self, fn, *args)
+   1346           pass
+   1347       message = error_interpolation.interpolate(message, self._graph)
+-&gt; 1348       raise type(e)(node_def, op, message)
+   1349 
+   1350   def _extend_graph(self):
+
+FailedPreconditionError: Combined status information from 9 operations:
+
+Status code: Failed precondition [9x]
+  Error while reading resource variable tpu_140680564147536//dense_1/kernel/adabound_m from Container: worker. This could mean that the variable was uninitialized. Not found: Resource worker/tpu_140680564147536//dense_1/kernel/adabound_m/N10tensorflow3VarE does not exist.
+  	 [[node tpu_140680564147536//dense_1/kernel/adabound_m (defined at &lt;ipython-input-36-baab4250bb83&gt;:77) ]] [1x]
+  Error while reading resource variable tpu_140680564147536//dense_1/kernel/adabound_m from Container: worker. This could mean that the variable was uninitialized. Not found: Resource worker/tpu_140680564147536//dense_1/kernel/adabound_m/N10tensorflow3VarE does not exist.
+  	 [[node tpu_140680564147536//dense_1/kernel/adabound_m (defined at &lt;ipython-input-36-baab4250bb83&gt;:77) ]]
+  	 [[node TPUReplicateMetadata (defined at &lt;ipython-input-37-fe905384dbd9&gt;:77) ]] [1x]
+  Error while reading resource variable tpu_140680564147536//dense_1/kernel/adabound_m from Container: worker. This could mean that the variable was uninitialized. Not found: Resource worker/tpu_140680564147536//dense_1/kernel/adabound_m/N10tensorflow3VarE does not exist.
+  	 [[node tpu_140680564147536//dense_1/kernel/adabound_m (defined at &lt;ipython-input-36-baab4250bb83&gt;:77) ]]
+  	 [[{{node cluster/_variable_copy/_80}}]] [7x]
+(0 successful operations.)
+
+Caused by op 'tpu_140680564147536//dense_1/kernel/adabound_m', defined at:
+  File "/usr/lib/python3.6/runpy.py", line 193, in _run_module_as_main
+    "__main__", mod_spec)
+  File "/usr/lib/python3.6/runpy.py", line 85, in _run_code
+    exec(code, run_globals)
+  File "/usr/local/lib/python3.6/dist-packages/ipykernel_launcher.py", line 16, in &lt;module&gt;
+    app.launch_new_instance()
+  File "/usr/local/lib/python3.6/dist-packages/traitlets/config/application.py", line 658, in launch_instance
+    app.start()
+  File "/usr/local/lib/python3.6/dist-packages/ipykernel/kernelapp.py", line 477, in start
+    ioloop.IOLoop.instance().start()
+  File "/usr/local/lib/python3.6/dist-packages/tornado/ioloop.py", line 888, in start
+    handler_func(fd_obj, events)
+  File "/usr/local/lib/python3.6/dist-packages/tornado/stack_context.py", line 277, in null_wrapper
+    return fn(*args, **kwargs)
+  File "/usr/local/lib/python3.6/dist-packages/zmq/eventloop/zmqstream.py", line 450, in _handle_events
+    self._handle_recv()
+  File "/usr/local/lib/python3.6/dist-packages/zmq/eventloop/zmqstream.py", line 480, in _handle_recv
+    self._run_callback(callback, msg)
+  File "/usr/local/lib/python3.6/dist-packages/zmq/eventloop/zmqstream.py", line 432, in _run_callback
+    callback(*args, **kwargs)
+  File "/usr/local/lib/python3.6/dist-packages/tornado/stack_context.py", line 277, in null_wrapper
+    return fn(*args, **kwargs)
+  File "/usr/local/lib/python3.6/dist-packages/ipykernel/kernelbase.py", line 283, in dispatcher
+    return self.dispatch_shell(stream, msg)
+  File "/usr/local/lib/python3.6/dist-packages/ipykernel/kernelbase.py", line 235, in dispatch_shell
+    handler(stream, idents, msg)
+  File "/usr/local/lib/python3.6/dist-packages/ipykernel/kernelbase.py", line 399, in execute_request
+    user_expressions, allow_stdin)
+  File "/usr/local/lib/python3.6/dist-packages/ipykernel/ipkernel.py", line 196, in do_execute
+    res = shell.run_cell(code, store_history=store_history, silent=silent)
+  File "/usr/local/lib/python3.6/dist-packages/ipykernel/zmqshell.py", line 533, in run_cell
+    return super(ZMQInteractiveShell, self).run_cell(*args, **kwargs)
+  File "/usr/local/lib/python3.6/dist-packages/IPython/core/interactiveshell.py", line 2718, in run_cell
+    interactivity=interactivity, compiler=compiler, result=result)
+  File "/usr/local/lib/python3.6/dist-packages/IPython/core/interactiveshell.py", line 2822, in run_ast_nodes
+    if self.run_code(code, result):
+  File "/usr/local/lib/python3.6/dist-packages/IPython/core/interactiveshell.py", line 2882, in run_code
+    exec(code_obj, self.user_global_ns, self.user_ns)
+  File "&lt;ipython-input-37-fe905384dbd9&gt;", line 77, in &lt;module&gt;
+    validation_data = data_gen(val,id_label_map,val_batch_size,do_inference_aug),validation_steps = val_steps,callbacks = callbacks)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/keras/engine/training.py", line 1426, in fit_generator
+    initial_epoch=initial_epoch)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/keras/engine/training_generator.py", line 191, in model_iteration
+    batch_outs = batch_function(*batch_data)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/keras/engine/training.py", line 1191, in train_on_batch
+    outputs = self._fit_function(ins)  # pylint: disable=not-callable
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/contrib/tpu/python/tpu/keras_support.py", line 1260, in __call__
+    infeed_manager)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/contrib/tpu/python/tpu/keras_support.py", line 1169, in _tpu_model_ops_for_input_specs
+    infeed_manager)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/contrib/tpu/python/tpu/keras_support.py", line 1079, in _specialize_model
+    _model_fn, inputs=[[] for _ in range(self._tpu_assignment.num_towers)])
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/contrib/tpu/python/tpu/tpu.py", line 689, in split_compile_and_replicate
+    outputs = computation(*computation_inputs)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/contrib/tpu/python/tpu/keras_support.py", line 1033, in _model_fn
+    self._cloned_model._make_fit_function()
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/keras/engine/training.py", line 1926, in _make_fit_function
+    '_fit_function', [self.total_loss] + metrics_tensors)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/keras/engine/training.py", line 1895, in _make_train_function_helper
+    params=self._collected_trainable_weights, loss=self.total_loss)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/keras/optimizers.py", line 763, in get_updates
+    grads, global_step=self.iterations)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/contrib/tpu/python/tpu/tpu_optimizer.py", line 171, in apply_gradients
+    return self._opt.apply_gradients(summed_grads_and_vars, global_step, name)
+  File "&lt;ipython-input-36-baab4250bb83&gt;", line 77, in apply_gradients
+    initializer=tf.zeros_initializer())
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/ops/variable_scope.py", line 1479, in get_variable
+    aggregation=aggregation)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/ops/variable_scope.py", line 1220, in get_variable
+    aggregation=aggregation)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/ops/variable_scope.py", line 530, in get_variable
+    return custom_getter(**custom_getter_kwargs)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/contrib/tpu/python/tpu/tpu.py", line 682, in custom_getter
+    return getter(name, *args, **kwargs)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/ops/variable_scope.py", line 499, in _true_getter
+    aggregation=aggregation)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/ops/variable_scope.py", line 911, in _get_single_variable
+    aggregation=aggregation)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/ops/variables.py", line 213, in __call__
+    return cls._variable_v1_call(*args, **kwargs)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/ops/variables.py", line 176, in _variable_v1_call
+    aggregation=aggregation)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/ops/variables.py", line 155, in &lt;lambda&gt;
+    previous_getter = lambda **kwargs: default_variable_creator(None, **kwargs)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/ops/variable_scope.py", line 2488, in default_variable_creator
+    import_scope=import_scope)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/ops/variables.py", line 217, in __call__
+    return super(VariableMetaclass, cls).__call__(*args, **kwargs)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/ops/resource_variable_ops.py", line 294, in __init__
+    constraint=constraint)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/ops/resource_variable_ops.py", line 413, in _init_from_args
+    graph_mode=self._in_graph_mode)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/ops/resource_variable_ops.py", line 67, in eager_safe_variable_handle
+    container=container)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/ops/gen_resource_variable_ops.py", line 1266, in var_handle_op
+    shared_name=shared_name, name=name)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/framework/op_def_library.py", line 788, in _apply_op_helper
+    op_def=op_def)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/util/deprecation.py", line 507, in new_func
+    return func(*args, **kwargs)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/framework/ops.py", line 3300, in create_op
+    op_def=op_def)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/framework/ops.py", line 1801, in __init__
+    self._traceback = tf_stack.extract_stack()
+
+FailedPreconditionError (see above for traceback): Combined status information from 9 operations:
+
+Status code: Failed precondition [9x]
+  Error while reading resource variable tpu_140680564147536//dense_1/kernel/adabound_m from Container: worker. This could mean that the variable was uninitialized. Not found: Resource worker/tpu_140680564147536//dense_1/kernel/adabound_m/N10tensorflow3VarE does not exist.
+  	 [[node tpu_140680564147536//dense_1/kernel/adabound_m (defined at &lt;ipython-input-36-baab4250bb83&gt;:77) ]] [1x]
+  Error while reading resource variable tpu_140680564147536//dense_1/kernel/adabound_m from Container: worker. This could mean that the variable was uninitialized. Not found: Resource worker/tpu_140680564147536//dense_1/kernel/adabound_m/N10tensorflow3VarE does not exist.
+  	 [[node tpu_140680564147536//dense_1/kernel/adabound_m (defined at &lt;ipython-input-36-baab4250bb83&gt;:77) ]]
+  	 [[node TPUReplicateMetadata (defined at &lt;ipython-input-37-fe905384dbd9&gt;:77) ]] [1x]
+  Error while reading resource variable tpu_140680564147536//dense_1/kernel/adabound_m from Container: worker. This could mean that the variable was uninitialized. Not found: Resource worker/tpu_140680564147536//dense_1/kernel/adabound_m/N10tensorflow3VarE does not exist.
+  	 [[node tpu_140680564147536//dense_1/kernel/adabound_m (defined at &lt;ipython-input-36-baab4250bb83&gt;:77) ]]
+  	 [[{{node cluster/_variable_copy/_80}}]] [7x]
+(0 successful operations.)
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='aaryapatel007' date='2019-03-26T00:51:17Z'>
+		The issue is that you're creating the variables in apply_gradients, so as the error message says, they're uninitialized.
+See _create_slots here for an example of where to create them:
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/master/tensorflow/python/training/adam.py&gt;https://github.com/tensorflow/tensorflow/blob/master/tensorflow/python/training/adam.py&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='2' author='aaryapatel007' date='2019-03-26T00:51:18Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=26950&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=26950&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='3' author='aaryapatel007' date='2019-03-26T00:52:09Z'>
+		&lt;denchmark-link:https://github.com/jing-dong&gt;@jing-dong&lt;/denchmark-link&gt;
+ for an example of an error message we should try to improve.
+		</comment>
+		<comment id='4' author='aaryapatel007' date='2019-03-26T15:47:22Z'>
+		&lt;denchmark-link:https://github.com/jhseu&gt;@jhseu&lt;/denchmark-link&gt;
+ Thanks for the example!
+		</comment>
+	</comments>
+</bug>

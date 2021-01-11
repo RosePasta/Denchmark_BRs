@@ -1,0 +1,277 @@
+<bug id='30885' author='corynezin' open_date='2019-07-19T18:39:54Z' closed_time='2020-05-04T02:06:50Z'>
+	<summary>Possible GPU Memory Leak in Non-Distributed Use of `tf.estimator.train_and_evaluate`</summary>
+	<description>
+Please make sure that this is a bug. As per our GitHub Policy, we only address code/doc bugs, performance issues, feature requests and build/installation issues on GitHub. tag:bug_template
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): Yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Red Hat 7
+Mobile device (e.g. iPhone 8, Pixel 2, Samsung Galaxy) if the issue happens on mobile device:
+TensorFlow installed from (source or binary): Binary
+TensorFlow version (use command below): 1.10.0
+Python version: 3.6.8
+Bazel version (if compiling from source):
+GCC/Compiler version (if compiling from source):
+CUDA/cuDNN version: 9.0
+GPU model and memory: K80 12GB
+
+Describe the current behavior
+When running tf.estimator.train_and_evaluate it seems the graph or session is somehow not properly destroyed when max_steps is None or less than the number of steps in the input_fn.  This can result in OOM errors when running prediction afterward on GPU.
+Describe the expected behavior
+Using tf.estimator.train_and_evaluate should destroy the graph/session when either the max steps has been reached, OR the input_fn raises an OutOfRangeError
+Code to reproduce the issue
+python min.py bad
+For expected behavior:
+python min.py good
+NOTE: Your running the bad code may or may not crash depending on your GPU memory.  To force crashing, you can increase the array size: np.random.rand(xx, yy)
+import sys
+
+import tensorflow as tf
+import numpy as np
+
+from hooks import InitHook
+
+def input_fn():
+  dataset = tf.data.Dataset.range(100)
+  # Make sequence data
+  dataset = dataset.map(lambda x: {'x': [x]})
+  dataset = dataset.repeat(3)
+  return dataset
+
+def model_fn(features, labels, mode, params):
+  seq = features['x']
+  with tf.device('/gpu:0'):
+    arr = np.random.rand(3000000, 400)
+    var = tf.get_variable('big', arr.shape, trainable=False)
+    emb = tf.nn.embedding_lookup(var, seq)
+  logits = tf.layers.dense(emb, 1000)
+  predictions = tf.greater(logits, 0.0)
+  # Don't care about loss but have to provide something
+  loss = tf.reduce_mean(logits)
+  trainable_vars = tf.trainable_variables()
+  global_step = tf.train.get_or_create_global_step()
+  saveable_vars = trainable_vars + [global_step]
+  def init_fn(scaffold, sess):
+    sess.run(var.initializer, {var.initial_value: arr})
+  saver = tf.train.Saver(var_list=saveable_vars)
+  if mode == tf.estimator.ModeKeys.TRAIN:
+    scaffold = tf.train.Scaffold(init_fn=init_fn, saver=saver)
+    optimizer = tf.train.GradientDescentOptimizer(0.1)
+    train_op = optimizer.minimize(loss, global_step=global_step)
+    output_spec = tf.estimator.EstimatorSpec(
+      mode=mode,
+      loss=loss,
+      scaffold=scaffold,
+      train_op=train_op)
+  elif mode == tf.estimator.ModeKeys.EVAL:
+    hooks = [InitHook(var.initializer, {var.initial_value: arr})]
+    ready_for_local_init_op = tf.constant([], dtype=tf.string)
+    ready_op = tf.constant([], dtype=tf.string)
+    scaffold = tf.train.Scaffold(init_fn=init_fn, saver=saver, ready_for_local_init_op=ready_for_local_init_op, ready_op=ready_op)
+    output_spec = tf.estimator.EstimatorSpec(
+      scaffold=scaffold,
+      mode=mode,
+      evaluation_hooks=hooks,
+      loss=loss)
+  elif mode == tf.estimator.ModeKeys.PREDICT:
+    ready_for_local_init_op = tf.constant([], dtype=tf.string)
+    ready_op = tf.constant([], dtype=tf.string)
+    scaffold = tf.train.Scaffold(ready_for_local_init_op=ready_for_local_init_op, ready_op=ready_op, saver=saver)
+    hooks = [InitHook(var.initializer, {var.initial_value: arr})]
+    predictions = {
+      'predictions': predictions
+    }
+    output_spec = tf.estimator.EstimatorSpec(
+      mode=mode,
+      predictions=predictions,
+      scaffold=scaffold,
+      prediction_hooks=hooks)
+  return output_spec
+
+tf.logging.set_verbosity(tf.logging.INFO)
+estimator = tf.estimator.Estimator(model_fn=model_fn, config=tf.estimator.RunConfig())
+eval_spec = tf.estimator.EvalSpec(input_fn=input_fn, start_delay_secs=0, throttle_secs=3)
+if sys.argv[1] == 'bad':
+  train_spec = tf.estimator.TrainSpec(input_fn=input_fn)
+  tf.estimator.train_and_evaluate(estimator, train_spec, eval_spec)
+elif sys.argv[1] == 'good':
+  train_spec = tf.estimator.TrainSpec(input_fn=input_fn, max_steps=100)
+  estimator.evaluate(input_fn=input_fn)
+results = estimator.predict(input_fn=input_fn)
+for result in results:
+  pass
+Edit:
+In the same directory is hooks.py containing the following:
+class InitHook(training.SessionRunHook):
+  def __init__(self, op, feed_dict):
+    self.op = op
+    self.feed_dict = feed_dict
+
+  def after_create_session(self, session, coord):  # pylint: disable=unused-argument
+    session.run(self.op, feed_dict=self.feed_dict)
+	</description>
+	<comments>
+		<comment id='1' author='corynezin' date='2019-07-31T22:28:35Z'>
+		Limiting gpu memory can help resolve OOM error.
+See &lt;denchmark-link:https://www.tensorflow.org/guide/using_gpu#allowing_gpu_memory_growth&gt;https://www.tensorflow.org/guide/using_gpu#allowing_gpu_memory_growth&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='2' author='corynezin' date='2019-08-03T20:20:30Z'>
+		
+Limiting gpu memory can help resolve OOM error.
+See https://www.tensorflow.org/guide/using_gpu#allowing_gpu_memory_growth
+
+I didn't get a GPU out of memory error, it was my RAM that eventually exceeded 70GB
+		</comment>
+		<comment id='3' author='corynezin' date='2019-08-27T04:47:44Z'>
+		TF Version : tensorflow-gpu==2.0.0-rc0
+When ever I use tf.data, I always experience a lag on my Dell G7 laptop (32GB RAM, Nividia 1060 6GB, 12cores i7). With TFRecords in place, the very reason of switching to Dataset APIs goes for waste. After each epoch the RAM memory foot print increases linearly till OS kicks in and kills the application.
+With Tensorflow 2, I had to do quite a bit of work to port my existing code out of contrib and tf.slim APIs, post that I am stuck with this dataset OOM issue :(
+Looking for the community help to resume my work ASAP. Thanks!
+Following code snippet is what I mostly use:
+def memory_usage_psutil():
+       # return the memory usage in MB
+       import psutil
+       process = psutil.Process(os.getpid())
+       mem = process.memory_info()[0] / float(2 ** 20)
+       print("\n\n\n\n\n\n")
+       print_info("&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;")
+       print(f"Memory used is {mem}")
+       print_info("&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;")
+       print("\n\n\n\n\n\n")
+       return mem
+
+#======================================================================
+
+   def _get_train_dataset(self):
+       """
+       Reads TFRecords, decode and batches them
+       :return: dataset
+       """
+       print_info("_get_train_dataset")
+       memory_usage_psutil()
+       path = os.path.join(self._train_out_dir, "*.tfrecords")
+       path = path.replace("//", "/")
+
+       files = tf.data.Dataset.list_files(path)
+
+       # assert len(files) &gt; 0
+
+       # print_info(f"Number of TFRecords : {len(files)}")
+
+       # TF dataset APIs
+       # dataset = tf.data.TFRecordDataset(files, num_parallel_reads=self._num_cores)
+       dataset = files.interleave(
+           tf.data.TFRecordDataset, cycle_length=self._num_cores,
+           num_parallel_calls=tf.data.experimental.AUTOTUNE)
+       dataset = dataset.shuffle(self._batch_size*2, 42)
+       # Map the generator output as features as a dict and labels
+       dataset = dataset.map(map_func=self.decode, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+       dataset = dataset.batch(batch_size=self._batch_size, drop_remainder=False)
+       dataset = dataset.prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
+       # dataset = dataset.repeat()
+       # dataset = dataset.cache(filename=os.path.join(self.iterator_dir, "train_data_cache"))
+       print_info("Dataset output sizes are: ")
+       print_info(dataset)
+       memory_usage_psutil()
+
+       return dataset
+
+#======================================================================
+
+   def _get_train_spec(self, max_steps=None):
+       # Estimators expect an input_fn to take no arguments.
+       # To work around this restriction, we use lambda to capture the arguments and provide the expected interface.
+       return tf.estimator.TrainSpec(
+           input_fn=lambda: self.dataset.train_set(),
+           max_steps=max_steps,
+           hooks=self._train_hooks)
+
+   def _get_eval_spec(self, steps):
+       return tf.estimator.EvalSpec(
+           input_fn=lambda: self.dataset.validation_set(),
+           steps=steps,
+           hooks=self._eval_hooks)
+
+#======================================================================
+
+self._estimator = tf.estimator.Estimator(model_fn=self._model, config=config, params=None)
+
+#======================================================================
+
+   def train_and_evaluate(self, max_train_steps=None, eval_steps=None):
+       """
+       Trains and evaluates the model. See
+       :tf_main:`tf.estimator.train_and_evaluate
+       &lt;estimator/train_and_evaluate&gt;` for more details.
+
+       Args:
+           max_train_steps (int, optional): Total number of steps for which
+               to train model. If `None`, train forever or until the train
+               data generates the OutOfRange exception. If OutOfRange occurs
+               in the middle, training stops before :attr:`max_steps` steps.
+           eval_steps (int, optional): Number of steps for which to evaluate
+               model. If `None`, evaluates until the eval data raises an
+               OutOfRange exception.
+       """
+       train_spec = self._get_train_spec(max_steps=max_train_steps)
+       eval_spec = self._get_eval_spec(steps=eval_steps)
+       tf.estimator.train_and_evaluate(self._estimator, train_spec, eval_spec)
+
+#======================================================================
+		</comment>
+		<comment id='4' author='corynezin' date='2019-08-27T11:43:52Z'>
+		&lt;denchmark-link:https://github.com/corynezin&gt;@corynezin&lt;/denchmark-link&gt;
+  could you please update the issue description stating RAM OOM ?
+		</comment>
+		<comment id='5' author='corynezin' date='2019-08-27T18:22:22Z'>
+		Update:
+By disabling TF 2 behavior, the memory build up got slowed down to MBs from GBs.
+import tensorflow.compat.v1 as tf
+tf.disable_v2_behavior()
+		</comment>
+		<comment id='6' author='corynezin' date='2019-08-27T18:55:09Z'>
+		&lt;denchmark-link:https://github.com/Mageswaran1989&gt;@Mageswaran1989&lt;/denchmark-link&gt;
+ Can you please post a new issue to describe your problem? Its better to keep one issue thread for each problem. Thanks!
+		</comment>
+		<comment id='7' author='corynezin' date='2019-08-28T15:25:15Z'>
+		&lt;denchmark-link:https://github.com/ymodak&gt;@ymodak&lt;/denchmark-link&gt;
+ A new issue is raised @ &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/32052&gt;#32052&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='8' author='corynezin' date='2019-08-30T12:03:58Z'>
+		&lt;denchmark-link:https://github.com/corynezin&gt;@corynezin&lt;/denchmark-link&gt;
+  I met this error, have you solve it ?
+		</comment>
+		<comment id='9' author='corynezin' date='2019-08-30T12:55:13Z'>
+		&lt;denchmark-link:https://github.com/ymodak&gt;@ymodak&lt;/denchmark-link&gt;
+  I have met the same issue, can you help us ?
+		</comment>
+		<comment id='10' author='corynezin' date='2019-09-01T15:58:07Z'>
+		
+@corynezin I met this error, have you solve it ?
+
+I have not been able to solve it, for now I am running predict in a separate process using the checkpoint produced during training.
+		</comment>
+		<comment id='11' author='corynezin' date='2020-03-21T01:46:53Z'>
+		&lt;denchmark-link:https://github.com/corynezin&gt;@corynezin&lt;/denchmark-link&gt;
+ Is this still an issue with latest tf version. Thanks!
+		</comment>
+		<comment id='12' author='corynezin' date='2020-04-20T00:44:56Z'>
+		It has been 29 days with no activity and the awaiting response label was assigned. Is this still an issue?
+		</comment>
+		<comment id='13' author='corynezin' date='2020-04-27T01:08:39Z'>
+		This issue has been automatically marked as stale because it has not had recent activity. It will be closed if no further activity occurs. Thank you.
+		</comment>
+		<comment id='14' author='corynezin' date='2020-05-04T02:06:48Z'>
+		Closing as stale. Please reopen if you'd like to work on this further.
+		</comment>
+		<comment id='15' author='corynezin' date='2020-05-04T02:06:52Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/30885&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/30885&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,188 @@
+<bug id='729' author='tmpethick' open_date='2019-06-06T15:34:28Z' closed_time='2019-06-06T15:48:52Z'>
+	<summary>[Bug] Tensor shape mismatch for low noise with cholesky</summary>
+	<description>
+&lt;denchmark-h:h1&gt;🐛 Bug&lt;/denchmark-h&gt;
+
+I stumbled on a funny error when testing something else. If noise level is low noise=0.0001 and double precision is not enabled (by using .double()) we know that CG approach will break. However, if we use cholesky approach instead we also break but weirdly enough with a Tensor shape mismatch (see stack trace).
+&lt;denchmark-h:h2&gt;To reproduce&lt;/denchmark-h&gt;
+
+** Code snippet to reproduce **
+import math
+import numpy as np
+import torch
+import gpytorch
+from matplotlib import pyplot as plt
+def gpytorch_model(noise=0.5, lengthscale=2.5, variance=2, n_iter=200, use_double=True):
+    bounds = np.array([[0,1]])
+    train_x = torch.linspace(bounds[0,0], bounds[0,1], 1000)
+    if use_double:
+        train_x = train_x.double()
+
+    train_y = np.sin(60 * train_x ** 4)
+    lengthscale_prior = None
+    outputscale_prior = None
+
+    class ExactGPModel(gpytorch.models.ExactGP):
+        def __init__(self, train_x, train_y, likelihood):
+            super(ExactGPModel, self).__init__(train_x, train_y, likelihood)
+            self.mean_module = gpytorch.means.ZeroMean()
+            self.covar_module = gpytorch.kernels.ScaleKernel(
+                gpytorch.kernels.RBFKernel(
+                    lengthscale_prior=lengthscale_prior,
+                ),
+                outputscale_prior=outputscale_prior,
+            )
+
+        def forward(self, x):
+            mean_x = self.mean_module(x)
+            covar_x = self.covar_module(x)
+            return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+
+    # initialize likelihood and model
+    likelihood = gpytorch.likelihoods.GaussianLikelihood()
+    # likelihood = gpytorch.likelihoods.FixedNoiseGaussianLikelihood(noise=torch.ones(1) * 0.0001)
+    model = ExactGPModel(train_x, train_y, likelihood)
+    if use_double:
+        model = model.double()
+
+    model.initialize(**{
+        'likelihood.noise': noise,
+        'covar_module.base_kernel.lengthscale': lengthscale,
+        'covar_module.outputscale': variance,
+    })
+    print("lengthscale: %.3f, variance: %.3f,   noise: %.5f" % (model.covar_module.base_kernel.lengthscale.item(),
+            model.covar_module.outputscale.item(),
+            model.likelihood.noise.item()))
+
+    # Find optimal model hyperparameters
+    model.train()
+    likelihood.train()
+
+    # Use the adam optimizer
+    optimizer = torch.optim.Adam([
+        {'params': model.parameters()}, 
+    ], lr=0.01)
+
+    # "Loss" for GPs - the marginal log likelihood
+    mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
+
+    with gpytorch.settings.fast_computations(covar_root_decomposition=False, log_prob=False, solves=False):
+        for i in range(n_iter):
+            # Zero gradients from previous iteration
+            optimizer.zero_grad()
+            # Output from model
+            output = model(train_x)
+            # Calc loss and backprop gradients
+            loss = -mll(output, train_y)
+            loss.backward()
+
+            optimizer.step()
+
+    # Prediction
+    # Get into evaluation (predictive posterior) mode
+    model.eval()
+    likelihood.eval()
+
+    # Test points are regularly spaced along [0,1]
+    # Make predictions by feeding model through likelihood
+    with torch.no_grad(), \
+        gpytorch.settings.fast_computations(covar_root_decomposition=False, log_prob=False, solves=False), \
+        gpytorch.settings.max_cg_iterations(100), \
+        gpytorch.settings.max_preconditioner_size(100):
+        
+        test_x = torch.linspace(bounds[0,0], bounds[0,1], 1000)
+        if use_double:
+            test_x = test_x.double()
+        observed_pred = likelihood(model(test_x))
+
+        # Initialize plot
+        f, ax = plt.subplots(1, 1, figsize=(8, 3))
+
+        # Get upper and lower confidence bounds
+        var = observed_pred.variance.numpy()
+        mean = observed_pred.mean.numpy()
+        lower, upper = mean - 2 * np.sqrt(var), mean + 2 * np.sqrt(var)
+        # Plot training data as black stars
+        ax.plot(train_x.numpy(), train_y.numpy(), 'k*')
+        # Plot predictive means as blue line
+        ax.plot(test_x.numpy(), mean, 'b')
+        # Shade between the lower and upper confidence bounds
+        ax.fill_between(test_x.numpy(), lower, upper, alpha=0.5)
+        ax.legend(['Observed Data', 'Mean', 'Confidence'])
+    return model, {
+        'lengthscale': model.covar_module.base_kernel.lengthscale.item(),
+        'variance': model.covar_module.outputscale.item(),
+        'noise': model.likelihood.noise.item(),
+    }
+
+model, params = gpytorch_model(noise=0.0001, lengthscale=0.01, variance=0.8, n_iter=100, use_double=False)
+** Stack trace/error message **
+&lt;denchmark-code&gt;---------------------------------------------------------------------------
+RuntimeError                              Traceback (most recent call last)
+&lt;ipython-input-84-86542a6e657b&gt; in &lt;module&gt;
+    122     }
+    123 
+--&gt; 124 model, params = gpytorch_model(noise=0.0001, lengthscale=0.01, variance=0.8, n_iter=100, use_double=False)
+
+&lt;ipython-input-84-86542a6e657b&gt; in gpytorch_model(noise, lengthscale, variance, n_iter, use_double)
+     72             output = model(train_x)
+     73             # Calc loss and backprop gradients
+---&gt; 74             loss = -mll(output, train_y)
+     75             loss.backward()
+     76 
+
+~/anaconda3/envs/lions/lib/python3.6/site-packages/gpytorch/module.py in __call__(self, *inputs, **kwargs)
+     20 
+     21     def __call__(self, *inputs, **kwargs):
+---&gt; 22         outputs = self.forward(*inputs, **kwargs)
+     23         if isinstance(outputs, list):
+     24             return [_validate_module_outputs(output) for output in outputs]
+
+~/anaconda3/envs/lions/lib/python3.6/site-packages/gpytorch/mlls/exact_marginal_log_likelihood.py in forward(self, output, target, *params)
+     26         # Get the log prob of the marginal distribution
+     27         output = self.likelihood(output, *params)
+---&gt; 28         res = output.log_prob(target)
+     29 
+     30         # Add terms for SGPR / when inducing points are learned
+
+~/anaconda3/envs/lions/lib/python3.6/site-packages/gpytorch/distributions/multivariate_normal.py in log_prob(self, value)
+    107     def log_prob(self, value):
+    108         if settings.fast_computations.log_prob.off():
+--&gt; 109             return super().log_prob(value)
+    110 
+    111         if self._validate_args:
+
+~/anaconda3/envs/lions/lib/python3.6/site-packages/torch/distributions/multivariate_normal.py in log_prob(self, value)
+    186             self._validate_sample(value)
+    187         diff = value - self.loc
+--&gt; 188         M = _batch_mahalanobis(self._unbroadcasted_scale_tril, diff)
+    189         half_log_det = _batch_diag(self._unbroadcasted_scale_tril).log().sum(-1)
+    190         return -0.5 * (self._event_shape[0] * math.log(2 * math.pi) + M) - half_log_det
+
+~/anaconda3/envs/lions/lib/python3.6/site-packages/torch/distributions/multivariate_normal.py in _batch_mahalanobis(bL, bx)
+     48     """
+     49     n = bx.size(-1)
+---&gt; 50     bL = bL.expand(bx.shape[bx.dim() - bL.dim() + 1:] + (n,))
+     51     flat_L = bL.reshape(-1, n, n)  # shape = b x n x n
+     52     flat_x = bx.reshape(-1, flat_L.size(0), n)  # shape = c x b x n
+
+RuntimeError: The expanded size of the tensor (1000) must match the existing size (100) at non-singleton dimension 1.  Target sizes: [1000, 1000].  Tensor sizes: [1000, 100]
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h2&gt;Expected Behavior&lt;/denchmark-h&gt;
+
+We cannot expect it to work under such low noise without high precision but the error is somewhat strange.
+&lt;denchmark-h:h2&gt;System information&lt;/denchmark-h&gt;
+
+Please complete the following information:
+GPyTorch Version: 0.3.2
+PyTorch Version: 1.0.1.post2
+Computer OS: MacOS 10.14
+	</description>
+	<comments>
+		<comment id='1' author='tmpethick' date='2019-06-06T15:48:51Z'>
+		Fixed by &lt;denchmark-link:https://github.com/cornellius-gp/gpytorch/commit/21f0aafe12e301ec153fc3ae22d75d716a41a05d&gt;21f0aaf&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

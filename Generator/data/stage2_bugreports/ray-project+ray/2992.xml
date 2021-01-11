@@ -1,0 +1,190 @@
+<bug id='2992' author='llan-ml' open_date='2018-09-29T03:37:45Z' closed_time='2018-10-21T07:22:39Z'>
+	<summary>[rllib] PPO loss affected by LSTM zero padding</summary>
+	<description>
+When we customize an RNN-based model or just set use_lstm to True, we need to pad zeros to sampled data, as the function TFPolicyGraph._get_loss_inputs_dict does.
+However, when calculating the final loss, we need to remove the padded zeros. The current PPO loss directly multiplies the padded  and . &lt;denchmark-link:https://github.com/ray-project/ray/blob/master/python/ray/rllib/agents/ppo/ppo_policy_graph.py#L69&gt;https://github.com/ray-project/ray/blob/master/python/ray/rllib/agents/ppo/ppo_policy_graph.py#L69&lt;/denchmark-link&gt;
+
+The summation is no problem, but for reduce_mean, we will have a large denominator due to the padded zeros.
+Is this an implementation error or an approximation? If max_seq_len is a relatively small value, I think the current implementation can be regarded as an approximation for the sake of efficiency.
+	</description>
+	<comments>
+		<comment id='1' author='llan-ml' date='2018-09-29T06:34:24Z'>
+		Thanks for pointing this out. I agree that when max_seq_len is small the approximation is pretty close, and even if not it just scales the loss by a small factor.
+This pattern seems dangerous in general though, since there could be loss functions that are intolerant of injected zeros. Two options I can think of to fix this:
+
+Mask out the zeros in the loss (e.g., using tf.sequence_mask/boolean_mask).
+Add the padding dynamically using TF ops in the LSTM model (using tf.sparse_to_dense?)
+
+Any thoughts on which is preferable?
+		</comment>
+		<comment id='2' author='llan-ml' date='2018-09-29T06:57:56Z'>
+		This could also be bad for the value loss, since it will tend to force the value function to zero (though only for the zero input).
+		</comment>
+		<comment id='3' author='llan-ml' date='2018-09-29T07:34:40Z'>
+		In my own code, I adopt the option 1, like this:
+max_seq_len = tf.reduce_max(seq_lens)
+mask = tf.sequence_mask(seq_lens, max_seq_len)
+mask = tf.reshape(mask, [-1])
+
+# before reduce_mean
+loss = tf.boolean_mask(loss, mask)
+
+As for the option 2, I think it is not convenient for customized models, and harder to implement.
+		</comment>
+		<comment id='4' author='llan-ml' date='2018-09-29T08:02:58Z'>
+		&lt;denchmark-link:https://github.com/llan-ml&gt;@llan-ml&lt;/denchmark-link&gt;
+ , if (2) was implemented as follows, would that address your concern for customized models?
+&lt;denchmark-code&gt;def build_layers(self, inputs, num_outputs, options):
+    last_layer = add_time_dimension(inputs, self.seq_lens) # pad input
+
+    ... lstm cell code ...
+
+    last_layer = tf.reshape(
+        remove_time_dimension(lstm_out, self.seq_lens),  # remove padding
+        [-1, cell_size])  
+
+    return ...
+&lt;/denchmark-code&gt;
+
+I'm thinking that the advantage of doing this is that we don't need to patch all the loss functions that support LSTMs.
+		</comment>
+		<comment id='5' author='llan-ml' date='2018-09-29T09:39:14Z'>
+		I believe that the function remove_time_dimension is friendly to build new models.
+At the same time, we need to consider which elements should be passed into  (&lt;denchmark-link:https://github.com/ray-project/ray/blob/master/python/ray/rllib/evaluation/tf_policy_graph.py#L147&gt;https://github.com/ray-project/ray/blob/master/python/ray/rllib/evaluation/tf_policy_graph.py#L147&lt;/denchmark-link&gt;
+). Maybe we should only process initial states and ignore other data in a batch.
+		</comment>
+		<comment id='6' author='llan-ml' date='2018-09-29T10:20:03Z'>
+		Given the input and seq_lens, the option 2 needs to dynamically split the input into several parts. The function tf.sparse_to_dense cannot handle this since the argument sparse_values should be a 0-D or 1-D Tensor.
+		</comment>
+		<comment id='7' author='llan-ml' date='2018-09-29T13:17:33Z'>
+		I tried to pad zeros in TF using while_loop and TensorArray as follows:
+import numpy as np
+import tensorflow as tf
+
+
+def tf_pad_zeros(inputs, seq_lens):
+    max_seq_len = tf.reduce_max(seq_lens)
+    num_seqs = tf.size(seq_lens)
+
+    tmp_array = tf.TensorArray(dtype=inputs.dtype,
+                               size=num_seqs,
+                               infer_shape=False)
+
+    idx = tf.constant(0)
+    slice_begin = tf.cumsum(seq_lens, exclusive=True)
+    slice_size = tf.cumsum(seq_lens) - tf.cumsum(seq_lens, exclusive=True)
+
+    def _pad_zeros(i, t):
+        sliced = tf.slice(inputs, [slice_begin[i], 0], [slice_size[i], -1])
+        pad_zeros = tf.zeros(
+            [max_seq_len - slice_size[i]] + inputs.get_shape().as_list()[1:],
+            dtype=inputs.dtype)
+        padded = tf.concat([sliced, pad_zeros], axis=0)
+        t = t.write(i, padded)
+        return tf.add(i, 1), t
+
+    _, tmp_array = tf.while_loop(cond=lambda i, _: tf.less(i, num_seqs),
+                                 body=_pad_zeros,
+                                 loop_vars=[idx, tmp_array])
+
+    padded_inputs = tmp_array.concat()
+    padded_inputs.set_shape([None] + inputs.get_shape().as_list()[1:])
+    return padded_inputs
+
+
+def numpy_pad_zeros(inputs, seq_lens):
+    max_seq_len = np.max(seq_lens)
+    f = np.array(inputs)
+    f_pad = np.zeros((len(seq_lens) * max_seq_len, ) + np.shape(f)[1:])
+    seq_base = 0
+    i = 0
+    for l in seq_lens:
+        for seq_offset in range(l):
+            f_pad[seq_base + seq_offset] = f[i]
+            i += 1
+        seq_base += max_seq_len
+    return f_pad
+
+
+seq_lens = np.random.randint(10, 50, size=100, dtype=np.int32)
+inputs = np.random.rand(seq_lens.sum(), 10).astype(dtype=np.float32)
+
+sess = tf.InteractiveSession()
+tf_inputs = tf.constant(inputs, dtype=tf.float32)
+tf_seq_lens = tf.constant(seq_lens, dtype=tf.int32)
+padded_inputs = tf_pad_zeros(tf_inputs, tf_seq_lens)
+
+
+def run_tf():
+    return sess.run(padded_inputs)
+
+
+def run_np():
+    return numpy_pad_zeros(inputs, seq_lens)
+
+
+x = run_tf()
+y = run_np()
+assert np.array_equal(x, y)
+
+In [1]: %timeit run_tf()
+4.99 ms ± 34 µs per loop (mean ± std. dev. of 7 runs, 100 loops each)
+In [2]: %timeit run_np()
+3.3 ms ± 18.4 µs per loop (mean ± std. dev. of 7 runs, 100 loops each)
+
+		</comment>
+		<comment id='8' author='llan-ml' date='2018-09-29T21:54:10Z'>
+		Ah, it looks like tf.scatter_nd() is the recommended way to do this.
+&lt;denchmark-code&gt;def tf_pad_zeros_scatter(inputs, seq_lens):
+    padded_size = tf.reduce_max(seq_lens) * tf.size(seq_lens)
+    indices = tf.boolean_mask(
+        tf.range(padded_size),
+        tf.reshape(tf.sequence_mask(seq_lens), [padded_size]))
+    return tf.scatter_nd(
+        tf.expand_dims(indices, 1), inputs,
+        [padded_size] + inputs.get_shape().as_list()[1:])
+&lt;/denchmark-code&gt;
+
+This seems to be the fastest
+&lt;denchmark-code&gt;Numpy
+Mean latency 0.003065221309661865
+Tf while
+Mean latency 0.0033680152893066405
+Tf scatter_nd
+Mean latency 0.00010882377624511719
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='9' author='llan-ml' date='2018-09-29T23:28:09Z'>
+		Unfortunately it looks like (2) further complicates the PPO multi-gpu / minibatch code a lot (it was already complicated to handle sequence lengths correctly). This is because dividing the data into minibatches is difficult if they aren't padded to sequence length.
+		</comment>
+		<comment id='10' author='llan-ml' date='2018-09-30T01:22:09Z'>
+		I am not familiar with the logic of the current multi-gpu implementation. In my understanding, we can just roughly evenly divide the batch into several parts based on the seq_lens. Then, for each part, optimize like simple_optimizer.
+If I understand correctly,  currently, different towers share the same set of input placeholders, and the function LocalSyncParallelOptimizer.load_data is used to split the data in a placeholder for different towers.
+Another logic could be to split data outside TF and define different sets of placeholders for each replica. On the other hand, in this way, we can optimize each tower simultaneously. I am not sure if there are other problems in this way.
+		</comment>
+		<comment id='11' author='llan-ml' date='2018-09-30T03:21:00Z'>
+		Yeah, I agree moving the splitting logic outside of TF would make the implementation a lot simpler. The existing implementation is brittle since it does so much work using tf.split() and slice indexing internally, when it could be computed ahead of time in python code.
+Btw, I found a different bug in the multi-gpu optimizer for RNNs. The batch is shuffled prior to loading, which breaks up the sequences: &lt;denchmark-link:https://github.com/ray-project/ray/pull/2996&gt;#2996&lt;/denchmark-link&gt;
+
+On the partially observed cartpole example: &lt;denchmark-link:https://github.com/ray-project/ray/blob/3a3782c39fc2e75f53515660b866e7cc501b7704/python/ray/rllib/examples/cartpole_lstm.py&gt;https://github.com/ray-project/ray/blob/3a3782c39fc2e75f53515660b866e7cc501b7704/python/ray/rllib/examples/cartpole_lstm.py&lt;/denchmark-link&gt;
+
+Magenta: before fix
+Blue: after fix (performance is much better -- though the value function seems worse?)
+&lt;denchmark-link:https://user-images.githubusercontent.com/14922/46252912-b89d8d80-c424-11e8-9fc2-67fc39551836.png&gt;&lt;/denchmark-link&gt;
+
+I also tried applying sequence masking before the reduce_mean ops, but it didn't really seem to affect performance (as expected). Since the padding issue doesn't seem to have much effect on actual performance, I'm inclined to leave it as is for now due to the multi-gpu optimizer complications.
+		</comment>
+		<comment id='12' author='llan-ml' date='2018-10-21T07:22:39Z'>
+		Fixed in master
+		</comment>
+		<comment id='13' author='llan-ml' date='2018-10-21T10:34:46Z'>
+		&lt;denchmark-link:https://github.com/ericl&gt;@ericl&lt;/denchmark-link&gt;
+ Can you refer the corresponding PR?
+		</comment>
+		<comment id='14' author='llan-ml' date='2018-10-21T17:51:47Z'>
+		Here it is: &lt;denchmark-link:https://github.com/ray-project/ray/commit/3c891c6ecec973a305e753fd8dcf8d374291e828&gt;3c891c6&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

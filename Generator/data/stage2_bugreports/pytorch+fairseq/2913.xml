@@ -1,0 +1,174 @@
+<bug id='2913' author='kwasnydam' open_date='2020-11-18T14:46:55Z' closed_time='2020-11-23T13:55:53Z'>
+	<summary>wav2vec2.0 arg_overrides does not apply when loading a model that has been finetuned in unuspervised manner.</summary>
+	<description>
+&lt;denchmark-h:h2&gt;🐛 Bug&lt;/denchmark-h&gt;
+
+In fairseq.models.wav2vec2_asr.Wav2VecEncoder there is a piece of code responsible for overwriting some of the model's parameters from the checkpoint:
+&lt;denchmark-code&gt;arg_overrides = {
+            "dropout": args.dropout,
+            "activation_dropout": args.activation_dropout,
+            "dropout_input": args.dropout_input,
+            "attention_dropout": args.attention_dropout,
+            "mask_length": args.mask_length,
+            "mask_prob": args.mask_prob,
+            "mask_selection": args.mask_selection,
+            "mask_other": args.mask_other,
+            "no_mask_overlap": args.no_mask_overlap,
+            "mask_channel_length": args.mask_channel_length,
+            "mask_channel_prob": args.mask_channel_prob,
+            "mask_channel_selection": args.mask_channel_selection,
+            "mask_channel_other": args.mask_channel_other,
+            "no_mask_channel_overlap": args.no_mask_channel_overlap,
+            "encoder_layerdrop": args.layerdrop,
+            "feature_grad_mult": args.feature_grad_mult,
+        }
+
+if getattr(args, "w2v_args", None) is None:
+            print("w2v_args is not None")
+            state = checkpoint_utils.load_checkpoint_to_cpu(
+                args.w2v_path, arg_overrides
+            )
+            for key, value in arg_overrides.items():
+                setattr(state["cfg"].model, key, value)
+            w2v_args = state.get("args", None) or state["cfg"].model
+            print(w2v_args)
+        else:
+            print("w2v_args is None")
+            state = None
+            w2v_args = args.w2v_args
+&lt;/denchmark-code&gt;
+
+when the model from &lt;denchmark-link:https://dl.fbaipublicfiles.com/fairseq/wav2vec/wav2vec_small.pt&gt;here&lt;/denchmark-link&gt;
+ is used for ctc fine-tuning, everything works fine and the parameters are correctly overridden, as it contains the  key in the loaded :
+&lt;denchmark-code&gt;if "args" in state and state["args"] is not None and arg_overrides is not None:
+        args = state["args"]
+        for arg_name, arg_val in arg_overrides.
+            setattr(args, arg_name, arg_val)
+&lt;/denchmark-code&gt;
+
+however, when you finetune the model in unsupervised manner, instead of args key, a cfg of type DictConf is saved in the checkpoint and this piece of logic is used:
+&lt;denchmark-code&gt;if "cfg" in state and state["cfg"] is not None and arg_overrides is not None:
+        overwrite_args_by_name(state["cfg"], arg_overrides)
+&lt;/denchmark-code&gt;
+
+the function overwrite_args_by_name looks like this
+&lt;denchmark-code&gt;def overwrite_args_by_name(cfg: DictConfig, overrides: Dict[str, any]):
+    # this will be deprecated when we get rid of argparse and model_overrides logic
+
+    with open_dict(cfg):
+        for k in cfg.keys():
+            if isinstance(cfg[k], DictConfig):
+                overwrite_args_by_name(cfg[k], overrides)
+            elif k in overrides:
+                cfg[k] = overrides[k]
+&lt;/denchmark-code&gt;
+
+so the idea here is correct, because we should recursively look for the relevant keys to overwrite. The problem is that the nested state['cfg'] in the unsupervised finetuning checkpoint is ill-defined. Especially, the model field which is the most relevant, is not of type DictConfig but of argparse.Namespace. So according to the logic above, the fields that are of such type won't get overridden. The effect is that the ctc finetuning code ignores all parameters that the user specified on cli and uses those of the base model that were specified for the purpose of unsupervised training.
+&lt;denchmark-h:h3&gt;To Reproduce&lt;/denchmark-h&gt;
+
+
+Finetune the  wav2vec_small in unsupervised manner using the command specified in readme (command slightly modified) to get a checkpoint:
+
+&lt;denchmark-code&gt;python train.py --distributed-world-size 2 "${data_dir}" \
+--save-dir "${save_model}" --fp16 --num-workers 6 --task audio_pretraining --criterion wav2vec --arch wav2vec2 \
+--log-keys '["prob_perplexity","code_perplexity","temp"]' --quantize-targets --extractor-mode default \
+--conv-feature-layers '[(512, 10, 5)] + [(512, 3, 2)] * 4 + [(512,2,2)] * 2' --final-dim 256 --latent-vars 320 \
+--latent-groups 2 --latent-temp '(2,0.5,0.999995)' --infonce --optimizer adam \
+--adam-betas '(0.9,0.98)' --adam-eps 1e-06 --lr-scheduler polynomial_decay --total-num-update 100000 \
+--lr 0.0005 --warmup-updates 8000 --mask-length 10 --mask-prob 0.65 --mask-selection static --mask-other 0 \
+--encoder-layerdrop 0.05 --dropout-input 0.1 --dropout-features 0.1 --feature-grad-mult 0.1 \
+--loss-weights '[0.1, 10]' --conv-pos 128 --conv-pos-groups 16 --num-negatives 100 --cross-sample-negatives 0 \
+--max-sample-size 250000 --min-sample-size 32000 --dropout 0.1 --attention-dropout 0.1 --weight-decay 0.01 \
+--max-tokens 640000 --max-update 100000 --skip-invalid-size-inputs-valid-test --ddp-backend no_c10d --update-freq 32 \
+--finetune-from-model "${base_model}"
+&lt;/denchmark-code&gt;
+
+
+
+ctc finetune the resulting model according to the command in readme
+
+
+print the argument you want to overwrite in wav2vec2_asr.py:
+
+
+&lt;denchmark-code&gt;class Wav2VecEncoder(FairseqEncoder):
+    def __init__(self, args, tgt_dict=None):
+        ...
+        print(f"attention_dropout args: {args.attention_dropout}")
+        print(f"attention_dropout w2v_args: {w2v_args.attention_dropout}")
+        print(f"attention_dropout cfg: {state['cfg'].model.attention_dropout}")
+
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h3&gt;Expected behavior&lt;/denchmark-h&gt;
+
+expected:
+&lt;denchmark-code&gt;attention_dropout args: 0.0
+attention_dropout w2v_args: 0.0
+attention_dropout cfg: 0.0
+&lt;/denchmark-code&gt;
+
+actual
+&lt;denchmark-code&gt;attention_dropout args: 0.0
+attention_dropout w2v_args: 0.1
+attention_dropout cfg: 0.1
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h3&gt;Temporary solution&lt;/denchmark-h&gt;
+
+set relevant fields in state["cfg"].model manually in wav2vec2_asr.py, line 330
+&lt;denchmark-code&gt; state = checkpoint_utils.load_checkpoint_to_cpu(
+                args.w2v_path, arg_overrides
+            )
+            for key, value in arg_overrides.items():
+                setattr(state["cfg"].model, key, value)
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h3&gt;Environment&lt;/denchmark-h&gt;
+
+
+fairseq Version (e.g., 1.0 or master): master, commit 1bc83c7
+PyTorch Version (e.g., 1.0): 1.7.0
+OS (e.g., Linux): ubuntu 18.04
+How you installed fairseq (pip, source): source
+
+	</description>
+	<comments>
+		<comment id='1' author='kwasnydam' date='2020-11-18T14:49:23Z'>
+		related to &lt;denchmark-link:https://github.com/pytorch/fairseq/issues/2828#issuecomment-720168015&gt;#2828 (comment)&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='2' author='kwasnydam' date='2020-11-18T18:25:25Z'>
+		thank you for the very detailed report. i believe this issue must have gotten fixed in the last few days. i followed your reproduction steps and i get the following:
+&lt;denchmark-code&gt;attention_dropout args: 0.0
+attention_dropout w2v_args: 0.0
+attention_dropout cfg: 0.0
+&lt;/denchmark-code&gt;
+
+or, if i set attention dropout to 0.5,
+&lt;denchmark-code&gt;attention_dropout args: 0.5
+attention_dropout w2v_args: 0.5
+attention_dropout cfg: 0.5
+&lt;/denchmark-code&gt;
+
+it is possible that you finetuned the model in between some of the changes. please let me know if it is still a problem.
+also i had to change this line
+&lt;denchmark-code&gt;print(f"attention_dropout w2v_args: {w2v_args.attention_dropout}")
+&lt;/denchmark-code&gt;
+
+to
+&lt;denchmark-code&gt;print(f"attention_dropout w2v_args: {w2v_args.model.attention_dropout}")
+&lt;/denchmark-code&gt;
+
+since w2v_args are converted after the pretrained model is loaded
+		</comment>
+		<comment id='3' author='kwasnydam' date='2020-11-18T19:29:54Z'>
+		Thanks &lt;denchmark-link:https://github.com/alexeib&gt;@alexeib&lt;/denchmark-link&gt;
+ for a prompt reaction! Indeed, the current version of the file on master looks different then the one in my version, I will update this post tmrrw (seems that particular part was changed a few times since I cloned the repo). Could you please tell me which commit/branch/tag you used to verify the behaviour? I could check it out and see if stuff behaves correctly for me on that version.
+		</comment>
+		<comment id='4' author='kwasnydam' date='2020-11-18T21:46:52Z'>
+		i just used the latest master, so something like &lt;denchmark-link:https://github.com/pytorch/fairseq/commit/e931009a91c430a66583e80a91d1de9cea656bd2&gt;e931009&lt;/denchmark-link&gt;
+ should work
+		</comment>
+	</comments>
+</bug>

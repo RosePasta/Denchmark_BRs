@@ -1,0 +1,57 @@
+<bug id='415' author='robertnishihara' open_date='2017-03-30T06:41:39Z' closed_time='2018-05-27T00:52:53Z'>
+	<summary>Tasks not being executed when a sufficiently large number of tasks are scheduled remotely.</summary>
+	<description>
+&lt;denchmark-link:https://github.com/atumanov&gt;@atumanov&lt;/denchmark-link&gt;
+ uncovered the following issue.
+On a 2-node cluster, start the head node with 0 CPUs, and start the other node normally.
+On the head node:
+&lt;denchmark-code&gt;./scripts/start_ray.sh --head --redis-port=6379 --num-cpus=0
+&lt;/denchmark-code&gt;
+
+On the remote node:
+&lt;denchmark-code&gt;./scripts/start_ray.sh --redis-address=&lt;HEAD-NODE-IP:6379&gt;
+&lt;/denchmark-code&gt;
+
+On the head node, connect to the cluster and launch 200000 tasks.
+import ray
+
+ray.init(redis_address="&lt;HEAD-NODE-IP:6379&gt;")
+
+@ray.remote
+def f():
+  pass
+
+l = [f.remote() for _ in range(200000)]
+If you do this, often not all of the tasks are executed. You can see this as follows.
+If you look at the task table, e.g.,
+r = ray.worker.global_worker.redis_client
+task_ids = r.keys("TT:*")
+task_info = [r.hgetall(task_id) for task_id in task_ids]
+task_states = [info[b"state"] for info in task_info]  # This line takes maybe 20 seconds.
+
+# Look at counts of different states.
+[(state, task_states.count(state)) for state in set(task_states)]
+All tasks should be in the DONE state 16, but sometimes a ton of them are in the SCHEDULED state 2 or even the RUNNING state 8, but nothing is in fact happening. It's almost as if the local scheduler (on the head node)'s pubsub connection to Redis which listens for tasks assigned to it has died (or something like that).
+I added a CHECK which checks to make sure the publish command in the redis module that assigns a task to a local scheduler is actually received by the local scheduler (we can do this because PUBLISH returns an integer equal to the number of subscribers that received the message). And this CHECK failed at one point in the computation, so I think we're FINALLY hitting the point where Redis pubsub is dropping messages (and once it drops one message, it may just kill that pubsub connection.
+	</description>
+	<comments>
+		<comment id='1' author='robertnishihara' date='2017-04-02T01:36:45Z'>
+		Update:
+The primary cause is overloading the redis client (local scheduler) pubsub buffer, configured by default to be 32MB size as a hard limit and only an 8MB soft-limit. If the latter persists for more than 60s (which was the case), the redis client is disconnected. Source:
+&lt;denchmark-link:https://github.com/antirez/redis/blob/d680eb6dbdf2d2030cb96edfb089be1e2a775ac1/redis.conf&gt;https://github.com/antirez/redis/blob/d680eb6dbdf2d2030cb96edfb089be1e2a775ac1/redis.conf&lt;/denchmark-link&gt;
+
+To get the configured limit:
+CONFIG GET client-output-buffer-limit inside a redis-client attached to the running redis-server.
+We address this by increasing both the hard and soft limits for the redis client pubsub buffer to 128MB:
+CONFIG SET client-output-buffer-limit "normal 0 0 0 slave 268435456 67108864 60 pubsub 134217728 134217728 60"
+The secondary cause is numerous retries triggered due to using a default redis retry data struct with unlimited retries. Over 200 thousand retries were observed at one point when issuing 1M tasks. We will separately investigate disabling retries.
+		</comment>
+		<comment id='2' author='robertnishihara' date='2017-04-08T22:24:47Z'>
+		The example described in this issue seems to work after &lt;denchmark-link:https://github.com/ray-project/ray/pull/442&gt;#442&lt;/denchmark-link&gt;
+, but the problem will likely still arise under extremely stressful workloads.
+		</comment>
+		<comment id='3' author='robertnishihara' date='2018-05-27T00:52:53Z'>
+		This has mostly been fixed by using more Redis shards and such.
+		</comment>
+	</comments>
+</bug>

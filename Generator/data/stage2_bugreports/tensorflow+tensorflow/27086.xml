@@ -1,0 +1,375 @@
+<bug id='27086' author='marwan116' open_date='2019-03-24T21:27:16Z' closed_time='2019-07-19T23:12:18Z'>
+	<summary>Tensorflow 2.0: Adding @tf.function decorator with categorical feature_column raises FailedPreconditionError: Table already initialized</summary>
+	<description>
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): Yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Mac OS X 10.14
+Mobile device (e.g. iPhone 8, Pixel 2, Samsung Galaxy) if the issue happens on mobile device:
+TensorFlow installed from (source or binary): binary
+TensorFlow version (use command below): 2.0.0-alpha0
+Python version: Python 3.6.7
+Bazel version (if compiling from source): N/A
+GCC/Compiler version (if compiling from source): N/A
+CUDA/cuDNN version: N/A
+GPU model and memory: N/A
+
+Describe the current behavior
+Just want to preface this by saying while strictly speaking I am using 'custom' code, all I did was piece together code from the 'classify structured data' and the 'introduction for experts'.
+I am trying to add @tf.function for performance enhancement reasons to my custom training code in Tensorflow 2.0. However, running the code raises a FailedPreconditionError: Table already initialized. when using categorical feature columns.
+What I suspect is happening is that the lookup tables for the categorical encoding are being initialized more than once (in the model definition and in @tf.function).  How should I go about using feature_columns and @tf.function?
+Code to reproduce the issue
+&lt;denchmark-code&gt;from __future__ import absolute_import, division, print_function
+
+import numpy as np
+import pandas as pd
+
+!pip install sklearn
+!pip install tensorflow==2.0.0-alpha0
+import tensorflow as tf
+
+from tensorflow import feature_column
+from tensorflow.keras import layers
+from tensorflow.keras.models import Model
+from sklearn.model_selection import train_test_split
+
+URL = 'https://storage.googleapis.com/applied-dl/heart.csv'
+dataframe = pd.read_csv(URL)
+
+train, test = train_test_split(dataframe, test_size=0.2)
+train, val = train_test_split(train, test_size=0.2)
+
+# A utility method to create a tf.data dataset from a Pandas Dataframe
+def df_to_dataset(dataframe, shuffle=True, batch_size=32):
+  dataframe = dataframe.copy()
+  labels = dataframe.pop('target').values.reshape(-1,1)
+  ds = tf.data.Dataset.from_tensor_slices((dict(dataframe), labels))
+  if shuffle:
+    ds = ds.shuffle(buffer_size=len(dataframe))
+  ds = ds.batch(batch_size)
+  return ds
+
+batch_size = 32
+train_ds = df_to_dataset(train, batch_size=batch_size)
+val_ds = df_to_dataset(val, shuffle=False, batch_size=batch_size)
+test_ds = df_to_dataset(test, shuffle=False, batch_size=batch_size)
+
+feature_columns = []
+
+# numeric cols
+for header in ['age', 'trestbps', 'chol', 'thalach', 'oldpeak', 'slope', 'ca']:
+  feature_columns.append(feature_column.numeric_column(header))
+
+# bucketized cols
+age = feature_column.numeric_column("age")
+age_buckets = feature_column.bucketized_column(age, boundaries=[18, 25, 30, 35, 40, 45, 50, 55, 60, 65])
+feature_columns.append(age_buckets)
+
+# indicator cols
+thal = feature_column.categorical_column_with_vocabulary_list(
+      'thal', ['fixed', 'normal', 'reversible'])
+thal_one_hot = feature_column.indicator_column(thal)
+feature_columns.append(thal_one_hot)
+
+# embedding cols
+thal_embedding = feature_column.embedding_column(thal, dimension=8)
+feature_columns.append(thal_embedding)
+
+#crossed cols
+crossed_feature = feature_column.crossed_column([age_buckets, thal], hash_bucket_size=1000)
+crossed_feature = feature_column.indicator_column(crossed_feature)
+feature_columns.append(crossed_feature)
+
+feature_layer = tf.keras.layers.DenseFeatures(feature_columns, trainable=False)
+
+
+class MyModel(Model):
+  def __init__(self):
+    super(MyModel, self).__init__()
+    self.features = feature_layer
+    self.dense = layers.Dense(128, activation = 'relu')
+    self.dense2 = layers.Dense(128, activation = 'relu')
+    self.sigmoid = layers.Dense(1, activation = 'sigmoid')
+
+  def call(self, x):
+    x = self.features(x)
+    x = self.dense(x)
+    x = self.dense2(x)
+    return self.sigmoid(x)
+
+model = MyModel()
+loss_object = tf.keras.losses.BinaryCrossentropy()
+optimizer = tf.keras.optimizers.Adam()
+
+train_loss = tf.keras.metrics.Mean(name='train_loss')
+train_accuracy = tf.keras.metrics.BinaryAccuracy(name='train_accuracy')
+
+test_loss = tf.keras.metrics.Mean(name='test_loss')
+test_accuracy = tf.keras.metrics.BinaryAccuracy(name='test_accuracy')
+
+@tf.function
+def train_step(features, label, counter):
+  with tf.GradientTape() as tape:
+    predictions = model(features)
+    loss = loss_object(label, predictions)
+  gradients = tape.gradient(loss, model.trainable_variables)
+  optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+  train_loss(loss)
+  train_accuracy(label, predictions)
+
+@tf.function
+def test_step(image, label):
+  predictions = model(image)
+  t_loss = loss_object(label, predictions)
+
+  test_loss(t_loss)
+  test_accuracy(label, predictions)
+
+EPOCHS = 5
+for epoch in range(EPOCHS):
+  counter = 0
+  for features, labels in train_ds:
+    train_step(features, labels, counter)
+    counter +=1
+
+  for features, labels in val_ds:
+      test_step(features, labels)
+
+  template = 'Epoch {}, Loss: {}, Accuracy: {}, Test Loss: {}, Test Accuracy: {}'
+  print (template.format(epoch+1,
+                           train_loss.result(), 
+                           train_accuracy.result()*100,
+                           test_loss.result(), 
+                           test_accuracy.result()*100))
+&lt;/denchmark-code&gt;
+
+Actual Output
+&lt;denchmark-code&gt;Epoch 1, Loss: 1.2603175640106201, Accuracy: 61.65803146362305, Test Loss: 1.3003877401351929, Test Accuracy: 67.34693908691406
+---------------------------------------------------------------------------
+FailedPreconditionError                   Traceback (most recent call last)
+&lt;ipython-input-3-165a6f89be48&gt; in &lt;module&gt;()
+    110   counter = 0
+    111   for features, labels in train_ds:
+--&gt; 112     train_step(features, labels, counter)
+    113     counter +=1
+    114 
+
+/usr/local/lib/python3.6/dist-packages/tensorflow/python/eager/def_function.py in __call__(self, *args, **kwds)
+    412       # In this case we have created variables on the first call, so we run the
+    413       # defunned version which is guaranteed to never create variables.
+--&gt; 414       return self._stateless_fn(*args, **kwds)  # pylint: disable=not-callable
+    415     elif self._stateful_fn is not None:
+    416       # In this case we have not created variables on the first call. So we can
+
+/usr/local/lib/python3.6/dist-packages/tensorflow/python/eager/function.py in __call__(self, *args, **kwargs)
+   1286     """Calls a graph function specialized to the inputs."""
+   1287     graph_function, args, kwargs = self._maybe_define_function(args, kwargs)
+-&gt; 1288     return graph_function._filtered_call(args, kwargs)  # pylint: disable=protected-access
+   1289 
+   1290   @property
+
+/usr/local/lib/python3.6/dist-packages/tensorflow/python/eager/function.py in _filtered_call(self, args, kwargs)
+    572     """
+    573     return self._call_flat(
+--&gt; 574         (t for t in nest.flatten((args, kwargs))
+    575          if isinstance(t, (ops.Tensor,
+    576                            resource_variable_ops.ResourceVariable))))
+
+/usr/local/lib/python3.6/dist-packages/tensorflow/python/eager/function.py in _call_flat(self, args)
+    625     # Only need to override the gradient in graph mode and when we have outputs.
+    626     if context.executing_eagerly() or not self.outputs:
+--&gt; 627       outputs = self._inference_function.call(ctx, args)
+    628     else:
+    629       self._register_gradient()
+
+/usr/local/lib/python3.6/dist-packages/tensorflow/python/eager/function.py in call(self, ctx, args)
+    413             attrs=("executor_type", executor_type,
+    414                    "config_proto", config),
+--&gt; 415             ctx=ctx)
+    416       # Replace empty list with None
+    417       outputs = outputs or None
+
+/usr/local/lib/python3.6/dist-packages/tensorflow/python/eager/execute.py in quick_execute(op_name, num_outputs, inputs, attrs, ctx, name)
+     64     else:
+     65       message = e.message
+---&gt; 66     six.raise_from(core._status_to_exception(e.code, message), None)
+     67   except TypeError as e:
+     68     if any(ops._is_keras_symbolic_tensor(x) for x in inputs):
+
+/usr/local/lib/python3.6/dist-packages/six.py in raise_from(value, from_value)
+
+FailedPreconditionError: Table already initialized.
+	 [[{{node my_model_2/dense_features_2/age_bucketized_X_thal_indicator/thal_lookup/hash_table/table_init/LookupTableImportV2}}]] [Op:__inference_train_step_34833]
+&lt;/denchmark-code&gt;
+
+Expected Output
+&lt;denchmark-code&gt;Epoch 1, Loss: 0.8113343119621277, Accuracy: 63.21243667602539, Test Loss: 0.5340840816497803, Test Accuracy: 71.42857360839844
+Epoch 2, Loss: 0.6469629406929016, Accuracy: 69.4300537109375, Test Loss: 0.5265070199966431, Test Accuracy: 72.44898223876953
+Epoch 3, Loss: 0.5749971270561218, Accuracy: 71.84800720214844, Test Loss: 0.5283268094062805, Test Accuracy: 72.10884094238281
+Epoch 4, Loss: 0.5360371470451355, Accuracy: 72.79792785644531, Test Loss: 0.5270806550979614, Test Accuracy: 72.44898223876953
+Epoch 5, Loss: 0.5122867226600647, Accuracy: 73.57512664794922, Test Loss: 0.5229357481002808, Test Accuracy: 72.65306091308594
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='marwan116' date='2019-03-27T22:51:24Z'>
+		&lt;denchmark-link:https://github.com/alextp&gt;@alextp&lt;/denchmark-link&gt;
+  - how to combine @tf.function with feature_columns ?
+		</comment>
+		<comment id='2' author='marwan116' date='2019-03-27T22:56:55Z'>
+		&lt;denchmark-link:https://github.com/rohan100jain&gt;@rohan100jain&lt;/denchmark-link&gt;
+ I thought you had already fixed this issue?
+		</comment>
+		<comment id='3' author='marwan116' date='2019-03-27T23:02:15Z'>
+		Thank you for responding!
+Btw interesting enough I just added a counter - and the model managed to run for one epoch before crashing ...
+EDIT (Just updated the code in the issue to show the behavior with the counter added...)
+		</comment>
+		<comment id='4' author='marwan116' date='2019-03-27T23:12:21Z'>
+		Ok! the code below solves the problem (adding a dummy counter for both training and testing steps ...)- but I am not sure why - thoughts &lt;denchmark-link:https://github.com/rohan100jain&gt;@rohan100jain&lt;/denchmark-link&gt;
+ ?
+(Not incrementing the counter i.e. passing a fixed value - causes the error to be rasied again)
+seems to me like counter is acting like an incrementing global step which tells the model not to initialize the lookup tables again ...
+&lt;denchmark-code&gt;import numpy as np
+import pandas as pd
+
+!pip install sklearn
+!pip install tensorflow==2.0.0-alpha0
+import tensorflow as tf
+
+from tensorflow import feature_column
+from tensorflow.keras import layers
+from tensorflow.keras.models import Model
+from sklearn.model_selection import train_test_split
+
+URL = 'https://storage.googleapis.com/applied-dl/heart.csv'
+dataframe = pd.read_csv(URL)
+
+train, test = train_test_split(dataframe, test_size=0.2)
+train, val = train_test_split(train, test_size=0.2)
+
+# A utility method to create a tf.data dataset from a Pandas Dataframe
+def df_to_dataset(dataframe, shuffle=True, batch_size=32):
+  dataframe = dataframe.copy()
+  labels = dataframe.pop('target').values.reshape(-1,1)
+  ds = tf.data.Dataset.from_tensor_slices((dict(dataframe), labels))
+  if shuffle:
+    ds = ds.shuffle(buffer_size=len(dataframe))
+  ds = ds.batch(batch_size)
+  return ds
+
+batch_size = 32
+train_ds = df_to_dataset(train, batch_size=batch_size)
+val_ds = df_to_dataset(val, shuffle=False, batch_size=batch_size)
+test_ds = df_to_dataset(test, shuffle=False, batch_size=batch_size)
+
+feature_columns = []
+
+# numeric cols
+for header in ['age', 'trestbps', 'chol', 'thalach', 'oldpeak', 'slope', 'ca']:
+  feature_columns.append(feature_column.numeric_column(header))
+
+# bucketized cols
+age = feature_column.numeric_column("age")
+age_buckets = feature_column.bucketized_column(age, boundaries=[18, 25, 30, 35, 40, 45, 50, 55, 60, 65])
+feature_columns.append(age_buckets)
+
+# indicator cols
+thal = feature_column.categorical_column_with_vocabulary_list(
+      'thal', ['fixed', 'normal', 'reversible'])
+thal_one_hot = feature_column.indicator_column(thal)
+feature_columns.append(thal_one_hot)
+
+# embedding cols
+thal_embedding = feature_column.embedding_column(thal, dimension=8)
+feature_columns.append(thal_embedding)
+
+#crossed cols
+crossed_feature = feature_column.crossed_column([age_buckets, thal], hash_bucket_size=1000)
+crossed_feature = feature_column.indicator_column(crossed_feature)
+feature_columns.append(crossed_feature)
+
+feature_layer = tf.keras.layers.DenseFeatures(feature_columns, trainable=False)
+
+
+class MyModel(Model):
+  def __init__(self):
+    super(MyModel, self).__init__()
+    self.features = feature_layer
+    self.dense = layers.Dense(128, activation = 'relu')
+    self.dense2 = layers.Dense(128, activation = 'relu')
+    self.sigmoid = layers.Dense(1, activation = 'sigmoid')
+
+  def call(self, x):
+    x = self.features(x)
+    x = self.dense(x)
+    x = self.dense2(x)
+    return self.sigmoid(x)
+
+model = MyModel()
+loss_object = tf.keras.losses.BinaryCrossentropy()
+optimizer = tf.keras.optimizers.Adam()
+
+train_loss = tf.keras.metrics.Mean(name='train_loss')
+train_accuracy = tf.keras.metrics.BinaryAccuracy(name='train_accuracy')
+
+test_loss = tf.keras.metrics.Mean(name='test_loss')
+test_accuracy = tf.keras.metrics.BinaryAccuracy(name='test_accuracy')
+
+@tf.function
+def train_step(features, label, counter):
+  with tf.GradientTape() as tape:
+    predictions = model(features)
+    loss = loss_object(label, predictions)
+  gradients = tape.gradient(loss, model.trainable_variables)
+  optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+  train_loss(loss)
+  train_accuracy(label, predictions)
+
+@tf.function
+def test_step(image, label, counter):
+  predictions = model(image)
+  t_loss = loss_object(label, predictions)
+
+  test_loss(t_loss)
+  test_accuracy(label, predictions)
+
+EPOCHS = 5
+counter = 0
+for epoch in range(EPOCHS):
+  
+  for features, labels in train_ds:
+    train_step(features, labels, counter)
+    counter +=1
+    
+  for features, labels in val_ds:
+    test_step(features, labels, counter)
+    counter +=1
+
+  template = 'Epoch {}, Loss: {}, Accuracy: {}, Test Loss: {}, Test Accuracy: {}'
+  print (template.format(epoch+1,
+                           train_loss.result(), 
+                           train_accuracy.result()*100,
+                           test_loss.result(), 
+                           test_accuracy.result()*100))
+  
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='5' author='marwan116' date='2019-04-08T18:17:08Z'>
+		&lt;denchmark-link:https://github.com/rohan100jain&gt;@rohan100jain&lt;/denchmark-link&gt;
+ did you have time to take a look?
+		</comment>
+		<comment id='6' author='marwan116' date='2019-07-18T19:14:47Z'>
+		&lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/f6e0ec468a3dee7c2ae1fa3575bb46d884b4a319&gt;f6e0ec4&lt;/denchmark-link&gt;
+ should hopefully fix this issue
+		</comment>
+		<comment id='7' author='marwan116' date='2019-07-19T23:12:19Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=27086&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=27086&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

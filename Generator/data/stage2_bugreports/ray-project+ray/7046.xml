@@ -1,0 +1,684 @@
+<bug id='7046' author='flying-mojo' open_date='2020-02-04T14:37:11Z' closed_time='2020-03-07T11:36:28Z'>
+	<summary>[RLlib] Loading keras weights in Model __init__ doesnt work</summary>
+	<description>
+&lt;denchmark-h:h3&gt;What is the problem?&lt;/denchmark-h&gt;
+
+I have pretrained my keras model outside of RLlib. Now i would like to load the weights of that model and continue training it with rllib. Issuing load_weights in init (TFModelV2) does load the weights with no errors. But it seems they get reinitialised/ereased by something further down the pipeline since we loss/reward starts an its initial value not a value i would expect after loading trained model.
+Ray version and other system information (Python version, TensorFlow version, OS):
+Linux, Ray=0.8.0, TF2.0
+&lt;denchmark-h:h3&gt;Reproduction (REQUIRED)&lt;/denchmark-h&gt;
+
+Please provide a script that can be run to reproduce the issue. The script should have no external library dependencies (i.e., use fake or mock data / environments):
+Repro:
+I have done the following:
+
+Add following
+base_model.zip
+custom_keras_model_loaded.txt
+
+code to _save() method of Trainer class:
+with self.get_policy().model.context():
+self.get_policy().model.base_model.save_weights("/tmp/base_model.h5")
+2. set checkpointfreq to 20 for custom_keras_model.py (from examples folder)
+3. run: python3 ./custom_keras_model.py --run "PPO"
+4. after 20 steps it saves the checkpoint (and my keras model weights to /tmp/base_model.h5"
+5. after 20 steps my mean reward is 184 (Cartpole-v0)
+6. i have now modifed the custom_keras_model.py script (see attachment) to load my weights after the base model is created (at the end of MyKerasModel):
+print("resoring weights")
+self.base_model.load_weights("/tmp/base_model.h5")
+7. now i run the python3 ./custom_keras_model.py --run "PPO"
+8 i would expect the training to start with mean reward of around 180 but it starts with 40 as is the case with training from scratch.
+I attach modifed version of custom_keras_model.py (one that loads weights) and the weights dumped after 20 iterations.
+If we cannot run your script, we cannot fix your issue.
+
+ I have verified my script runs in a clean environment and reproduces the issue.
+ I have verified the issue also occurs with the latest wheels.
+
+	</description>
+	<comments>
+		<comment id='1' author='flying-mojo' date='2020-02-27T15:16:29Z'>
+		I'm seeing the same thing:
+
+My Trainer._save method was modified to save the keras model's weights via self.get_policy().model.base_model.save_weights(...) to disk.
+I create a new PPO trainer from scratch (from some config).
+I call trainer.save("before_training") to have an initial checkpoint (plus the h5 file with the model.base_model weights)
+I call trainer.train() 10x (CartPole is being learnt)
+I save the trainer again via trainer.save("after_training") (plus the h5 file with the model.base_model weights)
+
+However, I see no difference when I print out the base_model's weights before and after the training. They remain unchanged, while doing  before and after does show learning progress.
+I'll keep digging. &lt;denchmark-link:https://github.com/ericl&gt;@ericl&lt;/denchmark-link&gt;
+: any ideas?
+		</comment>
+		<comment id='2' author='flying-mojo' date='2020-03-06T09:19:40Z'>
+		Almost there. It uses a different session for the load_weights call.
+So same graph, but running in a different session (Keras default?), which is why the loaded weights have no effect on the Agent (which has another session).
+Will fix this now by making it a top-level Trainer/Policy method to load weights from an h5 file.
+		</comment>
+		<comment id='3' author='flying-mojo' date='2020-03-06T10:22:46Z'>
+		Thanks great! Thank you for investigating! :)
+Jarek
+		</comment>
+		<comment id='4' author='flying-mojo' date='2020-03-06T11:19:55Z'>
+		&lt;denchmark-link:https://github.com/flying-mojo&gt;@flying-mojo&lt;/denchmark-link&gt;
+ Here is a minimal example that now works with the following PR (which will go in very shortly): &lt;denchmark-link:https://github.com/ray-project/ray/pull/7482&gt;#7482&lt;/denchmark-link&gt;
+
+Let me know, whether this works for you. We are currently trying to unify and clean up our model/agent/policy saving and restoring methods and update our documentation on this. Thanks for your patience.
+&lt;denchmark-code&gt;"""Example of using a pre-trained, custom ModelV2 Keras-style model."""
+import argparse
+
+import ray
+import ray.rllib.agents.ppo as ppo
+from ray.rllib.models import ModelCatalog
+from ray.rllib.models.tf.misc import normc_initializer
+from ray.rllib.models.tf.tf_modelv2 import TFModelV2
+from ray.rllib.utils import try_import_tf
+
+tf = try_import_tf()
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--stop-at-reward", type=int, default=190)
+
+
+class MyKerasModel(TFModelV2):
+    """Custom model for policy gradient algorithms."""
+    
+    def __init__(self, obs_space, action_space, num_outputs, model_config,
+                 name):
+        super(MyKerasModel, self).__init__(obs_space, action_space,
+                                           num_outputs, model_config, name)
+        self.inputs = tf.keras.layers.Input(
+            shape=obs_space.shape, name="observations")
+        layer_1 = tf.keras.layers.Dense(
+            16,
+            name="layer1",
+            activation=tf.nn.relu,
+            kernel_initializer=normc_initializer(1.0))(self.inputs)
+        layer_out = tf.keras.layers.Dense(
+            num_outputs,
+            name="out",
+            activation=None,
+            kernel_initializer=normc_initializer(0.01))(layer_1)
+        value_out = tf.keras.layers.Dense(
+            1,
+            name="value",
+            activation=None,
+            kernel_initializer=normc_initializer(0.01))(layer_1)
+        self.base_model = tf.keras.Model(self.inputs, [layer_out, value_out])
+
+        self.register_variables(self.base_model.variables)
+
+    def forward(self, input_dict, state, seq_lens):
+        model_out, self._value_out = self.base_model(input_dict["obs"])
+        return model_out, state
+    
+    def value_function(self):
+        return tf.reshape(self._value_out, [-1])
+
+    def import_from_h5(self, import_file):
+        # Override this to define custom weight loading behavior from h5 files.
+        self.base_model.load_weights(import_file)
+
+
+if __name__ == "__main__":
+    ray.init()
+    args = parser.parse_args()
+    ModelCatalog.register_custom_model(
+        "keras_model", MyKerasModel,
+    )
+    config = {
+            "num_workers": 0,
+            "model": {
+                "custom_model": "keras_model"
+            }, "env": "CartPole-v0"}
+    agent = ppo.PPOTrainer(config)
+
+    # Import weights for our custom model from an h5 file.
+    print("weight before importing from h5={}".format(agent.get_weights()["default_policy"]["default_policy/value/kernel"][0]))
+    agent.import_model("weights.h5")
+
+    # Print out to see, whether weights were correctly loaded.
+    print("weight after importing from h5={}".format(agent.get_weights()["default_policy"]["default_policy/value/kernel"][0]))
+
+    #agent.import_policy_model_from_h5("weights.h5")
+    #print(agent.get_weights()["default_policy"]["default_policy/value/kernel"][0])
+
+    # Train for a while.
+    for _ in range(3):
+        print(agent.train())
+
+    # Weights should have changed.
+    print("weight after training={}".format(agent.get_weights()["default_policy"]["default_policy/value/kernel"][0]))
+
+    # We can save the entire Agent and restore, weights should remain the same.
+    file_after_training = agent.save("after_train")
+    print("weight after Agent.save={}".format(agent.get_weights()["default_policy"]["default_policy/value/kernel"][0]))
+    agent.restore(file_after_training)
+    print("weight after Agent.restore={}".format(agent.get_weights()["default_policy"]["default_policy/value/kernel"][0]))
+
+    # Import (untrained) weights again.
+    agent.import_model("weights.h5")
+    print("weight after importing from h5={}".format(agent.get_weights()["default_policy"]["default_policy/value/kernel"][0]))
+
+    ## 1) Uncomment the following line to save weights into weights.h5.
+    #with agent.get_policy()._sess.graph.as_default():
+    #    agent.get_policy().model.base_model.save_weights("weights.h5")
+
+    #print(agent.get_weights()["default_policy"]["default_policy/value/kernel"][0])
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='5' author='flying-mojo' date='2020-03-07T11:36:28Z'>
+		Closing this issue.
+		</comment>
+		<comment id='6' author='flying-mojo' date='2020-05-24T04:03:15Z'>
+		&lt;denchmark-link:https://github.com/sven1977&gt;@sven1977&lt;/denchmark-link&gt;
+ Hi!  I just modified your code to finetune my model. However I met some unexpected problem. Here is my code:
+&lt;denchmark-code&gt;"""Example of using a pre-trained, custom ModelV2 Keras-style model."""
+import argparse
+
+import ray
+import ray.rllib.agents.ppo as ppo
+from ray.rllib.models import ModelCatalog
+from ray.rllib.models.tf.misc import normc_initializer
+from ray.rllib.models.tf.tf_modelv2 import TFModelV2
+from ray.rllib.utils import try_import_tf
+
+tf = try_import_tf()
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--stop-at-reward", type=int, default=190)
+
+
+class MyKerasModel(TFModelV2):
+    """Custom model for policy gradient algorithms."""
+
+    def __init__(self, obs_space, action_space, num_outputs, model_config,
+                 name):
+        super(MyKerasModel, self).__init__(obs_space, action_space,
+                                           num_outputs, model_config, name)
+        self.inputs = tf.keras.layers.Input(
+            shape=obs_space.shape, name="observations")
+        layer_1 = tf.keras.layers.Dense(
+            16,
+            name="layer1",
+            activation=tf.nn.relu,
+            kernel_initializer=normc_initializer(1.0))(self.inputs)
+        layer_out = tf.keras.layers.Dense(
+            num_outputs,
+            name="out",
+            activation=None,
+            kernel_initializer=normc_initializer(0.01))(layer_1)
+        value_out = tf.keras.layers.Dense(
+            1,
+            name="value",
+            activation=None,
+            kernel_initializer=normc_initializer(0.01))(layer_1)
+        self.base_model = tf.keras.Model(self.inputs, [layer_out, value_out])
+
+        self.register_variables(self.base_model.variables)
+
+    def forward(self, input_dict, state, seq_lens):
+        model_out, self._value_out = self.base_model(input_dict["obs"])
+        return model_out, state
+
+    def value_function(self):
+        return tf.reshape(self._value_out, [-1])
+
+    def import_from_h5(self, import_file):
+        # Override this to define custom weight loading behavior from h5 files.
+        self.base_model.load_weights(import_file)
+
+
+if __name__ == "__main__":
+    ray.init()
+    args = parser.parse_args()
+    ModelCatalog.register_custom_model(
+        "keras_model", MyKerasModel,
+    )
+    config = {
+        "num_workers": 0,
+        "model": {
+            "custom_model": "keras_model"
+        }, "env": "CartPole-v0"}
+    agent = ppo.PPOTrainer(config)
+    agent.import_model("weights.h5") # load pretrained model
+    for _ in range(10):
+        print(agent.train()) # Fine-tune
+    with agent.get_policy()._sess.graph.as_default(): # Save model after finetune
+       agent.get_policy().model.base_model.save_weights("weights.h5")
+&lt;/denchmark-code&gt;
+
+But I got traceback like this, looks like the session of  tf is different:
+&lt;denchmark-code&gt;Traceback (most recent call last):
+  File "/home/saber/anaconda3/lib/python3.7/site-packages/tensorflow/python/client/session.py", line 1356, in _do_call
+    return fn(*args)
+  File "/home/saber/anaconda3/lib/python3.7/site-packages/tensorflow/python/client/session.py", line 1341, in _run_fn
+    options, feed_dict, fetch_list, target_list, run_metadata)
+  File "/home/saber/anaconda3/lib/python3.7/site-packages/tensorflow/python/client/session.py", line 1429, in _call_tf_sessionrun
+    run_metadata)
+tensorflow.python.framework.errors_impl.FailedPreconditionError: Error while reading resource variable default_policy/layer1/bias from Container: localhost. This could mean that the variable was uninitialized. Not found: Container localhost does not exist. (Could not find resource: localhost/default_policy/layer1/bias)
+	 [[{{node default_policy/layer1/bias/Read/ReadVariableOp}}]]
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/home/saber/Desktop/Rlib/load_example.py", line 73, in &lt;module&gt;
+    agent.get_policy().model.base_model.save_weights("weights.h5")
+  File "/home/saber/anaconda3/lib/python3.7/site-packages/tensorflow/python/keras/engine/network.py", line 1310, in save_weights
+    saving.save_weights_to_hdf5_group(f, self.layers)
+  File "/home/saber/anaconda3/lib/python3.7/site-packages/tensorflow/python/keras/saving/hdf5_format.py", line 687, in save_weights_to_hdf5_group
+    weight_values = K.batch_get_value(weights)
+  File "/home/saber/anaconda3/lib/python3.7/site-packages/tensorflow/python/keras/backend.py", line 3010, in batch_get_value
+    return get_session(tensors).run(tensors)
+  File "/home/saber/anaconda3/lib/python3.7/site-packages/tensorflow/python/client/session.py", line 950, in run
+    run_metadata_ptr)
+  File "/home/saber/anaconda3/lib/python3.7/site-packages/tensorflow/python/client/session.py", line 1173, in _run
+    feed_dict_tensor, options, run_metadata)
+  File "/home/saber/anaconda3/lib/python3.7/site-packages/tensorflow/python/client/session.py", line 1350, in _do_run
+    run_metadata)
+  File "/home/saber/anaconda3/lib/python3.7/site-packages/tensorflow/python/client/session.py", line 1370, in _do_call
+    raise type(e)(node_def, op, message)
+tensorflow.python.framework.errors_impl.FailedPreconditionError: Error while reading resource variable default_policy/layer1/bias from Container: localhost. This could mean that the variable was uninitialized. Not found: Container localhost does not exist. (Could not find resource: localhost/default_policy/layer1/bias)
+	 [[node default_policy/layer1/bias/Read/ReadVariableOp (defined at /anaconda3/lib/python3.7/site-packages/ray/rllib/models/catalog.py:297) ]]
+
+Original stack trace for 'default_policy/layer1/bias/Read/ReadVariableOp':
+  File "/Desktop/Rlib/load_example.py", line 68, in &lt;module&gt;
+    agent = ppo.PPOTrainer(config)
+  File "/anaconda3/lib/python3.7/site-packages/ray/rllib/agents/trainer_template.py", line 90, in __init__
+    Trainer.__init__(self, config, env, logger_creator)
+  File "/anaconda3/lib/python3.7/site-packages/ray/rllib/agents/trainer.py", line 448, in __init__
+    super().__init__(config, logger_creator)
+  File "/anaconda3/lib/python3.7/site-packages/ray/tune/trainable.py", line 174, in __init__
+    self._setup(copy.deepcopy(self.config))
+  File "/anaconda3/lib/python3.7/site-packages/ray/rllib/agents/trainer.py", line 591, in _setup
+    self._init(self.config, self.env_creator)
+  File "/anaconda3/lib/python3.7/site-packages/ray/rllib/agents/trainer_template.py", line 117, in _init
+    self.config["num_workers"])
+  File "/anaconda3/lib/python3.7/site-packages/ray/rllib/agents/trainer.py", line 662, in _make_workers
+    logdir=self.logdir)
+  File "/anaconda3/lib/python3.7/site-packages/ray/rllib/evaluation/worker_set.py", line 61, in __init__
+    RolloutWorker, env_creator, policy, 0, self._local_config)
+  File "/anaconda3/lib/python3.7/site-packages/ray/rllib/evaluation/worker_set.py", line 279, in _make_worker
+    extra_python_environs=extra_python_environs)
+  File "/anaconda3/lib/python3.7/site-packages/ray/rllib/evaluation/rollout_worker.py", line 376, in __init__
+    self._build_policy_map(policy_dict, policy_config)
+  File "/anaconda3/lib/python3.7/site-packages/ray/rllib/evaluation/rollout_worker.py", line 859, in _build_policy_map
+    policy_map[name] = cls(obs_space, act_space, merged_conf)
+  File "/anaconda3/lib/python3.7/site-packages/ray/rllib/policy/tf_policy_template.py", line 143, in __init__
+    obs_include_prev_action_reward=obs_include_prev_action_reward)
+  File "/anaconda3/lib/python3.7/site-packages/ray/rllib/policy/dynamic_tf_policy.py", line 163, in __init__
+    framework="tf")
+  File "/anaconda3/lib/python3.7/site-packages/ray/rllib/models/catalog.py", line 304, in get_model_v2
+    **model_kwargs)
+  File "/Desktop/Rlib/load_example.py", line 30, in __init__
+    kernel_initializer=normc_initializer(1.0))(self.inputs)
+  File "/anaconda3/lib/python3.7/site-packages/tensorflow/python/keras/engine/base_layer.py", line 591, in __call__
+    self._maybe_build(inputs)
+  File "/anaconda3/lib/python3.7/site-packages/tensorflow/python/keras/engine/base_layer.py", line 1881, in _maybe_build
+    self.build(input_shapes)
+  File "/anaconda3/lib/python3.7/site-packages/tensorflow/python/keras/layers/core.py", line 1026, in build
+    trainable=True)
+  File "/anaconda3/lib/python3.7/site-packages/tensorflow/python/keras/engine/base_layer.py", line 384, in add_weight
+    aggregation=aggregation)
+  File "/anaconda3/lib/python3.7/site-packages/tensorflow/python/training/tracking/base.py", line 663, in _add_variable_with_custom_getter
+    **kwargs_for_getter)
+  File "/anaconda3/lib/python3.7/site-packages/tensorflow/python/keras/engine/base_layer_utils.py", line 155, in make_variable
+    shape=variable_shape if variable_shape.rank else None)
+  File "/anaconda3/lib/python3.7/site-packages/tensorflow/python/ops/variables.py", line 259, in __call__
+    return cls._variable_v1_call(*args, **kwargs)
+  File "/anaconda3/lib/python3.7/site-packages/tensorflow/python/ops/variables.py", line 220, in _variable_v1_call
+    shape=shape)
+  File "/anaconda3/lib/python3.7/site-packages/tensorflow/python/ops/variables.py", line 59, in getter
+    return captured_getter(captured_previous, **kwargs)
+  File "/anaconda3/lib/python3.7/site-packages/ray/rllib/models/catalog.py", line 297, in track_var_creation
+    v = next_creator(**kw)
+  File "/anaconda3/lib/python3.7/site-packages/tensorflow/python/ops/variables.py", line 198, in &lt;lambda&gt;
+    previous_getter = lambda **kwargs: default_variable_creator(None, **kwargs)
+  File "/anaconda3/lib/python3.7/site-packages/tensorflow/python/ops/variable_scope.py", line 2495, in default_variable_creator
+    shape=shape)
+  File "/anaconda3/lib/python3.7/site-packages/tensorflow/python/ops/variables.py", line 263, in __call__
+    return super(VariableMetaclass, cls).__call__(*args, **kwargs)
+  File "/anaconda3/lib/python3.7/site-packages/tensorflow/python/ops/resource_variable_ops.py", line 460, in __init__
+    shape=shape)
+  File "/anaconda3/lib/python3.7/site-packages/tensorflow/python/ops/resource_variable_ops.py", line 649, in _init_from_args
+    value = self._read_variable_op()
+  File "/anaconda3/lib/python3.7/site-packages/tensorflow/python/ops/resource_variable_ops.py", line 935, in _read_variable_op
+    self._dtype)
+  File "/anaconda3/lib/python3.7/site-packages/tensorflow/python/ops/gen_resource_variable_ops.py", line 587, in read_variable_op
+    "ReadVariableOp", resource=resource, dtype=dtype, name=name)
+  File "/anaconda3/lib/python3.7/site-packages/tensorflow/python/framework/op_def_library.py", line 788, in _apply_op_helper
+    op_def=op_def)
+  File "/anaconda3/lib/python3.7/site-packages/tensorflow/python/util/deprecation.py", line 507, in new_func
+    return func(*args, **kwargs)
+  File "/anaconda3/lib/python3.7/site-packages/tensorflow/python/framework/ops.py", line 3616, in create_op
+    op_def=op_def)
+  File "/anaconda3/lib/python3.7/site-packages/tensorflow/python/framework/ops.py", line 2005, in __init__
+    self._traceback = tf_stack.extract_stack()
+&lt;/denchmark-code&gt;
+
+Any advice? Thanks!
+		</comment>
+		<comment id='7' author='flying-mojo' date='2020-05-24T04:50:09Z'>
+		&lt;denchmark-link:https://github.com/sven1977&gt;@sven1977&lt;/denchmark-link&gt;
+ OK, I figure out alternative way to do this. I just extracted network weights from h5 file just like what  do.  It does not look like art but it save me a lots of time to combat with confusing  issues.
+Here is what I have done:
+&lt;denchmark-code&gt;"""Example of using a pre-trained, custom ModelV2 Keras-style model."""
+import argparse
+
+import ray
+import ray.rllib.agents.ppo as ppo
+from ray.rllib.models import ModelCatalog
+from ray.rllib.models.tf.misc import normc_initializer
+from ray.rllib.models.tf.tf_modelv2 import TFModelV2
+from ray.rllib.utils import try_import_tf
+import numpy as np
+
+tf = try_import_tf()
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--stop-at-reward", type=int, default=190)
+
+
+class MyKerasModel(TFModelV2):
+    """Custom model for policy gradient algorithms."""
+
+    def __init__(self, obs_space, action_space, num_outputs, model_config,
+                 name):
+        super(MyKerasModel, self).__init__(obs_space, action_space,
+                                           num_outputs, model_config, name)
+        self.inputs = tf.keras.layers.Input(
+            shape=obs_space.shape, name="observations")
+        layer_1 = tf.keras.layers.Dense(
+            16,
+            name="layer1",
+            activation=tf.nn.relu,
+            kernel_initializer=normc_initializer(1.0))(self.inputs)
+        layer_out = tf.keras.layers.Dense(
+            num_outputs,
+            name="out",
+            activation=None,
+            kernel_initializer=normc_initializer(0.01))(layer_1)
+        value_out = tf.keras.layers.Dense(
+            1,
+            name="value",
+            activation=None,
+            kernel_initializer=normc_initializer(0.01))(layer_1)
+        self.base_model = tf.keras.Model(self.inputs, [layer_out, value_out])
+
+        self.register_variables(self.base_model.variables)
+
+    def forward(self, input_dict, state, seq_lens):
+        model_out, self._value_out = self.base_model(input_dict["obs"])
+        return model_out, state
+
+    def value_function(self):
+        return tf.reshape(self._value_out, [-1])
+
+    def import_from_h5(self, import_file):
+        # Override this to define custom weight loading behavior from h5 files.
+        self.base_model.load_weights(import_file)
+
+
+if __name__ == "__main__":
+    ray.init()
+    args = parser.parse_args()
+    ModelCatalog.register_custom_model(
+        "keras_model", MyKerasModel,
+    )
+    config = {
+        "num_workers": 0,
+        "model": {
+            "custom_model": "keras_model"
+        }, "env": "CartPole-v0"}
+    agent = ppo.PPOTrainer(config)
+
+    # Uncommen this when you have coresponding weights
+    # weight = np.load('weights.npy', allow_pickle=True).item() 
+    # agent.get_policy().set_weights(weight)
+
+    for i in range(10):
+        print(agent.train())
+        if i % 2 == 0:  # Save the weights every 2 episodes
+            np.save('weights.npy', agent.get_policy().get_weights())
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='8' author='flying-mojo' date='2020-07-28T17:57:00Z'>
+		Re-edited.
+Hi &lt;denchmark-link:https://github.com/sven1977&gt;@sven1977&lt;/denchmark-link&gt;
+, by assembling some of the code above, I'm trying to
+
+train a model for 2 steps, then save its weights
+train the model for 10 steps,
+load weights back to the model and do the training.
+
+The expected result is, after the loading, the model should have the same weight as the saved one,
+and the following training performance should start at a lower point.
+I've tried three options
+
+load/save h5 file
+load/save bumpy file
+load/save via rllib api, restore/save
+load/save h5 file using the method provided by @sven1977
+
+However the two H5 file option seems to be not working.
+
+option 1 does not affect the model at all
+option 4 seems to load the model with the weights at the very beginning, not the one after 2 steps training.
+
+Is this a bug or I'm saving the H5 file wrongly, or is there any way I can use h5 file for loading correctly?
+Code for reproducing it is at the bottom.
+I'm using MacOS, python3.7, ray 0.8.6.
+import ray
+import ray.rllib.agents.ppo as ppo
+from ray.rllib.models import ModelCatalog
+from ray.rllib.models.tf.misc import normc_initializer
+from ray.rllib.models.tf.tf_modelv2 import TFModelV2
+from ray.rllib.utils import try_import_tf
+import numpy as np
+
+tf = try_import_tf()
+
+
+class MyKerasModel(TFModelV2):
+    """Custom model for policy gradient algorithms."""
+
+    def __init__(self, obs_space, action_space, num_outputs, model_config,
+                 name):
+        super(MyKerasModel, self).__init__(obs_space, action_space,
+                                           num_outputs, model_config, name)
+        self.inputs = tf.keras.layers.Input(
+            shape=obs_space.shape, name="observations")
+        layer_1 = tf.keras.layers.Dense(
+            16,
+            name="layer1",
+            activation=tf.nn.relu,
+            kernel_initializer=normc_initializer(1.0))(self.inputs)
+        layer_out = tf.keras.layers.Dense(
+            num_outputs,
+            name="out",
+            activation=None,
+            kernel_initializer=normc_initializer(0.01))(layer_1)
+        value_out = tf.keras.layers.Dense(
+            1,
+            name="value",
+            activation=None,
+            kernel_initializer=normc_initializer(0.01))(layer_1)
+        self.base_model = tf.keras.Model(self.inputs, [layer_out, value_out])
+
+        self.register_variables(self.base_model.variables)
+
+    def forward(self, input_dict, state, seq_lens):
+        model_out, self._value_out = self.base_model(input_dict["obs"])
+        return model_out, state
+
+    def value_function(self):
+        return tf.reshape(self._value_out, [-1])
+
+    def import_from_h5(self, import_file):
+        # Override this to define custom weight loading behavior from h5 files.
+        self.base_model.load_weights(import_file)
+
+
+def get_weights_from_agent(agent):
+    return agent.get_weights()["default_policy"]["default_policy/value/kernel"][0]
+
+
+def train_agent(agent, num_steps=5):
+    for i in range(num_steps):
+        result = agent.train()
+        print(f"training step{i}", result["episode_reward_mean"])
+
+
+if __name__ == "__main__":
+    ray.init()
+    ModelCatalog.register_custom_model(
+        "keras_model", MyKerasModel,
+    )
+    config = {
+        "lr": 0.01,
+        "num_workers": 0,
+        "model": {
+            "custom_model": "keras_model"
+        },
+        "env": "CartPole-v0",
+    }
+    agent = ppo.PPOTrainer(config)
+    option = 1
+
+    # train
+    print(f"weight before training = {get_weights_from_agent(agent)}")
+    train_agent(agent, num_steps=2)
+    print(f"weight after training = {get_weights_from_agent(agent)}")
+
+    # save
+    if option == 1 or option ==4:
+        with agent.get_policy()._sess.graph.as_default():
+            agent.get_policy().model.base_model.save_weights("weights.h5")
+    elif option == 2:
+        np.save('weights.npy', agent.get_policy().get_weights())
+    elif option == 3:
+        file_after_training = agent.save("after_train")
+
+    print(f"weight after base_model.save_weights = {get_weights_from_agent(agent)}")
+    train_agent(agent, num_steps=10)
+    print(f"weight after training = {get_weights_from_agent(agent)}")
+
+    if option == 1:
+        with agent.get_policy()._sess.graph.as_default():
+            agent.get_policy().model.base_model.load_weights("weights.h5")
+    elif option == 2:
+        weight = np.load('weights.npy', allow_pickle=True).item()
+        agent.get_policy().set_weights(weight)
+    elif option == 3:
+        agent.restore(file_after_training)
+    elif option == 4:
+        agent.import_model("weights.h5")
+
+    print(f"weight after agent.import_model = {get_weights_from_agent(agent)}")
+    train_agent(agent, num_steps=5)
+		</comment>
+		<comment id='9' author='flying-mojo' date='2020-07-30T14:42:05Z'>
+		So finally it's working
+the problem was we need to set both session and graph correctly when saving:
+    with agent.get_policy()._sess.graph.as_default():
+        with agent.get_policy()._sess.as_default():
+            agent.get_policy().model.base_model.save_weights("weights.h5")
+this code corresponds to the loading in &lt;denchmark-link:https://github.com/ray-project/ray/blob/master/rllib/policy/tf_policy.py#L476&gt;https://github.com/ray-project/ray/blob/master/rllib/policy/tf_policy.py#L476&lt;/denchmark-link&gt;
+
+import ray
+import ray.rllib.agents.ppo as ppo
+from ray.rllib.models import ModelCatalog
+from ray.rllib.models.tf.misc import normc_initializer
+from ray.rllib.models.tf.tf_modelv2 import TFModelV2
+from ray.rllib.utils import try_import_tf
+
+tf = try_import_tf()
+
+
+class MyKerasModel(TFModelV2):
+    """Custom model for policy gradient algorithms."""
+
+    def __init__(self, obs_space, action_space, num_outputs, model_config,
+                 name):
+        super(MyKerasModel, self).__init__(obs_space, action_space,
+                                           num_outputs, model_config, name)
+        self.inputs = tf.keras.layers.Input(
+            shape=obs_space.shape, name="observations")
+        layer_1 = tf.keras.layers.Dense(
+            16,
+            name="layer1",
+            activation=tf.nn.relu,
+            kernel_initializer=normc_initializer(1.0))(self.inputs)
+        layer_out = tf.keras.layers.Dense(
+            num_outputs,
+            name="out",
+            activation=None,
+            kernel_initializer=normc_initializer(0.01))(layer_1)
+        value_out = tf.keras.layers.Dense(
+            1,
+            name="value",
+            activation=None,
+            kernel_initializer=normc_initializer(0.01))(layer_1)
+        self.base_model = tf.keras.Model(self.inputs, [layer_out, value_out])
+
+        self.register_variables(self.base_model.variables)
+
+    def forward(self, input_dict, state, seq_lens):
+        model_out, self._value_out = self.base_model(input_dict["obs"])
+        return model_out, state
+
+    def value_function(self):
+        return tf.reshape(self._value_out, [-1])
+
+    def import_from_h5(self, import_file):
+        # Override this to define custom weight loading behavior from h5 files.
+        self.base_model.load_weights(import_file)
+
+
+def get_weights_from_agent(agent):
+    return agent.get_weights()["default_policy"]["default_policy/value/kernel"][0]
+
+
+def train_agent(agent, num_steps=5):
+    for i in range(num_steps):
+        result = agent.train()
+        print(f"training step{i}", result["episode_reward_mean"])
+
+
+if __name__ == "__main__":
+    ray.init()
+    ModelCatalog.register_custom_model(
+        "keras_model", MyKerasModel,
+    )
+    config = {
+        "lr": 0.01,
+        "num_workers": 0,
+        "model": {
+            "custom_model": "keras_model"
+        },
+        "env": "CartPole-v0",
+    }
+    agent = ppo.PPOTrainer(config)
+
+    # train
+    print(f"weight before training = {get_weights_from_agent(agent)}")
+    train_agent(agent, num_steps=2)
+    print(f"weight after training = {get_weights_from_agent(agent)}")
+
+    # save
+    with agent.get_policy()._sess.graph.as_default():
+        with agent.get_policy()._sess.as_default():
+            agent.get_policy().model.base_model.save_weights("weights.h5")
+
+    print(f"weight after base_model.save_weights = {get_weights_from_agent(agent)}")
+    train_agent(agent, num_steps=10)
+    print(f"weight after training = {get_weights_from_agent(agent)}")
+
+    agent.import_model("weights.h5")
+
+    print(f"weight after agent.import_model = {get_weights_from_agent(agent)}")
+    train_agent(agent, num_steps=5)
+		</comment>
+	</comments>
+</bug>

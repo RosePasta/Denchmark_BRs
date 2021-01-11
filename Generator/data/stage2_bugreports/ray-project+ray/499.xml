@@ -1,0 +1,149 @@
+<bug id='499' author='stephanie-wang' open_date='2017-05-02T02:33:12Z' closed_time='2018-09-12T19:59:37Z'>
+	<summary>Add reconstruct call to `ray.wait`</summary>
+	<description>
+Right now, if objects are evicted as others become available, a blocking ray.wait will hang forever, since it does not request reconstruction.
+	</description>
+	<comments>
+		<comment id='1' author='stephanie-wang' date='2018-08-22T20:21:03Z'>
+		See relevant discussion in &lt;denchmark-link:https://github.com/ray-project/ray/issues/499&gt;#499&lt;/denchmark-link&gt;
+.
+		</comment>
+		<comment id='2' author='stephanie-wang' date='2018-08-28T03:35:39Z'>
+		If ray.wait triggers reconstruction, will ray.get(object_ids) be equivalent to ray.wait(object_ids, len(object_ids), infinite_time)? If so, we can combine the code.
+		</comment>
+		<comment id='3' author='stephanie-wang' date='2018-08-28T03:56:52Z'>
+		&lt;denchmark-link:https://github.com/raulchen&gt;@raulchen&lt;/denchmark-link&gt;
+ there are some differences, e.g.,  returns the object IDs and  returns the deserialized objects. It may be possible to combine some code, but there are some crucial differences in the current implementation, e.g., the  logic is primarily in the plasma store, and the  logic is primarily in the object manager.
+		</comment>
+		<comment id='4' author='stephanie-wang' date='2018-08-28T17:38:14Z'>
+		Hi &lt;denchmark-link:https://github.com/robertnishihara&gt;@robertnishihara&lt;/denchmark-link&gt;
+ , I wonder if you have any plan to fix this issue. It seems that currently Ray cannot be used to train and tune models with cheap spot machines, which is really a pity.
+I was looking at the source code, but I am not sure what is the best way to fix it. As an initial step, I wrote a wrapper on ray.wait to call reconstruct_objects every 2 seconds if the required objects are not ready. This code can pass existing tests and is able to reconstruct missing objects when the  worker node is dead.
+Any comments would be greatly appreciated
+def wait(object_ids, num_returns=1, timeout=None, worker=global_worker):
+    worker.check_connected()
+
+    if worker.mode == LOCAL_MODE:
+        return object_ids[:num_returns], object_ids[num_returns:]
+
+    TIMEOUT_PER_ITERATION = 2000
+    remain_time = timeout or int(2 ** 30)
+    fetch_request_size = (ray._config.worker_fetch_request_size())
+    ready_ids_all = []
+    remaining_ids = object_ids
+
+    while remain_time &gt; 0 and len(ready_ids_all) &lt; num_returns and remaining_ids:
+        curr_time = time.time()
+        wait_time = min(TIMEOUT_PER_ITERATION, remain_time)
+        ready_ids, remaining_ids = _wait(remaining_ids, num_returns, wait_time, worker)
+        ready_ids_all.extend(ready_ids)
+
+        for i in range(0, len(remaining_ids), fetch_request_size):
+            if worker.use_raylet:
+                worker.local_scheduler_client.reconstruct_objects(
+                    remaining_ids[i: i + fetch_request_size], False)
+            else:
+                for unready_id in remaining_ids[i: i + fetch_request_size]:
+                    worker.local_scheduler_client.reconstruct_objects(
+                        [unready_id], False)
+
+        remain_time -= (time.time() - curr_time) * 1000
+
+    return ready_ids_all, remaining_ids
+
+# just renamed wait to _wait
+def _wait(object_ids, num_returns=1, timeout=None, worker=global_worker):
+    """Return a list of IDs that are ready and a list of IDs that are not.
+
+    If timeout is set, the function returns either when the requested number of
+    IDs are ready or when the timeout is reached, whichever occurs first. If it
+    is not set, the function simply waits until that number of objects is ready
+    and returns that exact number of object IDs.
+
+    This method returns two lists. The first list consists of object IDs that
+    correspond to objects that are available in the object store. The second
+    list corresponds to the rest of the object IDs (which may or may not be
+    ready).
+
+    Ordering of the input list of object IDs is preserved. That is, if A
+    precedes B in the input list, and both are in the ready list, then A will
+    precede B in the ready list. This also holds true if A and B are both in
+    the remaining list.
+
+    Args:
+        object_ids (List[ObjectID]): List of object IDs for objects that may or
+            may not be ready. Note that these IDs must be unique.
+        num_returns (int): The number of object IDs that should be returned.
+        timeout (int): The maximum amount of time in milliseconds to wait
+            before returning.
+
+    Returns:
+        A list of object IDs that are ready and a list of the remaining object
+        IDs.
+    """
+
+    if isinstance(object_ids, ray.ObjectID):
+        raise TypeError(
+            "wait() expected a list of ObjectID, got a single ObjectID")
+
+    if not isinstance(object_ids, list):
+        raise TypeError("wait() expected a list of ObjectID, got {}".format(
+            type(object_ids)))
+
+    if worker.mode != LOCAL_MODE:
+        for object_id in object_ids:
+            if not isinstance(object_id, ray.ObjectID):
+                raise TypeError("wait() expected a list of ObjectID, "
+                                "got list containing {}".format(
+                    type(object_id)))
+
+    worker.check_connected()
+    with profiling.profile("ray.wait", worker=worker):
+        # When Ray is run in LOCAL_MODE, all functions are run immediately,
+        # so all objects in object_id are ready.
+        if worker.mode == LOCAL_MODE:
+            return object_ids[:num_returns], object_ids[num_returns:]
+
+        # TODO(rkn): This is a temporary workaround for
+        # https://github.com/ray-project/ray/issues/997. However, it should be
+        # fixed in Arrow instead of here.
+        if len(object_ids) == 0:
+            return [], []
+
+        if len(object_ids) != len(set(object_ids)):
+            raise Exception("Wait requires a list of unique object IDs.")
+        if num_returns &lt;= 0:
+            raise Exception(
+                "Invalid number of objects to return %d." % num_returns)
+        if num_returns &gt; len(object_ids):
+            raise Exception("num_returns cannot be greater than the number "
+                            "of objects provided to ray.wait.")
+        timeout = timeout if timeout is not None else 2 ** 30
+        if worker.use_raylet:
+            ready_ids, remaining_ids = worker.local_scheduler_client.wait(
+                object_ids, num_returns, timeout, False)
+        else:
+            object_id_strs = [
+                plasma.ObjectID(object_id.id()) for object_id in object_ids
+            ]
+            ready_ids, remaining_ids = worker.plasma_client.wait(
+                object_id_strs, timeout, num_returns)
+            ready_ids = [
+                ray.ObjectID(object_id.binary()) for object_id in ready_ids
+            ]
+            remaining_ids = [
+                ray.ObjectID(object_id.binary()) for object_id in remaining_ids
+            ]
+        return ready_ids, remaining_ids
+
+		</comment>
+		<comment id='5' author='stephanie-wang' date='2018-09-12T19:59:37Z'>
+		Duplicate of &lt;denchmark-link:https://github.com/ray-project/ray/issues/1273&gt;#1273&lt;/denchmark-link&gt;
+ (even though this one came first).
+		</comment>
+		<comment id='6' author='stephanie-wang' date='2018-09-12T19:59:48Z'>
+		Working on it in &lt;denchmark-link:https://github.com/ray-project/ray/pull/2864&gt;#2864&lt;/denchmark-link&gt;
+.
+		</comment>
+	</comments>
+</bug>

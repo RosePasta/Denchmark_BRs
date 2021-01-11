@@ -1,0 +1,168 @@
+<bug id='32097' author='kristofgiber' open_date='2019-08-30T00:00:17Z' closed_time='2019-10-09T07:19:32Z'>
+	<summary>model.save in TF2 forces me to use saved_model.save() but then fails</summary>
+	<description>
+Calling model.save("path/model") from within my training loop which is inside strategy scope. I get this error:
+
+AssertionError: tf.saved_model.save is not supported inside a traced @tf.function. Move the call to the outer eagerly-executed context.
+
+But I'm in TF2, I'm NOT calling it inside a @tf.function. Even running tf.executing_eagerly() returns True when I stop the execution just before the save() call.
+How do I work around this?
+I can't use .h5 saving (it says nested classes not supported)
+I also noticed a warning earlier in the script that appeared around the same time as this error, it says:
+
+AssertionError: Nesting violated for default stack of &lt;class 'tensorflow.python.framework.func_graph.FuncGraph'&gt; objects
+
+probably related to my attempt trying to manually set_input_shape for my model (following the instructions of an error message that said I cannot otherwise save my model).
+The code I am using is just the tensorflow 2 tutorial for VAE plus distribute strategy. The model class is about the same used by the tutorial: &lt;denchmark-link:https://www.tensorflow.org/beta/tutorials/generative/cvae&gt;https://www.tensorflow.org/beta/tutorials/generative/cvae&lt;/denchmark-link&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='kristofgiber' date='2019-08-30T01:28:45Z'>
+		More details here about other things I've tried: &lt;denchmark-link:https://stackoverflow.com/questions/57719398/unable-to-save-model-with-tensorflow-2-0-0-beta1&gt;https://stackoverflow.com/questions/57719398/unable-to-save-model-with-tensorflow-2-0-0-beta1&lt;/denchmark-link&gt;
+
+Currently I find no way to save my VAE model in TF 2-beta (and RC)
+		</comment>
+		<comment id='2' author='kristofgiber' date='2019-08-30T07:06:26Z'>
+		&lt;denchmark-link:https://github.com/kristofgiber&gt;@kristofgiber&lt;/denchmark-link&gt;
+ ,
+In order to expedite the trouble-shooting process, please provide a code snippet to reproduce the issue reported here. Thanks!
+		</comment>
+		<comment id='3' author='kristofgiber' date='2019-08-30T13:21:30Z'>
+		Here is a minimal working example (that is, it works if you set save_model = False and it reproduces the described error when save_model = True).
+It may seem unnecessary in this example to use a subclassed model but I have lots of custom functions added to it in my original code that I need it for.
+Looks like the error is reproducible even after removing distribute strategy scope so the strategy scope wasn't related.
+Also notice that I have no @tf.function at all in this script yet the error complains about it:
+AssertionError: tf.saved_model.save is not supported inside a traced @tf.function. Move the call to the outer eagerly-executed context.
+Code:
+&lt;denchmark-code&gt;
+import tensorflow as tf
+
+save_model = True
+
+learning_rate = 1e-4
+BATCH_SIZE = 100
+TEST_BATCH_SIZE = 10
+color_channels = 1
+imsize = 28
+
+(train_images, _), (test_images, _) = tf.keras.datasets.mnist.load_data()
+
+train_images = train_images[:5000, ::]
+test_images = train_images[:1000, ::]
+train_images = train_images.reshape(-1, imsize, imsize, 1).astype('float32')
+test_images = test_images.reshape(-1, imsize, imsize, 1).astype('float32')
+train_images /= 255.
+test_images /= 255.
+train_dataset = tf.data.Dataset.from_tensor_slices(train_images).batch(BATCH_SIZE)
+test_dataset = tf.data.Dataset.from_tensor_slices(test_images).batch(TEST_BATCH_SIZE)
+
+class AE(tf.keras.Model):
+    def __init__(self):
+        super(AE, self).__init__()
+        self.network = tf.keras.Sequential([
+            tf.keras.layers.InputLayer(input_shape=(imsize, imsize, color_channels)),
+            tf.keras.layers.Flatten(),
+            tf.keras.layers.Dense(50),
+            tf.keras.layers.Dense(imsize**2 * color_channels),
+            tf.keras.layers.Reshape(target_shape=(imsize, imsize, color_channels)),
+        ])
+    def decode(self, input):
+        logits = self.network(input)
+        return logits
+
+optimizer = tf.keras.optimizers.Adam(learning_rate)
+model = AE()
+
+def compute_loss(data):
+    logits = model.decode(data)
+    loss = tf.reduce_mean(tf.losses.mean_squared_error(logits, data))
+    return loss
+
+def train_step(data):
+    with tf.GradientTape() as tape:
+        loss = compute_loss(data)
+    gradients = tape.gradient(loss, model.trainable_variables)
+    optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+    return loss, 0
+
+def test_step(data):
+    loss = compute_loss(data)
+    return loss
+
+input_shape_set = False
+epoch = 0
+epochs = 20
+for epoch in range(epochs):
+    for train_x in train_dataset:
+        train_step(train_x)
+    if epoch % 1 == 0:
+        loss = 0.0
+        num_batches = 0
+        for test_x in test_dataset:
+            loss += test_step(test_x)
+            num_batches += 1
+        loss /= num_batches
+        print("Epoch: {}, Loss: {}".format(epoch, loss))
+
+        if save_model:
+            print("Saving model...")
+            if not input_shape_set:
+                # Note: Why set input shape manually and why here:
+                # 1. If I do not set input shape manually: ValueError: Model &lt;main.CVAE object at 0x7f1cac2e7c50&gt; cannot be saved because the input shapes have not been set. Usually, input shapes are automatically determined from calling .fit() or .predict(). To manually set the shapes, call model._set_inputs(inputs).
+                # 2. If I set input shape manually BEFORE the first actual train step, I get: RuntimeError: Attempting to capture an EagerTensor without building a function.
+                model._set_inputs(train_dataset.__iter__().next())
+                input_shape_set = True
+            # Note: Why choose tf format: model.save('MNIST/Models/model.h5') will return NotImplementedError: Saving the model to HDF5 format requires the model to be a Functional model or a Sequential model. It does not work for subclassed models, because such models are defined via the body of a Python method, which isn't safely serializable. Consider saving to the Tensorflow SavedModel format (by setting save_format="tf") or using save_weights.
+            model.save('MNIST/Models/model', save_format='tf')
+
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='4' author='kristofgiber' date='2019-08-30T15:37:17Z'>
+		I have tried the same minimal reproduction example in tensorflow-gpu 2.0.0-rc0 and the error was more  revealing than what the beta version gave me. The error in RC says:
+
+NotImplementedError: When subclassing the Model class, you should implement a call method.
+
+This got me read through &lt;denchmark-link:https://www.tensorflow.org/beta/guide/keras/custom_layers_and_models&gt;https://www.tensorflow.org/beta/guide/keras/custom_layers_and_models&lt;/denchmark-link&gt;
+ where I found examples of how to do subclassing in TF2 in a way that allows saving. I was able to resolve the error and have the model saved by replacing my 'decode' method by 'call' in the above example (although this will be more complicated with my actual code where I had various methods defined for the class). This solved the error both in beta and in rc. Strangely, the training (or the saving) got also much faster in rc.
+So I have two propositions as a conclusion:
+
+
+proposition: Fix the error in TF 2.0.0-beta to provide the same clue as TF 2.0.0-RC because the current error message in beta seems fishy (no relation to the context, no hint at the solution, probably a bug?). But RC provides a great deal of more info.
+
+
+The VAE tutorial should also reflect the callable object-oriented concept and should already be written with the call method added and the various methods re-assigned to keras.layer classes, etc, to play nicely with the rest of the keras functional API that will allow saving and many more convenience functions. In fact, it would be better to replace the current CVA tutorial code with the VAE code described in the custom layers documentation. I built my code upon the VAE tutorial assuming that it shows the best possible way to start and will work with the default tf and keras methods such as saving.
+
+
+		</comment>
+		<comment id='5' author='kristofgiber' date='2019-09-03T12:29:21Z'>
+		Please find the replicated gist of colab for &lt;denchmark-link:https://colab.research.google.com/gist/oanush/404c8c09df7e69fcf01a00749b4f1da3/untitled0.ipynb&gt;TF version-2.0-rc0&lt;/denchmark-link&gt;
+.TThanks!
+		</comment>
+		<comment id='6' author='kristofgiber' date='2019-09-03T22:04:00Z'>
+		&lt;denchmark-link:https://github.com/kristofgiber&gt;@kristofgiber&lt;/denchmark-link&gt;
+ The "NotImplementedError: When subclassing the Model class, you should implement a call method." error has been in Keras for a while now, or are you talking about another error message in the first proposition?
+&lt;denchmark-link:https://github.com/yashk2810&gt;@yashk2810&lt;/denchmark-link&gt;
+ Can the VAE tutorial be updated to follow the Keras subclassing conventions?
+		</comment>
+		<comment id='7' author='kristofgiber' date='2019-10-09T00:18:39Z'>
+		&lt;denchmark-link:https://github.com/kristofgiber&gt;@kristofgiber&lt;/denchmark-link&gt;
+ Based on the error, I changed two lines in your code. I don't see any issue and the model was saved successfully.
+Line 1: from def decode(self, input): to def call(self, input):
+Line 2: from logits = model.decode(data) to logits = model(data).
+Please check the &lt;denchmark-link:https://colab.sandbox.google.com/gist/jvishnuvardhan/15ba2ea0afe019d505ae8f9205fe9a5f/untitled0.ipynb&gt;gist here&lt;/denchmark-link&gt;
+. Thanks!
+Please close this issue if this was resolved for you. Thanks!
+		</comment>
+		<comment id='8' author='kristofgiber' date='2019-10-09T07:19:32Z'>
+		Thanks, yes I stated the same in my 2nd comment (ie, that replacing the decode by call fixes the issue) and I think I only reported this as a documentation / error message issue which was only present with beta anyway. Thank you for the reply.
+		</comment>
+		<comment id='9' author='kristofgiber' date='2019-10-09T07:19:33Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/32097&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/32097&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

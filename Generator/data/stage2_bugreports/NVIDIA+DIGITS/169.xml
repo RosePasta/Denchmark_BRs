@@ -1,0 +1,151 @@
+<bug id='169' author='lukeyeager' open_date='2015-07-16T00:16:28Z' closed_time='2015-10-30T01:04:24Z'>
+	<summary>Subtract mean image or pixel in both training and inference</summary>
+	<description>
+Thanks to Yuguang Lee for pointing this out to me on &lt;denchmark-link:https://groups.google.com/d/msg/digits-users/WRAuVqnyi3g/Fw8NODUBDLQJ&gt;digits-users&lt;/denchmark-link&gt;
+.
+&lt;denchmark-h:h2&gt;Problem&lt;/denchmark-h&gt;
+
+Currently, DIGITS subtracts the mean  during training (see &lt;denchmark-link:https://github.com/NVIDIA/DIGITS/blob/v2.0.0-preview/digits/model/tasks/caffe_train.py#L232-L235&gt;here&lt;/denchmark-link&gt;
+) and the mean  during inference (see &lt;denchmark-link:https://github.com/NVIDIA/DIGITS/blob/v2.0.0-preview/digits/model/tasks/caffe_train.py#L963-L972&gt;here&lt;/denchmark-link&gt;
+). That's both illogical and incorrect [but still works pretty well, which is why I hadn't noticed it].
+&lt;denchmark-h:h2&gt;Explanation&lt;/denchmark-h&gt;
+
+I moved to subtracting the mean pixel during inference because it simplifies the inference path. I'll give an example to explain:
+Let's say you have 256x256 images in your dataset and your crop size is 227. During training, Caffe first subtracts the 256x256 mean image from the input image, and then takes a random 227x227 crop of the image before passing it to your network. But at inference time, the network only knows that images are supposed to be 227x227. So DIGITS resizes your test image to 227x227 and then subtracts the mean pixel across the whole image before passing it to the network.
+&lt;denchmark-h:h2&gt;Solution&lt;/denchmark-h&gt;
+
+DIGITS should allow you to do either mean pixel subtraction or mean image subtraction, but it shouldn't do this strange hybrid.
+&lt;denchmark-h:h4&gt;Mean pixel&lt;/denchmark-h&gt;
+
+
+For training - provide transform_param.mean_value (see here).
+For inference -  resize test image to crop size and then subtract the mean pixel. DIGITS already does this.
+
+&lt;denchmark-h:h4&gt;Mean image&lt;/denchmark-h&gt;
+
+
+For training - provide transform_param.mean_file (see here). DIGITS already does this.
+For inference - resize test image to the mean file size, subtract mean, resize again to the crop size.
+
+	</description>
+	<comments>
+		<comment id='1' author='lukeyeager' date='2015-07-17T20:15:46Z'>
+		Temporary fix for  in &lt;denchmark-link:https://github.com/NVIDIA/DIGITS/commit/3ea12e60d74e3cc51ab290bd5b578960b41c849a&gt;3ea12e6&lt;/denchmark-link&gt;
+ and for  in &lt;denchmark-link:https://github.com/NVIDIA/DIGITS/commit/71432607a71cf85739cba69b29bc1fd6a3bf0b0a&gt;7143260&lt;/denchmark-link&gt;
+.
+Still want to enable selection of either option in the UI.
+		</comment>
+		<comment id='2' author='lukeyeager' date='2015-12-17T12:58:12Z'>
+		Hi &lt;denchmark-link:https://github.com/lukeyeager&gt;@lukeyeager&lt;/denchmark-link&gt;
+
+Dunno If this is the correct way of bringing this up but I stumbled upon this, when trying to figure out why my pycaffe implementation is giving different output than DIGITS at test time, and I had some thoughts I wanted to share:
+Since the test image is being resized without cropping, I guess the assumption is that the test image has already been cropped to the proper scale. Wouldn't it then be more correct to crop the mean image before subtraction rather than resizing it and thus changing the scale of whatever "mean object" it depicts?
+Probably won't have a very big impact either way but feels like this way should be closer to what happens during training.
+		</comment>
+		<comment id='3' author='lukeyeager' date='2015-12-17T18:08:39Z'>
+		Good question &lt;denchmark-link:https://github.com/andredubbel&gt;@andredubbel&lt;/denchmark-link&gt;
+. I dug into it some more and learned a little more:
+Training with caffe -train:
+
+The crop window is calculated for each image (chosen randomly for TRAIN phase)
+The same crop window is used to pull data from both the image and the mean file
+So, during TRAIN the cropped mean image changes randomly with the crop window
+
+That's interesting, but not particularly relevant for this discussion about what do do when deploying the model.
+
+
+
+Using caffe.io.Transformer:
+
+The mean that you provide must already be cropped
+
+Again, not an issue for this discussion, but what do you do if you want to train with pycaffe? It seems you wouldn't be able to replicate the command-line results exactly without random crop windows for the mean image.
+
+
+
+In order to match the VAL phase of training exactly when we test an image in DIGITS, we would need to do the following:
+
+Crop the mean according to crop_size
+Initialize the Transformer object with the cropped mean
+Resize test images to the original dataset size (i.e. 256x256)
+Crop test image to crop size (i.e. 227x227)
+
+Can't let the Transformer do the 256-&gt;227 conversion because it resizes instead of crops
+
+
+Use the Transformer to preprocess the image
+
+Subtract the mean, etc.
+
+
+
+Here's what we're currently doing instead:
+
+Resize mean to crop_size
+Initialize the Transformer with the resized mean
+Resize test image to the original dataset size
+Use the Transformer to preprocess the image
+
+Resize to crop_size
+Subtract the resized mean
+
+
+
+Things we would need to change:
+
+Crop the mean image instead of resizing to crop_size
+Crop images before passing them to Transformer.preprocess (then the resize within Transformer will be a noop)
+
+Those seem like pretty reasonable changes to me.
+		</comment>
+		<comment id='4' author='lukeyeager' date='2015-12-18T10:03:07Z'>
+		Wow, thanks for a very thorough response &lt;denchmark-link:https://github.com/lukeyeager&gt;@lukeyeager&lt;/denchmark-link&gt;
+
+
+Things we would need to change:
+
+Crop the mean image instead of resizing to crop_size
+Crop images before passing them to Transformer (then the resize within Transformer will be a noop)
+
+
+I definitely agree with point 2, point 1 I think is a question of preference if not correctness.
+I tend to think of the training data's crop size as it's "actual" size, and the input size that size plus padding. The question then is if you expect test images to have the same padding or not.
+When deploying the model you most likely won't be doing any padding and if you wanted DIGITS to match a deployed system you might be better off just sticking to the squashing. That is, unless you want to have the option of oversampling in which case some padding might be needed :)
+In the end I think I would be happy with either soluion as long as it's clear what's expected of the test images.
+		</comment>
+		<comment id='5' author='lukeyeager' date='2017-03-27T16:56:10Z'>
+		Looks like I have run into the mean pixel vs mean image problem comparing results from DIGITS 5.0 interface to method used in example.py. It appears to have a significant impact and based on searching the forum can only find a discussion with no solution.
+I have already trained model with mean image subtraction which was the default and it took 3 days to train the model. In testing the model using the Digits web interface classify many very happy with the results in that for the primary target that I want to identify minimal false positives in other test images and near perfect on the primary image. Working on an April 1st deadline for a cancer tumor classification challenge so don't have time to do anything significantly different at this point.
+The images that I am submitting to example.py are already 256x256 so they don't need to be resized. The images I submitted to Caffe for training were also 256x256 so shouldn't have been resized related to the potential of a resizing problem.
+I am passing the mean file on the command line from the model via --mean mean.binaryproto which is triggering if mean_file in the get_transformer(deploy_file, mean_file=None)
+The comment clearly indicates #set mean pixel as the method. In looking through the code where I have no familiarity with the API I don't see an obvious path to doing a mean of the image where the assumption it should be a trivial change.
+Is it possible that someone who is familiar with the API could look at the code and provide the changes that are required to do mean image subtraction instead of mean pixel subtraction?
+The results I am getting with test images using the model that appears to be very good using the DIGITS web interface is not performing well via the example.py approach. I am already setup with a pipeline that has been tested using example.py for many many many images so hoping for a one or two line code update to improve results.
+		</comment>
+		<comment id='6' author='lukeyeager' date='2017-08-30T12:11:29Z'>
+		&lt;denchmark-link:https://github.com/willishf&gt;@willishf&lt;/denchmark-link&gt;
+ were you able to fix the problem ? I have a model that was trained in digits gets 96 % validation in digits. Once i load it into  pycaffe, it gets 10 % on the same validation data
+		</comment>
+		<comment id='7' author='lukeyeager' date='2017-08-30T12:35:06Z'>
+		Wasn't that bad. I suspect you need to select a different epoch model.
+&lt;denchmark-link:#&gt;…&lt;/denchmark-link&gt;
+
+
+On Wed, Aug 30, 2017, 8:11 AM karimhasebou ***@***.***&gt; wrote:
+ @willishf &lt;https://github.com/willishf&gt; were you able to fix the problem
+ ? I have a model that was trained in digits gets 96 % validation in digits.
+ Once i load it into pycaffe, it gets 10 % on the same validation data
+
+ —
+ You are receiving this because you were mentioned.
+ Reply to this email directly, view it on GitHub
+ &lt;#169 (comment)&gt;, or mute
+ the thread
+ &lt;https://github.com/notifications/unsubscribe-auth/AD3dnuskwtxPjmHfyNMaSTajpdlwYgZXks5sdVF9gaJpZM4FZg6W&gt;
+ .
+
+
+
+		</comment>
+	</comments>
+</bug>

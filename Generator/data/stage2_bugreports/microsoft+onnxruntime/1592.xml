@@ -1,0 +1,308 @@
+<bug id='1592' author='GuanLuo' open_date='2019-08-08T18:34:48Z' closed_time='2019-09-16T18:59:28Z'>
+	<summary>multi-GPU "alloc failed" error arises after updating to rel-0.5.0</summary>
+	<description>
+
+On a multi-GPU system, if a model session is created on GPUs other than GPU0 (i.e. GPU1), then "alloc failed" error will be thrown when running the model. The issue arise on &lt;denchmark-link:https://gallery.azure.ai/Model/DenseNet-121-1-2-2&gt;densenet&lt;/denchmark-link&gt;
+ and &lt;denchmark-link:https://gallery.azure.ai/Model/Inception-v1-1-2-3&gt;inception&lt;/denchmark-link&gt;
+, I scoped it down to a simple model that only have "concat" op. So the implementation of "concat" seems to be what causes the issue, but there might be more causes.
+Urgency
+none
+System information
+
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): 18.04
+ONNX Runtime installed from (source or binary): source
+ONNX Runtime version: rel-0.5.0
+Python version: 2.7
+Visual Studio version (if applicable):
+GCC/Compiler version (if compiling from source):
+CUDA/cuDNN version: gcc (Ubuntu 7.4.0-1ubuntu1~18.04.1) 7.4.0
+GPU model and memory: Tesla P100 / 16280MiB
+
+To Reproduce
+Describe steps/code to reproduce the behavior:
+
+Compile the following code snippet gcc -std=c++11 c_api_sample.cc -o ort_c_api -lonnxruntime -lstdc++ -lpthread
+copy the simple_concat model to pwd with name "model.onnx". Or you can use the densenet / inception model mentioned above
+./ort_c_api
+
+c_api_sample.cc
+#include &lt;assert.h&gt;
+#include &lt;onnxruntime/cuda_provider_factory.h&gt;
+#include &lt;onnxruntime/onnxruntime_c_api.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;iostream&gt;
+#include &lt;vector&gt;
+#include &lt;thread&gt;
+#include &lt;future&gt;
+
+//*****************************************************************************
+// helper function to check for status
+#define CHECK_STATUS(expr)                               \
+  {                                                      \
+    OrtStatus* onnx_status = (expr);                     \
+    if (onnx_status != NULL) {                           \
+      const char* msg = OrtGetErrorMessage(onnx_status); \
+      fprintf(stderr, "%s\n", msg);                      \
+      OrtReleaseStatus(onnx_status);                     \
+      exit(1);                                           \
+    }                                                    \
+  }
+
+std::string DimsToString(const std::vector&lt;int64_t&gt;&amp; dims)
+{
+  std::string res = "[";
+  for (const auto&amp; dim : dims) {
+    res += std::to_string(dim);
+    res += ",";
+  }
+  res.back() = ']';
+  return res;
+}
+
+struct TensorInfo {
+  TensorInfo(
+      const char* name, const ONNXTensorElementDataType&amp; type,
+      const std::vector&lt;int64_t&gt;&amp; dims)
+   : name_(name), type_(type), dims_(dims)
+  {
+  }
+
+  const char* name_;
+  ONNXTensorElementDataType type_;
+  std::vector&lt;int64_t&gt; dims_;
+};
+
+void CreateSession(
+  const char* model_path, const int device_id, OrtEnv* env,
+  OrtSessionOptions* session_options, OrtSession** session)
+{
+  // To deploy on different device, need to set provider on cloned option
+  // as you can remove a execution provider once it is appended
+  OrtSessionOptions* context_options;
+  CHECK_STATUS(OrtCloneSessionOptions(session_options, &amp;context_options));
+  std::unique_ptr&lt;OrtSessionOptions, decltype(&amp;OrtReleaseSessionOptions)&gt;
+      options_wrapper(context_options, OrtReleaseSessionOptions);
+
+  // Use CUDA, device 0. CPU if -1
+  if (device_id &gt;= 0) {
+    CHECK_STATUS(OrtSessionOptionsAppendExecutionProvider_CUDA(context_options, device_id));
+    std::cout &lt;&lt; "deploy on GPU " &lt;&lt; device_id &lt;&lt; std::endl;
+  } else {
+    std::cout &lt;&lt; "deploy on CPU" &lt;&lt; std::endl;
+  }
+  
+  CHECK_STATUS(OrtCreateSession(env, model_path, context_options, session));
+}
+
+std::vector&lt;TensorInfo&gt; GetIOTensors(OrtSession* session, bool is_input, bool print_info = true)
+{
+  std::vector&lt;TensorInfo&gt; res;
+
+  OrtAllocator* allocator;
+  CHECK_STATUS(OrtCreateDefaultAllocator(&amp;allocator));
+  std::unique_ptr&lt;OrtAllocator, decltype(&amp;OrtReleaseAllocator)&gt;
+      allocator_wrapper(allocator, OrtReleaseAllocator);
+
+  // print number of model input nodes
+  size_t num_nodes;
+  if (is_input) {
+    CHECK_STATUS(OrtSessionGetInputCount(session, &amp;num_nodes));
+  } else {
+    CHECK_STATUS(OrtSessionGetOutputCount(session, &amp;num_nodes));
+  }
+
+  // iterate over all input nodes
+  for (size_t i = 0; i &lt; num_nodes; i++) {
+    OrtTypeInfo* typeinfo;
+    if (is_input) {
+      CHECK_STATUS(OrtSessionGetInputTypeInfo(session, i, &amp;typeinfo));
+    } else {
+      CHECK_STATUS(OrtSessionGetOutputTypeInfo(session, i, &amp;typeinfo));
+    }
+    std::unique_ptr&lt;OrtTypeInfo, decltype(&amp;OrtReleaseTypeInfo)&gt;
+      type_info_wrapper(typeinfo, OrtReleaseTypeInfo);
+      
+    const OrtTensorTypeAndShapeInfo* tensor_info;
+
+    // node names
+    char* tensor_name;
+    if (is_input) {
+      CHECK_STATUS(OrtSessionGetInputName(session, i, allocator, &amp;tensor_name));
+    } else {
+      CHECK_STATUS(OrtSessionGetOutputName(session, i, allocator, &amp;tensor_name));
+    }
+    
+    // node types
+    ONNXTensorElementDataType type;
+    CHECK_STATUS(OrtCastTypeInfoToTensorInfo(typeinfo, &amp;tensor_info));
+    CHECK_STATUS(OrtGetTensorElementType(tensor_info, &amp;type));
+
+    // shapes/dims
+    size_t num_dims;
+    CHECK_STATUS(OrtGetDimensionsCount(tensor_info, &amp;num_dims));
+    std::vector&lt;int64_t&gt; dims(num_dims);
+    CHECK_STATUS(OrtGetDimensions(tensor_info, (int64_t*)dims.data(), num_dims));
+
+    res.emplace_back(tensor_name, type, dims);
+  }
+
+  if (print_info) {
+    std::cout &lt;&lt; "Number of tensors = " &lt;&lt; num_nodes &lt;&lt; std::endl;
+    for (size_t idx = 0; idx &lt; res.size(); idx++) {
+      std::cout &lt;&lt; "Tensor " &lt;&lt; idx &lt;&lt; ":" &lt;&lt; std::endl
+                &lt;&lt; "    name: " &lt;&lt; res[idx].name_ &lt;&lt; std::endl
+                &lt;&lt; "    type: " &lt;&lt; res[idx].type_ &lt;&lt; std::endl
+                &lt;&lt; "    dims: " &lt;&lt; DimsToString(res[idx].dims_)
+                &lt;&lt; std::endl;
+    }
+  }
+  return res;
+}
+
+OrtValue*
+CreateTensor(const TensorInfo&amp; info)
+{
+  OrtAllocator* allocator;
+  CHECK_STATUS(OrtCreateDefaultAllocator(&amp;allocator));
+  std::unique_ptr&lt;OrtAllocator, decltype(&amp;OrtReleaseAllocator)&gt;
+      allocator_wrapper(allocator, OrtReleaseAllocator);
+
+  OrtValue* res = nullptr;
+  CHECK_STATUS(OrtCreateTensorAsOrtValue(
+    allocator, info.dims_.data(), info.dims_.size(), info.type_, &amp;res));
+  return res;
+}
+
+int
+main(int argc, char* argv[])
+{
+  //===================== Factory Scope ======================
+  // initialize  enviroment...one enviroment per process
+  // enviroment maintains thread pools and other state info
+  
+  // [TODO] look into OrtCreateEnvWithCustomLogger()
+  OrtEnv* env;
+  CHECK_STATUS(OrtCreateEnv(ORT_LOGGING_LEVEL_WARNING, "test", &amp;env));
+  std::unique_ptr&lt;OrtEnv, decltype(&amp;OrtReleaseEnv)&gt;
+        env_wrapper(env, OrtReleaseEnv);
+
+  //===================== Backend Scope ======================
+  // session option is backend-wise as it also specified GPU device
+  // but other session option can be set "globally", like const variables
+  // defined in factory object and use it to set corresponding options
+  // initialize session options if needed
+  OrtSessionOptions* session_options;
+  CHECK_STATUS(OrtCreateSessionOptions(&amp;session_options));
+  std::unique_ptr&lt;OrtSessionOptions, decltype(&amp;OrtReleaseSessionOptions)&gt;
+        options_wrapper(session_options, OrtReleaseSessionOptions);
+  CHECK_STATUS(OrtSetSessionThreadPoolSize(session_options, 1));
+
+  // disable graph optimization
+  CHECK_STATUS(OrtSetSessionGraphOptimizationLevel(session_options, 0));
+
+  //===================== Context Scope ======================
+  // create multiple sessions and load models into memory
+  std::vector&lt;std::pair&lt;const char*, int&gt;&gt; model_spec;
+  {
+    // deploy model on all devices
+    // [TODO] argument option
+    model_spec.emplace_back("model.onnx", -1);
+    model_spec.emplace_back("model.onnx", 0);
+    model_spec.emplace_back("model.onnx", 1);
+  }
+
+  std::vector&lt;std::unique_ptr&lt;OrtSession, decltype(&amp;OrtReleaseSession)&gt;&gt; sessions;
+  for (const auto path_device : model_spec) {
+    OrtSession* session;
+    CreateSession(
+        path_device.first, path_device.second, env, session_options, &amp;session);
+    sessions.emplace_back(session, OrtReleaseSession);
+  }
+
+  //===================== Infer Scope ======================
+  for (auto&amp; session_wrapper : sessions) {
+    auto session = session_wrapper.get();
+    
+    // print model input/output layer (node names, types, shape etc.)
+    std::cout &lt;&lt; "Input infos:" &lt;&lt; std::endl;
+    auto input_infos = GetIOTensors(session, true);
+
+    std::cout &lt;&lt; "Output infos:" &lt;&lt; std::endl;
+    auto output_infos = GetIOTensors(session, false);
+
+    // Fill input tensors
+    std::vector&lt;const char*&gt; input_names;
+    std::vector&lt;OrtValue*&gt; input_tensors;
+    for (auto input_info : input_infos) {
+      if (input_info.type_ != ONNX_TENSOR_ELEMENT_DATA_TYPE_STRING) {
+        input_names.emplace_back(input_info.name_);
+        // [TODO] generate meaningful input so that output can be validated
+        input_tensors.emplace_back(CreateTensor(input_info));
+      } else {
+        std::cout &lt;&lt; "Inference with STRING input hasn't been implemented" &lt;&lt; std::endl;
+        exit(1);
+      }
+    }
+
+    // Set output tensors to be retrieved
+    std::vector&lt;const char*&gt; output_names;
+    std::vector&lt;OrtValue*&gt; output_tensors;
+    for (auto output_info : output_infos) {
+      output_names.emplace_back(output_info.name_);
+      output_tensors.emplace_back(nullptr);
+    }
+
+    // Run...
+    CHECK_STATUS(OrtRun(
+        session, NULL /* run options */, input_names.data(),
+        (const OrtValue* const*)input_tensors.data(), input_tensors.size(),
+        output_names.data(), output_names.size(), output_tensors.data()));
+  }
+
+  // Factory-wise
+  
+  return 0;
+}
+
+Expected behavior
+The sample code can run all model sessions on all devices without throwing errors.
+
+The commit version I used before was &lt;denchmark-link:https://github.com/microsoft/onnxruntime/commit/2f698bd54b713bb87dbd0bbb913e94bcf7fd480c&gt;2f698bd&lt;/denchmark-link&gt;
+
+Compare with rel-0.5.0:
+&lt;denchmark-link:https://github.com/microsoft/onnxruntime/compare/2f698bd54b713bb87dbd0bbb913e94bcf7fd480c...rel-0.5.0&gt;2f698bd...rel-0.5.0&lt;/denchmark-link&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='GuanLuo' date='2019-08-17T09:06:43Z'>
+		I have same problem.  Are there any solution to solve it?
+		</comment>
+		<comment id='2' author='GuanLuo' date='2019-08-19T01:07:53Z'>
+		Thank you for sending the great feedback! ORT is not supporting using multiple GPUs well in inference right now. We'll add the support later and update this issue once it's well supported.
+		</comment>
+		<comment id='3' author='GuanLuo' date='2019-08-19T22:57:51Z'>
+		Is there an ETA for fixing this particular operator? This is breaking the models that were okay with multi-GPU previously...
+		</comment>
+		<comment id='4' author='GuanLuo' date='2019-09-12T23:05:42Z'>
+		I've merged my pull request to master. With this change you can run a model on a device other than device 0. But it's still not possible to run multiple model in same thread but on different device, because the cudaSetDevice works with thread scope. more details refer to this link:
+&lt;denchmark-link:https://devblogs.nvidia.com/cuda-pro-tip-always-set-current-device-avoid-multithreading-bugs/&gt;https://devblogs.nvidia.com/cuda-pro-tip-always-set-current-device-avoid-multithreading-bugs/&lt;/denchmark-link&gt;
+
+so, from your sample code, there's a session using device 0, then another session using device 1. When the program runs, it will use device 1 for these 2 sessions finally. To make it able to run on different device within same thread, there are more work to be done. e.g. need to re-call cudaSetDevice before every cuda kernel and cuda allocator.
+For now, you can create and run different session in different threads, that is no problem.
+Let us know if you still have some concerns on this.
+		</comment>
+		<comment id='5' author='GuanLuo' date='2019-09-12T23:19:04Z'>
+		Thanks for the fix, I will try it out later and close the issue.
+And regarding the multiple devices issue you pointed out, does this &lt;denchmark-link:https://github.com/microsoft/onnxruntime/issues/1034#issuecomment-497184636&gt;workaround&lt;/denchmark-link&gt;
+ work the same as "create and run different session in different threads"? In this workaround, I will create the sessions in different threads, but I will only use one thread to distribute requests to different sessions.
+		</comment>
+		<comment id='6' author='GuanLuo' date='2019-09-12T23:30:10Z'>
+		Yes, that should work fine.
+		</comment>
+		<comment id='7' author='GuanLuo' date='2019-09-16T18:59:27Z'>
+		&lt;denchmark-link:https://github.com/HectorSVC&gt;@HectorSVC&lt;/denchmark-link&gt;
+ Thanks, I have verified that the issue is fixed, closing the issue now. By the way, it seems like multi-GPU work without using the workaround: I created sessions for the same model on different GPUs and send requests to them, the GPU memory usage and utilization increases roughly the same amount on both GPUs
+		</comment>
+	</comments>
+</bug>

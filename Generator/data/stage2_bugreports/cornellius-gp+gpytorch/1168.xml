@@ -1,0 +1,319 @@
+<bug id='1168' author='karlzhang-hhg' open_date='2020-06-05T05:34:23Z' closed_time='2020-06-12T20:13:10Z'>
+	<summary>[Bug]Expected the input to have 2 dimensionality (based on the ard_num_dims argument). Got 1.</summary>
+	<description>
+&lt;denchmark-h:h1&gt;🐛 Bug&lt;/denchmark-h&gt;
+
+I try to rerun my code to generate a GP prior distribution in 2-dimensional space. This code was run successfully on 0.3.5, but fail on 1.1.1
+&lt;denchmark-h:h2&gt;To reproduce&lt;/denchmark-h&gt;
+
+I defined following functions.
+&lt;denchmark-code&gt;# %%
+import math
+import torch
+import gpytorch
+import PIL
+import numpy as np
+import pandas as pd
+import os
+import sys
+import time
+import matplotlib.pyplot as plt
+from itertools import product
+from matplotlib.ticker import LinearLocator, FormatStrFormatter
+from matplotlib import cm
+from mpl_toolkits.mplot3d import Axes3D
+
+
+# %% [markdown]
+class GridGPPriorGenerator(gpytorch.models.ExactGP):
+    """
+    Generate prior distribution for GP.
+    """
+
+    def __init__(self, grid, train_x, train_y, lengthscale, likelihood, opscale=1):
+        """ Generate a GP prior realization just by giving only one pair of training observation and it is far away from all testing data input.
+            Args:
+                grid: The input value grids to get the GP prior.
+                train_x: One example of training x.
+                train_y: One example of training y.
+                lengthscale: An array of lengthscale along each axis.
+                likelihood: The likelihood function to mapping latent function to observation y (e.g., Gaussian for regression).
+                outputscale: The scale for the kernel (https://gpytorch.readthedocs.io/en/latest/kernels.html#gpytorch.kernels.RBFKernel).
+
+        """
+        super(GridGPPriorGenerator, self).__init__(train_x, train_y, likelihood)
+        self.dims = train_x.size(-1)
+        self.opscale = opscale
+        self.mean_module = gpytorch.means.ConstantMean() # Default is 0 constant mean.
+        kernel = gpytorch.kernels.RBFKernel(ard_num_dims=train_x.size(-1))
+        print("The default length scale is {}.".format(kernel.lengthscale)) # Default value: 
+        kernel.lengthscale = lengthscale.to(torch.float) # Assign the lengthscale values.        
+        self.covar_module = gpytorch.kernels.GridKernel(kernel, grid=grid)
+        
+    def forward(self, x):
+        mean_x = self.mean_module(x)
+        covar_x = self.covar_module(x)*self.opscale
+        print(mean_x.shape, covar_x.shape)
+        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+
+def Gen_GP_Latent_Func(dim: int, train_x: torch.tensor, train_y: torch.tensor,
+                       grid_size: int, lengthscale: torch.tensor, opscale: float=1, noise: float=0):
+    """
+        dim: The dimension of input space.
+        train_x: One example of training x.
+        train_y: One example of training y.
+        grid_size: The number of grid points along each axis.
+        lengthscale: The diagonal parameters of theta for specifying length-scale along each axis: https://gpytorch.readthedocs.io/en/latest/kernels.html#gpytorch.kernels.RBFKernel.
+        noise: The variance of noise: https://github.com/cornellius-gp/gpytorch/blob/92e07cf4dae26083fe0aed926e1dfd483443924e/gpytorch/likelihoods/gaussian_likelihood.py#L106.
+        opscale: The outputscale for the kernel.
+
+    """
+    grid = torch.zeros(grid_size, dim, dtype=torch.float)
+    for ci in range(dim):
+        grid[:, ci] = torch.arange(grid_size)
+    test_x = gpytorch.utils.grid.create_data_from_grid(grid)
+    
+    likelihood = gpytorch.likelihoods.GaussianLikelihood()
+    model = GridGPPriorGenerator(grid, train_x, train_y, lengthscale, likelihood, opscale=opscale)
+
+    model.train()
+    likelihood.train()
+
+    print(model.covar_module.base_kernel.lengthscale)
+
+    model.eval()
+    likelihood.eval()
+
+    with torch.no_grad(), gpytorch.settings.fast_pred_var():
+        observed_pred = likelihood(model(test_x), noise=noise*torch.ones(test_x.size(0)))
+
+    return observed_pred
+
+def Grayscale_Latent_Func(rfield_tensor):
+    rfield = rfield_tensor.detach().numpy()
+    min_v, max_v = np.min(rfield), np.max(rfield)
+    rfield = (rfield-min_v)/(max_v-min_v)*255
+    return rfield.astype(dtype=np.uint8)
+
+def Gen_Save_GP_Micro_Struct(dim: int, train_x: torch.tensor, train_y: torch.tensor, 
+                             grid_size: int, lengthscale: torch.tensor, opscale: float, noise: float,
+                             lat_func: object, save_path: str, postfix: str = "", lat_func_kwargs: dict = {}):
+    gp_proc = Gen_GP_Latent_Func(dim, train_x, train_y, grid_size, lengthscale, opscale, noise)
+
+    start_time = time.time()
+    rfield_tensor = gp_proc.rsample(sample_shape=torch.Size((grid_size, grid_size)))
+    print(rfield_tensor.size())
+    rfield_tensor = rfield_tensor.view(grid_size, grid_size)
+    print("The prediction for the 40000 grid points takes time: {}s.\n".format(
+        time.time()-start_time,))
+    print("The random realization is:\n {}.\n".format(rfield_tensor,))
+
+    # Postfix for plots.
+    if postfix != "":
+        postfix += '_'
+    postfix += '_'.join([str(int(lengthscale[0])), str(int(lengthscale[1]))])
+    save_subfolder_path = os.path.join(save_path, 'gp_obse_'+postfix)
+    if not os.path.exists(save_subfolder_path):
+        os.mkdir(save_subfolder_path)
+
+    # Latent function to micro-structure pixel observations.
+    img_arr = lat_func(rfield_tensor, **lat_func_kwargs)
+
+    img = PIL.Image.fromarray(img_arr)
+
+    img.save(os.path.join(save_subfolder_path, "one_gp_obse_micro_struct_{}.png".format(postfix,)))
+
+    return img
+&lt;/denchmark-code&gt;
+
+** Code snippet to reproduce **
+# Your code goes here
+# Please make sure it does not require any external dependencies (other than PyTorch!)
+# (We much prefer small snippets rather than links to existing libraries!)
+
+dim = 2
+train_x = torch.tensor([[10000, 10000],[10000, 20000]], dtype=torch.float) # The only one data point is far away from the testing point so that the testing point is just a GP prior.
+train_y = torch.tensor([0,0], dtype=torch.float)
+grid_size = 200
+lengthscale = torch.tensor([[5, 5]]) # Have to
+opscale = 4.0
+noise = 0.05 * opscale
+lat_func = Grayscale_Latent_Func
+save_path = "/projects/p30309/CD/20200606-Gen_GP_Rand_Struct/"
+postfix = 'ref'
+
+ref_img = Gen_Save_GP_Micro_Struct(dim, train_x, train_y, grid_size, lengthscale, opscale, noise, lat_func, save_path, postfix)
+** Stack trace/error message **
+&lt;denchmark-code&gt;The default length scale is tensor([[0.6931, 0.6931]], grad_fn=&lt;SoftplusBackward&gt;).
+tensor([[5., 5.]], grad_fn=&lt;SoftplusBackward&gt;)
+torch.Size([2]) torch.Size([2, 2])
+torch.Size([40002]) torch.Size([40002, 40002])
+40000
+---------------------------------------------------------------------------
+RuntimeError                              Traceback (most recent call last)
+/projects/p30309/CD/CD_github/gen_matsci_img_dataset.py in 
+     10 postfix = 'ref'
+     11 
+---&gt; 12 ref_img = Gen_Save_GP_Micro_Struct(dim, train_x, train_y, grid_size, lengthscale, opscale, noise, lat_func, save_path, postfix)
+     13 
+
+/projects/p30309/CD/CD_github/control_chart/matsci_data_generation.py in Gen_Save_GP_Micro_Struct(dim, train_x, train_y, grid_size, lengthscale, opscale, noise, lat_func, save_path, postfix, lat_func_kwargs)
+    155 
+    156     start_time = time.time()
+--&gt; 157     rfield_tensor = gp_proc.rsample(sample_shape=torch.Size((grid_size, grid_size)))
+    158     print(rfield_tensor.size())
+    159     rfield_tensor = rfield_tensor.view(grid_size, grid_size)
+
+~/.local/lib/python3.7/site-packages/gpytorch/distributions/multivariate_normal.py in rsample(self, sample_shape, base_samples)
+    146             # Get samples
+    147             print(num_samples)
+--&gt; 148             print(covar.zero_mean_mvn_samples(num_samples))
+    149             print(self.loc.unsqueeze(0))
+    150             res = covar.zero_mean_mvn_samples(num_samples) + self.loc.unsqueeze(0)
+
+~/.local/lib/python3.7/site-packages/gpytorch/lazy/lazy_tensor.py in zero_mean_mvn_samples(self, num_samples)
+   1589             covar_root = self.evaluate().sqrt()
+   1590         else:
+-&gt; 1591             covar_root = self.root_decomposition().root
+   1592 
+   1593         base_samples = torch.randn(
+
+~/.local/lib/python3.7/site-packages/gpytorch/utils/memoize.py in g(self, *args, **kwargs)
+     32         cache_name = name if name is not None else method
+     33         if not is_in_cache(self, cache_name):
+---&gt; 34             add_to_cache(self, cache_name, method(self, *args, **kwargs))
+     35         return get_from_cache(self, cache_name)
+     36 
+
+~/.local/lib/python3.7/site-packages/gpytorch/lazy/lazy_tensor.py in root_decomposition(self)
+   1331                 )
+   1332 
+-&gt; 1333         res = self._root_decomposition()
+   1334         return RootLazyTensor(res)
+   1335 
+
+~/.local/lib/python3.7/site-packages/gpytorch/lazy/lazy_tensor.py in _root_decomposition(self)
+    584         func = RootDecomposition()
+    585         res, _ = func.apply(
+--&gt; 586             self.representation_tree(),
+    587             self._root_decomposition_size(),
+    588             self.dtype,
+
+~/.local/lib/python3.7/site-packages/gpytorch/lazy/lazy_tensor.py in representation_tree(self)
+   1273         including all subobjects. This is used internally.
+   1274         """
+-&gt; 1275         return LazyTensorRepresentationTree(self)
+   1276 
+   1277     @property
+
+~/.local/lib/python3.7/site-packages/gpytorch/lazy/lazy_tensor_representation_tree.py in __init__(self, lazy_tsr)
+     11         for arg in lazy_tsr._args:
+     12             if hasattr(arg, "representation") and callable(arg.representation):  # Is it a lazy tensor?
+---&gt; 13                 representation_size = len(arg.representation())
+     14                 self.children.append((slice(counter, counter + representation_size, None), arg.representation_tree()))
+     15                 counter += representation_size
+
+~/.local/lib/python3.7/site-packages/gpytorch/lazy/lazy_tensor.py in representation(self)
+   1261                 representation.append(arg)
+   1262             elif hasattr(arg, "representation") and callable(arg.representation):  # Is it a LazyTensor?
+-&gt; 1263                 representation += list(arg.representation())
+   1264             else:
+   1265                 raise RuntimeError("Representation of a LazyTensor should consist only of Tensors")
+
+~/.local/lib/python3.7/site-packages/gpytorch/lazy/lazy_tensor.py in representation(self)
+   1261                 representation.append(arg)
+   1262             elif hasattr(arg, "representation") and callable(arg.representation):  # Is it a LazyTensor?
+-&gt; 1263                 representation += list(arg.representation())
+   1264             else:
+   1265                 raise RuntimeError("Representation of a LazyTensor should consist only of Tensors")
+
+~/.local/lib/python3.7/site-packages/gpytorch/lazy/lazy_evaluated_kernel_tensor.py in representation(self)
+    311         # representation
+    312         else:
+--&gt; 313             return self.evaluate_kernel().representation()
+    314 
+    315     def representation_tree(self):
+
+~/.local/lib/python3.7/site-packages/gpytorch/utils/memoize.py in g(self, *args, **kwargs)
+     32         cache_name = name if name is not None else method
+     33         if not is_in_cache(self, cache_name):
+---&gt; 34             add_to_cache(self, cache_name, method(self, *args, **kwargs))
+     35         return get_from_cache(self, cache_name)
+     36 
+
+~/.local/lib/python3.7/site-packages/gpytorch/lazy/lazy_evaluated_kernel_tensor.py in evaluate_kernel(self)
+    278             temp_active_dims = self.kernel.active_dims
+    279             self.kernel.active_dims = None
+--&gt; 280             res = self.kernel(x1, x2, diag=False, last_dim_is_batch=self.last_dim_is_batch, **self.params)
+    281             self.kernel.active_dims = temp_active_dims
+    282 
+
+~/.local/lib/python3.7/site-packages/gpytorch/kernels/kernel.py in __call__(self, x1, x2, diag, last_dim_is_batch, **params)
+    394                 res = LazyEvaluatedKernelTensor(x1_, x2_, kernel=self, last_dim_is_batch=last_dim_is_batch, **params)
+    395             else:
+--&gt; 396                 res = lazify(super(Kernel, self).__call__(x1_, x2_, last_dim_is_batch=last_dim_is_batch, **params))
+    397             return res
+    398 
+
+~/.local/lib/python3.7/site-packages/gpytorch/module.py in __call__(self, *inputs, **kwargs)
+     26 
+     27     def __call__(self, *inputs, **kwargs):
+---&gt; 28         outputs = self.forward(*inputs, **kwargs)
+     29         if isinstance(outputs, list):
+     30             return [_validate_module_outputs(output) for output in outputs]
+
+~/.local/lib/python3.7/site-packages/gpytorch/kernels/grid_kernel.py in forward(self, x1, x2, diag, last_dim_is_batch, **params)
+    120                 covars = [
+    121                     self.base_kernel(first, proj, last_dim_is_batch=False, **params)
+--&gt; 122                     for first, proj in zip(first_grid_point, grid)
+    123                 ]  # Each entry i contains a 1 x grid_size[i] covariance matrix
+    124                 covars = [delazify(c) for c in covars]
+
+~/.local/lib/python3.7/site-packages/gpytorch/kernels/grid_kernel.py in (.0)
+    120                 covars = [
+    121                     self.base_kernel(first, proj, last_dim_is_batch=False, **params)
+--&gt; 122                     for first, proj in zip(first_grid_point, grid)
+    123                 ]  # Each entry i contains a 1 x grid_size[i] covariance matrix
+    124                 covars = [delazify(c) for c in covars]
+
+~/.local/lib/python3.7/site-packages/gpytorch/kernels/kernel.py in __call__(self, x1, x2, diag, last_dim_is_batch, **params)
+    378                 raise RuntimeError(
+    379                     "Expected the input to have {} dimensionality "
+--&gt; 380                     "(based on the ard_num_dims argument). Got {}.".format(self.ard_num_dims, x1_.size(-1))
+    381                 )
+    382 
+
+RuntimeError: Expected the input to have 2 dimensionality (based on the ard_num_dims argument). Got 1.
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h2&gt;Expected Behavior&lt;/denchmark-h&gt;
+
+It should generate a random realization of Gaussian Process field. Because here, I only have 2 training data points and it is far away from testing data, so that the random field should behave like a prior distribution.
+&lt;denchmark-h:h2&gt;System information&lt;/denchmark-h&gt;
+
+Please complete the following information:
+
+
+ 1.1.1
+
+
+ 1.5.0
+
+
+ MacOS
+
+
+&lt;denchmark-h:h2&gt;Additional context&lt;/denchmark-h&gt;
+
+Add any other context about the problem here.
+	</description>
+	<comments>
+		<comment id='1' author='karlzhang-hhg' date='2020-06-05T20:30:13Z'>
+		Thanks for the code snippet. We'll take a look.
+		</comment>
+		<comment id='2' author='karlzhang-hhg' date='2020-06-12T20:13:09Z'>
+		Closed by &lt;denchmark-link:https://github.com/cornellius-gp/gpytorch/pull/1059&gt;#1059&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

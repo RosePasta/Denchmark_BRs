@@ -1,0 +1,133 @@
+<bug id='7547' author='tomoaki0705' open_date='2016-10-25T09:09:44Z' closed_time='2016-11-28T21:04:17Z'>
+	<summary>Calib3d_StereoCalibrate fails on ARM64bit</summary>
+	<description>
+&lt;denchmark-h:h5&gt;System information (version)&lt;/denchmark-h&gt;
+
+
+OpenCV master (d18e45b)
+OS (Ubuntu 16.04 64bit, Jetson TX1, ODROID-C2, PINE64)
+Compiler GCC 5.4.0
+
+&lt;denchmark-h:h5&gt;Detailed description&lt;/denchmark-h&gt;
+
+The tests Calib3d_StereoCalibrate_C and Calib3d_StereoCalibrate_CPP fails on 64bit ARM.
+&lt;denchmark-code&gt;[----------] 1 test from Calib3d_StereoCalibrate_C
+[ RUN      ] Calib3d_StereoCalibrate_C.regression
+/home/ubuntu/opencv-fork/modules/ts/src/ts.cpp:518: Failure
+Failed
+
+    failure reason: Invalid function output
+    test case #-1
+    seed: ffffffffffffffff
+-----------------------------------
+    LOG:
+Points reprojected with a matrix Q and points reconstructed by triangulation are different, testcase 1
+Testcase 1. Max distance (calibrated) =2.2571
+Max distance (uncalibrated) =3.5603
+
+-----------------------------------
+
+[  FAILED  ] Calib3d_StereoCalibrate_C.regression (6188 ms)
+[----------] 1 test from Calib3d_StereoCalibrate_C (6188 ms total)
+
+[----------] 1 test from Calib3d_StereoCalibrate_CPP
+[ RUN      ] Calib3d_StereoCalibrate_CPP.regression
+/home/ubuntu/opencv-fork/modules/ts/src/ts.cpp:518: Failure
+Failed
+
+    failure reason: Invalid function output
+    test case #-1
+    seed: ffffffffffffffff
+-----------------------------------
+    LOG:
+Points reprojected with a matrix Q and points reconstructed by triangulation are different, testcase 1
+Testcase 1. Max distance (calibrated) =2.2571
+Max distance (uncalibrated) =3.5603
+
+-----------------------------------
+
+[  FAILED  ] Calib3d_StereoCalibrate_CPP.regression (6189 ms)
+[----------] 1 test from Calib3d_StereoCalibrate_CPP (6190 ms total)
+&lt;/denchmark-code&gt;
+
+I traced this issue.
+I realized that this issue doesn't reproduce under debug mode.
+&lt;denchmark-code&gt;[----------] 1 test from Calib3d_StereoCalibrate_C
+[ RUN      ] Calib3d_StereoCalibrate_C.regression
+[       OK ] Calib3d_StereoCalibrate_C.regression (29540 ms)
+[----------] 1 test from Calib3d_StereoCalibrate_C (29540 ms total)
+
+[----------] 1 test from Calib3d_StereoCalibrate_CPP
+[ RUN      ] Calib3d_StereoCalibrate_CPP.regression
+[       OK ] Calib3d_StereoCalibrate_CPP.regression (29350 ms)
+[----------] 1 test from Calib3d_StereoCalibrate_CPP (29350 ms total)
+
+&lt;/denchmark-code&gt;
+
+Now, I traced back where the difference cause and realize that the difference appears before any of the calib3d computation, but after RNG
+
+test_cameraclibration.cpp
+
+&lt;denchmark-code&gt;        rng.fill(disparities, RNG::UNIFORM, minDisparity, maxDisparity);
+        std::cout &lt;&lt; disparities &lt;&lt; std::endl;
+&lt;/denchmark-code&gt;
+
+
+release mode
+
+&lt;denchmark-code&gt;[371.84973, 332.55664, 312.13449, 576.74884, 10.361774, .....
+&lt;/denchmark-code&gt;
+
+
+debug mode
+
+&lt;denchmark-code&gt;[371.84973, 332.55664, 312.13449, 576.74884, 10.361786, .....
+&lt;/denchmark-code&gt;
+
+I faced this situation some times in the past.
+The cause is because of the difference between fmadd and separate multiply + add.
+GCC on 64bit tends to use fmadd as much as possible, compared to 32bit version.
+I looked in to the rand.cpp and figured out that in randf_32f, SSE operation is used for x86 in order not to use double.
+&lt;denchmark-code&gt;static void randf_32f( float* arr, int len, uint64* state, const Vec2f* p, bool )
+{
+    uint64 temp = *state;
+    int i = 0;
+
+    for( ; i &lt;= len - 4; i += 4 )
+    {
+        float f[4];
+        f[0] = (float)(int)(temp = RNG_NEXT(temp));
+        f[1] = (float)(int)(temp = RNG_NEXT(temp));
+        f[2] = (float)(int)(temp = RNG_NEXT(temp));
+        f[3] = (float)(int)(temp = RNG_NEXT(temp));
+
+        // handwritten SSE is required not for performance but for numerical stability!
+        // both 32-bit gcc and MSVC compilers trend to generate double precision SSE
+        // while 64-bit compilers generate single precision SIMD instructions
+        // so manual vectorisation forces all compilers to the single precision
+#if defined __SSE2__ || (defined _M_IX86_FP &amp;&amp; 2 == _M_IX86_FP)
+        __m128 q0 = _mm_loadu_ps((const float*)(p + i));
+        __m128 q1 = _mm_loadu_ps((const float*)(p + i + 2));
+
+        __m128 q01l = _mm_unpacklo_ps(q0, q1);
+        __m128 q01h = _mm_unpackhi_ps(q0, q1);
+
+        __m128 p0 = _mm_unpacklo_ps(q01l, q01h);
+        __m128 p1 = _mm_unpackhi_ps(q01l, q01h);
+
+        _mm_storeu_ps(arr + i, _mm_add_ps(_mm_mul_ps(_mm_loadu_ps(f), p0), p1));
+#else
+        arr[i+0] = f[0]*p[i+0][0] + p[i+0][1];
+        arr[i+1] = f[1]*p[i+1][0] + p[i+1][1];
+        arr[i+2] = f[2]*p[i+2][0] + p[i+2][1];
+        arr[i+3] = f[3]*p[i+3][0] + p[i+3][1];
+#endif
+    }
+&lt;/denchmark-code&gt;
+
+I forced not to use fmadd here, and confirmed that it let the test pass.
+I think it's adequate to implement ARM 64bit version here, too.
+	</description>
+	<comments>
+	</comments>
+</bug>

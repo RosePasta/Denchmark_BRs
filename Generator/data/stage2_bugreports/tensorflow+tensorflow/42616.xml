@@ -1,0 +1,543 @@
+<bug id='42616' author='AlexanderJLiu' open_date='2020-08-24T08:27:07Z' closed_time='2020-09-04T21:26:02Z'>
+	<summary>Memory leak when using MultiWorkerMirroredStrategy for distributed training</summary>
+	<description>
+System information
+
+Have I written custom code: YES
+OS Platform and Distribution: CentOS 7.3
+TensorFlow installed from: pip
+TensorFlow version: 2.3.0
+Python version:3.7.7
+CPU ONLY
+
+Describe the current behavior
+When I use MultiWorkerMirroredStrategy for distributed training, as the number of training epochs increases, memory usage of tensorflow is also increasing, until beyond the memory limitation.
+But the memory usage of stand-alone(not distributed) training is always stable.
+Because I use cpu only for distributed training, I can't get any memory infomation from tensorboard using profiler.
+Standalone code to reproduce the issue
+Note that I don't know how to use MultiWorkerMirroredStrategy in colab, so I just give the reproduce steps here, and it's very easy.
+
+Training Code (worker.py)
+
+import os
+import json
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+from absl import app, flags
+import numpy as np
+
+FLAGS = flags.FLAGS
+flags.DEFINE_string("logs", "logs", "logs dir")
+flags.DEFINE_integer("index", 0, "worker index")
+
+class ThreeLayerMLP(keras.Model):
+    def __init__(self, name=None):
+        super().__init__(name=name)
+        self.dense_1 = layers.Dense(32, activation='relu', name='dense_1')
+        self.dense_2 = layers.Dense(16, activation='relu', name='dense_2')
+        self.pred_layer = layers.Dense(
+            1,
+            activation='sigmoid',
+            name='predictions',
+        )
+
+    def call(self, inputs, training=None):
+        print(inputs.shape)
+        x = self.dense_1(inputs)
+        x = self.dense_2(x)
+        return self.pred_layer(x)
+
+
+def prepare_data():
+    np.random.seed(0)
+    x_train, y_train = (
+        np.random.random((6000000, 31)),
+        np.random.randint(2, size=(6000000, 1)),
+    )
+
+    x_val, y_val = (
+        np.random.random((10000, 31)),
+        np.random.randint(2, size=(10000, 1)),
+    )
+
+    return ((x_train, y_train), (x_val, y_val))
+
+
+def main(argv):
+    del argv  # Unused args
+    tf_config = {
+        "cluster": {
+            "worker": ["ip1:12345", "ip2:12345"],
+        },
+        "task": {
+            "index": FLAGS.index,
+            "type": "worker"
+        }
+    }
+    os.environ["TF_CONFIG"] = json.dumps(tf_config)
+    print(json.loads(os.environ["TF_CONFIG"]))
+    # distributed strategy
+    strategy = tf.distribute.experimental.MultiWorkerMirroredStrategy()
+    BATCH_SIZE_PER_REPLICA = 128
+    BATCH_SIZE = BATCH_SIZE_PER_REPLICA * strategy.num_replicas_in_sync
+    print('Number of devices: %d' % strategy.num_replicas_in_sync)
+
+    with strategy.scope():
+        model = ThreeLayerMLP(name='3_layer_mlp')
+        model.compile(
+            loss=tf.keras.losses.BinaryCrossentropy(),
+            optimizer=keras.optimizers.RMSprop(),
+            metrics=["AUC"],
+        )
+
+    tensorboard_callback = tf.keras.callbacks.TensorBoard(
+        log_dir=FLAGS.logs,
+        histogram_freq=10,
+        update_freq=100,
+    )
+
+    ((x_train, y_train), (x_val, y_val)) = prepare_data()
+
+    model.fit(
+        x_train,
+        y_train,
+        epochs=100,
+        batch_size=BATCH_SIZE,
+        validation_data=(x_val, y_val),
+        callbacks=[tensorboard_callback],
+    )
+
+
+if __name__ == '__main__':
+    app.run(main)
+
+Distributed training: change the ip1 and ip2 to your machine's ip in the codes above, and execute the command below seperately:
+
+python worker.py --index=0
+python worker.py --index=1
+
+
+The memory change curve of distributed training in my machine is shown as below：
+
+
+
+The memory usage of stand-alone training is only 3-4G.
+
+
+	</description>
+	<comments>
+		<comment id='1' author='AlexanderJLiu' date='2020-08-25T01:53:33Z'>
+		Hi &lt;denchmark-link:https://github.com/AlexanderJLiu&gt;@AlexanderJLiu&lt;/denchmark-link&gt;
+, do you observe the same behavior when you remove the callbacks?
+I did not realize that with CPU only configurations you can't use the memory page of the Profiler. Since you didn't use the profiler, what did you use instead to plot the usage?
+In the meantime, I will try and reproduce this behavior this on my end.
+		</comment>
+		<comment id='2' author='AlexanderJLiu' date='2020-08-25T02:34:05Z'>
+		&lt;denchmark-link:https://github.com/nikitamaia&gt;@nikitamaia&lt;/denchmark-link&gt;
+ Thanks for your quick response.
+
+do you observe the same behavior when you remove the callbacks?
+
+Yes, when I remove the callbacks, the same behavior occurs.
+
+I did not realize that with CPU only configurations you can't use the memory page of the Profiler. Since you didn't use the profiler.
+
+I've used the profiler in another training by setting profile_batch='100,1000', in tensorboard callback.
+And the memory tool of tensorboard is shown as below: (Other tool like overview_page works well)
+&lt;denchmark-link:https://user-images.githubusercontent.com/15494997/91115748-78e98a00-e6bd-11ea-8a3d-10076c67e517.png&gt;&lt;/denchmark-link&gt;
+
+According to the comment &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/42123#issuecomment-675047711&gt;here&lt;/denchmark-link&gt;
+, may be the memory tool is designed for device (i.e. GPU or TPU) not on the host (CPU). But I'm not pretty sure.
+
+what did you use instead to plot the usage?
+
+I use hadoop yarn for scheduling tensorflow distributed training, so the memory usage is plotted by yarn web.
+
+In the meantime, I will try and reproduce this behavior this on my end.
+
+Thanks again, I have been troubled by this problem for a long time.
+		</comment>
+		<comment id='3' author='AlexanderJLiu' date='2020-08-26T16:20:50Z'>
+		Can you report if you see the memory leak when using a single machine with MultiWorkerMirroredStrategy? Despite the name, MultiWorkerMirroredStrategy can be used on a single machine without additional setup.
+Additionally, can you provide the logs for the training with two machines?
+		</comment>
+		<comment id='4' author='AlexanderJLiu' date='2020-08-28T02:26:55Z'>
+		
+Can you report if you see the memory leak when using a single machine with MultiWorkerMirroredStrategy?
+
+There is no memory leak using  a single machine with MultiWorkerMirroredStrategy just like stand-alone training without strategy. Their memory usage is around 2.6 G.
+&lt;denchmark-h:hr&gt;&lt;/denchmark-h&gt;
+
+In addition the memory usage diagram I've provide is not very suitable, because it also contain the memory usage of jvm(yarn container).
+But the distributed training memory  is indeed growing as the steps continue, every worker will reach to 6.3G and more.
+I could understand that distributed training may take up more memory, but not so much, I mean 2-3 times of stand-alone training.
+&lt;denchmark-h:hr&gt;&lt;/denchmark-h&gt;
+
+Below are logs of two machines:
+
+chief worker:
+
+{'cluster': {'worker': ['host1:12345', 'host2:12345']}, 'task': {'index': 0, 'type': 'worker'}}
+2020-08-27 15:38:20.297571: I tensorflow/core/platform/cpu_feature_guard.cc:142] This TensorFlow binary is optimized with oneAPI Deep Neural Network Library (oneDNN)to use the following CPU instructions in performance-critical operations:  AVX2 FMA
+To enable them in other operations, rebuild TensorFlow with the appropriate compiler flags.
+2020-08-27 15:38:20.375920: I tensorflow/core/platform/profile_utils/cpu_utils.cc:104] CPU Frequency: 2194920000 Hz
+2020-08-27 15:38:20.390435: I tensorflow/compiler/xla/service/service.cc:168] XLA service 0x7fdde155bc60 initialized for platform Host (this does not guarantee that XLA will be used). Devices:
+2020-08-27 15:38:20.390500: I tensorflow/compiler/xla/service/service.cc:176]   StreamExecutor device (0): Host, Default Version
+2020-08-27 15:38:20.513077: I tensorflow/core/distributed_runtime/rpc/grpc_channel.cc:301] Initialize GrpcChannelCache for job worker -&gt; {0 -&gt; host1:12345, 1 -&gt; host2:12345}
+2020-08-27 15:38:20.528659: I tensorflow/core/distributed_runtime/rpc/grpc_server_lib.cc:405] Started server with target: grpc://host1:12345
+INFO:tensorflow:Enabled multi-worker collective ops with available devices: ['/job:worker/replica:0/task:0/device:CPU:0', '/job:worker/replica:0/task:0/device:XLA_CPU:0']
+I0827 15:38:20.540649 140590888851264 collective_all_reduce_strategy.py:329] Enabled multi-worker collective ops with available devices: ['/job:worker/replica:0/task:0/device:CPU:0', '/job:worker/replica:0/task:0/device:XLA_CPU:0']
+INFO:tensorflow:Using MirroredStrategy with devices ('/job:worker/task:0',)
+I0827 15:38:20.543771 140590888851264 mirrored_strategy.py:341] Using MirroredStrategy with devices ('/job:worker/task:0',)
+INFO:tensorflow:MultiWorkerMirroredStrategy with cluster_spec = {'worker': ['host1:12345', 'host2:12345']}, task_type = 'worker', task_id = 0, num_workers = 2, local_devices = ('/job:worker/task:0',), communication = CollectiveCommunication.AUTO
+I0827 15:38:20.544113 140590888851264 collective_all_reduce_strategy.py:380] MultiWorkerMirroredStrategy with cluster_spec = {'worker': ['host1:12345', 'host2:12345']}, task_type = 'worker', task_id = 0, num_workers = 2, local_devices = ('/job:worker/task:0',), communication = CollectiveCommunication.AUTO
+Number of devices: 2
+2020-08-27 15:39:16.963784: I tensorflow/core/profiler/lib/profiler_session.cc:164] Profiler session started.
+INFO:tensorflow:Running Distribute Coordinator with mode = 'independent_worker', cluster_spec = {'worker': ['host1:12345', 'host2:12345']}, task_type = 'worker', task_id = 0, environment = None, rpc_layer = 'grpc'
+I0827 15:39:19.306446 140590888851264 distribute_coordinator.py:783] Running Distribute Coordinator with mode = 'independent_worker', cluster_spec = {'worker': ['host1:12345', 'host2:12345']}, task_type = 'worker', task_id = 0, environment = None, rpc_layer = 'grpc'
+WARNING:tensorflow:`eval_fn` is not passed in. The `worker_fn` will be used if an "evaluator" task exists in the cluster.
+W0827 15:39:19.306725 140590888851264 distribute_coordinator.py:832] `eval_fn` is not passed in. The `worker_fn` will be used if an "evaluator" task exists in the cluster.
+WARNING:tensorflow:`eval_strategy` is not passed in. No distribution strategy will be used for evaluation.
+W0827 15:39:19.306816 140590888851264 distribute_coordinator.py:836] `eval_strategy` is not passed in. No distribution strategy will be used for evaluation.
+INFO:tensorflow:Using MirroredStrategy with devices ('/job:worker/task:0',)
+I0827 15:39:19.310764 140590888851264 mirrored_strategy.py:341] Using MirroredStrategy with devices ('/job:worker/task:0',)
+INFO:tensorflow:MultiWorkerMirroredStrategy with cluster_spec = {'worker': ['host1:12345', 'host2:12345']}, task_type = 'worker', task_id = 0, num_workers = 2, local_devices = ('/job:worker/task:0',), communication = CollectiveCommunication.AUTO
+I0827 15:39:19.310969 140590888851264 collective_all_reduce_strategy.py:380] MultiWorkerMirroredStrategy with cluster_spec = {'worker': ['host1:12345', 'host2:12345']}, task_type = 'worker', task_id = 0, num_workers = 2, local_devices = ('/job:worker/task:0',), communication = CollectiveCommunication.AUTO
+INFO:tensorflow:Using MirroredStrategy with devices ('/job:worker/task:0',)
+I0827 15:39:19.313967 140590888851264 mirrored_strategy.py:341] Using MirroredStrategy with devices ('/job:worker/task:0',)
+INFO:tensorflow:MultiWorkerMirroredStrategy with cluster_spec = {'worker': ['host1:12345', 'host2:12345']}, task_type = 'worker', task_id = 0, num_workers = 2, local_devices = ('/job:worker/task:0',), communication = CollectiveCommunication.AUTO
+I0827 15:39:19.314168 140590888851264 collective_all_reduce_strategy.py:380] MultiWorkerMirroredStrategy with cluster_spec = {'worker': ['host1:12345', 'host2:12345']}, task_type = 'worker', task_id = 0, num_workers = 2, local_devices = ('/job:worker/task:0',), communication = CollectiveCommunication.AUTO
+2020-08-27 15:39:21.066740: W tensorflow/core/grappler/optimizers/data/auto_shard.cc:521] In AUTO-mode, and switching to DATA-based sharding, instead of FILE-based sharding as we cannot find appropriate reader dataset op(s) to shard. Error: Did not find a shardable source, walked to a node which is not a dataset: name: "FlatMapDataset/_9"
+op: "FlatMapDataset"
+input: "PrefetchDataset/_8"
+attr {
+  key: "Targuments"
+  value {
+    list {
+    }
+  }
+}
+attr {
+  key: "f"
+  value {
+    func {
+      name: "__inference_Dataset_flat_map_slice_batch_indices_84"
+    }
+  }
+}
+attr {
+  key: "output_shapes"
+  value {
+    list {
+      shape {
+        dim {
+          size: -1
+        }
+      }
+    }
+  }
+}
+attr {
+  key: "output_types"
+  value {
+    list {
+      type: DT_INT64
+    }
+  }
+}
+. Consider either turning off auto-sharding or switching the auto_shard_policy to DATA to shard this dataset. You can do this by creating a new `tf.data.Options()` object then setting `options.experimental_distribute.auto_shard_policy = AutoShardPolicy.DATA` before applying the options object to the dataset via `dataset.with_options(options)`.
+Epoch 1/100
+WARNING:tensorflow:From /data2/xiaohu/python37-tensorflow-2.3.0/lib/python3.7/site-packages/tensorflow/python/data/ops/multi_device_iterator_ops.py:601: get_next_as_optional (from tensorflow.python.data.ops.iterator_ops) is deprecated and will be removed in a future version.
+Instructions for updating:
+Use `tf.data.Iterator.get_next_as_optional()` instead.
+W0827 15:42:17.483410 140422423435072 deprecation.py:323] From /data2/xiaohu/python37-tensorflow-2.3.0/lib/python3.7/site-packages/tensorflow/python/data/ops/multi_device_iterator_ops.py:601: get_next_as_optional (from tensorflow.python.data.ops.iterator_ops) is deprecated and will be removed in a future version.
+Instructions for updating:
+Use `tf.data.Iterator.get_next_as_optional()` instead.
+INFO:tensorflow:Collective batch_all_reduce: 1 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+I0827 15:42:17.520840 140422423435072 cross_device_ops.py:1085] Collective batch_all_reduce: 1 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+(None, 31)
+INFO:tensorflow:Collective batch_all_reduce: 6 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+I0827 15:42:19.048505 140422423435072 cross_device_ops.py:1079] Collective batch_all_reduce: 6 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+INFO:tensorflow:Collective batch_all_reduce: 1 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+I0827 15:42:19.305560 140422423435072 cross_device_ops.py:1085] Collective batch_all_reduce: 1 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+INFO:tensorflow:Collective batch_all_reduce: 1 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+I0827 15:42:19.309205 140422423435072 cross_device_ops.py:1085] Collective batch_all_reduce: 1 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+INFO:tensorflow:Collective batch_all_reduce: 1 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+I0827 15:42:19.315551 140422423435072 cross_device_ops.py:1085] Collective batch_all_reduce: 1 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+INFO:tensorflow:Collective batch_all_reduce: 1 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+I0827 15:42:19.318860 140422423435072 cross_device_ops.py:1085] Collective batch_all_reduce: 1 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+INFO:tensorflow:Collective batch_all_reduce: 1 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+I0827 15:42:19.323117 140422423435072 cross_device_ops.py:1085] Collective batch_all_reduce: 1 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+INFO:tensorflow:Collective batch_all_reduce: 1 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+I0827 15:42:19.327072 140422423435072 cross_device_ops.py:1085] Collective batch_all_reduce: 1 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+INFO:tensorflow:Collective batch_all_reduce: 1 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+I0827 15:42:19.330104 140422423435072 cross_device_ops.py:1085] Collective batch_all_reduce: 1 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+INFO:tensorflow:Collective batch_all_reduce: 1 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+I0827 15:42:19.333960 140422423435072 cross_device_ops.py:1085] Collective batch_all_reduce: 1 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+INFO:tensorflow:Collective batch_all_reduce: 1 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+I0827 15:42:20.492240 140422423435072 cross_device_ops.py:1085] Collective batch_all_reduce: 1 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+(None, 31)
+INFO:tensorflow:Collective batch_all_reduce: 6 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+I0827 15:42:20.632939 140422423435072 cross_device_ops.py:1079] Collective batch_all_reduce: 6 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+  408/23438 [..............................] - ETA: 58s - loss: 0.6936 - auc: 0.5005
+
+worker
+
+{'cluster': {'worker': ['host1:12345', 'host2:12345']}, 'task': {'index': 1, 'type': 'worker'}}
+2020-08-27 15:45:00.512494: I tensorflow/core/platform/cpu_feature_guard.cc:142] This TensorFlow binary is optimized with oneAPI Deep Neural Network Library (oneDNN)to use the following CPU instructions in performance-critical operations:  AVX2 FMA
+To enable them in other operations, rebuild TensorFlow with the appropriate compiler flags.
+2020-08-27 15:45:00.522673: I tensorflow/core/platform/profile_utils/cpu_utils.cc:104] CPU Frequency: 2194960000 Hz
+2020-08-27 15:45:00.536417: I tensorflow/compiler/xla/service/service.cc:168] XLA service 0x7f8c6a65eca0 initialized for platform Host (this does not guarantee that XLA will be used). Devices:
+2020-08-27 15:45:00.536485: I tensorflow/compiler/xla/service/service.cc:176]   StreamExecutor device (0): Host, Default Version
+2020-08-27 15:45:00.591712: I tensorflow/core/distributed_runtime/rpc/grpc_channel.cc:301] Initialize GrpcChannelCache for job worker -&gt; {0 -&gt; host1:12345, 1 -&gt; host2:12345}
+2020-08-27 15:45:00.605558: I tensorflow/core/distributed_runtime/rpc/grpc_server_lib.cc:405] Started server with target: grpc://host2:12345
+INFO:tensorflow:Enabled multi-worker collective ops with available devices: ['/job:worker/replica:0/task:1/device:CPU:0', '/job:worker/replica:0/task:1/device:XLA_CPU:0']
+I0827 15:45:00.608686 140240986761024 collective_all_reduce_strategy.py:329] Enabled multi-worker collective ops with available devices: ['/job:worker/replica:0/task:1/device:CPU:0', '/job:worker/replica:0/task:1/device:XLA_CPU:0']
+INFO:tensorflow:Using MirroredStrategy with devices ('/job:worker/task:1',)
+I0827 15:45:00.611357 140240986761024 mirrored_strategy.py:341] Using MirroredStrategy with devices ('/job:worker/task:1',)
+INFO:tensorflow:MultiWorkerMirroredStrategy with cluster_spec = {'worker': ['host1:12345', 'host2:12345']}, task_type = 'worker', task_id = 1, num_workers = 2, local_devices = ('/job:worker/task:1',), communication = CollectiveCommunication.AUTO
+I0827 15:45:00.611701 140240986761024 collective_all_reduce_strategy.py:380] MultiWorkerMirroredStrategy with cluster_spec = {'worker': ['host1:12345', 'host2:12345']}, task_type = 'worker', task_id = 1, num_workers = 2, local_devices = ('/job:worker/task:1',), communication = CollectiveCommunication.AUTO
+Number of devices: 2
+2020-08-27 15:45:17.748821: I tensorflow/core/profiler/lib/profiler_session.cc:164] Profiler session started.
+INFO:tensorflow:Running Distribute Coordinator with mode = 'independent_worker', cluster_spec = {'worker': ['host1:12345', 'host2:12345']}, task_type = 'worker', task_id = 1, environment = None, rpc_layer = 'grpc'
+I0827 15:45:20.202999 140240986761024 distribute_coordinator.py:783] Running Distribute Coordinator with mode = 'independent_worker', cluster_spec = {'worker': ['host1:12345', 'host2:12345']}, task_type = 'worker', task_id = 1, environment = None, rpc_layer = 'grpc'
+WARNING:tensorflow:`eval_fn` is not passed in. The `worker_fn` will be used if an "evaluator" task exists in the cluster.
+W0827 15:45:20.203293 140240986761024 distribute_coordinator.py:832] `eval_fn` is not passed in. The `worker_fn` will be used if an "evaluator" task exists in the cluster.
+WARNING:tensorflow:`eval_strategy` is not passed in. No distribution strategy will be used for evaluation.
+W0827 15:45:20.203418 140240986761024 distribute_coordinator.py:836] `eval_strategy` is not passed in. No distribution strategy will be used for evaluation.
+INFO:tensorflow:Using MirroredStrategy with devices ('/job:worker/task:1',)
+I0827 15:45:20.205906 140240986761024 mirrored_strategy.py:341] Using MirroredStrategy with devices ('/job:worker/task:1',)
+INFO:tensorflow:MultiWorkerMirroredStrategy with cluster_spec = {'worker': ['host1:12345', 'host2:12345']}, task_type = 'worker', task_id = 1, num_workers = 2, local_devices = ('/job:worker/task:1',), communication = CollectiveCommunication.AUTO
+I0827 15:45:20.206124 140240986761024 collective_all_reduce_strategy.py:380] MultiWorkerMirroredStrategy with cluster_spec = {'worker': ['host1:12345', 'host2:12345']}, task_type = 'worker', task_id = 1, num_workers = 2, local_devices = ('/job:worker/task:1',), communication = CollectiveCommunication.AUTO
+INFO:tensorflow:Using MirroredStrategy with devices ('/job:worker/task:1',)
+I0827 15:45:20.208848 140240986761024 mirrored_strategy.py:341] Using MirroredStrategy with devices ('/job:worker/task:1',)
+INFO:tensorflow:MultiWorkerMirroredStrategy with cluster_spec = {'worker': ['host1:12345', 'host2:12345']}, task_type = 'worker', task_id = 1, num_workers = 2, local_devices = ('/job:worker/task:1',), communication = CollectiveCommunication.AUTO
+I0827 15:45:20.209068 140240986761024 collective_all_reduce_strategy.py:380] MultiWorkerMirroredStrategy with cluster_spec = {'worker': ['host1:12345', 'host2:12345']}, task_type = 'worker', task_id = 1, num_workers = 2, local_devices = ('/job:worker/task:1',), communication = CollectiveCommunication.AUTO
+2020-08-27 15:45:22.340415: W tensorflow/core/grappler/optimizers/data/auto_shard.cc:521] In AUTO-mode, and switching to DATA-based sharding, instead of FILE-based sharding as we cannot find appropriate reader dataset op(s) to shard. Error: Did not find a shardable source, walked to a node which is not a dataset: name: "FlatMapDataset/_9"
+op: "FlatMapDataset"
+input: "PrefetchDataset/_8"
+attr {
+  key: "Targuments"
+  value {
+    list {
+    }
+  }
+}
+attr {
+  key: "f"
+  value {
+    func {
+      name: "__inference_Dataset_flat_map_slice_batch_indices_78"
+    }
+  }
+}
+attr {
+  key: "output_shapes"
+  value {
+    list {
+      shape {
+        dim {
+          size: -1
+        }
+      }
+    }
+  }
+}
+attr {
+  key: "output_types"
+  value {
+    list {
+      type: DT_INT64
+    }
+  }
+}
+. Consider either turning off auto-sharding or switching the auto_shard_policy to DATA to shard this dataset. You can do this by creating a new `tf.data.Options()` object then setting `options.experimental_distribute.auto_shard_policy = AutoShardPolicy.DATA` before applying the options object to the dataset via `dataset.with_options(options)`.
+Epoch 1/100
+WARNING:tensorflow:From /data2/xiaohu/test/python37-tensorflow-2.3.0/lib/python3.7/site-packages/tensorflow/python/data/ops/multi_device_iterator_ops.py:601: get_next_as_optional (from tensorflow.python.data.ops.iterator_ops) is deprecated and will be removed in a future version.
+Instructions for updating:
+Use `tf.data.Iterator.get_next_as_optional()` instead.
+W0827 15:45:22.731915 140240986761024 deprecation.py:323] From /data2/xiaohu/test/python37-tensorflow-2.3.0/lib/python3.7/site-packages/tensorflow/python/data/ops/multi_device_iterator_ops.py:601: get_next_as_optional (from tensorflow.python.data.ops.iterator_ops) is deprecated and will be removed in a future version.
+Instructions for updating:
+Use `tf.data.Iterator.get_next_as_optional()` instead.
+INFO:tensorflow:Collective batch_all_reduce: 1 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+I0827 15:45:22.753906 140240986761024 cross_device_ops.py:1085] Collective batch_all_reduce: 1 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+(None, 31)
+INFO:tensorflow:Collective batch_all_reduce: 6 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+I0827 15:45:23.100841 140240986761024 cross_device_ops.py:1079] Collective batch_all_reduce: 6 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+INFO:tensorflow:Collective batch_all_reduce: 1 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+I0827 15:45:23.330459 140240986761024 cross_device_ops.py:1085] Collective batch_all_reduce: 1 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+INFO:tensorflow:Collective batch_all_reduce: 1 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+I0827 15:45:23.332968 140240986761024 cross_device_ops.py:1085] Collective batch_all_reduce: 1 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+INFO:tensorflow:Collective batch_all_reduce: 1 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+I0827 15:45:23.336559 140240986761024 cross_device_ops.py:1085] Collective batch_all_reduce: 1 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+INFO:tensorflow:Collective batch_all_reduce: 1 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+I0827 15:45:23.338489 140240986761024 cross_device_ops.py:1085] Collective batch_all_reduce: 1 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+INFO:tensorflow:Collective batch_all_reduce: 1 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+I0827 15:45:23.340856 140240986761024 cross_device_ops.py:1085] Collective batch_all_reduce: 1 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+INFO:tensorflow:Collective batch_all_reduce: 1 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+I0827 15:45:23.343185 140240986761024 cross_device_ops.py:1085] Collective batch_all_reduce: 1 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+INFO:tensorflow:Collective batch_all_reduce: 1 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+I0827 15:45:23.345053 140240986761024 cross_device_ops.py:1085] Collective batch_all_reduce: 1 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+INFO:tensorflow:Collective batch_all_reduce: 1 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+I0827 15:45:23.349698 140240986761024 cross_device_ops.py:1085] Collective batch_all_reduce: 1 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+INFO:tensorflow:Collective batch_all_reduce: 1 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+I0827 15:45:24.438810 140240986761024 cross_device_ops.py:1085] Collective batch_all_reduce: 1 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+(None, 31)
+INFO:tensorflow:Collective batch_all_reduce: 6 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+I0827 15:45:24.590398 140240986761024 cross_device_ops.py:1079] Collective batch_all_reduce: 6 all-reduces, num_devices = 1, group_size = 2, communication_hint = AUTO, num_packs = 1
+ 1028/23438 [&gt;.............................] - ETA: 56s - loss: 0.6937 - auc: 0.4986
+		</comment>
+		<comment id='5' author='AlexanderJLiu' date='2020-08-31T15:48:15Z'>
+		I was able to reproduce the memory increase. However when I changed the numpy arrays to a tf.data.dataset the memory was pretty stable. Under the hood, model.fit should convert your numpy arrays to a tf.data.dataset, but there is possibly some problem there. Can you try the same and convert your data (both training and validation) ahead of time so you are passing in a tf.data.dataset to model.fit?
+		</comment>
+		<comment id='6' author='AlexanderJLiu' date='2020-09-01T07:24:38Z'>
+		
+Can you try the same and convert your data (both training and validation) ahead of time so you are passing in a tf.data.dataset to model.fit?
+
+Yes, I converted the numpy array to tf.data.Dataset before training using the code below, but the memory usage was still slowly growing. With almost the same number of training steps, the memory reaches about 4G at the end of training, which is lower than before. Is there something different with your test code?
+def prepare_data():
+    np.random.seed(0)
+    x_train, y_train = (
+        np.random.random((6000000, 31)),
+        np.random.randint(2, size=(6000000, 1)),
+    )
+
+    x_val, y_val = (
+        np.random.random((10000, 31)),
+        np.random.randint(2, size=(10000, 1)),
+    )
+
+    train_dataset = tf.data.Dataset.from_tensor_slices((x_train, y_train))
+    train_dataset = train_dataset.shuffle(buffer_size=1024).batch(256).repeat()
+
+    val_dataset = tf.data.Dataset.from_tensor_slices((x_val, y_val))
+    val_dataset = val_dataset.batch(256).repeat()
+
+    return train_dataset, val_dataset
+  
+# Training
+train_dataset, val_dataset = prepare_data()
+
+model.fit(
+    train_dataset,
+    epochs=100,
+    steps_per_epoch=20000,
+    validation_data=val_dataset,
+    validation_steps=100,
+)
+And in my real training job, I did use tf.data.Dataset API for reading data from files, the memory was growing as what I've said. PS: numpy inputs are just used to test and illustrate the distributed problem(May be related to the input pipeline). Here are codes I've used for reading data from HDFS files:
+def make_dataset(input_pattern, shuffle_size, batch_size):
+    # For vectorized map
+    def labeler(record):
+        fields = tf.io.decode_csv(
+            record,
+            record_defaults=['0'] * 64,
+            field_delim='\t',
+        )
+        data = tf.strings.to_number(fields[1:64], out_type=tf.int32)
+        label = tf.strings.to_number(fields[:1], out_type=tf.int32)
+
+        data = tf.transpose(data)
+        label = tf.transpose(label)
+
+        return data, label
+
+    filenames = tf.data.Dataset.list_files(input_pattern)
+    dataset = filenames.interleave(
+        lambda filename: tf.data.TextLineDataset(filename),
+        cycle_length=tf.data.experimental.AUTOTUNE,
+        num_parallel_calls=tf.data.experimental.AUTOTUNE,
+    )
+    dataset = dataset.repeat().shuffle(shuffle_size).batch(batch_size)
+    dataset = dataset.map(
+        lambda ex: labeler(ex),
+        num_parallel_calls=tf.data.experimental.AUTOTUNE,
+    )
+
+    dataset = dataset.prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
+
+    return dataset
+
+# Training
+train_dataset = make_dataset(
+    os.path.join(FLAGS.input, "train", "*"),
+    SHUFFLE_SIZE,
+    BATCH_SIZE,
+)
+validation_dataset = make_dataset(
+    os.path.join(FLAGS.input, "validation", "*"),
+    SHUFFLE_SIZE,
+    BATCH_SIZE,
+)
+
+model.fit(train_dataset,
+          epochs=1,
+          steps_per_epoch=10,
+          validation_data=validation_dataset,
+          validation_steps=10,
+          callbacks=tensorboard_callback)
+At the beginning, I also suspected that it was caused by data input, but there is no memory leak in stand-alone local training with the same data pipeline. And in distributed training, tf.data.experimental.AutoShardPolicy will use FILE policy, which means every worker will only be responsible for its own files same as the local training, may not the key problem causing the memory leak.
+The main difference between distributed training and local training is parameters synchronization, when using MultiWorkerMirroredStrategy strategy, it will select communication method automatically, will the CollectiveOps be added to the tensorflow graph gradually or will the memory leak be releated to it?
+Those are just my personal opinion, I'm looking forward to your view.
+Thanks~
+		</comment>
+		<comment id='7' author='AlexanderJLiu' date='2020-09-01T16:42:07Z'>
+		You're right, changing to a tf.data.dataset did not solve the leak. However, when I ran the code with the tf.data.Dataset, I was actually running in tf-nightly so I'm wondering if it was the switch to nightly that solved the leak for me. I used the following dataset function, and did not pass in steps_per_epoch or validation_steps in my model.fit
+&lt;denchmark-code&gt;def prepare_data(BATCH_SIZE):
+    np.random.seed(0)
+    x_train, y_train = (
+        np.random.random((6000000, 31)),
+        np.random.randint(2, size=(6000000, 1)),
+    )
+
+
+    train_dataset = tf.data.Dataset.from_tensor_slices((x_train, y_train))
+    train_dataset = train_dataset.batch(BATCH_SIZE)
+    x_val, y_val = (
+        np.random.random((10000, 31)),
+        np.random.randint(2, size=(10000, 1)),
+    )
+
+    validation_dataset = tf.data.Dataset.from_tensor_slices((x_val, y_val))
+    validation_dataset = validation_dataset.batch(128)
+    return train_dataset, validation_dataset
+&lt;/denchmark-code&gt;
+
+I've just kicked off another training job in nightly using the prepare_data() function you've provided with the .repeat() .shuffle() and passing in the steps_per_epoch and validation_steps args to model.fit. I will let you know what the results look like, but so far they seem pretty stable
+		</comment>
+		<comment id='8' author='AlexanderJLiu' date='2020-09-01T21:08:30Z'>
+		Okay, with tf-nightly, I only see a slight increase in memory usage over the 100 epochs. I monitored every minute and memory trended upwards from ~8.3G to ~8.9G over the 100 epochs. So still an increase but significantly lower than what I was seeing in 2.3.
+		</comment>
+		<comment id='9' author='AlexanderJLiu' date='2020-09-04T09:55:39Z'>
+		I've tried tf-nightly-cpu==2.4.0-dev20200828 with the codes above, exactly as you said. And according to my real training job, I can see a pretty stable memory usage as the figure shown below.
+&lt;denchmark-link:https://user-images.githubusercontent.com/15494997/92226692-b3ca9980-eed7-11ea-8016-ac2feb7d1852.png&gt;&lt;/denchmark-link&gt;
+
+Although the memory is still growing as the training continues, the growth can be tolerated.
+I will continue to focus on this problem, if there are any new changes, I will sync it here.
+Thanks very much for your help.
+		</comment>
+		<comment id='10' author='AlexanderJLiu' date='2020-09-04T21:26:02Z'>
+		Awesome, very glad to hear that moving to nightly works for now. We are currently working hard on improving MWMS and to move it out of experimental. I will close this issue since upgrading to nightly is sufficient for now. But please do feel free to reopen this thread should you encounter any follow up issues with the memory growth or file a new issue if you run into a different bug. Thanks!
+		</comment>
+		<comment id='11' author='AlexanderJLiu' date='2020-09-04T21:26:04Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/42616&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/42616&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='12' author='AlexanderJLiu' date='2020-11-12T07:29:01Z'>
+		my situation is similar to yours but I can not solve the problem by using tf-nightly.
+environments (docker, 2.5.0.dev20201110, 10 workers):
+&lt;denchmark-link:url&gt;https://hub.docker.com/r/tensorflow/tensorflow/tags&lt;/denchmark-link&gt;
+
+
+I used your codes to test and add a memory callback:
+class MemoryCallback(tf.keras.callbacks.Callback): def on_epoch_end(self, batch, logs=None): print(" - Memory: {:.04f} GB ".format(psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024 / 1024))
+the memory increase like:
+&lt;denchmark-link:https://user-images.githubusercontent.com/30276826/98908442-6849f280-24fb-11eb-99ed-d8b59bbbf340.png&gt;&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,150 @@
+<bug id='33724' author='omoindrot' open_date='2019-10-25T15:33:43Z' closed_time='2020-02-03T19:21:56Z'>
+	<summary>Infinite loop with generators wrapping a dataset in tf.function</summary>
+	<description>
+Please make sure that this is a bug. As per our GitHub Policy, we only address code/doc bugs, performance issues, feature requests and build/installation issues on GitHub. tag:bug_template
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Ubuntu 16.04
+Mobile device (e.g. iPhone 8, Pixel 2, Samsung Galaxy) if the issue happens on mobile device:
+TensorFlow installed from (source or binary): binary
+TensorFlow version (use command below): v2.0.0-rc2-26-g64c3d38 2.0.0
+Python version: 3.7.4
+Bazel version (if compiling from source):
+GCC/Compiler version (if compiling from source):
+CUDA/cuDNN version: 10.0 / 7.6.3
+GPU model and memory: TITAN Xp, 12196MiB
+
+You can collect some of this information using our environment capture
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/tree/master/tools/tf_env_collect.sh&gt;script&lt;/denchmark-link&gt;
+
+You can also obtain the TensorFlow version with: 1. TF 1.0:  2. TF 2.0: 
+Describe the current behavior
+My use case was to use tqdm to track progress on a training loop over a tf.data.Dataset:
+@tf.function
+def train_one_epoch(model, dataset):
+    for x in tqdm(dataset):
+        train_step(model, x)
+However, when the function train_one_epoch is wrapped in a tf.function, the AutoGraph is stuck in an infinite loop.
+Describe the expected behavior
+The expected behavior would be that using tf.function results in the same behavior than the eager mode.
+The current issue is that AutoGraph doesn't recognize tqdm(dataset) as a tf.data.Dataset (which is normal). However, iterating infinitely over the dataset in AutoGraph is weird and shouldn't happen. Maybe it should give an exception.
+Maybe the easiest fix would be to prevent dataset.__iter__ being called inside tf.function if it is not in a loop.
+So for x in dataset would be fine, but for x in tqdm(dataset) wouldn't.
+Code to reproduce the issue
+import tensorflow as tf
+
+
+class Iterable():
+    def __init__(self, iterable):
+        self.iterable = iterable
+
+    def __iter__(self):
+        for obj in self.iterable:
+            yield obj
+
+@tf.function
+def f(dataset):
+    for x in Iterable(dataset):
+        print(x)
+
+dataset = tf.data.Dataset.range(5)
+f(dataset)
+The minimal Iterable class can be replaced by tqdm (from tqdm import tqdm), and this should yield the same results.
+Other info / logs
+Include any logs or source code that would be helpful to diagnose the problem. If including tracebacks, please include the full traceback. Large logs and files should be attached.
+Without the @tf.function, the wrapped dataset Iterable(dataset) is iterated over in eager mode:
+&lt;denchmark-code&gt;tf.Tensor(0, shape=(), dtype=int64)
+tf.Tensor(1, shape=(), dtype=int64)
+tf.Tensor(2, shape=(), dtype=int64)
+tf.Tensor(3, shape=(), dtype=int64)
+tf.Tensor(4, shape=(), dtype=int64)
+&lt;/denchmark-code&gt;
+
+With the @tf.function, the AutoGraph mode doesn't recognize the wrapped Iterable(dataset) as a tf.data.Dataset, so it tries to iterate over it in python to trace the graph. However, it looks like the Iterable(dataset).__iter__ infinitely yields a next element named IteratorGetNext.
+This results in an infinite iteration over the dataset:
+&lt;denchmark-code&gt;Tensor("IteratorGetNext:0", shape=(), dtype=int64)
+Tensor("IteratorGetNext_1:0", shape=(), dtype=int64)
+Tensor("IteratorGetNext_2:0", shape=(), dtype=int64)
+Tensor("IteratorGetNext_3:0", shape=(), dtype=int64)
+Tensor("IteratorGetNext_4:0", shape=(), dtype=int64)
+Tensor("IteratorGetNext_5:0", shape=(), dtype=int64)
+Tensor("IteratorGetNext_6:0", shape=(), dtype=int64)
+Tensor("IteratorGetNext_7:0", shape=(), dtype=int64)
+...
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='omoindrot' date='2019-12-24T13:07:28Z'>
+		Indeed, AutoGraph does not recognize Iterator or the generators executed by tqdm. I'll explain in more detail below, but in general the objects are not recognized because they are not subclasses of a dataset or a dataset iterator.
+AutoGraph only transforms objects of types it recognizes - everything else is executed in Python, at function tracing time. For this reason, when running the code above, it's as if you ran it without AutoGraph (try executing , it should behave identically). To better understand this, have a look at the &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/master/tensorflow/python/autograph/operators/control_flow.py#L331&gt;dispatch logic for for loops&lt;/denchmark-link&gt;
+. Since  is not an instance of any of the classes listed there, AutoGraph reverts to running the for loop in Python. In Python, it will cycle infinitely because the  objects that the hidden  iterator returns evaluate to True.  never returns  in graph mode - it can't, because it doesn't know how much data there is at graph construction.
+You might wonder why AutoGraph doesn't detect that the for loop inside  which does use a Dataset. The answer is because AutoGraph doesn't touch generators, however &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/master/tensorflow/python/autograph/core/unsupported_features_checker.py#L40&gt;the warning it generates is silenced by default&lt;/denchmark-link&gt;
+. I think we'll need to make that warning more obvious.
+Now, AutoGraph could detect that a for loop is trying to iterate over a generator and disallow it in graph mode. However, that could break legitimate uses of generators (e.g. such as those used by Keras), but again, it looks like a warning would be useful.
+Separately from all that, tqdm itself contains console output logic and other operations that are highly dependent on the Python runtime and which are not very compatible with TF graphs. So it would be tricky to run in graph mode regardless (though it could be possible to create a more graph-friendly version). When running training loops inside tf.function, you can currently only use summaries and tf.print and tensorboard to monitor the training progress.
+I think adding a graph-compatible tqdm (one that uses TF Iterators and tf.print) would be a useful API, although we probably won't have the chance to build one soon (it would be a welcome contribution though).
+		</comment>
+		<comment id='2' author='omoindrot' date='2020-02-03T19:21:56Z'>
+		There is now a verification in autograph that outputs a warning in situations such as this. We could add a verification that looks specifically for tqdm, but that won't work work the custom generator in the OP so it would be of limited help.
+Here is an alternative that might be useful for adding a progress bar to a dataset - it modifies a dataset to print tqdm messages whenever it is being iterated, using tf.py_function:
+&lt;denchmark-code&gt;def tf_tqdm(ds):
+
+  # Suppress printing the initial status message - it creates extra newlines, for some reason.
+  bar = tqdm.tqdm(file=io.StringIO())
+
+  def advance_tqdm(e):
+    def fn():
+      bar.update(1)
+      # Print the status update manually.
+      print('\r', end='')
+      print(repr(bar), end='')
+    tf.py_function(fn, [], [])
+    return e
+
+  return ds.map(advance_tqdm)
+
+
+@tf.function
+def f(ds):
+  for x in tf_tqdm(ds):
+    pass
+
+ds = tf.data.Dataset.from_tensor_slices(tf.range(3))
+f(ds)
+&lt;/denchmark-code&gt;
+
+Another similar alternative is to use Dataset.from_generator and supply it with a custom generator that itself includes tqdm. This will work whenever you are constructing the dataset from a Python object (it will not work when using built-in datasets like TFRecordDataset, though):
+&lt;denchmark-code&gt;data = tf.range(3)
+
+def f():
+  bar = tqdm.tqdm(file=io.StringIO())
+  for i in data:
+    bar.update(1)
+    # Print the status update manually.
+    print('\r', end='')
+    print(repr(bar), end='')
+    yield i
+
+ds = tf.data.Dataset.from_generator(f, tf.int32)
+
+
+@tf.function
+def f():
+  for x in ds:
+    pass
+
+f()
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='3' author='omoindrot' date='2020-02-03T19:21:58Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/33724&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/33724&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

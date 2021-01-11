@@ -1,0 +1,119 @@
+<bug id='4302' author='AlexDBlack' open_date='2017-11-15T05:59:47Z' closed_time='2017-11-22T08:13:18Z'>
+	<summary>CompGraph: Array leaking out of workspace in computeGradientAndScore</summary>
+	<description>
+See test below. With training workspace enabled, the result is a JVM crash:
+&lt;denchmark-link:https://gist.github.com/AlexDBlack/bc761268f9115ab08ffaaf2130e317c3&gt;https://gist.github.com/AlexDBlack/bc761268f9115ab08ffaaf2130e317c3&lt;/denchmark-link&gt;
+
+&lt;denchmark-code&gt;public static void main(String[] args) throws Exception {
+        ComputationGraph c = createResnet50();
+//        c.getConfiguration().setTrainingWorkspaceMode(WorkspaceMode.NONE);
+        c.getConfiguration().setTrainingWorkspaceMode(WorkspaceMode.SEPARATE);
+
+        org.nd4j.linalg.dataset.DataSet ds = new org.nd4j.linalg.dataset.DataSet();
+        ds.load(new File("dataSet.bin"));
+
+        System.out.println("Train workspace: " + c.getConfiguration().getTrainingWorkspaceMode());
+        System.out.println("Inference workspace: " + c.getConfiguration().getInferenceWorkspaceMode());
+
+        c.setInputs(ds.getFeatures());
+        c.setLabels(ds.getLabels());
+
+        c.computeGradientAndScore();
+    }
+
+
+
+    public static ComputationGraph createResnet50() throws Exception {
+        int labelSize = 5;
+
+        ZooModel zooModel = new ResNet50(
+                labelSize,
+                12345,
+                1,
+                WorkspaceMode.NONE
+        );
+
+        Map&lt;Integer,Double&gt; lrsch = new LinkedHashMap&lt;&gt;();
+        lrsch.put(0,0.0005);
+        lrsch.put(500, 0.001);
+        lrsch.put(1000, 0.0005);
+        lrsch.put(2000, 0.0001);
+        lrsch.put(4000, 0.00008);
+        lrsch.put(6000, 0.00002);
+        lrsch.put(8000, 0.00001);
+        lrsch.put(10000, 0.000005);
+        ISchedule lrSchedule = new MapSchedule(ScheduleType.ITERATION,lrsch);
+        
+            ComputationGraph zooModelOriginal = (ComputationGraph) zooModel.initPretrained(PretrainedType.IMAGENET);
+            FineTuneConfiguration fineTuneConf = new FineTuneConfiguration.Builder()
+                    .optimizationAlgo(OptimizationAlgorithm.STOCHASTIC_GRADIENT_DESCENT)
+                    .l1(0.0)
+                    .l2(0.0)
+                    .updater(new Adam.Builder().learningRateSchedule(lrSchedule).build())
+                    .seed(12345)
+                    .trainingWorkspaceMode(WorkspaceMode.NONE)
+                    .inferenceWorkspaceMode(WorkspaceMode.NONE)
+                    .build();
+
+            ComputationGraph model = new TransferLearning.GraphBuilder(zooModelOriginal)
+                    .setFeatureExtractor("activation_138")
+                    .fineTuneConfiguration(fineTuneConf)
+                    .removeVertexKeepConnections("fc1000")
+                    .addLayer("fc1000",
+                            new OutputLayer.Builder(new LossBinaryXENT())
+                                    .nIn(2048)
+                                    .nOut(labelSize)
+                                    .activation(Activation.SIGMOID)
+                                    .weightInit(WeightInit.XAVIER)
+                                    .dropOut(0)
+                                    .build(),
+                            "flatten_3"
+                    )
+                    .setOutputs("fc1000")
+                    .setWorkspaceMode(WorkspaceMode.SEPARATE)
+                    .build();
+            
+            return model;
+    }
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='AlexDBlack' date='2017-11-20T04:07:09Z'>
+		Some small amount of progress: this seems to be happening early in the first few layers (logging was added here):
+Usually fails right after:
+&lt;denchmark-code&gt;2017-11-20 14:48:03 [main] INFO  o.d.nn.graph.ComputationGraph - About to do forward pass 1 for: zeropadding2d_3
+2017-11-20 14:48:03 [main] INFO  o.d.nn.graph.ComputationGraph - About to do forward pass 2 for: conv1
+&lt;/denchmark-code&gt;
+
+But occasionally fails after:
+&lt;denchmark-code&gt;017-11-20 14:47:08 [main] INFO  o.d.nn.graph.ComputationGraph - About to do forward pass 1 for: zeropadding2d_3
+2017-11-20 14:47:08 [main] INFO  o.d.nn.graph.ComputationGraph - About to do forward pass 2 for: conv1
+2017-11-20 14:47:08 [main] INFO  o.d.nn.graph.ComputationGraph - About to do forward pass 3 for: bn_conv1
+&lt;/denchmark-code&gt;
+
+The network structure at this point is simple; input -&gt; zero padding -&gt; conv1 -&gt; bn_conv1
+Consequently, this may not simply be due to an array leaking out of the workspace, as originally hypothesized...
+&lt;denchmark-link:https://user-images.githubusercontent.com/2360237/33001827-6258794c-ce04-11e7-8294-0a69e7cc9c90.png&gt;&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='2' author='AlexDBlack' date='2017-11-21T03:56:21Z'>
+		Isolated so far to this: &lt;denchmark-link:https://gist.github.com/AlexDBlack/a2e77656e08cf2463210adf98a4fe17e&gt;https://gist.github.com/AlexDBlack/a2e77656e08cf2463210adf98a4fe17e&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='3' author='AlexDBlack' date='2017-11-21T08:17:36Z'>
+		
+c.computeGradientAndScore();
+
+Here's what happens here: LOOP_FF workspace exists in this method, but LOOP_EXTERNAL, which should be used to store activations - does NOT. That workspace is instantiated in fit() methods. So, activations can't be stored in external workspace, and apparently can't survive next FF iteration. Causing crash.
+SCOPE_PANIC profiling mode now shows this kind of bugs.
+		</comment>
+		<comment id='4' author='AlexDBlack' date='2017-11-21T11:19:17Z'>
+		Looks like the solution is fairly simple: computeGradientAndScore doesn't open the appropriate workspace (but later we try to move arrays to it).
+Fix should be implemented and merged tomorrow.
+		</comment>
+		<comment id='5' author='AlexDBlack' date='2018-09-24T08:43:56Z'>
+		This thread has been automatically locked since there has not been any recent activity after it was closed. Please open a new issue for related bugs.
+		</comment>
+	</comments>
+</bug>

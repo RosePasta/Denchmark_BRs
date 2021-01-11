@@ -1,0 +1,123 @@
+<bug id='11004' author='tomoaki0705' open_date='2018-03-06T10:16:28Z' closed_time='2018-03-06T15:49:25Z'>
+	<summary>imgproc: test OCL_Filter/Bilateral fails under specific situation</summary>
+	<description>
+It was a very long journey to get to the conclusion, but I think there's a bug in the compiler.
+&lt;denchmark-h:h5&gt;System information (version)&lt;/denchmark-h&gt;
+
+
+OpenCV =&gt; ee180d5
+Operating System / Platform =&gt; Windows 10 Pro 64bit
+Compiler =&gt; Visual Studio 2012 Update 5
+CMake option =&gt; -DWITH_CUDA=OFF -G"Visual Studio 11 2012 Win64" -DCPU_BASELINE=AVX
+Configuration =&gt;Release / RelWithDebInfo, never on Debug
+
+&lt;denchmark-h:h5&gt;Detailed description&lt;/denchmark-h&gt;
+
+
+32 test fails on opencv_test_imgproc
+The tests are all from OCL_Filter/Bilateral
+I pasted a part of screenshot below
+
+&lt;denchmark-code&gt;Note: Google Test filter = OCL_Filter/Bilateral.Mat/8*
+[==========] Running 1 test from 1 test case.
+[----------] Global test environment set-up.
+[----------] 1 test from OCL_Filter/Bilateral
+[ RUN      ] OCL_Filter/Bilateral.Mat/8, where GetParam() = (8UC1, 5, 0x0, BORDER_REFLECT, 0, false, 1)
+[ INFO:0] Successfully initialized OpenCL cache directory: C:\Users\foo\AppData\Local\Temp\opencv\3.4.1-dev\opencl_cache\
+[ INFO:0] Preparing OpenCL cache configuration for context: Intel_R__Corporation--Intel_R__HD_Graphics_630--23_20_16_4877
+c:\opencv\modules\imgproc\test\ocl\test_filters.cpp(123): error: Expected: (TestUtils::checkNorm2(dst_roi, udst_roi)) &lt;= (threshold), actual: 181 vs 1
+Size: [21 x 15]
+
+[  FAILED  ] OCL_Filter/Bilateral.Mat/8, where GetParam() = (8UC1, 5, 0x0, BORDER_REFLECT, 0, false, 1) (15 ms)
+[----------] 1 test from OCL_Filter/Bilateral (18 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test case ran. (19 ms total)
+[  PASSED  ] 0 tests.
+[  FAILED  ] 1 test, listed below:
+[  FAILED  ] OCL_Filter/Bilateral.Mat/8, where GetParam() = (8UC1, 5, 0x0, BORDER_REFLECT, 0, false, 1)
+&lt;/denchmark-code&gt;
+
+
+So the test was failing with the accuracy error and the difference was quite large, too large as a rounding error
+I checked on Debug mode, and the test passes well.
+Since it's error from OpenCL test, I tried various devices but the result didn't change. (Intel Iris/GeForce/Corei7)
+I dumped the result and got following 4 results
+
+CPU version from Release mode
+CPU version from Debug mode
+OpenCL version from Release mode
+OpenCL version from Debug mode
+
+
+Only the CPU version from Release mode was different from others
+
+It sounds like something went wrong in the optimization of Release mode
+
+
+I also tried following different cmake configuration / Visual Studio but it only happened on the first configuration
+
+test fails: -DWITH_CUDA=OFF -G"Visual Studio 11 2012 Win64" -DCPU_BASELINE=AVX
+test passes: -DWITH_CUDA=OFF -G"Visual Studio 11 2012 Win64"
+test passes: -DWITH_CUDA=OFF -G"Visual Studio 11 2012 Win64" -DCPU_DISPATCH=SSE2;SSE3;SSSE3;SSE4_1;SSE4_2;POPCNT;AVX
+test passes: -DWITH_CUDA=OFF -G"Visual Studio 12 2013 Win64" -DCPU_BASELINE=AVX
+test passes: -DWITH_CUDA=OFF -G"Visual Studio 12 2013 Win64"
+
+
+So it started to sound like a compiler bug.
+I traced the code and strange behavior was coming from here
+
+&lt;denchmark-code&gt;v_float32x4 _sw = v_load(space_weight+k);
+v_float32x4 _w = _cw * _sw;
+_cw = _w * _valF;
+
+vsumw += _w;
+vsumc += _cw;
+&lt;/denchmark-code&gt;
+
+
+Also comparing with the assembly, the code was described as following (I removed some parts, but it has enough information for evidence)
+
+&lt;denchmark-code&gt;vmovaps xmm6, xmm10                    ; vsumw = v_setzero_f32();(zero clear)
+vmovaps xmm2,xmm6                      ; zero clear
+                                       ; beginning of loop
+vinsertps xmm4, xmm4, xmm0, 30h        ; v_float32x4 _valF = v_float32x4(sptr[j+..)
+vmulps xmm0, xmm2, xmm4                ; _cw = _w * _valF  (somthing wrong)
+vaddps xmm5,xmm0,xmm5                  ; vsumc += _cw
+vmulps xmm1,xmm1,xmmword ptr [r14-10h] ; _sw = v_load(space_weight+k)
+                                       ; _w = _cw * _sw
+vaddps xmm6,xmm6,xmm1                  ; vsumw += _w;
+&lt;/denchmark-code&gt;
+
+
+So the point was _w which should be equal to _cw * _sw but was used before it was written
+Thus, xmm5 which is vsumc ended up in a smaller value than usual, and this was causing the difference.
+Good that we had a OpenCL version.  For either Debug/Release configuration, OpenCL result was same and this told us the wrong optimization of CPU version.
+I tweaked a bit of source code and managed to avoid this bug.
+I'll send a PR later
+
+&lt;denchmark-h:h5&gt;Steps to reproduce&lt;/denchmark-h&gt;
+
+
+Run opencv_test_imgproc under the environment described above
+
+	</description>
+	<comments>
+		<comment id='1' author='tomoaki0705' date='2018-03-06T10:41:09Z'>
+		Nice investigation! Looks like this is a compiler bug in AVX code generator.
+I believe we should add separate code branch in this place to avoid "unintended" future optimizations of this code:
+&lt;denchmark-code&gt;#if defined(_MSC_VER) &amp;&amp; _MSC_VER == 1700/* MSVS 2012 */ &amp;&amp; CV_AVX
+    // details: https://github.com/opencv/opencv/issues/11004
+    ... hacks ...
+#else
+    ... old optimized code ...
+#endif
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='2' author='tomoaki0705' date='2018-03-06T10:42:46Z'>
+		Ah, right !
+Let me update the patch
+		</comment>
+	</comments>
+</bug>

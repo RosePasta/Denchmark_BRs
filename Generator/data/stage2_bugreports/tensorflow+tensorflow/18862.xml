@@ -1,0 +1,245 @@
+<bug id='18862' author='mycrazycracy' open_date='2018-04-25T14:16:23Z' closed_time='2018-04-27T21:21:49Z'>
+	<summary>failure when using Dataset to build a model with dilation convolutional layers</summary>
+	<description>
+&lt;denchmark-h:h3&gt;System information&lt;/denchmark-h&gt;
+
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): yes
+**OS Platform and Distribution **:  Ubuntu 16.04
+TensorFlow installed from (source or binary): binary
+TensorFlow version (use command below): 1.5.0
+Python version: 3.6.4
+Bazel version (if compiling from source):
+GCC/Compiler version (if compiling from source):
+CUDA/cuDNN version:
+GPU model and memory:
+Exact command to reproduce:
+
+&lt;denchmark-h:h3&gt;Describe the problem&lt;/denchmark-h&gt;
+
+I happened to find this issue when I tried to add dilation convolution to my model. Here I give basic steps to reproduce the issue.
+First, I use placeholder to create a tiny network.
+&lt;denchmark-code&gt;# [batch, 1, length, feat_dim]
+input = tf.placeholder(tf.float32, shape=(128, 1, 100, 20), name='input')
+label = tf.placeholder(tf.int64, shape=(128,), name='label')
+input_value = np.random.normal(size=(128,1,100,20))
+label_value = np.random.randint(9852, size=(128))
+
+conv0 = tf.layers.conv2d(input,
+                         512,
+                         (1, 5),
+                         dilation_rate=(1, 1),
+                         activation=tf.nn.relu,
+                         name='conv0')
+
+conv1 = tf.layers.conv2d(conv0,
+                         512,
+                         (1, 3),
+                         dilation_rate=(1, 2),
+                         activation=tf.nn.relu,
+                         name='conv1')
+conv1_squeeze, _ = tf.nn.moments(tf.squeeze(conv1, [1]), axes=[1])
+logits = tf.layers.dense(conv1_squeeze, 9852, name='logits')
+loss = tf.losses.sparse_softmax_cross_entropy(labels=label, logits=logits, scope="loss")
+train_op = tf.train.AdamOptimizer(0.01).minimize(loss)
+
+init = tf.global_variables_initializer()
+
+with tf.Session() as sess:
+    sess.run(init)
+    _ = sess.run(train_op, feed_dict={input:input_value, label:label_value})
+    print("Here we are")
+&lt;/denchmark-code&gt;
+
+I add two conv layers and the second one uses a dilation convolution with rate=2. It is actually 1d conv, though I use conv2d here. A mean pooling is performed before the fully connected layer. It works.
+Then I introduce the Dataset to build to the input pipeline:
+&lt;denchmark-code&gt;def _parse_tfrecord(example_proto):
+    dics = {'input': tf.FixedLenFeature(shape=(), dtype=tf.string),
+            'input_shape': tf.FixedLenFeature(shape=(2,), dtype=tf.int64),
+            'output': tf.FixedLenFeature(shape=(), dtype=tf.int64)}
+    parsed_example = tf.parse_single_example(example_proto, dics)
+    # the dtype of feature is 'float32'
+    parsed_example['input'] = tf.decode_raw(parsed_example['input'], tf.float32)
+    parsed_example['input'] = tf.reshape(parsed_example['input'], parsed_example['input_shape'])
+    return parsed_example
+
+def create_variable_dataset(filenames, batch_size, feat_dim):
+    dataset = tf.data.Dataset.from_tensor_slices(filenames)
+    dataset = dataset.interleave(lambda filename:
+                               tf.data.TFRecordDataset(filename).map(
+                                   _parse_tfrecord, num_parallel_calls=8).padded_batch(
+                                       batch_size,
+                                       padded_shapes=({'input': [None, feat_dim], 'input_shape': [2], 'output': []})),
+                                cycle_length=len(filenames), block_length=1
+                               )
+
+    dataset = dataset.prefetch(5)
+    itr = dataset.make_initializable_iterator()
+    element = itr.get_next()
+    return itr, element['input'], element['output']
+
+train_itr, input, label = create_variable_train_dataset(['egs/egs.1.tfrecord'],
+                                                                      batch_size=64,
+                                                                      feat_dim=20)
+input = tf.expand_dims(input, 1)
+conv0 = tf.layers.conv2d(input,
+                         512,
+                         (1, 5),
+                         dilation_rate=(1, 1),
+                         activation=tf.nn.relu,
+                         name='conv0')
+
+conv1 = tf.layers.conv2d(conv0,
+                         512,
+                         (1, 3),
+                         dilation_rate=(1, 2),
+                         activation=tf.nn.relu,
+                         name='conv1')
+
+conv1_squeeze, _ = tf.nn.moments(tf.squeeze(conv1, [1]), axes=[1])
+logits = tf.layers.dense(conv1_squeeze, 9852, name='logits')
+loss = tf.losses.sparse_softmax_cross_entropy(labels=label, logits=logits, scope="loss")
+train_op = tf.train.AdamOptimizer(0.01).minimize(loss)
+
+init = tf.global_variables_initializer()
+
+with tf.Session() as sess:
+    sess.run(init)
+    sess.run(train_itr.initializer)
+    _ = sess.run(train_op)
+    print("Here we are")
+&lt;/denchmark-code&gt;
+
+I load to the tfrecords which are made before. The data loaded has size [length, feat_dim]. With batch, it becomes [batch, length, feat_dim]. And it also works.
+Now, I slightly change the input pipeline to
+&lt;denchmark-code&gt;def create_variable_train_dataset(filenames, batch_size, feat_dim, shuffle_size=-1):
+    dataset = tf.data.Dataset.from_tensor_slices(filenames)
+    dataset = dataset.interleave(lambda filename:
+                               tf.data.TFRecordDataset(filename).map(
+                                   _parse_tfrecord, num_parallel_calls=8).apply(
+                                   tf.contrib.data.padded_batch_and_drop_remainder(
+                                       batch_size,
+                                       padded_shapes=({'input': [None, feat_dim], 'input_shape': [2], 'output': []}))),
+                                cycle_length=len(filenames), block_length=1
+                               )
+
+    dataset = dataset.prefetch(5)
+    itr = dataset.make_initializable_iterator()
+    element = itr.get_next()
+    return itr, element['input'], element['output']
+&lt;/denchmark-code&gt;
+
+It breaks and throws the exception:
+&lt;denchmark-code&gt;2018-04-25 22:07:04.779657: I C:\tf_jenkins\workspace\rel-win\M\windows\PY\36\tensorflow\core\platform\cpu_feature_guard.cc:137] Your CPU supports instructions that this TensorFlow binary was not compiled to use: AVX AVX2
+Traceback (most recent call last):
+  File "C:\Python36\lib\site-packages\tensorflow\python\client\session.py", line 1350, in _do_call
+    return fn(*args)
+  File "C:\Python36\lib\site-packages\tensorflow\python\client\session.py", line 1329, in _run_fn
+    status, run_metadata)
+  File "C:\Python36\lib\site-packages\tensorflow\python\framework\errors_impl.py", line 473, in __exit__
+    c_api.TF_GetCode(self.status.status))
+tensorflow.python.framework.errors_impl.InvalidArgumentError: padded_shape[1]=97 is not divisible by block_shape[1]=2
+	 [[Node: conv1/SpaceToBatchND = SpaceToBatchND[T=DT_FLOAT, Tblock_shape=DT_INT32, Tpaddings=DT_INT32, _device="/job:localhost/replica:0/task:0/device:CPU:0"](conv0/Relu, conv1/SpaceToBatchND/block_shape, conv1/strided_slice_2)]]
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Program Files (x86)\JetBrains\PyCharm Community Edition 2016.1\helpers\pydev\pydevd.py", line 1530, in &lt;module&gt;
+    globals = debugger.run(setup['file'], None, None, is_module)
+  File "C:\Program Files (x86)\JetBrains\PyCharm Community Edition 2016.1\helpers\pydev\pydevd.py", line 937, in run
+    pydev_imports.execfile(file, globals, locals)  # execute the script
+  File "C:\Program Files (x86)\JetBrains\PyCharm Community Edition 2016.1\helpers\pydev\_pydev_imps\_pydev_execfile.py", line 18, in execfile
+    exec(compile(contents+"\n", file, 'exec'), glob, loc)
+  File "G:/kaldi-master/egs/fisher/v3/xvector/train_model.py", line 3, in &lt;module&gt;
+    from xvector_train import *
+  File "G:/kaldi-master/egs/fisher/v3/xvector\xvector_train.py", line 48, in &lt;module&gt;
+    _ = sess.run(train_op)
+  File "C:\Python36\lib\site-packages\tensorflow\python\client\session.py", line 895, in run
+    run_metadata_ptr)
+  File "C:\Python36\lib\site-packages\tensorflow\python\client\session.py", line 1128, in _run
+    feed_dict_tensor, options, run_metadata)
+  File "C:\Python36\lib\site-packages\tensorflow\python\client\session.py", line 1344, in _do_run
+    options, run_metadata)
+  File "C:\Python36\lib\site-packages\tensorflow\python\client\session.py", line 1363, in _do_call
+    raise type(e)(node_def, op, message)
+tensorflow.python.framework.errors_impl.InvalidArgumentError: padded_shape[1]=97 is not divisible by block_shape[1]=2
+	 [[Node: conv1/SpaceToBatchND = SpaceToBatchND[T=DT_FLOAT, Tblock_shape=DT_INT32, Tpaddings=DT_INT32, _device="/job:localhost/replica:0/task:0/device:CPU:0"](conv0/Relu, conv1/SpaceToBatchND/block_shape, conv1/strided_slice_2)]]
+
+Caused by op 'conv1/SpaceToBatchND', defined at:
+  File "C:\Program Files (x86)\JetBrains\PyCharm Community Edition 2016.1\helpers\pydev\pydevd.py", line 1530, in &lt;module&gt;
+    globals = debugger.run(setup['file'], None, None, is_module)
+  File "C:\Program Files (x86)\JetBrains\PyCharm Community Edition 2016.1\helpers\pydev\pydevd.py", line 937, in run
+    pydev_imports.execfile(file, globals, locals)  # execute the script
+  File "C:\Program Files (x86)\JetBrains\PyCharm Community Edition 2016.1\helpers\pydev\_pydev_imps\_pydev_execfile.py", line 18, in execfile
+    exec(compile(contents+"\n", file, 'exec'), glob, loc)
+  File "G:/kaldi-master/egs/fisher/v3/xvector/train_model.py", line 3, in &lt;module&gt;
+    from xvector_train import *
+  File "&lt;frozen importlib._bootstrap&gt;", line 971, in _find_and_load
+  File "&lt;frozen importlib._bootstrap&gt;", line 955, in _find_and_load_unlocked
+  File "&lt;frozen importlib._bootstrap&gt;", line 665, in _load_unlocked
+  File "&lt;frozen importlib._bootstrap_external&gt;", line 678, in exec_module
+  File "&lt;frozen importlib._bootstrap&gt;", line 219, in _call_with_frames_removed
+  File "G:/kaldi-master/egs/fisher/v3/xvector\xvector_train.py", line 36, in &lt;module&gt;
+    name='conv1')
+  File "C:\Python36\lib\site-packages\tensorflow\python\layers\convolutional.py", line 614, in conv2d
+    return layer.apply(inputs)
+  File "C:\Python36\lib\site-packages\tensorflow\python\layers\base.py", line 762, in apply
+    return self.__call__(inputs, *args, **kwargs)
+  File "C:\Python36\lib\site-packages\tensorflow\python\layers\base.py", line 652, in __call__
+    outputs = self.call(inputs, *args, **kwargs)
+  File "C:\Python36\lib\site-packages\tensorflow\python\layers\convolutional.py", line 167, in call
+    outputs = self._convolution_op(inputs, self.kernel)
+  File "C:\Python36\lib\site-packages\tensorflow\python\ops\nn_ops.py", line 838, in __call__
+    return self.conv_op(inp, filter)
+  File "C:\Python36\lib\site-packages\tensorflow\python\ops\nn_ops.py", line 502, in __call__
+    return self.call(inp, filter)
+  File "C:\Python36\lib\site-packages\tensorflow\python\ops\nn_ops.py", line 493, in _with_space_to_batch_call
+    paddings=paddings)
+  File "C:\Python36\lib\site-packages\tensorflow\python\ops\gen_array_ops.py", line 6670, in space_to_batch_nd
+    paddings=paddings, name=name)
+  File "C:\Python36\lib\site-packages\tensorflow\python\framework\op_def_library.py", line 787, in _apply_op_helper
+    op_def=op_def)
+  File "C:\Python36\lib\site-packages\tensorflow\python\framework\ops.py", line 3160, in create_op
+    op_def=op_def)
+  File "C:\Python36\lib\site-packages\tensorflow\python\framework\ops.py", line 1625, in __init__
+    self._traceback = self._graph._extract_stack()  # pylint: disable=protected-access
+
+InvalidArgumentError (see above for traceback): padded_shape[1]=97 is not divisible by block_shape[1]=2
+	 [[Node: conv1/SpaceToBatchND = SpaceToBatchND[T=DT_FLOAT, Tblock_shape=DT_INT32, Tpaddings=DT_INT32, _device="/job:localhost/replica:0/task:0/device:CPU:0"](conv0/Relu, conv1/SpaceToBatchND/block_shape, conv1/strided_slice_2)]]
+&lt;/denchmark-code&gt;
+
+All the examples in the tfrecords have the size [100, 20].The only thing changed is the batch function "padded_batch_and_drop_remainder". I don't know why it tell me the dilation operation cannot be performed because padding should be used in the operation. I felt stranger that if I change the dilation rate of the first layer (which is 1 now) to (1, 2), it works again!
+&lt;denchmark-code&gt;conv0 = tf.layers.conv2d(input,
+                         512,
+                         (1, 5),
+                         dilation_rate=(1, 2),
+                         activation=tf.nn.relu,
+                         name='conv0')
+&lt;/denchmark-code&gt;
+
+Could anyone tell me what is going on here? Is anything wrong with the pipeline, or it is a bug ?
+I use TF 1.5.0 in a server.
+	</description>
+	<comments>
+		<comment id='1' author='mycrazycracy' date='2018-04-27T21:01:54Z'>
+		&lt;denchmark-link:https://github.com/mrry&gt;@mrry&lt;/denchmark-link&gt;
+ can you take a look at this? I can't tell if it could be a bug or not.
+		</comment>
+		<comment id='2' author='mycrazycracy' date='2018-04-27T21:21:49Z'>
+		I think this is working as intended: if you specify None for a dimension in the padded_shapes then its size at runtime will be determined by the batch element with the largest size in that dimension. From the error message it appears that there is an element with size 97 in that dimension.
+To fix this, you’ll either need to ensure that the input data all have a size divisible by 2 in that dimension, or you’ll need to add extra padding to make the resulting size divisible by 2 (e.g. using tf.pad()).
+		</comment>
+		<comment id='3' author='mycrazycracy' date='2018-04-28T03:12:38Z'>
+		&lt;denchmark-link:https://github.com/mrry&gt;@mrry&lt;/denchmark-link&gt;
+ If the input length is 100 (which is the case in the egs), after 1st conv, it should be 96. I don't know where 97 comes from? The actual length of the data is the same when using padded_batch and padded_batch_and_drop_remainder. But padded_batch , which is weird.
+		</comment>
+		<comment id='4' author='mycrazycracy' date='2018-04-28T06:07:43Z'>
+		That does sound strange. Try computing tf.shape(input) and tf.shape(label) and printing their values to see if there’s anything unexpected about the shapes being returned from the iterator.
+		</comment>
+		<comment id='5' author='mycrazycracy' date='2018-05-06T01:53:48Z'>
+		If padded_batch_and_drop_remainder is used, the shape is [128, ?, 20], which is [batch, length, dim], while padded_batch give me [?, ?, 20]. I think this is expected. The actual length is 100 in the examples and the only difference is the batch function I used.
+The shapes between input and label seem to be consistent in both conditions.
+I just change padded_batch_and_drop_remainder to padded_batch in my code, and it works well now.
+		</comment>
+	</comments>
+</bug>

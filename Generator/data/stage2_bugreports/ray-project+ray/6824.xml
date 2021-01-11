@@ -1,0 +1,181 @@
+<bug id='6824' author='eugenevinitsky' open_date='2020-01-18T03:41:41Z' closed_time='2020-01-19T04:05:56Z'>
+	<summary>[rllib] Custom train script isn't updating weights for multi-agent training</summary>
+	<description>
+&lt;denchmark-h:h3&gt;What is the problem?&lt;/denchmark-h&gt;
+
+The following custom training script does not seem to actually update the weight of the agents.
+Ray version and other system information (Python version, TensorFlow version, OS):
+&lt;denchmark-h:h3&gt;Reproduction (REQUIRED)&lt;/denchmark-h&gt;
+
+Please provide a script that can be run to reproduce the issue. The script should have no external library dependencies (i.e., use fake or mock data / environments):
+If we cannot run your script, we cannot fix your issue.
+
+ I have verified my script runs in a clean environment and reproduces the issue.
+ I have verified the issue also occurs with the latest wheels.
+
+&lt;denchmark-code&gt;from copy import copy
+import errno
+from datetime import datetime
+import os
+import subprocess
+import sys
+
+import pytz
+import ray
+from ray.rllib.agents.ppo.ppo_policy import PPOTFPolicy
+from ray.rllib.agents.ppo.ppo import PPOTrainer, DEFAULT_CONFIG
+
+from ray.rllib.models import ModelCatalog
+from ray import tune
+from ray.tune import Trainable
+from ray.tune.logger import pretty_print
+from ray.tune import run as run_tune
+from ray.tune.registry import register_env
+
+
+from visualize.pendulum.transfer_tests import run_transfer_tests
+from visualize.pendulum.visualize_adversaries import visualize_adversaries
+from utils.parsers import init_parser, ray_parser, ma_env_parser
+from utils.pendulum_env_creator import lerrel_pendulum_env_creator
+from utils.rllib_utils import get_config_from_path
+
+from models.recurrent_tf_model_v2 import LSTM
+
+from ray.rllib.env.multi_agent_env import MultiAgentEnv
+from gym.spaces import Box
+import random
+import numpy as np
+
+class DummyEnv(MultiAgentEnv):
+    """Simple env in which the policy learns to repeat a previous observation
+    token after a given delay."""
+
+    def __init__(self):
+        self.observation_space = Box(low=-1, high=1, shape=(2,))
+        self.action_space = Box(low=-1, high=1, shape=(2,))
+        self.step_num = 0
+
+    def reset(self):
+        self.step_num = 0.0
+        return {'pendulum': np.zeros(2), 'adversary': np.zeros(2)}
+
+    def step(self, action):
+        self.step_num += 1
+        done = {'__all__': False}
+        if self.step_num &gt; 100:
+            done = {'__all__': True}
+        else:
+            done = {'__all__': False}
+        return {'pendulum': np.zeros(2), 'adversary': np.zeros(2)}, {'pendulum': 1.0, 'adversary': 1.0}, done, {}
+
+
+class AlternateTraining(Trainable):
+    def _setup(self, config):
+        self.config = config
+        self.env = config['env']
+        agent_config = self.config
+        adv_config = copy(self.config)
+        agent_config['multiagent']['policies_to_train'] = ['pendulum']
+        adv_config['multiagent']['policies_to_train'] = ['adversary']
+
+        self.agent_trainer = PPOTrainer(env=self.env, config=agent_config)
+        self.adv_trainer = PPOTrainer(env=self.env, config=adv_config)
+
+    def _train(self):
+        # improve the Adversary policy
+        print("-- Adversary Training --")
+        original_weight = self.adv_trainer.get_weights(["adversary"])['adversary']['adversary/fc_1/kernel'][0, 0]
+        self.adv_trainer.train()
+        first_weight = self.adv_trainer.get_weights(["adversary"])['adversary']['adversary/fc_1/kernel'][0, 0]
+
+        # Check that the weights are updating after training
+        assert original_weight != first_weight, 'The weight hasn\'t changed after training what gives'
+
+        # swap weights to synchronize
+        self.agent_trainer.set_weights(self.adv_trainer.get_weights(["adversary"]))
+
+        # improve the Agent policy
+        print("-- Agent Training --")
+        output = self.agent_trainer.train()
+
+        # Assert that the weight hasn't changed but it has
+        new_weight = self.agent_trainer.get_weights(["adversary"])['adversary']['adversary/fc_1/kernel'][0, 0]
+
+        # Check that the adversary is not being trained when the agent trainer is training
+        assert first_weight == new_weight, 'The weight of the adversary matrix has changed but it shouldnt have been updated!'
+
+        # swap weights to synchronize
+        self.adv_trainer.set_weights(self.agent_trainer.get_weights(["pendulum"]))
+
+        return output
+
+    def _save(self, tmp_checkpoint_dir):
+        return self.agent_trainer._save(tmp_checkpoint_dir)
+
+
+if __name__ == '__main__':
+    env = DummyEnv()
+    config = DEFAULT_CONFIG
+    config['train_batch_size'] = 500
+    policy_graphs = {'pendulum': (PPOTFPolicy, env.observation_space, env.action_space, {}),
+                     'adversary': (PPOTFPolicy, env.observation_space, env.action_space, {})}
+
+    print("========= Policy Graphs ==========")
+    print(policy_graphs)
+
+    policies_to_train = ['pendulum', 'adversary']
+
+
+    def policy_mapping_fn(agent_id):
+        return agent_id
+
+    config.update({
+        'multiagent': {
+            'policies': policy_graphs,
+            'policy_mapping_fn': policy_mapping_fn,
+            'policies_to_train': policies_to_train
+        }
+    })
+
+    config['env'] = 'DummyEnv'
+    env_creator = lambda config: DummyEnv()
+    register_env('DummyEnv', env_creator)
+
+    exp_dict = {
+        'name': 'ProofOfConcept',
+        'run_or_experiment': AlternateTraining,
+        'stop': {
+            'training_iteration': 100
+        },
+        'config': config,
+    }
+
+    ray.init(local_mode=True)
+    run_tune(**exp_dict, queue_trials=False)
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='eugenevinitsky' date='2020-01-18T03:42:29Z'>
+		I'm training to run a training procedure in which there are two agents but only one is getting trained at each training iteration. As can be seen by the assert statement that fails, the weights aren't updating?
+		</comment>
+		<comment id='2' author='eugenevinitsky' date='2020-01-18T04:56:31Z'>
+		It's quite possible I've misunderstood something and this isn't a bug!
+		</comment>
+		<comment id='3' author='eugenevinitsky' date='2020-01-18T21:24:07Z'>
+		I think the other layers are changing, just not fc1. Maybe the LR is small enough that fc1 isn't updated with just one train step?
+		</comment>
+		<comment id='4' author='eugenevinitsky' date='2020-01-19T02:17:29Z'>
+		Good call! If I set the lr to 1 I pass the first assert but now I fail at the second assert which is testing that gradients aren't propagating into the adversary.
+		</comment>
+		<comment id='5' author='eugenevinitsky' date='2020-01-19T03:39:39Z'>
+		Oh it's because you   adv_config = copy(self.config), however the policies_to_train key is nested inside the config so you  need to copy.deepcopy the config instead.
+		</comment>
+		<comment id='6' author='eugenevinitsky' date='2020-01-19T03:41:46Z'>
+		Oh man what a mistake. Thanks for the help Eric! However, even after making that change it still doesn't pass the second assert?
+		</comment>
+		<comment id='7' author='eugenevinitsky' date='2020-01-19T04:05:56Z'>
+		It was an error in comparing NaNs. Thanks for all the help!
+		</comment>
+	</comments>
+</bug>

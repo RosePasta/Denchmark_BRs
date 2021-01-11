@@ -1,0 +1,537 @@
+<bug id='9076' author='gmcather' open_date='2018-03-14T12:07:31Z' closed_time='2018-03-21T02:54:47Z'>
+	<summary>The program suddenly crashed, the error message shown as below</summary>
+	<description>
+*** Aborted at 1521028443 (unix time) try "date -d @1521028443" if you are using GNU date ***
+PC: @                0x0 (unknown)
+*** SIGSEGV (@0x7f0f4d031b64) received by PID 2524 (TID 0x7f16a98b0700) from PID 1292049252; stack trace: ***
+    @     0x7f16a948d390 (unknown)
+    @     0x7f1671535b83 mkl_blas_avx_sgemm_kernel_0_b0
+Segmentation fault
+from __future__ import print_function
+import numpy as np
+import paddle.v2 as paddle
+import paddle.fluid as fluid
+import paddle.fluid.layers as layers
+import sys
+import time
+from functools import partial
+
+batch_size = 300
+d_model = 64
+
+def position_encoding_init(n_position, d_pos_vec):
+    """
+    Generate the initial values for the sinusoid position encoding table.
+    """
+    position_enc = np.array([[
+        pos / np.power(10000, 2 * (j // 2) / d_pos_vec)
+        for j in range(d_pos_vec)
+    ] if pos != 0 else np.zeros(d_pos_vec) for pos in range(n_position)])
+    position_enc[1:, 0::2] = np.sin(position_enc[1:, 0::2])  # dim 2i
+    position_enc[1:, 1::2] = np.cos(position_enc[1:, 1::2])  # dim 2i+1
+    return position_enc.astype("float32")
+
+
+def multi_head_attention(queries,
+                         keys,
+                         values,
+                         attn_bias,
+                         d_key,
+                         d_value,
+                         d_model,
+                         n_head=1,
+                         dropout_rate=0.):
+    """
+    Multi-Head Attention. Note that attn_bias is added to the logit before
+    computing softmax activiation to mask certain selected positions so that
+    they will not considered in attention weights.
+    """
+    if not (len(queries.shape) == len(keys.shape) == len(values.shape) == 3):
+        raise ValueError(
+            "Inputs: quries, keys and values should all be 3-D tensors.")
+
+    def __compute_qkv(queries, keys, values, n_head, d_key, d_value):
+        """
+        Add linear projection to queries, keys, and values.
+        """
+        q = layers.fc(input=queries,
+                      size=d_key * n_head,
+                      param_attr=fluid.initializer.Xavier(
+                          uniform=False,
+                          fan_in=d_model * d_key,
+                          fan_out=n_head * d_key),
+                      bias_attr=False,
+                      num_flatten_dims=2)
+        k = layers.fc(input=keys,
+                      size=d_key * n_head,
+                      param_attr=fluid.initializer.Xavier(
+                          uniform=False,
+                          fan_in=d_model * d_key,
+                          fan_out=n_head * d_key),
+                      bias_attr=False,
+                      num_flatten_dims=2)
+        v = layers.fc(input=values,
+                      size=d_value * n_head,
+                      param_attr=fluid.initializer.Xavier(
+                          uniform=False,
+                          fan_in=d_model * d_value,
+                          fan_out=n_head * d_value),
+                      bias_attr=False,
+                      num_flatten_dims=2)
+        return q, k, v
+
+    def __split_heads(x, n_head):
+        """
+        Reshape the last dimension of inpunt tensor x so that it becomes two
+        dimensions and then transpose. Specifically, input a tensor with shape
+        [bs, max_sequence_length, n_head * hidden_dim] then output a tensor
+        with shape [bs, n_head, max_sequence_length, hidden_dim].
+        """
+        if n_head == 1:
+            return x
+
+        hidden_size = x.shape[-1]
+        # FIXME(guosheng): Decouple the program desc with batch_size.
+        reshaped = layers.reshape(
+            x=x, shape=[batch_size, -1, n_head, hidden_size // n_head])
+
+        # permuate the dimensions into:
+        # [batch_size, n_head, max_sequence_len, hidden_size_per_head]
+        return layers.transpose(x=reshaped, perm=[0, 2, 1, 3])
+
+    def __combine_heads(x):
+        """
+        Transpose and then reshape the last two dimensions of inpunt tensor x
+        so that it becomes one dimension, which is reverse to __split_heads.
+        """
+        if len(x.shape) == 3: return x
+        if len(x.shape) != 4:
+            raise ValueError("Input(x) should be a 4-D Tensor.")
+
+        trans_x = layers.transpose(x, perm=[0, 2, 1, 3])
+        # FIXME(guosheng): Decouple the program desc with batch_size.
+        return layers.reshape(
+            x=trans_x,
+            shape=map(int,
+                      [batch_size, -1, trans_x.shape[2] * trans_x.shape[3]]))
+
+    def scaled_dot_product_attention(q, k, v, attn_bias, d_model, dropout_rate):
+        """
+        Scaled Dot-Product Attention
+        """
+
+        # FIXME(guosheng): Optimize the shape in reshape_op or softmax_op.
+
+        # The current implementation of softmax_op only supports 2D tensor,
+        # consequently it cannot be directly used here.
+        # If to use the reshape_op, Besides, the shape of product inferred in
+        # compile-time is not the actual shape in run-time. It cann't be used
+        # to set the attribute of reshape_op.
+        # So, here define the softmax for temporary solution.
+
+        def __softmax(x, eps=1e-9):
+            exp_out = layers.exp(x=x)
+            sum_out = layers.reduce_sum(exp_out, dim=-1, keep_dim=False)
+            return layers.elementwise_div(x=exp_out, y=sum_out, axis=0)
+
+        scaled_q = layers.scale(x=q, scale=d_model**-0.5)
+        product = layers.matmul(x=scaled_q, y=k, transpose_y=True)
+        weights = __softmax(layers.elementwise_add(x=product, y=attn_bias))
+        if dropout_rate:
+            weights = layers.dropout(
+                weights, dropout_prob=dropout_rate, is_test=False)
+        out = layers.matmul(weights, v)
+        return out
+
+    q, k, v = __compute_qkv(queries, keys, values, n_head, d_key, d_value)
+
+    q = __split_heads(q, n_head)
+    k = __split_heads(k, n_head)
+    v = __split_heads(v, n_head)
+
+    ctx_multiheads = scaled_dot_product_attention(q, k, v, attn_bias, d_model,
+                                                  dropout_rate)
+
+    out = __combine_heads(ctx_multiheads)
+
+    # Project back to the model size.
+    proj_out = layers.fc(input=out,
+                         size=d_model,
+                         param_attr=fluid.initializer.Xavier(uniform=False),
+                         bias_attr=False,
+                         num_flatten_dims=2)
+    return proj_out
+
+
+def positionwise_feed_forward(x, d_inner_hid, d_hid):
+    """
+    Position-wise Feed-Forward Networks.
+    This module consists of two linear transformations with a ReLU activation
+    in between, which is applied to each position separately and identically.
+    """
+    hidden = layers.fc(input=x,
+                       size=d_inner_hid,
+                       num_flatten_dims=2,
+                       param_attr=fluid.initializer.Uniform(
+                           low=-(d_hid**-0.5), high=(d_hid**-0.5)),
+                       act="relu")
+    out = layers.fc(input=hidden,
+                    size=d_hid,
+                    num_flatten_dims=2,
+                    param_attr=fluid.initializer.Uniform(
+                        low=-(d_inner_hid**-0.5), high=(d_inner_hid**-0.5)))
+    return out
+
+
+def pre_post_process_layer(prev_out, out, process_cmd, dropout=0.):
+    """
+    Add residual connection, layer normalization and droput to the out tensor
+    optionally according to the value of process_cmd.
+
+    This will be used before or after multi-head attention and position-wise
+    feed-forward networks.
+    """
+    for cmd in process_cmd:
+        if cmd == "a":  # add residual connection
+            out = out + prev_out if prev_out else out
+        elif cmd == "n":  # add layer normalization
+            out = layers.layer_norm(
+                out,
+                begin_norm_axis=len(out.shape) - 1,
+                param_attr=fluid.initializer.Constant(1.),
+                bias_attr=fluid.initializer.Constant(0.))
+        elif cmd == "d":  # add dropout
+            if dropout:
+                out = layers.dropout(out, dropout_prob=dropout, is_test=False)
+    return out
+
+
+pre_process_layer = partial(pre_post_process_layer, None)
+post_process_layer = pre_post_process_layer
+
+
+def prepare_encoder(src_word,
+                    src_pos,
+                    src_vocab_size,
+                    src_emb_dim,
+                    src_pad_idx,
+                    src_max_len,
+                    dropout=0.,
+                    pos_pad_idx=0,
+                    pos_enc_param_name=None):
+    """Add word embeddings and position encodings.
+    The output tensor has a shape of:
+    [batch_size, max_src_length_in_batch, d_model].
+
+    This module is used at the bottom of the encoder stacks.
+    """
+    src_word_emb = layers.embedding(
+        src_word,
+        size=[src_vocab_size, src_emb_dim],
+        padding_idx=src_pad_idx,
+        param_attr=fluid.initializer.Normal(0., 1.))
+    src_pos_enc = layers.embedding(
+        src_pos,
+        size=[src_max_len, src_emb_dim],
+        padding_idx=pos_pad_idx,
+        param_attr=fluid.ParamAttr(
+            name=pos_enc_param_name, trainable=False))
+    enc_input = src_word_emb + src_pos_enc
+
+    # FIXME(guosheng): Decouple the program desc with batch_size.
+    enc_input = layers.reshape(x=enc_input, shape=[batch_size, -1, src_emb_dim])
+    return layers.dropout(
+        enc_input, dropout_prob=dropout,
+        is_test=False) if dropout else enc_input
+
+
+#prepare_encoder = partial(
+#    prepare_encoder, pos_enc_param_name=pos_enc_param_names[0])
+
+
+def encoder_layer(enc_input,
+                  attn_bias,
+                  n_head,
+                  d_key,
+                  d_value,
+                  d_model,
+                  d_inner_hid,
+                  dropout_rate=0.):
+    """The encoder layers that can be stacked to form a deep encoder.
+
+    This module consits of a multi-head (self) attention followed by
+    position-wise feed-forward networks and both the two components companied
+    with the post_process_layer to add residual connection, layer normalization
+    and droput.
+    """
+    attn_output = multi_head_attention(enc_input, enc_input, enc_input,
+                                       attn_bias, d_key, d_value, d_model,
+                                       n_head, dropout_rate)
+    attn_output = post_process_layer(enc_input, attn_output, "dan",
+                                     dropout_rate)
+    ffd_output = positionwise_feed_forward(attn_output, d_inner_hid, d_model)
+    return post_process_layer(attn_output, ffd_output, "dan", dropout_rate)
+
+
+def encoder(enc_input,
+            attn_bias,
+            n_layer,
+            n_head,
+            d_key,
+            d_value,
+            d_model,
+            d_inner_hid,
+            dropout_rate=0.):
+    """
+    The encoder is composed of a stack of identical layers returned by calling
+    encoder_layer.
+    """
+    for i in range(n_layer):
+        enc_output = encoder_layer(enc_input, attn_bias, n_head, d_key, d_value,
+                                   d_model, d_inner_hid, dropout_rate)
+        enc_input = enc_output
+    return enc_output
+
+def to_lodtensor(data, place):
+    """
+    load LODtensor
+    """
+    seq_lens = [len(seq) for seq in data]
+    cur_len = 0
+    lod = [cur_len]
+    for l in seq_lens:
+        cur_len += l
+        lod.append(cur_len)
+    flattened_data = np.concatenate(data, axis=0).astype("int64")
+    flattened_data = flattened_data.reshape([len(flattened_data), 1])
+    res = fluid.LoDTensor()
+    res.set(flattened_data, place)
+    res.set_lod([lod])
+    return res
+
+def load_vocab(filename):
+    """
+    load vocabulary
+    """
+    vocab = {}
+    with open(filename) as f:
+        wid = 0
+        for line in f:
+            vocab[line.strip()] = wid
+            wid += 1
+    vocab["&lt;unk&gt;"] = len(vocab)
+    return vocab
+
+def prepare_batch_input(data, pad_idx, n_head, place):
+    """
+    Pad the instances to the max sequence length in batch, and generate the
+    corresponding position data and attention bias. Then, convert the numpy
+    data to tensors and return a dict mapping names to tensors.
+    """
+    input_dict = {}
+
+    def __pad_batch_data(data,
+                         pad_idx,
+                        n_head):
+        """
+        Pad the instances to the max sequence length in batch, and generate the
+        corresponding position data and attention bias.
+        """
+        insts = [x[0] for x in data]
+
+        return_list = []
+        max_len = max(len(inst) for inst in insts)
+
+        inst_data = np.array(
+            [inst + [pad_idx] * (max_len - len(inst)) for inst in insts])
+        return_list += [inst_data.astype("int64").reshape([-1, 1])]
+
+        src_mask = np.array(
+            [ [ [1] * d_model ] * len(inst) + [ [0] * d_model ] * (max_len - len(inst)) for inst in insts])
+        return_list += [src_mask.astype("float32").reshape([batch_size, -1, d_model])]
+
+        inst_pos = np.array([[
+                        pos_i + 1 if w_i != pad_idx else 0
+                        for pos_i, w_i in enumerate(inst)
+                        ] for inst in inst_data])
+
+        return_list += [inst_pos.astype("int64").reshape([-1, 1])]
+
+        label_data = np.array(map(lambda x: x[1], data)).astype("int64")
+        label_data = label_data.reshape([-1, 1])
+        return_list += [label_data]
+        # This is used to avoid attention on paddings.
+        slf_attn_bias_data = np.array([[0] * len(inst) + [-1e9] *
+                                               (max_len - len(inst))
+                                               for inst in insts])
+        slf_attn_bias_data = np.tile(
+                            slf_attn_bias_data.reshape([-1, 1, 1, max_len]),
+                            [1, n_head, max_len, 1])
+        return_list += [slf_attn_bias_data.astype("float32")]
+
+        return return_list if len(return_list) &gt; 1 else return_list[0]
+
+    def data_to_tensor(data_list, name_list, input_dict, place):
+        assert len(data_list) == len(name_list)
+        for i in range(len(name_list)):
+            tensor = fluid.LoDTensor()
+            tensor.set(data_list[i], place)
+            input_dict[name_list[i]] = tensor
+
+    src_word, src_mask, src_pos, src_label, src_slf_attn_bias = __pad_batch_data(data, pad_idx, n_head)
+
+    data_to_tensor([src_word, src_mask, src_pos, src_label, src_slf_attn_bias],
+                    ["source_text", "source_mask", "source_pos", "label", "source_slf_attn_bias"], input_dict, place)
+
+    return input_dict
+
+def main(max_length = 3000,
+        n_head = 2,
+        n_layer = 1,
+        d_key = 64,
+        d_value = 64,
+        d_inner_hid = 64,
+        d_model = 64,
+        lr = 0.001):
+
+    start_time = time.time()
+
+    word_dict = load_vocab("imdb.vocab")
+    dict_dim = len(word_dict)
+    pad_idx = dict_dim - 1
+
+    src_word = layers.data(
+        name="source_text",
+        shape=[batch_size * max_length, 1],
+        dtype="int64",
+        append_batch_size=False)
+
+    src_mask = layers.data(
+        name="source_mask",
+        shape=[batch_size, max_length, d_model],
+        dtype="float32",
+        append_batch_size=False)
+
+    src_pos = layers.data(
+        name="source_pos",
+        shape=[batch_size * max_length, 1],
+        dtype="int64",
+        append_batch_size=False)
+
+    label = layers.data(
+        name="label",
+        shape=[batch_size, 1],
+        dtype="int64",
+        append_batch_size=False)
+
+    # The actual shape of src_slf_attn_bias in runtime is:
+    # [batch_size, n_head, max_src_length_in_a_batch, max_src_length_in_a_batch].
+    # This input is used to remove attention weights on paddings.
+    src_slf_attn_bias = layers.data(
+        name="source_slf_attn_bias",
+        shape=[batch_size, n_head, max_length, max_length],
+        dtype="float32",
+        append_batch_size=False)
+
+    dropout_rate = 0.0
+    enc_input = prepare_encoder(
+        src_word,
+        src_pos,
+        dict_dim,
+        d_model,
+        pad_idx,
+        max_length,
+        dropout_rate)
+
+    enc_output = encoder(
+        enc_input,
+        src_slf_attn_bias,
+        n_layer,
+        n_head,
+        d_key,
+        d_value,
+        d_model,
+        d_inner_hid,
+        dropout_rate)
+
+    mask_data = layers.elementwise_mul(enc_output, src_mask)
+    print(mask_data)
+    bow_out = layers.reduce_sum(mask_data, dim = 1)
+    print(bow_out)
+    # TODO(guosheng): Share the weight matrix between the embedding layers and
+    # the pre-softmax linear transformation.
+    class_dim = 2
+    prediction = layers.fc(input=[bow_out],
+                    size=class_dim,
+                    act="softmax",
+                    num_flatten_dims=1)
+    #print(prediction)
+    #print(label)
+    cost = layers.cross_entropy(input=prediction, label=label)
+    avg_cost = fluid.layers.mean(x=cost)
+    sgd_optimizer = fluid.optimizer.SGD(learning_rate=lr)
+    sgd_optimizer.minimize(avg_cost)
+
+    # accuracy metric
+    accuracy = fluid.evaluator.Accuracy(input=prediction, label=label)
+    #print(accuracy)
+    inference_program = fluid.default_main_program().clone()
+    with fluid.program_guard(inference_program):
+        test_target = accuracy.metrics + accuracy.states
+        inference_program = fluid.io.get_inference_program(test_target)
+
+    # train data set
+    train_reader = paddle.batch(
+        paddle.reader.shuffle(
+            paddle.dataset.imdb.train(word_dict), buf_size=50000),
+        batch_size=batch_size)
+    test_reader = paddle.batch(
+        paddle.reader.shuffle(
+            paddle.dataset.imdb.test(word_dict), buf_size=50000),
+        batch_size=batch_size)
+
+    # train in cpu
+    place = fluid.CPUPlace()
+
+    def test(exe):
+        accuracy.reset(exe)
+        for data in test_reader():
+            data = prepare_batch_input(data, pad_idx, n_head, place)
+            acc = exe.run(inference_program,
+                      feed=data)
+        return accuracy.eval(exe)
+
+    # just like session in tensorflow
+    exe = fluid.Executor(place)
+
+    # not sure what's going on here
+    exe.run(fluid.default_startup_program())
+
+    # loop for 30 epochs, print acc ever 1000 batch
+    PASS_NUM = 30
+
+    for pass_id in xrange(PASS_NUM):
+        accuracy.reset(exe)
+        for data in train_reader():
+            print(len(data))
+            data = prepare_batch_input(data, pad_idx, n_head, place)
+            cost_val, acc_val = exe.run(fluid.default_main_program(),
+                                    feed=data,
+                                    fetch_list=[avg_cost, accuracy.metrics[0]])
+            pass_acc = accuracy.eval(exe)
+
+        pass_test_acc = test(exe)
+        print("test_acc: %f" % pass_test_acc)
+
+    end_time = time.time()
+    print(end_time - start_time)
+
+if __name__ == "__main__":
+    main()
+	</description>
+	<comments>
+		<comment id='1' author='gmcather' date='2018-03-15T00:31:47Z'>
+		it seems that the parameter max_length is not large enough, so that segment fault happened. Once again, I reset the max_length to be 5000, the program run normally without any errors, at least in one pass.
+		</comment>
+	</comments>
+</bug>

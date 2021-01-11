@@ -1,0 +1,254 @@
+<bug id='6251' author='ericyue' open_date='2016-12-11T06:45:25Z' closed_time='2017-06-16T17:27:02Z'>
+	<summary>tensorflow crash when training in distribution</summary>
+	<description>
+I'am train my model in distribution, running 12 workers and 2 ps server.
+But the worker crash and dumping core files continuously.
+&lt;denchmark-h:h3&gt;What related GitHub issues or StackOverflow threads have you found by searching the web for your problem?&lt;/denchmark-h&gt;
+
+nothing
+&lt;denchmark-h:h3&gt;Environment info&lt;/denchmark-h&gt;
+
+Operating System:
+centos 6.3 with cpu
+tensorflow version 0.12
+&lt;denchmark-h:h3&gt;If possible, provide a minimal reproducible example (We usually don't have time to read hundreds of lines of your code)&lt;/denchmark-h&gt;
+
+&lt;denchmark-code&gt;if __name__ == "__main__":
+  ps_hosts = FLAGS.ps_hosts.split(",")
+  worker_hosts = FLAGS.worker_hosts.split(",")
+  cluster = tf.train.ClusterSpec({"ps": ps_hosts, "worker": worker_hosts})
+  server = tf.train.Server(cluster,
+                           job_name=FLAGS.job_name,
+                           task_index=FLAGS.task_index)
+  if FLAGS.job_name == "ps":
+    server.join()
+  elif FLAGS.job_name == "worker":
+    with tf.device(tf.train.replica_device_setter(
+            worker_device="/job:worker/task:%d" % FLAGS.task_index,
+            cluster=cluster)):
+        # Read TFRecords files for training
+        filename_queue = tf.train.string_input_producer(
+            tf.train.match_filenames_once(FLAGS.train),
+            num_epochs=epoch_number)
+        serialized_example = read_and_decode(filename_queue)
+        batch_serialized_example = tf.train.shuffle_batch(
+            [serialized_example],
+            batch_size=batch_size,
+            num_threads=thread_number,
+            capacity=capacity,
+            min_after_dequeue=min_after_dequeue)
+        features = tf.parse_example(
+            batch_serialized_example,
+            features={
+                "label": tf.FixedLenFeature([], tf.float32),
+                "ids": tf.VarLenFeature(tf.int64),
+                "values": tf.VarLenFeature(tf.float32),
+            })
+        batch_labels = features["label"]
+        batch_ids = features["ids"]
+        batch_values = features["values"]
+
+        # Read TFRecords file for validatioin
+        validate_filename_queue = tf.train.string_input_producer(
+            tf.train.match_filenames_once(FLAGS.eval),
+            num_epochs=epoch_number)
+        validate_serialized_example = read_and_decode(validate_filename_queue)
+        validate_batch_serialized_example = tf.train.shuffle_batch(
+            [validate_serialized_example],
+            batch_size=validate_batch_size,
+            num_threads=thread_number,
+            capacity=capacity,
+            min_after_dequeue=min_after_dequeue)
+        validate_features = tf.parse_example(
+            validate_batch_serialized_example,
+            features={
+                "label": tf.FixedLenFeature([], tf.float32),
+                "ids": tf.VarLenFeature(tf.int64),
+                "values": tf.VarLenFeature(tf.float32),
+            })
+        validate_batch_labels = features["label"]
+        validate_batch_ids = features["ids"]
+        validate_batch_values = features["values"]
+        logits = inference(batch_ids, batch_values)
+        batch_labels = tf.to_int64(batch_labels)
+        cross_entropy = tf.nn.sparse_softmax_cross_entropy_with_logits(logits,
+                                                                       batch_labels)
+        loss = tf.reduce_mean(cross_entropy, name='loss')
+
+        print("Use the optimizer: {}".format(FLAGS.optimizer))
+        if FLAGS.optimizer == "sgd":
+            optimizer = tf.train.GradientDescentOptimizer(learning_rate)
+        elif FLAGS.optimizer == "momentum":
+            # optimizer = tf.train.MomentumOptimizer(learning_rate)
+            print("Not support optimizer: {} yet, exit now".format(FLAGS.optimizer))
+            exit(1)
+        elif FLAGS.optimizer == "adadelta":
+            optimizer = tf.train.AdadeltaOptimizer(learning_rate)
+        elif FLAGS.optimizer == "adagrad":
+            optimizer = tf.train.AdagradOptimizer(learning_rate)
+        elif FLAGS.optimizer == "adam":
+            optimizer = tf.train.AdamOptimizer(learning_rate)
+        elif FLAGS.optimizer == "ftrl":
+            optimizer = tf.train.FtrlOptimizer(learning_rate)
+        elif FLAGS.optimizer == "rmsprop":
+            optimizer = tf.train.RMSPropOptimizer(learning_rate)
+        else:
+            print("Unknow optimizer: {}, exit now".format(FLAGS.optimizer))
+            exit(1)
+
+        #with tf.device("/cpu:0"):
+        global_step = tf.Variable(0, name='global_step', trainable=False)
+        train_op = optimizer.minimize(loss, global_step=global_step)
+
+        # Compute accuracy
+        tf.get_variable_scope().reuse_variables()
+        accuracy_logits = inference(validate_batch_ids, validate_batch_values)
+        validate_softmax = tf.nn.softmax(accuracy_logits)
+        validate_batch_labels = tf.to_int64(validate_batch_labels)
+        correct_prediction = tf.equal(
+            tf.argmax(validate_softmax, 1), validate_batch_labels)
+        accuracy = tf.reduce_mean(tf.cast(correct_prediction, tf.float32))
+
+        # Compute auc
+        validate_batch_labels = tf.cast(validate_batch_labels, tf.int32)
+        sparse_labels = tf.reshape(validate_batch_labels, [-1, 1])
+        derived_size = tf.shape(validate_batch_labels)[0]
+        indices = tf.reshape(tf.range(0, derived_size, 1), [-1, 1])
+        concated = tf.concat(1, [indices, sparse_labels])
+        outshape = tf.pack([derived_size, LABEL_SIZE])
+        new_validate_batch_labels = tf.sparse_to_dense(concated, outshape, 1.0, 0.0)
+        _, auc_op = tf.contrib.metrics.streaming_auc(validate_softmax,
+                                                     new_validate_batch_labels)
+
+        # Define inference op
+        sparse_index = tf.placeholder(tf.int64)
+        sparse_ids = tf.placeholder(tf.int64)
+        sparse_values = tf.placeholder(tf.float32)
+        sparse_shape = tf.placeholder(tf.int64)
+        inference_ids = tf.SparseTensor(sparse_index, sparse_ids, sparse_shape)
+        inference_values = tf.SparseTensor(sparse_index, sparse_values, sparse_shape)
+        inference_logits = inference(inference_ids, inference_values)
+        inference_softmax = tf.nn.softmax(inference_logits)
+        inference_op = tf.argmax(inference_softmax, 1)
+
+        # Initialize saver and summary
+        #checkpoint_file = checkpoint_dir + "checkpoint.ckpt"
+        steps_to_validate = FLAGS.steps_to_validate
+        init_op = tf.initialize_all_variables()
+
+        saver = tf.train.Saver(max_to_keep = 2)
+        keys_placeholder = tf.placeholder("float")
+        keys = tf.identity(keys_placeholder)
+        tf.add_to_collection("inputs", json.dumps({'key': keys_placeholder.name}))
+        tf.add_to_collection("outputs", json.dumps({'key': keys.name,
+                                                    'softmax': inference_softmax.name,
+                                                    'prediction': inference_op.name}))
+        tf.scalar_summary('loss', loss)
+        tf.scalar_summary('accuracy', accuracy)
+        tf.scalar_summary('auc', auc_op)
+        summary_op = tf.merge_all_summaries()
+
+
+    sv = tf.train.Supervisor(is_chief=(FLAGS.task_index == 0),
+                             logdir="./train_process/",
+                             init_op=init_op,
+                             summary_op=summary_op,
+                             saver=saver,
+                             global_step=global_step,
+                             save_model_secs=60)
+
+    # Create session to run graph
+    with sv.managed_session(server.target) as sess:
+        if mode == "train" or mode == "train_from_scratch":
+            while not sv.should_stop():
+                # Get coordinator and run queues to read data
+                coord = tf.train.Coordinator()
+                threads = tf.train.start_queue_runners(coord=coord, sess=sess)
+
+                start_time = datetime.datetime.now()
+
+                try:
+                    while not coord.should_stop():
+                        _, loss_value, step = sess.run([train_op, loss, global_step])
+                        if step % steps_to_validate == 0:
+                            accuracy_value, auc_value, summary_value = sess.run(
+                                [accuracy, auc_op, summary_op])
+                            end_time = datetime.datetime.now()
+                            print("[{}] Task: {}, Step: {}, loss: {}, accuracy: {}, auc: {}".format(
+                                end_time - start_time,
+                                FLAGS.task_index,
+                                step, loss_value, accuracy_value,
+                                auc_value))
+
+                            start_time = end_time
+                except tf.errors.OutOfRangeError:
+                    print("Done training after reading all data")
+                finally:
+                    coord.request_stop()
+                    print("coord stopped")
+
+                # Wait for threads to exit
+                coord.join(threads)
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h3&gt;logs&lt;/denchmark-h&gt;
+
+gdb python core.xxxxx , and then 'bt', shows that
+&lt;denchmark-code&gt;
+#0  0x00007f5943d3f166 in pthread_detach () from /opt/glibc-2.17/lib/libpthread.so.0
+#1  0x00007f58fc8c8ab5 in std::thread::detach() ()
+    at /opt/install/gcc-build/x86_64-redhat-linux/libstdc++-v3/include/x86_64-redhat-linux/bits/gthr-default.h:674
+#2  0x00007f58fec7f0bf in tensorflow::(anonymous namespace)::PosixEnv::SchedClosure(std::function&lt;void ()()&gt;) ()
+   from /home/serving/anaconda2/lib/python2.7/site-packages/tensorflow/python/_pywrap_tensorflow.so
+#3  0x00007f58fea8e981 in tensorflow::SchedClosure(std::function&lt;void ()()&gt;) ()
+   from /home/serving/anaconda2/lib/python2.7/site-packages/tensorflow/python/_pywrap_tensorflow.so
+#4  0x00007f58fd5f72cd in tensorflow::Master::RunStep(tensorflow::CallOptions*, tensorflow::RunStepRequest const*, tensorflow::RunStepResponse*, std::function&lt;void ()(tensorflow::Status const&amp;)&gt;) ()
+   from /home/serving/anaconda2/lib/python2.7/site-packages/tensorflow/python/_pywrap_tensorflow.so
+#5  0x00007f58fd5f10f9 in tensorflow::GrpcMasterService::RunStepHandler(tensorflow::Call&lt;tensorflow::GrpcMasterService, tensorflow::grpc::MasterService::AsyncService, tensorflow::RunStepRequest, tensorflow::RunStepResponse&gt;*) ()
+   from /home/serving/anaconda2/lib/python2.7/site-packages/tensorflow/python/_pywrap_tensorflow.so
+#6  0x00007f58fd5f2c4c in tensorflow::GrpcMasterService::HandleRPCsLoop() ()
+   from /home/serving/anaconda2/lib/python2.7/site-packages/tensorflow/python/_pywrap_tensorflow.so
+#7  0x00007f58fc8c8b80 in execute_native_thread_routine_compat ()
+    at ../../../../../gcc-6.2.0/libstdc++-v3/src/c++11/thread.cc:110
+#8  0x00007f5943d3df83 in start_thread () from /opt/glibc-2.17/lib/libpthread.so.0
+#9  0x00007f59433668bd in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:113
+
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='ericyue' date='2016-12-11T06:47:54Z'>
+		And when not in distribution mode, the training process works well. and the core dump not happend in every worker, I start 12 worker ,and cored 7 workers
+		</comment>
+		<comment id='2' author='ericyue' date='2016-12-11T06:54:41Z'>
+		I restart the train and a few hours later ,it's cored again.
+		</comment>
+		<comment id='3' author='ericyue' date='2016-12-11T19:00:25Z'>
+		&lt;denchmark-link:https://github.com/mrry&gt;@mrry&lt;/denchmark-link&gt;
+ any suggestions on what to try next to debug this?
+		</comment>
+		<comment id='4' author='ericyue' date='2016-12-13T02:44:09Z'>
+		&lt;denchmark-link:https://github.com/mrry&gt;@mrry&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/michaelisard&gt;@michaelisard&lt;/denchmark-link&gt;
+   is there any progress here ? or do you need me to provide more infomation, such as core dump file? (maybe large...)
+		</comment>
+		<comment id='5' author='ericyue' date='2016-12-13T23:16:29Z'>
+		This appears to be a crash in the C++ runtime library, possibly triggered by the distributed runtime creating a larger number than the single-process version creates.
+Is there anything unusual about your configuration? e.g. Are you using the pre-built binaries? Did you build TensorFlow yourself with a custom libc, or libstdc++? Are there any resource limits on the number of threads that a process can create?).
+		</comment>
+		<comment id='6' author='ericyue' date='2016-12-14T13:37:28Z'>
+		I'm install tensorflow 0.12 by pip. how to provide some useful infomation to you ? such as some system-command output ? can you tell me some . I'm wish to help solving this. &lt;denchmark-link:https://github.com/mrry&gt;@mrry&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='7' author='ericyue' date='2016-12-19T14:58:01Z'>
+		This core may caused by the difference of linux kernel, Maybe you need to compile the tf lib by yourself.
+		</comment>
+		<comment id='8' author='ericyue' date='2016-12-22T18:50:30Z'>
+		An update on this issue: we have not been able to reproduce the crash. Since CentOS 6.3 is not a supported configuration, and it appears that the failure is happening inside standard library code, it is possible that there is some incompatibility between the pre-built binaries and either your libc or your kernel.
+Since we cannot easily reproduce the failure, I'm throwing open this issue to Community Support. In the mean time, you may want to try building from source on your platform, to see if that fixes the issue.
+		</comment>
+		<comment id='9' author='ericyue' date='2017-06-16T17:27:02Z'>
+		Automatically closing due to lack of recent activity. We hope that you were able to resolve it on your own. However, since this is a support issue rather than a bug or feature request, you will probably get more information by posting it on StackOverflow.
+		</comment>
+	</comments>
+</bug>

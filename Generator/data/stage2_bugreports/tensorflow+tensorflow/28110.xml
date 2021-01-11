@@ -1,0 +1,142 @@
+<bug id='28110' author='KichangKim' open_date='2019-04-24T13:14:06Z' closed_time='2019-05-07T13:36:10Z'>
+	<summary>[TF 2.0] TF 2.0 consumes twice as much memory as TF 1.x or CNTK.</summary>
+	<description>
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow):
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Windows 10 x64 1809
+Mobile device (e.g. iPhone 8, Pixel 2, Samsung Galaxy) if the issue happens on mobile device:
+TensorFlow installed from (source or binary): pip install tensorflow-gpu==2.0.0-alpha0
+TensorFlow version (use command below): v1.12.0-9492-g2c319fb415 2.0.0-alpha0
+Python version: 3.6.7
+Bazel version (if compiling from source):
+GCC/Compiler version (if compiling from source):
+CUDA/cuDNN version: CUDA 10.0, cudnn-10.0-windows10-x64-v7.5.0.56
+GPU model and memory: GeForce GTX 1070 8GB
+
+Describe the current behavior
+Evaluating TF 2.0 keras model allocates twice as much memory as TF 1.x or CNTK.
+Describe the expected behavior
+Memory usage of TF 2.0 should be same or similar to other libraries, not double.
+Code to reproduce the issue
+For TF 2.0 or 1.x
+&lt;denchmark-code&gt;import numpy as np
+import tensorflow as tf
+
+# tf.config.gpu.set_per_process_memory_growth(True)
+
+size = 28000
+
+inputs = tf.keras.Input((size,), dtype='float32')
+outputs = tf.keras.layers.Dense(size)(inputs)
+model = tf.keras.models.Model(inputs=inputs, outputs=outputs)
+
+model.predict(np.ones((1, size,), dtype=np.float32))
+
+print('complete')
+
+while True:
+    pass
+&lt;/denchmark-code&gt;
+
+For TF 1.x or CNTK with keras
+&lt;denchmark-code&gt;import keras
+import numpy as np
+
+size = 28000
+
+inputs = keras.Input((size,), dtype='float32')
+outputs = keras.layers.Dense(size)(inputs)
+model = keras.models.Model(inputs=inputs, outputs=outputs)
+
+model.predict(np.ones((1, size,), dtype=np.float32))
+
+print('complete')
+
+while True:
+    pass
+&lt;/denchmark-code&gt;
+
+With 8GB VRAM GPU, TF 1.x and CNTK works successfully, and TF 2.0 code are failed due to Resource exhausted exception.
+	</description>
+	<comments>
+		<comment id='1' author='KichangKim' date='2019-05-06T22:45:31Z'>
+		TL;DR It's actually a somewhat niche case (a single weight is O(gpu memory size)), but it's also a pretty easy fix.
+In your example, the model is failing when it builds the kernel for the dense layer; or more specifically, when it calls the initializer. If you consider a much simpler example:
+&lt;denchmark-code&gt;a = tf.ones((size, size))
+b = a + 1
+c = b + 1
+&lt;/denchmark-code&gt;
+
+In graph mode when you evaluate c (which is a symbolic tensor), TensorFlow's memory allocator will reuse blocks of memory when it detects that they are no longer being used, so by the time c is computed the buffer that backed a is long gone. By contrast, in eager a handle to all three tensors co-exist in the body, so the runtime is not allowed to free them until they go out of scope on the python side. (Since a user could presumably add other computations later, unlike the graph case where all computations are known.)
+Fortunately, wrapping the initializer call in a tf.function fixes the issue. In general I suspect more and more of these utility functions are going to get function'd for precisely this sort of reason.
+		</comment>
+		<comment id='2' author='KichangKim' date='2019-05-06T23:06:57Z'>
+		&lt;denchmark-link:https://github.com/robieta&gt;@robieta&lt;/denchmark-link&gt;
+ Thanks for investigation. Can you provide sample code of tf.function usage? What is the initializer?
+Also, my actual code is big CNN network with TF 2.0 keras API and has manual training loop by using tf.data.Dataset and GradientTape, samely suffer from this memory and performance issue. If you provide sample code of the usage of tf.function for keras model and manual training loop, it will be very helpful.
+		</comment>
+		<comment id='3' author='KichangKim' date='2019-05-06T23:25:36Z'>
+		For the case I described:
+&lt;denchmark-code&gt;size = 40000  # Slightly larger b/c I was testing on a GPU w/ 16 GB
+init_fn = tf.keras.initializers.glorot_uniform()
+init_fn = tf.function(init_fn, autograph=False) # &lt;== This is what prevents the OOM (Comment it out to test)
+layer = tf.keras.layers.Dense(size, kernel_initializer=init_fn)
+layer.build((size,))
+&lt;/denchmark-code&gt;
+
+And my plan is to make builtin initializers do the tf.function wrap automatically.
+In general functions are documented in &lt;denchmark-link:https://www.tensorflow.org/alpha/tutorials/eager/tf_function&gt;https://www.tensorflow.org/alpha/tutorials/eager/tf_function&lt;/denchmark-link&gt;
+, &lt;denchmark-link:https://www.tensorflow.org/versions/r2.0/api_docs/python/tf/function&gt;https://www.tensorflow.org/versions/r2.0/api_docs/python/tf/function&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='4' author='KichangKim' date='2019-05-06T23:44:42Z'>
+		Thanks for sample code! But I have one more question, how about "gamma_initializer" for BatchNormailization layer? its initializer is a Class (Ones or Zeros), not method so I can't wrap it with tf.function.
+		</comment>
+		<comment id='5' author='KichangKim' date='2019-05-06T23:49:46Z'>
+		glorot_uniform is also a class. (When you trace through it's just the init_ops.GlorotUniform class). That's why we call it on the second line. So tf.function is actually wrapping __call__ of that particular class instance. So Ones or Zeros should work the same.
+		</comment>
+		<comment id='6' author='KichangKim' date='2019-05-07T00:53:16Z'>
+		Oh, I mistaked that using "ones" instead of "Ones". Using Ones() works for gamma_initializer.
+		</comment>
+		<comment id='7' author='KichangKim' date='2019-05-07T01:01:11Z'>
+		
+And my plan is to make builtin initializers do the tf.function wrap automatically.
+
+&lt;denchmark-link:https://github.com/robieta&gt;@robieta&lt;/denchmark-link&gt;
+ You mean that this temporary fix will not be needed in official TF 2.0 release?
+		</comment>
+		<comment id='8' author='KichangKim' date='2019-05-07T01:14:54Z'>
+		Also, I found that TF 2.0 requires more memory than CNTK for training. In example, completly same model (same structure, same # of trainable_variable) with same PC, cntk can train the model with x2 batch size. It may not be related this issue but disturb migrating from cntk to TF 2.0.
+		</comment>
+		<comment id='9' author='KichangKim' date='2019-05-07T13:36:10Z'>
+		Using GradientTape for manual training loop requires double GPU ram. I found that using Model.train_on_batch() instead of GradientTape is more fast and comsume less GPU ram. Wrapping entire train loop by using tf.function makes GradientTape to be fast as train_on_batch(), but memory usage does not changed.
+Also, train_on_batch() has another issue that allocate CPU memory infinity without tf.keras.backend.set_learning_phase(1). I'll open as new issue for this when I found minimul reproducible code.
+		</comment>
+		<comment id='10' author='KichangKim' date='2019-05-07T13:36:12Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=28110&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=28110&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='11' author='KichangKim' date='2019-05-08T03:52:29Z'>
+		
+
+And my plan is to make builtin initializers do the tf.function wrap automatically.
+
+@robieta You mean that this temporary fix will not be needed in official TF 2.0 release?
+
+I'm not sure if it will make it into the next release, but yes that's the plan.
+		</comment>
+		<comment id='12' author='KichangKim' date='2019-10-16T08:51:12Z'>
+		I don't train. only loading the trained model takes more than twice memory.
+I have 2 environments. tf 1.14 installed for python 3.5 and tf 2 for python 3.7.
+I run the same code and load the same keras model in both environments. in py3.5, after model loaded, it takes 560MB memory. while in py3.7, it takes 1.2GB.
+is there any way to reduce the memory for tf 2 ?
+		</comment>
+		<comment id='13' author='KichangKim' date='2019-11-18T16:19:24Z'>
+		Same problem here. Loading the model it's consuming a lot of memory. Some solution was found?
+		</comment>
+	</comments>
+</bug>

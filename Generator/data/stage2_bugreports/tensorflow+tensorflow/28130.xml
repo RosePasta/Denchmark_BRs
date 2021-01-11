@@ -1,0 +1,123 @@
+<bug id='28130' author='mhurliman' open_date='2019-04-25T00:33:38Z' closed_time='2019-05-03T19:36:42Z'>
+	<summary>tf.data.Dataset Performance Issue</summary>
+	<description>
+System information
+
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow):
+
+
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Windows 10
+
+
+Mobile device (e.g. iPhone 8, Pixel 2, Samsung Galaxy) if the issue happens on mobile device:
+
+
+TensorFlow installed from (source or binary): binary
+
+
+TensorFlow version (use command below): 1.13.1
+
+
+Python version: 3.7
+
+
+Bazel version (if compiling from source):
+
+
+GCC/Compiler version (if compiling from source):
+
+
+CUDA/cuDNN version: 10.0 / 7.4.1
+
+
+GPU model and memory: NVIDIA Titan V
+
+
+CPU Make &amp; Model: 2x Intel Xeon E5-2620 v4 (8 cores/16 logical)
+
+
+Data Drive: Samsung SSD 960 EVO 1 TB
+
+
+Describe the current behavior
+Currently using the tf.data.Dataset API to load image pairs for super resolution. I believe based on the minimal examples I could find the method below is as optimized as I can get for my use-case. However, when I grew my path list from 550 to 7950 items it slows down over 3x. It doesn't seem like this part of the pipeline should scale so poorly since the batches themselves are the same size. And the process of mapping &amp; batching (mostly IO) should be parallelized across the 32 CPU cores of the machine.
+Any ideas? Pertinent code below.
+&lt;denchmark-code&gt;lr_paths, hr_paths = ... # Flat lists of paths to LR &amp; HR images, respectively.
+
+def load_image(path): return tf.image.decode_png(tf.read_file(path), 3)
+
+# Create the dataset
+dataset = (tf.data.Dataset.from_tensor_slices((lr_paths, hr_paths))
+    .apply(tf.data.experimental.shuffle_and_repeat(count, FLAGS.max_epochs))
+    .apply(tf.data.experimental.map_and_batch(lambda x, y: (load_image(x), load_image(y)), FLAGS.batch_size, num_parallel_batches=max(1, (cpu_count() - 1) // FLAGS.batch_size)))
+    .apply(tf.data.experimental.prefetch_to_device('/device:GPU:0')))
+
+# Query for the iterator
+iterator = dataset.make_one_shot_iterator()
+im_LR_batch, im_HR_batch = iterator.get_next()
+
+... # Preprocess the image batches with crop, data augmentation, type conversion
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='mhurliman' date='2019-04-25T19:39:21Z'>
+		Can you try the following uses the best practices from the &lt;denchmark-link:https://www.tensorflow.org/alpha/guide/data_performance&gt;tf.data performance guide&lt;/denchmark-link&gt;
+:
+&lt;denchmark-code&gt;dataset = tf.data.Dataset.from_tensor_slices((lr_paths, hr_paths)
+dataset = dataset.interleave(lambda x, y: tf.data.Dataset.from_tensors((tf.read_file(x), tf.read_file(y))), num_parallel_calls=tf.data.experimental.AUTOTUNE)
+dataset = dataset.shuffle(count)
+dataset = dataset.repeat(FLAGS.max_epochs)  # shuffle and repeat will be fused automatically
+dataset = dataset.map(lambda x, y: (tf.image.decode_png(x, 3), tf.image.decode_png(y, 3)), num_parallel_calls=tf.data.experimental.AUTOTUNE)
+dataset = dataset.batch(FLAGS.batch_size)  # map and batch will be fused automatically
+dataset = dataset.apply(tf.data.experimental.prefetch_to_device('/device:GPU:0')))
+&lt;/denchmark-code&gt;
+
+If you would like further help, please provide a reproducible example.
+		</comment>
+		<comment id='2' author='mhurliman' date='2019-04-29T19:14:54Z'>
+		Hey, just giving an update here. I created a performance test for four data pipeline configurations - &lt;denchmark-link:https://gist.github.com/mhurliman/3a955c9253b9477fa1aa297647b3c063&gt;https://gist.github.com/mhurliman/3a955c9253b9477fa1aa297647b3c063&lt;/denchmark-link&gt;
+.
+Your demo-code of interleave didn't match the API specification, whose intended purpose seems to be splitting up a dataset into multiple datasets which can then be interleaved. This means the data in the original dataset needs to nested in some form to be properly processed by interleave. I leveraged it by chunking the filename list into N-equally sized lists of filenames. Hopefully this is acceptable to make full efficiency of it.
+I also decided to try an initializable iterator to avoid embedding a littany of string filename data into the graph, but it didn't seem to help.
+The four configurations are a cross of non-chunked vs. chunked, and standard vs. experimental APIs. Performance was pretty comparable across the board, even when experimenting with the number of data splits and data count. I did see a huge divergence between two separate computers, which is strange since the seemingly dominant computer has about 1/3 perf as the other.
+Still trying to pin down exactly where the performance delta is being introduced, but unlike the actual production scenario it doesn't seem to be as affected by the list size in the test environment.
+		</comment>
+		<comment id='3' author='mhurliman' date='2019-04-29T20:57:55Z'>
+		&lt;denchmark-link:https://github.com/mhurliman&gt;@mhurliman&lt;/denchmark-link&gt;
+ thanks for the update.
+interleave is a generalized version of flat_map -- flat_map maps input elements into (finite) datasets and produces their elements as (flattened) output, interleave is similar except that its output interleaves the elements of multiple datasets. My example was missing tf.data.Dataset.from_tensors(...) which is needed as the result of the interleave function needs to be a dataset. With that modification, the example should work as is (avoiding the need for jumping through the the filename list chunking hoop).
+I am happy to test out (and profile) the example code as long as you provide me with (synthetic) data that to test the input pipeline with.
+		</comment>
+		<comment id='4' author='mhurliman' date='2019-05-03T00:15:30Z'>
+		Here's a script to synthesize junk super rez training pairs: &lt;denchmark-link:https://gist.github.com/mhurliman/934fa8e13dca3586e9be8f7464b769fd&gt;https://gist.github.com/mhurliman/934fa8e13dca3586e9be8f7464b769fd&lt;/denchmark-link&gt;
+
+I updated the previous tests (&lt;denchmark-link:https://gist.github.com/mhurliman/3a955c9253b9477fa1aa297647b3c063&gt;https://gist.github.com/mhurliman/3a955c9253b9477fa1aa297647b3c063&lt;/denchmark-link&gt;
+) to implement your suggested usage pattern. I also expanded it to generate a number of randomized image crops at once, creating a dataset out of those with 'from_tensor_slices(...)'. This eliminates the need for the later 'map' function, though I suppose data augmentation steps could be moved there - haven't tested perf to see if that would matter.
+The results are pretty significant. The experimental version of parallel_interleave seems to perform drastically better than the interleave in the standard API. Went from about 16 samples per second up to 600 samples per second. Not sure the initial problem is solved, but I'm satisfied with this performance. So probably stopping my investigations here.
+Thanks for all your help &lt;denchmark-link:https://github.com/jsimsa&gt;@jsimsa&lt;/denchmark-link&gt;
+!
+		</comment>
+		<comment id='5' author='mhurliman' date='2019-05-03T00:18:10Z'>
+		I'm also considering implementing jittered sampling (partitioned stochastic sampling) instead of completely randomized crops to get better coverage of samples, but this was easiest to test initially.
+		</comment>
+		<comment id='6' author='mhurliman' date='2019-05-03T19:36:43Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=28130&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=28130&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='7' author='mhurliman' date='2019-05-03T19:47:18Z'>
+		&lt;denchmark-link:https://github.com/mhurliman&gt;@mhurliman&lt;/denchmark-link&gt;
+ regarding the difference between  and , did you set the  argument of ? if so, could you please share the two versions of the input pipeline. The performance of the two transformations should be identical. If it's not, it's a bug that I would like to fix.
+		</comment>
+		<comment id='8' author='mhurliman' date='2019-05-09T23:21:24Z'>
+		Both versions of the input pipeline are available in the gist I linked above. Given references to the synthesized input directories it should work out of the box.
+		</comment>
+		<comment id='9' author='mhurliman' date='2019-05-09T23:29:19Z'>
+		Thanks!
+		</comment>
+	</comments>
+</bug>

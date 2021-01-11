@@ -1,0 +1,169 @@
+<bug id='320' author='srikanthparupati' open_date='2018-09-11T18:50:57Z' closed_time='2018-09-28T23:53:24Z'>
+	<summary>Memory reorder of (10 x 1 x 390 x 590) tensor size is taking about 250ms</summary>
+	<description>
+I am benchmarking MKL DNN convolution performance for 10 filters with 11x11 kernel size against 600 x 400 image. Convolution is taking on average about 16 - 20 ms but memory reordering of convolution output to user memory is taking about 250ms. I am not sure how to get rid of memory reorder time, can you please help figuring out the issue?
+&lt;denchmark-h:hr&gt;&lt;/denchmark-h&gt;
+
+&lt;denchmark-h:h3&gt;Environment&lt;/denchmark-h&gt;
+
+
+CPU make and model - 2.8 GHz Intel Core i7
+OS version - OS X 10.13
+Compiler - Clang
+MKLROOT - mklml_mac_2019.0.20180710
+MKLDNN - 0.16
+
+&lt;denchmark-h:h3&gt;Code snippet to reproduce the issue:&lt;/denchmark-h&gt;
+
+void convolution_perfnet(int times = 1000) {
+&lt;denchmark-code&gt;auto cpu_engine = engine(engine::cpu, 0);
+
+std::vector&lt;primitive&gt; net;
+std::vector&lt;primitive&gt; net_weights;
+
+const int batch = 1;
+
+const int inW = 600;
+const int inH = 400;
+const int nPlanes = 1;
+
+const int nFilters = 10;
+const int kernelSize = 11;
+
+const int outW = 590;
+const int outH = 390;
+
+memory::dims conv1_src_tz = { batch, nPlanes, inH, inW };
+memory::dims conv1_weights_tz = { nFilters, nPlanes, kernelSize, kernelSize };
+memory::dims conv1_bias_tz = { nFilters };
+memory::dims conv1_dst_tz = { batch, nFilters, outH, outW };
+memory::dims conv1_strides = { 1, 1 };
+auto conv1_padding = { 0, 0 };
+
+std::vector&lt;float&gt; user_src(batch * nPlanes * inH * inW);
+std::vector&lt;float&gt; user_dst(batch * nFilters * outH * outW);
+
+std::vector&lt;float&gt; conv1_weights(std::accumulate(conv1_weights_tz.begin(), conv1_weights_tz.end(), 1, std::multiplies&lt;uint32_t&gt;()));
+std::vector&lt;float&gt; conv1_bias(std::accumulate(conv1_bias_tz.begin(), conv1_bias_tz.end(), 1, std::multiplies&lt;uint32_t&gt;()));
+
+// create memory for user data
+auto user_src_memory = memory({ { { conv1_src_tz }, memory::data_type::f32, memory::format::nchw }, cpu_engine }, user_src.data());
+
+auto user_weights_memory = memory({ { { conv1_weights_tz }, memory::data_type::f32, memory::format::oihw }, cpu_engine }, conv1_weights.data());
+auto user_bias_memory = memory({ { { conv1_bias_tz }, memory::data_type::f32, memory::format::x }, cpu_engine }, conv1_bias.data());
+
+auto user_dst_memory = memory({ { { conv1_dst_tz }, memory::data_type::f32, memory::format::nchw }, cpu_engine }, user_dst.data());
+
+// create memory descriptors for convolution data w/ no specified format
+auto conv1_src_md = memory::desc({ conv1_src_tz }, memory::data_type::f32, memory::format::any);
+auto conv1_bias_md = memory::desc({ conv1_bias_tz }, memory::data_type::f32, memory::format::any);
+auto conv1_weights_md = memory::desc({ conv1_weights_tz }, memory::data_type::f32, memory::format::any);
+auto conv1_dst_md = memory::desc({ conv1_dst_tz }, memory::data_type::f32, memory::format::any);
+
+// Create convolution descriptor
+ auto conv1_desc = convolution_forward::desc(prop_kind::forward_inference, convolution_direct, conv1_src_md,
+ conv1_weights_md, conv1_bias_md, conv1_dst_md, conv1_strides, conv1_padding, conv1_padding, padding_kind::zero);
+
+
+auto conv1_prim_desc = convolution_forward::primitive_desc(conv1_desc, cpu_engine);
+
+// create reorders for data and weights if layout requested by convolution is different from NCHW/OIHW
+auto conv1_src_memory = user_src_memory;
+if (memory::primitive_desc(conv1_prim_desc.src_primitive_desc()) != user_src_memory.get_primitive_desc()) {
+    conv1_src_memory = memory(conv1_prim_desc.src_primitive_desc());
+    net.push_back(reorder(user_src_memory, conv1_src_memory));
+}
+
+auto conv1_weights_memory = user_weights_memory;
+if (memory::primitive_desc(conv1_prim_desc.weights_primitive_desc()) != user_weights_memory.get_primitive_desc()) {
+    conv1_weights_memory = memory(conv1_prim_desc.weights_primitive_desc());
+    net_weights.push_back(reorder(user_weights_memory, conv1_weights_memory));
+}
+
+auto conv1_dst_memory = user_dst_memory; //
+// create reorder between output convolution output and user output memory
+if (memory::primitive_desc(conv1_prim_desc.dst_primitive_desc()) != user_dst_memory.get_primitive_desc()) {
+    conv1_dst_memory = memory(conv1_prim_desc.dst_primitive_desc());
+}
+
+// Create convolution primitive and add it to net 
+net.push_back(convolution_forward(conv1_prim_desc, conv1_src_memory, conv1_weights_memory, user_bias_memory, conv1_dst_memory));
+
+// Memory reorder is taking about 250 ms - 10 x 1 x 390 x 590
+if (conv1_dst_memory != user_dst_memory) {
+    net.push_back(reorder(conv1_dst_memory, user_dst_memory));
+}
+
+
+// Run inference
+stream(stream::kind::eager).submit(net_weights).wait();
+for (int j = 0; j &lt; times; ++j) {
+    stream(stream::kind::eager).submit(net).wait();
+}
+&lt;/denchmark-code&gt;
+
+}
+	</description>
+	<comments>
+		<comment id='1' author='srikanthparupati' date='2018-09-11T19:03:37Z'>
+		Hi,
+Could you please post the output of the program run with MKLDNN_VERBOSE=1 (environment variable)?
+		</comment>
+		<comment id='2' author='srikanthparupati' date='2018-09-11T20:58:50Z'>
+		&lt;denchmark-link:https://github.com/emfomenk&gt;@emfomenk&lt;/denchmark-link&gt;
+  please find the MKL DNN output for 2 runs
+mkldnn_verbose,exec,reorder,simple:any,undef,in:f32_oihw out:f32_Ohwi8o,num:1,10x1x11x11,0.165039
+mkldnn_verbose,exec,convolution,jit:avx2,forward_inference,fsrc:nchw fwei:Ohwi8o fbia:x fdst:nChw8c,alg:convolution_direct,mb1_g1ic1oc10_ih400oh390kh11sh1dh0ph0_iw600ow590kw11sw1dw0pw0,17.4231
+mkldnn_verbose,exec,reorder,simple:any,undef,in:f32_nChw8c out:f32_nchw,num:1,1x10x390x590,287.683
+mkldnn_verbose,exec,convolution,jit:avx2,forward_inference,fsrc:nchw fwei:Ohwi8o fbia:x fdst:nChw8c,alg:convolution_direct,mb1_g1ic1oc10_ih400oh390kh11sh1dh0ph0_iw600ow590kw11sw1dw0pw0,12.832
+mkldnn_verbose,exec,reorder,simple:any,undef,in:f32_nChw8c out:f32_nchw,num:1,1x10x390x590,276.932
+		</comment>
+		<comment id='3' author='srikanthparupati' date='2018-09-11T21:12:28Z'>
+		Thanks &lt;denchmark-link:https://github.com/srikanthparupati&gt;@srikanthparupati&lt;/denchmark-link&gt;
+,
+Really weird. I will take a look.
+One more question. Do you use OpenMP? Or clang that you use doesn't support OpenMP?
+		</comment>
+		<comment id='4' author='srikanthparupati' date='2018-09-11T21:14:38Z'>
+		And just to confirm -- did you build a RELEASE or DEBUG version?
+		</comment>
+		<comment id='5' author='srikanthparupati' date='2018-09-11T22:27:10Z'>
+		Thank you &lt;denchmark-link:https://github.com/emfomenk&gt;@emfomenk&lt;/denchmark-link&gt;
+ . I am using OS X default Clang compiler, I do no think it supports OpenMP by default. I am using modified version of simplnet.cpp in MKL-DNN examples directory, it is getting linked with libomp5.dylib in MKL DNN libs directory.
+		</comment>
+		<comment id='6' author='srikanthparupati' date='2018-09-12T00:58:34Z'>
+		I built it in release mode
+		</comment>
+		<comment id='7' author='srikanthparupati' date='2018-09-21T17:01:36Z'>
+		&lt;denchmark-link:https://github.com/emfomenk&gt;@emfomenk&lt;/denchmark-link&gt;
+ Did you get a chance to look into the issue?
+		</comment>
+		<comment id='8' author='srikanthparupati' date='2018-09-21T20:17:52Z'>
+		Hi &lt;denchmark-link:https://github.com/srikanthparupati&gt;@srikanthparupati&lt;/denchmark-link&gt;
+,
+Sorry for delay.
+Could you please try the following fix?
+$ git diff
+diff --git a/src/cpu/cpu_reorder.cpp b/src/cpu/cpu_reorder.cpp
+index 4c5f5c9a..829acca5 100644
+--- a/src/cpu/cpu_reorder.cpp
++++ b/src/cpu/cpu_reorder.cpp
+@@ -74,6 +74,7 @@ static const rpd_create_f cpu_reorder_impl_list[] = {
+     jit_uni_reorder_create,
+
+     /* fp32: flat &lt;-&gt; blocked with tail */
++    REG_SR_BIDIR(f32, any, f32, nChw8c),
+     REG_SR_BIDIR(f32, any, f32, nChw16c),
+     REG_SR_BIDIR(f32, any, f32, nCdhw16c),
+
+		</comment>
+		<comment id='9' author='srikanthparupati' date='2018-09-22T02:19:57Z'>
+		&lt;denchmark-link:https://github.com/emfomenk&gt;@emfomenk&lt;/denchmark-link&gt;
+  Thanks a lot for the fix. It worked and reorder time dropped from 250ms to 3 ms.
+		</comment>
+		<comment id='10' author='srikanthparupati' date='2018-09-22T03:00:48Z'>
+		Thanks for confirming!
+I will keep this open until promote the fix to the master.
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,251 @@
+<bug id='3356' author='astenuz' open_date='2020-09-05T01:05:16Z' closed_time='2020-10-05T15:15:05Z'>
+	<summary>Inconsistent behavior between `validation_epoch_end` and `training_epoch_end`</summary>
+	<description>
+&lt;denchmark-h:h2&gt;Inconsistent behavior between validation_epoch_end and training_epoch_end&lt;/denchmark-h&gt;
+
+Assignation of a variable to results in train_step (result.y =y) does not work the same as in validation. Take a look at the code in the section below to make it more clear.
+For context, I'm trying to calculate AUC after both training and validation epochs. Calculating on batch might not work if the particular batch gets labels for only one class, so it would be undefined for the particular step.
+&lt;denchmark-h:h3&gt;To Reproduce&lt;/denchmark-h&gt;
+
+Include this in a pl module:
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+        y_hat = self(x)
+        loss = self.criterion(y_hat, y)
+        result = pl.TrainResult(loss)
+        result.log('train_loss', loss)
+        
+        
+        y_pred = F.softmax(y_hat, dim=0)[:, 1]
+
+        result.y = y
+        result.y_pred = y_pred
+
+        return result
+  
+    def training_epoch_end(self, outputs):
+        y = outputs.y
+        y_pred = outputs.y_pred
+
+        roc_auc_fn = pl.metrics.classification.AUROC()
+        roc_auc = roc_auc_fn(y_pred, y)
+
+        result = pl.TrainResult()
+        result.log('train_roc_auc', roc_auc)
+
+        return result
+Then the stacktrace shows:
+&lt;denchmark-code&gt;---------------------------------------------------------------------------
+
+KeyError                                  Traceback (most recent call last)
+
+&lt;ipython-input-48-01044cd5ab91&gt; in &lt;module&gt;()
+      7 # train
+      8 trainer = pl.Trainer(gpus=1, max_epochs=50)
+----&gt; 9 trainer.fit(model, dm)
+
+8 frames
+
+/usr/local/lib/python3.6/dist-packages/pytorch_lightning/trainer/states.py in wrapped_fn(self, *args, **kwargs)
+     46             if entering is not None:
+     47                 self._state = entering
+---&gt; 48             result = fn(self, *args, **kwargs)
+     49 
+     50             # The INTERRUPTED state can be set inside the run function. To indicate that run was interrupted
+
+/usr/local/lib/python3.6/dist-packages/pytorch_lightning/trainer/trainer.py in fit(self, model, train_dataloader, val_dataloaders, datamodule)
+   1071         """
+   1072         # --------------------------
+-&gt; 1073         # Setup??
+   1074         # --------------------------
+   1075         ref_model = model
+
+/usr/local/lib/python3.6/dist-packages/pytorch_lightning/accelerators/gpu_backend.py in train(self, model)
+     49 
+     50         self.trainer.model = model
+---&gt; 51 
+     52     def train(self):
+     53         model = self.trainer.model
+
+/usr/local/lib/python3.6/dist-packages/pytorch_lightning/trainer/trainer.py in run_pretrain_routine(self, model)
+   1237             trainer = Trainer()
+   1238             model = LightningModule()
+-&gt; 1239 
+   1240             trainer.fit(model)
+   1241             trainer.test(test_dataloaders=test, ckpt_path='path/to/checkpoint.ckpt')
+
+/usr/local/lib/python3.6/dist-packages/pytorch_lightning/trainer/training_loop.py in train(self)
+    392 
+    393                 # early stopping
+--&gt; 394                 met_min_epochs = epoch &gt;= self.min_epochs - 1
+    395                 met_min_steps = self.global_step &gt;= self.min_steps if self.min_steps else True
+    396 
+
+/usr/local/lib/python3.6/dist-packages/pytorch_lightning/trainer/training_loop.py in run_training_epoch(self)
+    548         # TODO bake this logic into the checkpoint callback
+    549         should_activate = not is_overridden('validation_step', self.get_model()) and not should_check_val
+--&gt; 550         if should_activate:
+    551             checkpoint_callbacks = [c for c in self.callbacks if isinstance(c, ModelCheckpoint)]
+    552             [c.on_validation_end(self, self.get_model()) for c in checkpoint_callbacks]
+
+/usr/local/lib/python3.6/dist-packages/pytorch_lightning/trainer/training_loop.py in run_training_epoch_end(self, epoch_output, checkpoint_accumulator, early_stopping_accumulator, num_optimizers)
+    655         epoch_log_metrics = {}
+    656         epoch_progress_bar_metrics = {}
+--&gt; 657         for opt_outputs in epoch_output:
+    658             # reduce across time first
+    659             time_reduced_outputs = []
+
+/usr/local/lib/python3.6/dist-packages/pytorch_lightning/trainer/training_loop.py in __gather_result_across_time_and_optimizers(self, epoch_output)
+    731         is_last_batch_for_infinite_dataset = (is_last_batch and self.val_check_batch == float('inf'))
+    732         should_check_val = can_check_val and (should_check_val or is_last_batch_for_infinite_dataset)
+--&gt; 733 
+    734         return should_check_val
+    735 
+
+/usr/local/lib/python3.6/dist-packages/pytorch_lightning/core/step_result.py in padded_gather(cls, outputs)
+    336 
+    337                 if is_reserved:
+--&gt; 338                     padding_key = default_padding_idx
+    339                 else:
+    340                     padding_key = meta[name]['tbptt_pad_token']
+
+KeyError: 'y'
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h4&gt;Code sample&lt;/denchmark-h&gt;
+
+Full module to give full context.
+class LitModel(pl.LightningModule):
+
+    def set_parameter_requires_grad(self):
+        if self.feature_extract:
+            for param in self.model.parameters():
+                param.requires_grad = False
+
+    def __init__(self, num_classes, use_pretrained=True, feature_extract = True):
+        super().__init__()
+        self.feature_extract = feature_extract
+        self.criterion = nn.CrossEntropyLoss()
+
+        self.model = models.resnet18(pretrained=use_pretrained)
+        self.set_parameter_requires_grad()
+
+        num_ftrs = self.model.fc.in_features
+        self.model.fc = nn.Linear(num_ftrs, num_classes)
+
+        self.input_size = 224
+
+    def forward(self, x):
+        x = self.model(x)
+        return x
+
+    def configure_optimizers(self):
+        print("Params to learn:")
+        if self.feature_extract:
+            params_to_update = []
+            for name, param in self.model.named_parameters():
+                if param.requires_grad == True:
+                    params_to_update.append(param)
+                    print("\t",name)
+        else:
+            params_to_update = self.model.parameters()
+            for name,param in model_ft.named_parameters():
+                if param.requires_grad == True:
+                    print("\t",name)
+
+        optimizer = optim.Adam(params_to_update, lr=0.0001, betas=(0.9, 0.999), eps=1e-08, weight_decay=0)
+        return optimizer
+
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+        y_hat = self(x)
+        loss = self.criterion(y_hat, y)
+        result = pl.TrainResult(loss)
+        result.log('train_loss', loss)
+        
+        
+        y_pred = F.softmax(y_hat, dim=0)[:, 1]
+
+        result.y = y
+        result.y_pred = y_pred
+
+        return result
+
+    def training_epoch_end(self, outputs):
+        y = outputs.y
+        y_pred = outputs.y_pred
+
+        roc_auc_fn = pl.metrics.classification.AUROC()
+        roc_auc = roc_auc_fn(y_pred, y)
+
+        result = pl.TrainResult()
+        result.log('train_roc_auc', roc_auc)
+
+        return result
+
+    def validation_step(self, batch, batch_idx):
+        x, y = batch
+        y_hat = self(x)
+        loss = self.criterion(y_hat, y)
+        result = pl.EvalResult(checkpoint_on=loss)
+        result.log('val_loss', loss)
+
+        y_pred = F.softmax(y_hat, dim=0)[:, 1]
+
+        result.y = y
+        result.y_pred = y_pred
+
+        return result
+
+    def validation_epoch_end(self, outputs):
+        y = outputs.y
+        y_pred = outputs.y_pred
+
+        roc_auc_fn = pl.metrics.classification.AUROC()
+        roc_auc = roc_auc_fn(y_pred, y)
+
+        result = pl.EvalResult(checkpoint_on=roc_auc)
+        result.log('val_roc_auc', roc_auc)
+
+        return result
+&lt;denchmark-h:h3&gt;Expected behavior&lt;/denchmark-h&gt;
+
+I would expect the behavior in both to be quite similar, in particular, if both *_epoch_end methods have the same signatures. The current docs do not mention how both methods differ so I interpreted you could do the same.
+&lt;denchmark-h:h3&gt;Environment&lt;/denchmark-h&gt;
+
+pytorch lightning on colab, installed wit
+pytroch lightning version 0.9.0
+Please copy and paste the output from our
+&lt;denchmark-link:https://raw.githubusercontent.com/PyTorchLightning/pytorch-lightning/master/tests/collect_env_details.py&gt;environment collection script&lt;/denchmark-link&gt;
+
+(or fill out the checklist below manually).
+You can get the script and run it with:
+
+PyTorch Version (e.g., 1.0):1.6.0+cu101
+OS (e.g., Linux): colab
+
+	</description>
+	<comments>
+		<comment id='1' author='astenuz' date='2020-09-05T01:05:55Z'>
+		Hi! thanks for your contribution!, great first issue!
+		</comment>
+		<comment id='2' author='astenuz' date='2020-09-08T15:48:08Z'>
+		&lt;denchmark-link:https://github.com/williamFalcon&gt;@williamFalcon&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='3' author='astenuz' date='2020-09-16T06:15:39Z'>
+		It's seems impossible to compute roc_auc in every epoch end when using new Result class.... I quit...
+		</comment>
+		<comment id='4' author='astenuz' date='2020-09-17T16:28:52Z'>
+		Hi there! We are currently working on a fix to epoch-level metrics with the Results object. We realize that the method outlined in the documentation does not actually work.
+In the mean time I would recommend using the old dictionary-based approach, which shouldn't lead to any issues
+		</comment>
+		<comment id='5' author='astenuz' date='2020-09-17T18:23:36Z'>
+		&lt;denchmark-link:https://github.com/NickYi1990&gt;@NickYi1990&lt;/denchmark-link&gt;
+ for training i ended up using the  flag for the AUC  in the training_step. Sometimes it had some issues because the AUC can not be calculated when all datapoints in the minibatch have the same class, So I had to increase batch size a bit.
+		</comment>
+		<comment id='6' author='astenuz' date='2020-10-05T15:15:25Z'>
+		fixed on master! please switch to the new API which decouples data from logging.
+		</comment>
+	</comments>
+</bug>

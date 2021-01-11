@@ -1,0 +1,336 @@
+<bug id='35942' author='MariaHeuss' open_date='2020-01-16T14:10:56Z' closed_time='2020-06-27T12:26:06Z'>
+	<summary>Loading model with tf.keras.models.load_model not working on multi GPU</summary>
+	<description>
+System information
+
+Custom code
+TensorFlow version 2.1.0
+Python version: 3.7
+GPU model: 4 V100 GPUs on Kubernetes Engine
+
+Describe the current behavior
+On multi GPU loading the model from a h5 file is not working.
+Describe the expected behavior
+Saving and reloading the model from a h5 file using model.save and  keras.models.load_model should work on both single and multi GPU.
+Code to reproduce the issue
+import tensorflow as tf 
+import os
+import contextlib
+import numpy as np
+import tensorflow.keras as keras  
+
+def get_model():
+    model = keras.Sequential([
+        keras.layers.Flatten(input_shape=(28, 28)),
+        keras.layers.Dense(10, activation=tf.nn.softmax)
+    ])
+    model.compile(optimizer=tf.keras.optimizers.Adam(),
+                      loss='sparse_categorical_crossentropy')
+    return model
+
+def get_model_path():
+    model_dir = '/tmp/m' + str(np.random.randint(0, 1000000))
+    os.makedirs(model_dir)
+    model_path = os.path.join(model_dir, 'model')
+    return model_path + ".h5"
+
+def attempt_save_and_reload(model_path, distributed_training=False):
+    fashion_mnist = keras.datasets.fashion_mnist
+    (train_images, train_labels), (test_images, test_labels) = fashion_mnist.load_data()
+    train_images = train_images / 255.0
+    test_images = test_images / 255.0
+
+    with strategy.scope() if distributed_training else contextlib.nullcontext():
+        model = get_model()
+        model.fit(
+            train_images,
+            train_labels,
+            epochs=1,
+        )
+        model.save(model_path)
+        model = tf.keras.models.load_model(model_path)
+
+if __name__ == '__main__':
+    strategy = tf.distribute.MirroredStrategy()
+    for distributed_training in [False, True]:
+        print('distributed training: ', distributed_training)
+        model_path = get_model_path()
+        try:
+            attempt_save_and_reload(model_path, distributed_training)
+        except Exception as e:
+            print('Exception raised: \n', e)
+        print()
+
+I need to use h5 files since saving the optimizer state does not work otherwise (see &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/33424&gt;#33424&lt;/denchmark-link&gt;
+).  The logs I get are:
+&lt;denchmark-code&gt;INFO:tensorflow:Using MirroredStrategy with devices ('/job:localhost/replica:0/task:0/device:GPU:0', '/job:localhost/replica:0/task:0/device:GPU:1', '/job:localhost/replica:0/task:0/device:GPU:2', '/job:localhost/replica:0/task:0/device:GPU:3')
+distributed training:  False
+Train on 60000 samples
+60000/60000 [==============================] - 3s 52us/sample - loss: 0.5991
+
+distributed training:  True
+Train on 60000 samples
+INFO:tensorflow:batch_all_reduce: 2 all-reduces with algorithm = nccl, num_packs = 1, agg_small_grads_max_bytes = 0 and agg_small_grads_max_group = 10
+INFO:tensorflow:Reduce to /job:localhost/replica:0/task:0/device:CPU:0 then broadcast to ('/job:localhost/replica:0/task:0/device:CPU:0',).
+INFO:tensorflow:Reduce to /job:localhost/replica:0/task:0/device:CPU:0 then broadcast to ('/job:localhost/replica:0/task:0/device:CPU:0',).
+INFO:tensorflow:batch_all_reduce: 2 all-reduces with algorithm = nccl, num_packs = 1, agg_small_grads_max_bytes = 0 and agg_small_grads_max_group = 10
+INFO:tensorflow:Reduce to /job:localhost/replica:0/task:0/device:CPU:0 then broadcast to ('/job:localhost/replica:0/task:0/device:CPU:0',).
+INFO:tensorflow:Reduce to /job:localhost/replica:0/task:0/device:CPU:0 then broadcast to ('/job:localhost/replica:0/task:0/device:CPU:0',).
+60000/60000 [==============================] - 9s 152us/sample - loss: 0.6016
+Exception raised: 
+ `handle` is not available outside the replica context or a `tf.distribute.Strategy.update()` call.
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='MariaHeuss' date='2020-01-20T22:04:46Z'>
+		&lt;denchmark-link:https://github.com/ravikyram&gt;@ravikyram&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/ymodak&gt;@ymodak&lt;/denchmark-link&gt;
+ The failure can also be observed in this &lt;denchmark-link:https://colab.research.google.com/drive/1nXw4V5LwtxrVNB8XlJ5TaOxbAOXRS1O3&gt;colab notebook&lt;/denchmark-link&gt;
+.
+		</comment>
+		<comment id='2' author='MariaHeuss' date='2020-01-22T22:27:14Z'>
+		The loading works if one saves and loads the model outside the distribution scope (i.e outside the with strategy.scope() block). Looks like one is not allowed to save or load models when in a cross device context. Is it safe to assume that from tf 2.1+ one can save and load keras models only outside the distribution scope?
+		</comment>
+		<comment id='3' author='MariaHeuss' date='2020-01-23T12:07:46Z'>
+		&lt;denchmark-link:https://github.com/pidajay&gt;@pidajay&lt;/denchmark-link&gt;
+ How would you fit the reloaded model using multiple GPUs then? Could you provide a code example?
+		</comment>
+		<comment id='4' author='MariaHeuss' date='2020-01-24T02:09:17Z'>
+		Loading and saving keras models inside a distribution strategy scope as TF SavedModel / Checkpoint format is supported and should work as expected. However loading .h5 format model inside a strategy scope is not yet supported.
+However as mentioned in one of the early thread (&lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/33424&gt;#33424&lt;/denchmark-link&gt;
+), loading a SavedModel / Checkpoint doesn't restore the optimizer state. Before the issue is fixed, only model weights will be carried over and the training won't be resumed exactly where you left off.
+		</comment>
+		<comment id='5' author='MariaHeuss' date='2020-03-12T06:04:38Z'>
+		This appears not to work across different distribution strategies. I saved a model under a tpu distribution strategy and tried to load it with just cpu and it didn't work, producing the following error below. The model was saved with tf version 2.2.0-dev20200309 (in 2.1 save_model with a tpu distribution strategy didn't work) and tried to load with tf version 2.1.0-rc0.
+&lt;denchmark-code&gt;/opt/conda/lib/python3.6/site-packages/tensorflow_core/python/keras/engine/input_layer.py in __init__(self, input_shape, batch_size, dtype, input_tensor, sparse, name, ragged, **kwargs)
+     84                          'batch_input_shape argument to '
+     85                          'InputLayer, not both at the same time.')
+---&gt; 86       batch_size = batch_input_shape[0]
+     87       input_shape = batch_input_shape[1:]
+     88     if kwargs:
+
+KeyError: 0
+&lt;/denchmark-code&gt;
+
+Also loading weights appears not to work between the two environments.
+&lt;denchmark-code&gt;/opt/conda/lib/python3.6/site-packages/tensorflow_core/python/keras/engine/training.py in load_weights(self, filepath, by_name, skip_mismatch)
+    232         raise ValueError('Load weights is not yet supported with TPUStrategy '
+    233                          'with steps_per_run greater than 1.')
+--&gt; 234     return super(Model, self).load_weights(filepath, by_name, skip_mismatch)
+
+...
+
+/opt/conda/lib/python3.6/site-packages/tensorflow_core/python/framework/tensor_shape.py in assert_is_compatible_with(self, other)
+   1108     """
+   1109     if not self.is_compatible_with(other):
+-&gt; 1110       raise ValueError("Shapes %s and %s are incompatible" % (self, other))
+   1111 
+   1112   def most_specific_compatible_shape(self, other):
+
+ValueError: Shapes (512,) and (1,) are incompatible
+&lt;/denchmark-code&gt;
+
+It looks like the number of layers is different between the two environments.
+The  net of this is that there is no way to restore a saved model or checkpoints from 2.2.0-dev20200309 on tpu to 2.1 on cpu.
+The model did load with tf.saved_model.load but it didn't work for inference, producing the following error. I tried loading the model under strategy.scope() to no avail.
+&lt;denchmark-code&gt;InvalidArgumentError: Cannot assign a device for operation ... was explicitly assigned to /job:worker/replica:0/task:0/device:CPU:0 but available devices are [ /job:localhost/replica:0/task:0/device:CPU:0, /job:localhost/replica:0/task:0/device:XLA_CPU:0 ]. Make sure the device specification refers to a valid device.
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='6' author='MariaHeuss' date='2020-03-21T15:46:50Z'>
+		training on tpu with 2.2.0-dev20200311 and loading under strategy.scope() on a different machine with gpu only runs on the cpu.
+tried strategy = tf.distribute.OneDeviceStrategy('gpu:0') to no avail.
+tried loading with tf.saved_model.load and inferencing with model.signatures['serving_default'] and got the following error.
+&lt;denchmark-code&gt;InvalidArgumentError: Cannot assign a device for operation StatefulPartitionedCall/sequential_6/efficientnet-b0/stem_bn/FusedBatchNormV3/AddN: {{node StatefulPartitionedCall/sequential_6/efficientnet-b0/stem_bn/FusedBatchNormV3/AddN}} was explicitly assigned to /job:worker/replica:0/task:0/device:CPU:0 but available devices are [ /job:localhost/replica:0/task:0/device:CPU:0, /job:localhost/replica:0/task:0/device:XLA_CPU:0 ]. Make sure the device specification refers to a valid device.
+	 [[StatefulPartitionedCall/sequential_6/efficientnet-b0/stem_bn/FusedBatchNormV3/AddN]] [Op:__inference_signature_wrapper_313855]
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='7' author='MariaHeuss' date='2020-03-21T16:40:53Z'>
+		tried loading the model from tf.keras.models.model_from_json and got the following error:
+&lt;denchmark-code&gt;---------------------------------------------------------------------------
+ValueError                                Traceback (most recent call last)
+&lt;ipython-input-8-72d87b8e325d&gt; in &lt;module&gt;
+      2     model_config = json.load(json_file)
+      3 
+----&gt; 4 model = tf.keras.models.model_from_json(model_config)
+
+~/anaconda3/lib/python3.7/site-packages/tensorflow/python/keras/saving/model_config.py in model_from_json(json_string, custom_objects)
+    114   config = json.loads(json_string)
+    115   from tensorflow.python.keras.layers import deserialize  # pylint: disable=g-import-not-at-top
+--&gt; 116   return deserialize(config, custom_objects=custom_objects)
+
+~/anaconda3/lib/python3.7/site-packages/tensorflow/python/keras/layers/serialization.py in deserialize(config, custom_objects)
+    107       module_objects=globs,
+    108       custom_objects=custom_objects,
+--&gt; 109       printable_module_name='layer')
+
+~/anaconda3/lib/python3.7/site-packages/tensorflow/python/keras/utils/generic_utils.py in deserialize_keras_object(identifier, module_objects, custom_objects, printable_module_name)
+    371             custom_objects=dict(
+    372                 list(_GLOBAL_CUSTOM_OBJECTS.items()) +
+--&gt; 373                 list(custom_objects.items())))
+    374       with CustomObjectScope(custom_objects):
+    375         return cls.from_config(cls_config)
+
+~/anaconda3/lib/python3.7/site-packages/tensorflow/python/keras/engine/sequential.py in from_config(cls, config, custom_objects)
+    398     for layer_config in layer_configs:
+    399       layer = layer_module.deserialize(layer_config,
+--&gt; 400                                        custom_objects=custom_objects)
+    401       model.add(layer)
+    402     if (not model.inputs and build_input_shape and
+
+~/anaconda3/lib/python3.7/site-packages/tensorflow/python/keras/layers/serialization.py in deserialize(config, custom_objects)
+    107       module_objects=globs,
+    108       custom_objects=custom_objects,
+--&gt; 109       printable_module_name='layer')
+
+~/anaconda3/lib/python3.7/site-packages/tensorflow/python/keras/utils/generic_utils.py in deserialize_keras_object(identifier, module_objects, custom_objects, printable_module_name)
+    371             custom_objects=dict(
+    372                 list(_GLOBAL_CUSTOM_OBJECTS.items()) +
+--&gt; 373                 list(custom_objects.items())))
+    374       with CustomObjectScope(custom_objects):
+    375         return cls.from_config(cls_config)
+
+~/anaconda3/lib/python3.7/site-packages/tensorflow/python/keras/engine/network.py in from_config(cls, config, custom_objects)
+    980     """
+    981     input_tensors, output_tensors, created_layers = reconstruct_from_config(
+--&gt; 982         config, custom_objects)
+    983     model = cls(inputs=input_tensors, outputs=output_tensors,
+    984                 name=config.get('name'))
+
+~/anaconda3/lib/python3.7/site-packages/tensorflow/python/keras/engine/network.py in reconstruct_from_config(config, custom_objects, created_layers)
+   2012   # First, we create all layers and enqueue nodes to be processed
+   2013   for layer_data in config['layers']:
+-&gt; 2014     process_layer(layer_data)
+   2015   # Then we process nodes in order of layer depth.
+   2016   # Nodes that cannot yet be processed (if the inbound node
+
+~/anaconda3/lib/python3.7/site-packages/tensorflow/python/keras/engine/network.py in process_layer(layer_data)
+   1994       from tensorflow.python.keras.layers import deserialize as deserialize_layer  # pylint: disable=g-import-not-at-top
+   1995 
+-&gt; 1996       layer = deserialize_layer(layer_data, custom_objects=custom_objects)
+   1997       created_layers[layer_name] = layer
+   1998 
+
+~/anaconda3/lib/python3.7/site-packages/tensorflow/python/keras/layers/serialization.py in deserialize(config, custom_objects)
+    107       module_objects=globs,
+    108       custom_objects=custom_objects,
+--&gt; 109       printable_module_name='layer')
+
+~/anaconda3/lib/python3.7/site-packages/tensorflow/python/keras/utils/generic_utils.py in deserialize_keras_object(identifier, module_objects, custom_objects, printable_module_name)
+    360     config = identifier
+    361     (cls, cls_config) = class_and_config_for_serialized_keras_object(
+--&gt; 362         config, module_objects, custom_objects, printable_module_name)
+    363 
+    364     if hasattr(cls, 'from_config'):
+
+~/anaconda3/lib/python3.7/site-packages/tensorflow/python/keras/utils/generic_utils.py in class_and_config_for_serialized_keras_object(config, module_objects, custom_objects, printable_module_name)
+    319   cls = get_registered_object(class_name, custom_objects, module_objects)
+    320   if cls is None:
+--&gt; 321     raise ValueError('Unknown ' + printable_module_name + ': ' + class_name)
+    322 
+    323   cls_config = config['config']
+
+ValueError: Unknown layer: FixedDropout
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='8' author='MariaHeuss' date='2020-04-09T12:59:28Z'>
+		Hello All,
+Same issue using Colab (TF 2.2 RC2).
+My test-model run and then it was saved without implementing TPU or GPU.  I wanted to test the behaviour. Now loading it, I have:
+&lt;denchmark-code&gt;new_model = tf.keras.models.load_model('model.h5')
+new_model.summary()
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-code&gt;    319   cls = get_registered_object(class_name, custom_objects, module_objects)
+    320   if cls is None:
+--&gt; 321     raise ValueError('Unknown ' + printable_module_name + ': ' + class_name)
+    322 
+    323   cls_config = config['config']
+
+ValueError: Unknown layer: FixedDropout
+
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='9' author='MariaHeuss' date='2020-04-16T21:34:22Z'>
+		&lt;denchmark-link:https://github.com/CalebEverett&gt;@CalebEverett&lt;/denchmark-link&gt;
+ For saving and loading across different strategies, can you try it in tf 2.2? It might haven been fixed. BTW when using load_weights / checkpoint.restore, if the model that you are restoring into was created in a scope (potentially different than the save scope) then you need to call restore within that scope.
+		</comment>
+		<comment id='10' author='MariaHeuss' date='2020-04-16T21:35:13Z'>
+		&lt;denchmark-link:https://github.com/murdav&gt;@murdav&lt;/denchmark-link&gt;
+ can you post the colab link that leads to this error?
+		</comment>
+		<comment id='11' author='MariaHeuss' date='2020-04-18T07:07:32Z'>
+		&lt;denchmark-link:https://github.com/ckkuang&gt;@ckkuang&lt;/denchmark-link&gt;
+ sorry for later reply. It was my fault. Basically I'm using &lt;denchmark-link:https://github.com/qubvel/efficientnet&gt;https://github.com/qubvel/efficientnet&lt;/denchmark-link&gt;
+ and I have to import the  like:
+&lt;denchmark-code&gt;import efficientnet.tfkeras
+from tensorflow.keras.models import load_model
+
+model = load_model('path/to/model.h5')
+&lt;/denchmark-code&gt;
+
+Otherwise and logically I have ValueError: Unknown layer: FixedDropout.
+Davide
+		</comment>
+		<comment id='12' author='MariaHeuss' date='2020-05-04T22:49:18Z'>
+		Having the same issue as CalebEverett
+It seems to be that loading expects the input shape to be a list and it is a tupel?
+		</comment>
+		<comment id='13' author='MariaHeuss' date='2020-06-08T22:55:02Z'>
+		&lt;denchmark-link:https://github.com/MariaHeuss&gt;@MariaHeuss&lt;/denchmark-link&gt;
+ This is fixed with TensorFlow 2.2 Thanks!
+Rest of the users - Can you please post a new github issue explaining your problem.
+We would like to keep each issue thread specific to one problem. Thank you!
+		</comment>
+		<comment id='14' author='MariaHeuss' date='2020-06-15T23:09:17Z'>
+		This issue has been automatically marked as stale because it has not had recent activity. It will be closed if no further activity occurs. Thank you.
+		</comment>
+		<comment id='15' author='MariaHeuss' date='2020-06-20T11:33:43Z'>
+		&lt;!--
+/* Font Definitions */
+&lt;denchmark-link:https://github.com/font-face&gt;@font-face&lt;/denchmark-link&gt;
+
+	{font-family:"Cambria Math";
+	panose-1:2 4 5 3 5 4 6 3 2 4;}
+&lt;denchmark-link:https://github.com/font-face&gt;@font-face&lt;/denchmark-link&gt;
+
+	{font-family:Calibri;
+	panose-1:2 15 5 2 2 2 4 3 2 4;}
+/* Style Definitions */
+p.MsoNormal, li.MsoNormal, div.MsoNormal
+	{margin:0cm;
+	margin-bottom:.0001pt;
+	font-size:11.0pt;
+	font-family:"Calibri",sans-serif;}
+a:link, span.MsoHyperlink
+	{mso-style-priority:99;
+	color:blue;
+	text-decoration:underline;}
+.MsoChpDefault
+	{mso-style-type:export-only;}
+&lt;denchmark-link:https://github.com/page&gt;@page&lt;/denchmark-link&gt;
+ WordSection1
+	{size:612.0pt 792.0pt;
+	margin:72.0pt 72.0pt 72.0pt 72.0pt;}
+div.WordSection1
+	{page:WordSection1;}
+--&gt;    From: Chenkai KuangSent: jeudi 16 avril 2020 23:34To: tensorflow/tensorflowCc: Eric Fournié; ManualSubject: Re: [tensorflow/tensorflow] Loading model with tf.keras.models.load_model not working on multi GPU (&lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/35942&gt;#35942&lt;/denchmark-link&gt;
+) &lt;denchmark-link:https://github.com/CalebEverett&gt;@CalebEverett&lt;/denchmark-link&gt;
+ For saving and loading across different strategies, can you try it in tf 2.2? It might haven been fixed. BTW when using load_weights / checkpoint.restore, if the model that you are restoring into was created in a scope (potentially different than the save scope) then you need to call restore within that scope.—You are receiving this because you are subscribed to this thread.Reply to this email directly, view it on GitHub, or unsubscribe. 
+		</comment>
+		<comment id='16' author='MariaHeuss' date='2020-06-27T12:26:05Z'>
+		Closing as stale. Please reopen if you'd like to work on this further.
+		</comment>
+		<comment id='17' author='MariaHeuss' date='2020-06-27T12:26:07Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/35942&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/35942&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

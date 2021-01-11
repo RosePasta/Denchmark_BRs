@@ -1,0 +1,436 @@
+<bug id='30918' author='jordanparker6' open_date='2019-07-22T07:03:36Z' closed_time='2020-06-10T08:09:06Z'>
+	<summary>Keras fails to initiate training with custom BERT layer.</summary>
+	<description>
+System information
+
+Have I manipulated custom code in attempt to build a Keras layer for BERT. Following this example: https://towardsdatascience.com/bert-in-keras-with-tensorflow-hub-76bcbc9417b
+Windows 10:
+TensorFlow installed from (source or binary):
+TensorFlow version: 1.14
+Python version: 3.7
+CUDA/cuDNN version: CUDA 10
+GPU model and memory:  NVIDIA GTX1080ti
+
+Describe the current behavior
+The training data is pre-processed and loaded into memory. The model is compiled and the correct model output is produced with model.summary(). See logs bellow...
+On model.fit(), nothing happens... The GPU is at 3% utilization and one CPU core is at 100%.
+Describe the expected behavior
+I was expecting the keras training logging to be printed post model.fit(). It doesn't appear to be training at all.
+Code to reproduce the issue
+Custom Code:
+&lt;denchmark-code&gt;import tensorflow as tf
+from sklearn.preprocessing import OneHotEncoder
+import matplotlib.pyplot as plt
+import numpy as np
+from tensorflow.keras import backend as K
+import sys
+
+from BertLayer import BertLayer
+from preprocessing import MyDocs
+
+sess = tf.Session()
+
+def build_model(bert_path, max_seq_length):
+    in_id = tf.keras.layers.Input(shape=(max_seq_length,), name="input_ids")
+    in_mask = tf.keras.layers.Input(shape=(max_seq_length,), name="input_masks")
+    in_segment = tf.keras.layers.Input(shape=(max_seq_length,), name="segment_ids")
+    bert_inputs = [in_id, in_mask, in_segment]
+
+    bert_output = BertLayer(n_fine_tune_layers=3, bert_path=bert_path, pooling="first")(bert_inputs)
+    dense = tf.keras.layers.Dense(256, activation="relu")(bert_output)
+    pred = tf.keras.layers.Dense(5, activation="sigmoid")(dense)  # change this to build classifier
+
+    model = tf.keras.models.Model(inputs=bert_inputs, outputs=pred)
+    model.compile(loss="binary_crossentropy", optimizer="adam",  metrics=['binary_accuracy', 'categorical_accuracy'])
+    model.summary()
+
+    return model
+
+
+def initialize_vars(sess):
+    sess.run(tf.compat.v1.local_variables_initializer())
+    sess.run(tf.compat.v1.global_variables_initializer())
+    sess.run(tf.compat.v1.tables_initializer())
+    K.set_session(sess)
+
+def main():
+    # Params for bert model and tokenization
+    bert_path = "https://tfhub.dev/google/bert_uncased_L-12_H-768_A-12/1"
+    max_seq_length = 256
+
+    corpus = MyDocs("datasets/bbc/raw", bert_path, max_seq_length)
+
+    ids = []
+    masks = []
+    segment_ids = []
+    for id, mask, segment, label in corpus:
+        ids.append(id)
+        masks.append(masks)
+        segment_ids.append(segment)
+    X = [ids, masks, segment_ids]
+
+    labels = corpus.labels
+    label_encoder = OneHotEncoder()
+    y = label_encoder.fit_transform(np.array(labels).reshape(-1, 1)).todense()
+    print('Dimension of labels input is {}.'.format(y.shape))
+
+    print('Building model...')
+    model = build_model(bert_path, max_seq_length)
+
+    print('Training model...')
+    history = model.fit(X, y,
+                        validation_split=0.2,
+                        epochs=1,
+                        batch_size=1,
+                        verbose=2,
+                        use_multiprocessing=True)
+
+if __name__ == "__main__":
+    main()
+&lt;/denchmark-code&gt;
+
+BertLayer
+&lt;denchmark-code&gt;import tensorflow as tf
+from tensorflow.keras import backend as K
+import tensorflow_hub as hub
+
+class BertLayer(tf.keras.layers.Layer):
+    def __init__(
+        self,
+        n_fine_tune_layers=10,
+        pooling="mean",
+        bert_path="https://tfhub.dev/google/bert_uncased_L-12_H-768_A-12/1",
+        **kwargs,
+    ):
+        self.n_fine_tune_layers = n_fine_tune_layers
+        self.trainable = True
+        self.output_size = 768
+        self.pooling = pooling
+        self.bert_path = bert_path
+
+        if self.pooling not in ["first", "mean"]:
+            raise NameError(
+                f"Undefined pooling type (must be either first or mean, but is {self.pooling}"
+                )
+
+        super(BertLayer, self).__init__(**kwargs)
+
+    def build(self, input_shape):
+        self.bert = hub.Module(
+            self.bert_path, trainable=self.trainable, name=f"{self.name}_module"
+        )
+
+        # Remove unused layers
+        trainable_vars = self.bert.variables
+        if self.pooling == "first":
+            trainable_vars = [var for var in trainable_vars if not "/cls/" in var.name]
+            trainable_layers = ["pooler/dense"]
+
+        elif self.pooling == "mean":
+            trainable_vars = [
+                var
+                for var in trainable_vars
+                if not "/cls/" in var.name and not "/pooler/" in var.name
+            ]
+            trainable_layers = []
+        else:
+            raise NameError(
+                f"Undefined pooling type (must be either first or mean, but is {self.pooling}"
+            )
+
+        # Select how many layers to fine tune
+        for i in range(self.n_fine_tune_layers):
+            trainable_layers.append(f"encoder/layer_{str(11 - i)}")
+
+        # Update trainable vars to contain only the specified layers
+        trainable_vars = [
+            var
+            for var in trainable_vars
+            if any([l in var.name for l in trainable_layers])
+        ]
+
+        # Add to trainable weights
+        for var in trainable_vars:
+            self._trainable_weights.append(var)
+
+        for var in self.bert.variables:
+            if var not in self._trainable_weights:
+                self._non_trainable_weights.append(var)
+
+        super(BertLayer, self).build(input_shape)
+
+    def call(self, inputs):
+        inputs = [K.cast(x, dtype="int32") for x in inputs]
+        input_ids, input_mask, segment_ids = inputs
+        bert_inputs = dict(
+            input_ids=input_ids, input_mask=input_mask, segment_ids=segment_ids
+        )
+        if self.pooling == "first":
+            # pooled output of the entire sequence [batch, hidden_size]
+            pooled = self.bert(inputs=bert_inputs, signature="tokens", as_dict=True)["pooled_output"]
+        elif self.pooling == "mean":
+            # representation of every token in the sequence [batch, max_seq_length, hidden_size]
+            result = self.bert(inputs=bert_inputs, signature="tokens", as_dict=True)["sequence_output"]
+
+            mul_mask = lambda x, m: x * tf.expand_dims(m, axis=-1)
+            masked_reduce_mean = lambda x, m: tf.reduce_sum(mul_mask(x, m), axis=1) / (
+                    tf.reduce_sum(m, axis=1, keepdims=True) + 1e-10)
+            input_mask = tf.cast(input_mask, tf.float32)
+            pooled = masked_reduce_mean(result, input_mask)
+        else:
+            raise NameError(f"Undefined pooling type (must be either first or mean, but is {self.pooling}")
+
+        return pooled
+
+    def compute_output_shape(self, input_shape):
+        return (input_shape[0], self.output_size)
+&lt;/denchmark-code&gt;
+
+Other info / logs
+model.summary()
+&lt;denchmark-code&gt;__________________________________________________________________________________________________
+Layer (type)                    Output Shape         Param #     Connected to                     
+==================================================================================================
+input_ids (InputLayer)          [(None, 256)]        0                                            
+__________________________________________________________________________________________________
+input_masks (InputLayer)        [(None, 256)]        0                                            
+__________________________________________________________________________________________________
+segment_ids (InputLayer)        [(None, 256)]        0                                            
+__________________________________________________________________________________________________
+bert_layer (BertLayer)          (None, 768)          110104890   input_ids[0][0]                  
+                                                                 input_masks[0][0]                
+                                                                 segment_ids[0][0]                
+__________________________________________________________________________________________________
+dense (Dense)                   (None, 256)          196864      bert_layer[0][0]                 
+__________________________________________________________________________________________________
+dense_1 (Dense)                 (None, 5)            1285        dense[0][0]                      
+==================================================================================================
+Total params: 110,303,039
+Trainable params: 22,052,357
+Non-trainable params: 88,250,682
+__________________________________________________________________________________________________
+&lt;/denchmark-code&gt;
+
+Other logs:
+&lt;denchmark-code&gt;WARNING: Logging before flag parsing goes to stderr.
+W0722 16:38:28.879759 14352 deprecation_wrapper.py:119] From C:\Users\jorda\OneDrive\Documents\Programs\aria_projects\document_classifier\BERT\venv\preprocessing.py:7: The name tf.Session is deprecated. Please use tf.compat.v1.Session instead.
+
+2019-07-22 16:38:28.917117: I tensorflow/stream_executor/platform/default/dso_loader.cc:42] Successfully opened dynamic library nvcuda.dll
+2019-07-22 16:38:29.034609: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1640] Found device 0 with properties: 
+name: GeForce GTX 1080 Ti major: 6 minor: 1 memoryClockRate(GHz): 1.6325
+pciBusID: 0000:08:00.0
+2019-07-22 16:38:29.034810: I tensorflow/stream_executor/platform/default/dlopen_checker_stub.cc:25] GPU libraries are statically linked, skip dlopen check.
+2019-07-22 16:38:29.035881: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1763] Adding visible gpu devices: 0
+2019-07-22 16:38:29.041192: I tensorflow/core/platform/cpu_feature_guard.cc:142] Your CPU supports instructions that this TensorFlow binary was not compiled to use: AVX2
+2019-07-22 16:38:29.044644: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1640] Found device 0 with properties: 
+name: GeForce GTX 1080 Ti major: 6 minor: 1 memoryClockRate(GHz): 1.6325
+pciBusID: 0000:08:00.0
+2019-07-22 16:38:29.044900: I tensorflow/stream_executor/platform/default/dlopen_checker_stub.cc:25] GPU libraries are statically linked, skip dlopen check.
+2019-07-22 16:38:29.045354: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1763] Adding visible gpu devices: 0
+2019-07-22 16:38:30.462499: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1181] Device interconnect StreamExecutor with strength 1 edge matrix:
+2019-07-22 16:38:30.462613: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1187]      0 
+2019-07-22 16:38:30.462745: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1200] 0:   N 
+2019-07-22 16:38:30.464681: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1326] Created TensorFlow device (/job:localhost/replica:0/task:0/device:GPU:0 with 8788 MB memory) -&gt; physical GPU (device: 0, name: GeForce GTX 1080 Ti, pci bus id: 0000:08:00.0, compute capability: 6.1)
+2019-07-22 16:38:30.470977: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1640] Found device 0 with properties: 
+name: GeForce GTX 1080 Ti major: 6 minor: 1 memoryClockRate(GHz): 1.6325
+pciBusID: 0000:08:00.0
+2019-07-22 16:38:30.471127: I tensorflow/stream_executor/platform/default/dlopen_checker_stub.cc:25] GPU libraries are statically linked, skip dlopen check.
+Building docs...
+2019-07-22 16:38:30.471801: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1763] Adding visible gpu devices: 0
+2019-07-22 16:38:30.471966: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1181] Device interconnect StreamExecutor with strength 1 edge matrix:
+2019-07-22 16:38:30.472067: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1187]      0 
+2019-07-22 16:38:30.472126: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1200] 0:   N 
+2019-07-22 16:38:30.472605: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1326] Created TensorFlow device (/job:localhost/replica:0/task:0/device:GPU:0 with 8788 MB memory) -&gt; physical GPU (device: 0, name: GeForce GTX 1080 Ti, pci bus id: 0000:08:00.0, compute capability: 6.1)
+W0722 16:38:34.138283 14352 deprecation_wrapper.py:119] From C:\Users\jorda\OneDrive\Documents\Programs\aria_projects\document_classifier\BERT\venv\bert\tokenization.py:125: The name tf.gfile.GFile is deprecated. Please use tf.io.gfile.GFile instead.
+
+Dimension of labels input is (2225, 5).
+Building model...
+W0722 16:39:05.050155 14352 deprecation.py:506] From C:\Program Files\Python37\lib\site-packages\tensorflow\python\ops\init_ops.py:1251: calling VarianceScaling.__init__ (from tensorflow.python.ops.init_ops) with dtype is deprecated and will be removed in a future version.
+Instructions for updating:
+Call initializer instance with the dtype argument instead of passing it to the constructor
+W0722 16:39:05.109156 14352 deprecation.py:323] From C:\Program Files\Python37\lib\site-packages\tensorflow\python\ops\nn_impl.py:180: add_dispatch_support.&lt;locals&gt;.wrapper (from tensorflow.python.ops.array_ops) is deprecated and will be removed in a future version.
+Instructions for updating:
+Use tf.where in 2.0, which has the same broadcast rule as np.where
+Model: "model"
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='jordanparker6' date='2019-07-22T14:40:06Z'>
+		How long did you wait for?
+In the background (it is not printed to console) the weights for the TF Hub module will have to be downloaded (500MB for BERTBASE, 1GB for BERTLARGE), and then the BERT layer instantiated. This does take a fair amount of time for the download, and then to build the graph.
+Also, note that in the medium post they made a few mistakes e.g. the way they implemented fine_tune_layers is completely wrong.
+I have a much improved version in this Colab notebook:
+&lt;denchmark-link:https://colab.research.google.com/github/NVAITC/examples/blob/master/keras_bert_amp.ipynb&gt;https://colab.research.google.com/github/NVAITC/examples/blob/master/keras_bert_amp.ipynb&lt;/denchmark-link&gt;
+
+You are free to take this and use it.
+		</comment>
+		<comment id='2' author='jordanparker6' date='2019-07-26T03:11:28Z'>
+		
+How long did you wait for?
+
+I waited for about 48 hours...
+
+I have a much improved version in this Colab notebook:
+
+I will have a look and implement this version and post back my findings.
+
+You are free to take this and use it.
+
+You rock! Thanks.
+		</comment>
+		<comment id='3' author='jordanparker6' date='2019-07-29T04:56:59Z'>
+		&lt;denchmark-link:https://github.com/tlkh&gt;@tlkh&lt;/denchmark-link&gt;
+
+
+In the background (it is not printed to console) the weights for the TF Hub module will have to be downloaded (500MB for BERTBASE, 1GB for BERTLARGE), and then the BERT layer instantiated. This does take a fair amount of time for the download, and then to build the graph.
+
+I have taken the BERT class from your script and adjusted my code to fit; however, I am still getting the same issue. Training fails to start. I waited 6 hours. Network i/o was not evidencing any download either.
+** main.py **
+&lt;denchmark-code&gt;def build_model(bert_path, max_seq_length, tune_cells):
+    in_id = tf.keras.layers.Input(shape=(max_seq_length,), name="input_ids")
+    in_mask = tf.keras.layers.Input(shape=(max_seq_length,), name="input_masks")
+    in_segment = tf.keras.layers.Input(shape=(max_seq_length,), name="segment_ids")
+    bert_inputs = [in_id, in_mask, in_segment]
+
+    bert_output = BERT(finetune_cells=tune_cells, bert_path=bert_path)(bert_inputs)
+    pooled = tf.keras.layers.GlobalMaxPooling1D()(bert_output)
+    dense = tf.keras.layers.Dense(256, activation="relu")(pooled)
+    pred = tf.keras.layers.Dense(5, activation="sigmoid")(dense)
+
+    model = tf.keras.models.Model(inputs=bert_inputs, outputs=pred)
+    model.compile(loss="binary_crossentropy", optimizer="adam",  metrics=['binary_accuracy', 'categorical_accuracy'])
+    model.summary()
+
+    return model
+
+def set_session(USE_XLA=True, MIXED_PRECISION=True):
+    """
+    Set the session config to optimise GPU computations.
+    - Automatic Mixed Precision is available for server grade GPUs.
+    """
+    config = tf.ConfigProto()
+    if USE_XLA:
+        opt_level = tf.OptimizerOptions.ON_1
+        tf.enable_resource_variables()
+    else:
+        opt_level = tf.OptimizerOptions.OFF
+
+    config.graph_options.optimizer_options.global_jit_level = opt_level
+
+    config.graph_options.rewrite_options.auto_mixed_precision = MIXED_PRECISION
+
+    sess = tf.Session(config=config)
+    tf.keras.backend.set_session(sess)
+
+    return tf.keras.backend.get_session()
+
+def initialize_sess(sess):
+    sess.run(tf.local_variables_initializer())
+    sess.run(tf.global_variables_initializer())
+    sess.run(tf.tables_initializer())
+    tf.keras.backend.set_session(sess)
+
+    K.set_session(sess)
+
+def main():
+    """
+    0. Set Global Variables
+    """
+    sess = set_session()
+    bert_path = "https://tfhub.dev/google/bert_uncased_L-12_H-768_A-12/1"
+    max_seq_length = 256
+    tune_layers = 1
+    epochs = 2
+    batch_size = 64
+
+    """
+    1. Build Data Set
+    """
+    corpus = MyDocs("datasets/bbc/raw", sess, bert_path, max_seq_length)
+
+    ids = []
+    masks = []
+    segment_ids = []
+    for id, mask, segment, label in corpus:
+        ids.append(id)
+        masks.append(masks)
+        segment_ids.append(segment)
+    X = [ids, masks, segment_ids]
+
+    labels = corpus.labels
+    label_encoder = OneHotEncoder()
+    y = label_encoder.fit_transform(np.array(labels).reshape(-1, 1)).todense()
+    print('Dimension of labels input is {}.'.format(y.shape))
+
+    """
+    2. Build Model and Train
+    """
+    print('Building model...')
+    model = build_model(bert_path, max_seq_length, tune_layers)
+
+    # Instantiate variables
+    initialize_sess(sess)
+
+    print('Training model...')
+    history = model.fit(X, y,
+                        validation_split=0.2,
+                        epochs=epochs,
+                        batch_size=batch_size,
+                        verbose=2,
+                        use_multiprocessing=True)
+
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='4' author='jordanparker6' date='2019-08-12T03:49:35Z'>
+		&lt;denchmark-link:https://github.com/jordanparker6&gt;@jordanparker6&lt;/denchmark-link&gt;
+ Thanks for the bug!  will only print 1 line per epoch. Could it be that your Model is taking a huge amount of time to run through an epoch? Try , which outputs on every batch. Please let me know if you still don't see any output
+		</comment>
+		<comment id='5' author='jordanparker6' date='2019-08-19T01:06:23Z'>
+		&lt;denchmark-link:https://github.com/omalleyt12&gt;@omalleyt12&lt;/denchmark-link&gt;
+ No change in the output post changing the verbose level. I let it run for 4 days...
+		</comment>
+		<comment id='6' author='jordanparker6' date='2019-08-19T06:36:46Z'>
+		The only thing that stand out to me is that model.fit(..., use_multiprocessing=True) should be False here, as True is only relevant to keras.Sequence or generator objects. Could you try that and let me know if it starts training?
+		</comment>
+		<comment id='7' author='jordanparker6' date='2019-09-24T03:57:36Z'>
+		Sorry for the late reply. I will try it tonight and get back to you.
+		</comment>
+		<comment id='8' author='jordanparker6' date='2019-09-25T08:22:01Z'>
+		&lt;denchmark-link:https://github.com/omalleyt12&gt;@omalleyt12&lt;/denchmark-link&gt;
+ that didn't work either...
+		</comment>
+		<comment id='9' author='jordanparker6' date='2019-09-25T08:22:57Z'>
+		&lt;denchmark-link:https://github.com/omalleyt12&gt;@omalleyt12&lt;/denchmark-link&gt;
+ is the fact that i am using a GTX1080ti with 11gb of GPU RAM an issue?
+		</comment>
+		<comment id='10' author='jordanparker6' date='2020-05-06T07:57:53Z'>
+		&lt;denchmark-link:https://github.com/jordanparker6&gt;@jordanparker6&lt;/denchmark-link&gt;
+
+Is this still an issue
+		</comment>
+		<comment id='11' author='jordanparker6' date='2020-05-06T10:41:00Z'>
+		&lt;denchmark-link:https://github.com/Saduf2019&gt;@Saduf2019&lt;/denchmark-link&gt;
+ no many other libraries have provided a work around. See huggingfaces transformer library or fastbert.
+		</comment>
+		<comment id='12' author='jordanparker6' date='2020-05-06T11:37:11Z'>
+		&lt;denchmark-link:https://github.com/jordanparker6&gt;@jordanparker6&lt;/denchmark-link&gt;
+
+IN that case please confirm if we may move this to closed status.
+		</comment>
+		<comment id='13' author='jordanparker6' date='2020-06-03T07:34:23Z'>
+		This issue has been automatically marked as stale because it has not had recent activity. It will be closed if no further activity occurs. Thank you.
+		</comment>
+		<comment id='14' author='jordanparker6' date='2020-06-10T08:09:05Z'>
+		Closing as stale. Please reopen if you'd like to work on this further.
+		</comment>
+		<comment id='15' author='jordanparker6' date='2020-06-10T08:09:07Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/30918&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/30918&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

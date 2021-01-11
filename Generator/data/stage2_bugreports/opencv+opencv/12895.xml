@@ -1,0 +1,665 @@
+<bug id='12895' author='tomoaki0705' open_date='2018-10-23T00:41:54Z' closed_time='2019-01-24T10:18:08Z'>
+	<summary>cudaoptflow: test failure of FarnebackOpticalFlow</summary>
+	<description>
+&lt;denchmark-h:h5&gt;System information (version)&lt;/denchmark-h&gt;
+
+
+OpenCV =&gt; recent 3.4 branch
+Operating System / Platform =&gt; Windows 10 64bit
+Compiler =&gt; Visual Studio 2015 + CUDA 10
+
+&lt;denchmark-h:h5&gt;Summarized description&lt;/denchmark-h&gt;
+
+
+When I run opencv_test_cudaoptflow --gtest_filter=CUDA_OptFlow*FarnebackOpticalFlow.Accuracy/19:CUDA_OptFlow*FarnebackOpticalFlow.Accuracy/23 the test fails
+The test fails on one the platform I own, but it doesn't on others
+
+&lt;denchmark-h:h5&gt;Detailed description&lt;/denchmark-h&gt;
+
+
+I traced and figured out that the output was different.
+
+
+&lt;denchmark-link:https://user-images.githubusercontent.com/3737315/47286318-1dfe2c00-d629-11e8-9a77-04e5cef5f964.png&gt;&lt;/denchmark-link&gt;
+
+VS
+&lt;denchmark-link:https://user-images.githubusercontent.com/3737315/47286323-22c2e000-d629-11e8-90ab-360e49a0c0ab.png&gt;&lt;/denchmark-link&gt;
+
+
+The result was a floating point array, but I dumped as 4 channel 8bit image.
+You can see there is a "blob" near the bottom left of the image, which is much larger than just a rounding error
+
+&lt;denchmark-h:h5&gt;Starting tracking&lt;/denchmark-h&gt;
+
+
+I traced back where this difference occours, and the difference was happening here
+
+
+
+opencv/modules/cudaoptflow/src/farneback.cpp
+
+
+         Line 435
+      in
+      4139898
+
+
+
+
+
+
+ device::optflow_farneback::updateMatricesGpu(curFlowX, curFlowY, R[0], R[1], M, StreamAccessor::getStream(streams[0])); 
+
+
+
+
+
+The first 4 parameters are inputs and M is the output which differs between the platforms
+Now, already, curFlowX and curFlowY were different
+I traced back further and it started to look weird
+
+&lt;denchmark-h:h5&gt;Tracing back the curFlow&lt;/denchmark-h&gt;
+
+
+This device::optflow_farneback::updateMatricesGpu exists inside the loop, and the data was corrupted from the first iteration.
+At this section, flowx0 is converted to curFlowX as well as Y.
+
+
+
+opencv/modules/cudaoptflow/src/farneback.cpp
+
+
+        Lines 375 to 381
+      in
+      4139898
+
+
+
+
+
+
+ if (flags_ &amp; OPTFLOW_USE_INITIAL_FLOW) 
+
+
+
+ { 
+
+
+
+ cuda::resize(flowx0, curFlowX, Size(width, height), 0, 0, INTER_LINEAR, streams[0]); 
+
+
+
+ cuda::resize(flowy0, curFlowY, Size(width, height), 0, 0, INTER_LINEAR, streams[1]); 
+
+
+
+     curFlowX.convertTo(curFlowX, curFlowX.depth(), scale, streams[0]); 
+
+
+
+     curFlowY.convertTo(curFlowY, curFlowY.depth(), scale, streams[1]); 
+
+
+
+ } 
+
+
+
+
+
+Now tracing back flowx0 and flowy0, they are passed from the parent function call calc. but they don't heritate the initial flow, it just allocates new memory here
+
+
+
+opencv/modules/cudaoptflow/src/farneback.cpp
+
+
+        Lines 170 to 173
+      in
+      4139898
+
+
+
+
+
+
+ GpuMat flowx = pool.getBuffer(frame0.size(), CV_32FC1); 
+
+
+
+ GpuMat flowy = pool.getBuffer(frame0.size(), CV_32FC1); 
+
+
+
+ 
+
+
+
+ calcImpl(frame0, frame1, flowx, flowy, stream); 
+
+
+
+
+
+but used as an input (uninitialized) here
+
+
+
+opencv/modules/cudaoptflow/src/farneback.cpp
+
+
+        Lines 375 to 381
+      in
+      4139898
+
+
+
+
+
+
+ if (flags_ &amp; OPTFLOW_USE_INITIAL_FLOW) 
+
+
+
+ { 
+
+
+
+ cuda::resize(flowx0, curFlowX, Size(width, height), 0, 0, INTER_LINEAR, streams[0]); 
+
+
+
+ cuda::resize(flowy0, curFlowY, Size(width, height), 0, 0, INTER_LINEAR, streams[1]); 
+
+
+
+     curFlowX.convertTo(curFlowX, curFlowX.depth(), scale, streams[0]); 
+
+
+
+     curFlowY.convertTo(curFlowY, curFlowY.depth(), scale, streams[1]); 
+
+
+
+ } 
+
+
+
+
+
+Judging from the name OPTFLOW_USE_INITIAL_FLOW , it looks like the implementation is expecting flowx0 and flowy0 to have some initial value, but then why is it not passed from the beginning ?
+Also, judging from the test code it looks like the test code is trying to give some kind of pre-computed flow as an initial value input.
+
+
+
+opencv/modules/cudaoptflow/test/test_optflow.cpp
+
+
+        Lines 328 to 333
+      in
+      4139898
+
+
+
+
+
+
+ if (useInitFlow) 
+
+
+
+ { 
+
+
+
+     d_flow.download(flow); 
+
+
+
+ 
+
+
+
+     farn-&gt;setFlags(farn-&gt;getFlags() | cv::OPTFLOW_USE_INITIAL_FLOW); 
+
+
+
+     farn-&gt;calc(loadMat(frame0), loadMat(frame1), d_flow); 
+
+
+
+
+
+
+&lt;denchmark-h:h5&gt;Actual behavior when the test passes&lt;/denchmark-h&gt;
+
+
+When the test passes, flowx0 has somehow pre-computed value.
+I don't know where the pre-computed value comes from, but it looks "reasonable" data
+So my guess is that this pre-computed value is the memory garbage of the previous computation, and luckily, it was pointing to a meaning memory area, so the computation passes.
+In another word, it's a miracle that the test passes usually, and it's supposed to fail.
+
+&lt;denchmark-h:h5&gt;My question&lt;/denchmark-h&gt;
+
+
+This "memory garbage" comes from somewhere, and it'll require so much work to trace back, and I'm not sure if it's the correct way either.
+I just want to raise the issue first, and discuss how to fix.
+It started as a "environment specific issue" but now it looks like there are some weird code blocks
+There are some "my guess" in this issue, so I want to make sure that I'm on the correct track
+
+&lt;denchmark-h:h5&gt;Steps to reproduce&lt;/denchmark-h&gt;
+
+
+run opencv_test_cudaoptflow --gtest_filter=CUDA_OptFlow*FarnebackOpticalFlow.Accuracy/19:CUDA_OptFlow*FarnebackOpticalFlow.Accuracy/23
+
+	</description>
+	<comments>
+		<comment id='1' author='tomoaki0705' date='2019-01-10T09:03:37Z'>
+		Hi, &lt;denchmark-link:https://github.com/tomoaki0705&gt;@tomoaki0705&lt;/denchmark-link&gt;
+ ,
+Based on your primary investigation, I've also looked into the issue. Following is my test environments.
+&lt;denchmark-code&gt;GTX 1080    with CUDA 10.0 on Windows
+GTX 1080 Ti with CUDA ( &gt;= 8.0 &amp;&amp; &lt;= 10.0 ) on Ubuntu 16.04
+&lt;/denchmark-code&gt;
+
+In my case, the two tests mentioned fail on GTX 1080 Ti, and pass on GTX 1080.
+According to the &lt;denchmark-link:https://docs.opencv.org/3.4.5/dc/d6b/group__video__track.html#ga5d10ebbd59fe09c5f650289ec0ece5af&gt;documentation for the Farneback optical flow algorithm on CPU&lt;/denchmark-link&gt;
+, the  flag is used to decide whether to use the input parameter  as an initial flow approximation.
+I think the problem is that the input parameter flow is reallocated even when the OPTFLOW_USE_INITIAL_FLOW flag is set, in both CPU and GPU(CUDA) implementations.
+In the following GPU implementation code, it seems that when the OPTFLOW_USE_INITIAL_FLOW is set, the value of the parameter named _flow should be used as the initial value for flowx and flowy. But currently, they are always reallocated.
+
+
+
+opencv/modules/cudaoptflow/src/farneback.cpp
+
+
+        Lines 164 to 177
+      in
+      054bd23
+
+
+
+
+
+
+ void FarnebackOpticalFlowImpl::calc(InputArray _frame0, InputArray _frame1, InputOutputArray _flow, Stream&amp; stream) 
+
+
+
+ { 
+
+
+
+ const GpuMat frame0 = _frame0.getGpuMat(); 
+
+
+
+ const GpuMat frame1 = _frame1.getGpuMat(); 
+
+
+
+ 
+
+
+
+     BufferPool pool(stream); 
+
+
+
+     GpuMat flowx = pool.getBuffer(frame0.size(), CV_32FC1); 
+
+
+
+     GpuMat flowy = pool.getBuffer(frame0.size(), CV_32FC1); 
+
+
+
+ 
+
+
+
+ calcImpl(frame0, frame1, flowx, flowy, stream); 
+
+
+
+ 
+
+
+
+     GpuMat flows[] = {flowx, flowy}; 
+
+
+
+ cuda::merge(flows, 2, _flow, stream); 
+
+
+
+ } 
+
+
+
+
+
+The following code is the CPU implementation of the algorithm. At line1115, _flow0 is always reallocated whether the OPTFLOW_USE_INITIAL_FLOW is set or not.
+
+
+
+opencv/modules/video/src/optflowgf.cpp
+
+
+        Lines 1096 to 1117
+      in
+      054bd23
+
+
+
+
+
+
+ void FarnebackOpticalFlowImpl::calc(InputArray _prev0, InputArray _next0, 
+
+
+
+                                     InputOutputArray _flow0) 
+
+
+
+ { 
+
+
+
+ CV_INSTRUMENT_REGION(); 
+
+
+
+ 
+
+
+
+ CV_OCL_RUN(_flow0.isUMat() &amp;&amp; 
+
+
+
+ ocl::Image2D::isFormatSupported(CV_32F, 1, false), 
+
+
+
+ calc_ocl(_prev0,_next0,_flow0)) 
+
+
+
+     Mat prev0 = _prev0.getMat(), next0 = _next0.getMat(); 
+
+
+
+ const int min_size = 32; 
+
+
+
+ const Mat* img[2] = { &amp;prev0, &amp;next0 }; 
+
+
+
+ 
+
+
+
+ int i, k; 
+
+
+
+ double scale; 
+
+
+
+     Mat prevFlow, flow, fimg; 
+
+
+
+ int levels = numLevels_; 
+
+
+
+ 
+
+
+
+ CV_Assert( prev0.size() == next0.size() &amp;&amp; prev0.channels() == next0.channels() &amp;&amp; 
+
+
+
+                prev0.channels() == 1 &amp;&amp; pyrScale_ &lt; 1 ); 
+
+
+
+     _flow0.create( prev0.size(), CV_32FC2 ); 
+
+
+
+     Mat flow0 = _flow0.getMat(); 
+
+
+
+ 
+
+
+
+
+
+Also in the "OCV" implementation, flowx and flowy are always reallocated, as can be seen at line 649 and 650 in the following code.
+
+
+
+opencv/modules/video/src/optflowgf.cpp
+
+
+        Lines 636 to 653
+      in
+      054bd23
+
+
+
+
+
+
+ #ifdef HAVE_OPENCL 
+
+
+
+ bool operator ()(const UMat &amp;frame0, const UMat &amp;frame1, UMat &amp;flowx, UMat &amp;flowy) 
+
+
+
+     { 
+
+
+
+ CV_Assert(frame0.channels() == 1 &amp;&amp; frame1.channels() == 1); 
+
+
+
+ CV_Assert(frame0.size() == frame1.size()); 
+
+
+
+ CV_Assert(polyN_ == 5 || polyN_ == 7); 
+
+
+
+ CV_Assert(!fastPyramids_ || std::abs(pyrScale_ - 0.5) &lt; 1e-6); 
+
+
+
+ 
+
+
+
+ const int min_size = 32; 
+
+
+
+ 
+
+
+
+ Size size = frame0.size(); 
+
+
+
+         UMat prevFlowX, prevFlowY, curFlowX, curFlowY; 
+
+
+
+ 
+
+
+
+         flowx.create(size, CV_32F); 
+
+
+
+         flowy.create(size, CV_32F); 
+
+
+
+         UMat flowx0 = flowx; 
+
+
+
+         UMat flowy0 = flowy; 
+
+
+
+ 
+
+
+
+
+
+Why did the tests pass when the OPTFLOW_USE_INITIAL_FLOW flag was not set?
+When the flag is not set, it seems that flowx and flowy are initialized to zero after they are reallocated. This happens in all three implementations.
+GPU:
+
+
+
+opencv/modules/cudaoptflow/src/farneback.cpp
+
+
+        Lines 382 to 386
+      in
+      054bd23
+
+
+
+
+
+
+ else 
+
+
+
+ { 
+
+
+
+     curFlowX.setTo(0, streams[0]); 
+
+
+
+     curFlowY.setTo(0, streams[1]); 
+
+
+
+ } 
+
+
+
+
+
+CPU:
+
+
+
+opencv/modules/video/src/optflowgf.cpp
+
+
+        Lines 1151 to 1152
+      in
+      054bd23
+
+
+
+
+
+
+ else 
+
+
+
+     flow = Mat::zeros( height, width, CV_32FC2 ); 
+
+
+
+
+
+OCL:
+
+
+
+opencv/modules/video/src/optflowgf.cpp
+
+
+        Lines 722 to 726
+      in
+      054bd23
+
+
+
+
+
+
+ else 
+
+
+
+ { 
+
+
+
+     curFlowX.setTo(0); 
+
+
+
+     curFlowY.setTo(0); 
+
+
+
+ } 
+
+
+
+
+
+When the OPTFLOW_USE_INITIAL_FLOW flag was set, flowx and flowy are reallocated without initialization, which gives some possibility to contain garbage data. I think this is the reason behind test failures.
+		</comment>
+		<comment id='2' author='tomoaki0705' date='2019-01-23T10:35:54Z'>
+		&lt;denchmark-link:https://github.com/tomoaki0705&gt;@tomoaki0705&lt;/denchmark-link&gt;
+ Please check latest code updates from &lt;denchmark-link:https://github.com/nglee&gt;@nglee&lt;/denchmark-link&gt;
+.
+		</comment>
+		<comment id='3' author='tomoaki0705' date='2019-01-23T15:23:05Z'>
+		Yep, I'll be back with test result
+		</comment>
+		<comment id='4' author='tomoaki0705' date='2019-01-24T10:18:08Z'>
+		I confirmed that the failure is fixed
+Win10 + GTX 1060 (3.4 branch)
+Ubuntu 16.04 + GTX 1050ti (3.4 branch)
+Ubuntu 16.04 + GTX 1050ti (master branch)
+All passed
+Great work &lt;denchmark-link:https://github.com/nglee&gt;@nglee&lt;/denchmark-link&gt;
+ !
+Closing the issue
+		</comment>
+	</comments>
+</bug>

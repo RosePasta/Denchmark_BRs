@@ -1,0 +1,150 @@
+<bug id='2977' author='raingo' open_date='2015-08-26T01:13:44Z' closed_time='2017-01-17T20:47:56Z'>
+	<summary>A MultiGPU bug with multiple input layers</summary>
+	<description>
+With &lt;denchmark-link:https://github.com/BVLC/caffe/pull/2903&gt;#2903&lt;/denchmark-link&gt;
+, the data is logically laid out sequentially for multiple solvers. However, there is no coordinates regarding multiple input layers. Following is an example of logical error.
+Suppose solver S1 and S2 are running in parallel, loading two input layers D1 and D2. S1 gets the first batch of D1, but somehow it get evicted from running queue. In parallel, S2 get second batch of D1 and continue to get first batch of D2. Obviously, both S1 and S2 get inconsistent data, which is a serious bug.
+Suggestions, (either..or...)
+
+logical check in the net init function to disallow multiple input in a multi-solver process;
+Forget about sharing data loaders, use the original random skip parameter to make sure each solver load different data batches.
+
+	</description>
+	<comments>
+		<comment id='1' author='raingo' date='2015-08-26T01:56:31Z'>
+		&lt;denchmark-link:https://github.com/raingo&gt;@raingo&lt;/denchmark-link&gt;
+ I don't quite understand here, could you be more specific?
+Suppose we are using DataLayer that loads LMDB/LEVELDB, which is not shared.
+
+With #2903, the data is logically laid out sequentially for multiple solvers
+
+Yes. Sequential loading for (LMDB/LEVELDB) DataLayer is ensured by DataReader which distribute data in a round robin style, and each solver's training net owns a data layer.
+
+Suppose solver S1 and S2 are running in parallel, loading two input layers D1 and D2.
+
+Yes, this is what's happening. Each solver has different input data layer in its train net.
+But:
+
+S1 gets the first batch of D1, but somehow it get evicted from running queue. In parallel, S2 get second batch of D1 and continue to get first batch of D2.
+
+This cannot happen. S1 can only load from D1 while S2 only from D2. S1 owns D1 in its train net, and S2 owns D2 in its test net. There is no way that S2 can load data from D1. Also, data is distributed in a round-robin fashion in DataReader.
+Please correct me if I'm wrong.
+		</comment>
+		<comment id='2' author='raingo' date='2015-08-26T02:05:34Z'>
+		&lt;denchmark-link:https://github.com/ronghanghu&gt;@ronghanghu&lt;/denchmark-link&gt;
+ Both S1 and S2 will load data from D1 and D2. Only concerned about the training phase. Following is an example of prototxt.
+&lt;denchmark-code&gt;layer {
+  name: "D1"
+  type: "Data"
+  top: "data"
+  top: "label"
+  data_param {
+    source: "path1"
+  }
+}
+layer {
+  name: "D2"
+  type: "Data"
+  top: "data2"
+  top: "label2"
+  data_param {
+    source: "path2"
+  }
+}
+
+# both data1 and data2 will be consumed in the following layers
+&lt;/denchmark-code&gt;
+
+The actual usage of multiple input layers are &lt;denchmark-link:https://github.com/BVLC/caffe/issues/1698&gt;#1698&lt;/denchmark-link&gt;
+ and &lt;denchmark-link:https://github.com/BVLC/caffe/pull/1873&gt;#1873&lt;/denchmark-link&gt;
+.
+		</comment>
+		<comment id='3' author='raingo' date='2015-08-26T02:08:02Z'>
+		Oh, I see what you mean here. You mean two different data layers in one net. Yes, this is indeed a problem.
+		</comment>
+		<comment id='4' author='raingo' date='2015-08-26T02:10:26Z'>
+		I agree this should be fixed. I'm not sure if this is also a problem for (LMDB/LEVELDB) DataLayer illustrated in your case (which relies on DataReader). I'll check for that.
+		</comment>
+		<comment id='5' author='raingo' date='2015-08-26T02:12:02Z'>
+		I think all the input layers, include HDF5 and DataLayer, have this problem.
+Essentially, the entire data loading part of the net should be serialized. A solver parameter to lock all the input layers will be a quick solution, which makes &lt;denchmark-link:https://github.com/BVLC/caffe/pull/2903&gt;#2903&lt;/denchmark-link&gt;
+ unnecessary.
+		</comment>
+		<comment id='6' author='raingo' date='2015-08-26T02:14:54Z'>
+		
+Essentially, the entire data loading part of the net should be serialized.
+
+This is probably unaffordable, since it's going to introduce big overhead for data loading for LMDB/LEVELDBs. I'll first check if there is such a problem in DataLayer, and if yes, whether this can be fixed in DataReader class.
+Anyway, we should fix this issue.
+		</comment>
+		<comment id='7' author='raingo' date='2015-08-26T03:49:51Z'>
+		Might it be sufficient to extend the Datum protobuf to include an arbitrary number of arbitrarily shaped inputs, eliminating the need for multiple synchronized input layers?
+		</comment>
+		<comment id='8' author='raingo' date='2015-08-26T14:37:02Z'>
+		&lt;denchmark-link:https://github.com/ronghanghu&gt;@ronghanghu&lt;/denchmark-link&gt;
+ Agreed, there is an overhead, but might be a good idea to use as an option. If this is implemented properly, the overhead can be minimized. The prefetching threads can still working in the background to fill the buffer. The forward thread simply memcpy from the buffer.
+Anyway, thanks a lot for looking at this issue!
+		</comment>
+		<comment id='9' author='raingo' date='2015-08-26T21:37:05Z'>
+		I checked DataReader today. Unfortunately it seems to suffer from this issue as well, since in DataReader::DataReader there is no guarantee on the order of push in body_-&gt;new_queue_pairs_.push(queue_pair_);
+&lt;denchmark-link:https://github.com/BVLC/caffe/blob/master/src/caffe/data_reader.cpp#L30&gt;https://github.com/BVLC/caffe/blob/master/src/caffe/data_reader.cpp#L30&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='10' author='raingo' date='2015-08-26T21:43:09Z'>
+		Interesting.  The original code specifically used a singular layer for all solvers but had other issues.
+So where &lt;denchmark-link:https://github.com/ronghanghu&gt;@ronghanghu&lt;/denchmark-link&gt;
+ where do you want to go?  Either we need to move to an ordered queue or unwind some of the data layer changes.  It sounds like we basically need to guarantee the order of building the batch is always stable and notification to the solvers is only done when the batch is fully completed.
+The complicating in the future will be distributed training where we will have to figure out distributed loading of data and sychronization of the datalayers.  We should probably carefully think this through before we hack something in.
+		</comment>
+		<comment id='11' author='raingo' date='2015-08-26T22:04:26Z'>
+		&lt;denchmark-link:https://github.com/thatguymike&gt;@thatguymike&lt;/denchmark-link&gt;
+ I'm not sure where to go at this moment, as it takes careful consideration.
+
+The complicating in the future will be distributed training where we will have to figure out distributed loading of data and sychronization of the datalayers. We should probably carefully think this through before we hack something in.
+
+I agree.
+		</comment>
+		<comment id='12' author='raingo' date='2015-08-28T21:35:20Z'>
+		Maybe one way to fix the DB code, that might also simplify other data layer types, would be to create all solvers on the main thread, and hand them off to the worker thread only when training starts?
+		</comment>
+		<comment id='13' author='raingo' date='2015-09-04T20:46:19Z'>
+		After another check today, it seems to me that solvers are indeed created in the main thread, which sort of confused me...
+&lt;denchmark-h:h4&gt;On one hand,&lt;/denchmark-h&gt;
+
+Worker solvers are created in , which is called by  and  in
+&lt;denchmark-link:https://github.com/BVLC/caffe/blob/master/src/caffe/parallel.cpp#L224&gt;https://github.com/BVLC/caffe/blob/master/src/caffe/parallel.cpp#L224&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://github.com/BVLC/caffe/blob/master/src/caffe/parallel.cpp#L416&gt;https://github.com/BVLC/caffe/blob/master/src/caffe/parallel.cpp#L416&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://github.com/BVLC/caffe/blob/master/tools/caffe.cpp#L208-L209&gt;https://github.com/BVLC/caffe/blob/master/tools/caffe.cpp#L208-L209&lt;/denchmark-link&gt;
+
+and root solver is created in  in
+&lt;denchmark-link:https://github.com/BVLC/caffe/blob/master/tools/caffe.cpp#L195-L196&gt;https://github.com/BVLC/caffe/blob/master/tools/caffe.cpp#L195-L196&lt;/denchmark-link&gt;
+
+all these are called from main thread.  only calls . So it seems that all solver construction are done in main thread. Only solving is performed in each solver's thread.
+Therefore, there shouldn't be race in constructing solvers since they all run in the main thread sequentially. And  is called in , which should only be called by net construction during solver construction. Thus, at a glance there isn't concurrence on  in
+&lt;denchmark-link:https://github.com/BVLC/caffe/blob/master/src/caffe/data_reader.cpp#L30&gt;https://github.com/BVLC/caffe/blob/master/src/caffe/data_reader.cpp#L30&lt;/denchmark-link&gt;
+
+&lt;denchmark-h:h4&gt;On the other hand,&lt;/denchmark-h&gt;
+
+I see that  is protected by mutex as in &lt;denchmark-link:https://github.com/BVLC/caffe/pull/2903&gt;#2903&lt;/denchmark-link&gt;
+ (originally &lt;denchmark-link:https://github.com/BVLC/caffe/pull/2114&gt;#2114&lt;/denchmark-link&gt;
+), as in
+&lt;denchmark-link:https://github.com/BVLC/caffe/blob/master/src/caffe/data_reader.cpp#L22&gt;https://github.com/BVLC/caffe/blob/master/src/caffe/data_reader.cpp#L22&lt;/denchmark-link&gt;
+
+so according to this design, I assumed previously that there should actually be concurrence on .
+&lt;denchmark-h:h4&gt;So...&lt;/denchmark-h&gt;
+
+I am a bit confused here whether there is concurrence and race condition on DataReader::DataReader (I hope there isn't and the mutex is just for future-proof). Maybe I messed up something in my mind and I'll double check.
+&lt;denchmark-link:https://github.com/cypof&gt;@cypof&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/thatguymike&gt;@thatguymike&lt;/denchmark-link&gt;
+ perhaps you can enlighten me on this?
+		</comment>
+		<comment id='14' author='raingo' date='2015-09-04T21:02:33Z'>
+		Oh you're right, worker solvers used to be created in P2PSync::InternalThreadEntry(). I don't remember when it changed. The lock in the data reader might still be necessary in case a solver exits while another one is still getting constructed. Not really possible today but in case we go asynchronous maybe.
+		</comment>
+		<comment id='15' author='raingo' date='2015-09-04T21:30:58Z'>
+		OK, then I expect this multi-gpu bug described in this issue doesn't apply to DataLayer (LMDB/LevelDB) . I'll try to test it sometime in the weekend.
+		</comment>
+	</comments>
+</bug>

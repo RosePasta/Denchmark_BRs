@@ -1,0 +1,190 @@
+<bug id='42661' author='s0r2637' open_date='2020-08-25T16:15:57Z' closed_time='2020-09-10T07:16:29Z'>
+	<summary>Out of memory situation with tf keras Model.fit using tcmalloc library</summary>
+	<description>
+
+This is a bug related to memory management
+
+System information
+
+I have created my own code for tf.Keras model building and compiling and run model.fit train and eval:
+Red Hat 7.8 (Maipo):
+Not a mobile device:
+From binary:
+v2.0.0-rc2-26-g64c3d38 2.0.0:
+3.6.9:
+Bazel version (if compiling from source):
+GCC/Compiler version (if compiling from source):
+Cuda 10.0/cuDNN 7.X:
+Tesla P-100, 16 GB:
+
+You can collect some of this information using our environment capture
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/tree/master/tools/tf_env_collect.sh&gt;script&lt;/denchmark-link&gt;
+
+You can also obtain the TensorFlow version with:
+
+TF 1.0: python -c "import tensorflow as tf; print(tf.GIT_VERSION, tf.VERSION)"
+TF 2.0: python -c "import tensorflow as tf; print(tf.version.GIT_VERSION, tf.version.VERSION)"
+
+**
+Currently the model.fit training and eval aborts due to out of memory error.  I found from stackoverflow that this error is due to the inability of malloc to efficiently collect garbage.  As suggested &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/2942&gt;here&lt;/denchmark-link&gt;
+, I used tcmalloc through LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4 before running the tensorflow training script.  The problem is alleviated but not eliminated completely.  Compared to just using gcc malloc, the tcmalloc allows for training a few more epochs, but ultimately gets into an out of memory situation.  The CPU memory that I have available is ~377 GB.  As the training proceeds over epochs, the memory usage increases until the limit and the whole program aborts.  Also, the speed of training decreases with every epoch
+**
+**
+I expect the out of memory issue to never occur.  Also, I expect the speed of training to be consistent across the epochs.
+**
+**
+`
+if name=='main':
+tf.keras.backend.clear_session()
+tf.config.optimizer.set_jit(True)
+from tf_tools import read_h5
+from glob import glob
+import os
+from Feature_compression import build_model
+train_data_folder = os.path.join(os.environ['FAST_DRIVE'],'DATA','DSIFT','train','Visible','imagery')
+test_data_folder = os.path.join(os.environ['FAST_DRIVE'],'DATA','DSIFT','test','Visible','imagery')
+vis_model_folder = os.path.join(os.environ['FAST_DRIVE'],'MODEL','Visible2')
+with h5py.File(os.path.join(train_data_folder,'All_train_visible_data.h5'),'r') as f:
+num_samples = len(f['DSIFT_image'])*(len(f['DSIFT_image'])-1)//2
+strategy = tf.distribute.MirroredStrategy()
+BATCH_SIZE_PER_REPLICA =512
+BATCH_SIZE = BATCH_SIZE_PER_REPLICA * strategy.num_replicas_in_sync
+EPOCHS =15
+STEPS_PER_EPOCH = 5000 #int(num_samples/EPOCHS)
+model_folder = os.path.join(os.environ['FAST_DRIVE'],'MODEL','Visible_2_Visible')
+os.makedirs(model_folder,exist_ok=True)
+csv_logger = CSVLogger(os.path.join(model_folder,'DSIFT_training.log'),append=True)
+checkpoint_dir = os.path.join(model_folder,'training_checkpoints')
+checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt_{epoch}")
+early_stop = tf.keras.callbacks.EarlyStopping(monitor='val_accuracy',patience=3,min_delta=1E-5,baseline=0.999)
+#tf.keras.callbacks.TensorBoard(log_dir='./logs'),
+callbacks = [tf.keras.callbacks.ModelCheckpoint(filepath=checkpoint_prefix, save_weights_only=True),csv_logger]#,early_stop]
+#====================== Preparing the dataset optimizaion options =============================================================================#
+dataset_options = tf.data.Options()
+dataset_options.experimental_threading.private_threadpool_size = 60#mp.cpu_count()
+dataset_options.experimental_threading.max_intra_op_parallelism = 1 #mp.cpu_count()
+dataset_options.experimental_optimization.apply_default_optimizations = True
+dataset_options.experimental_optimization.map_vectorization.enabled = True
+#====================== Preparing the training dataset =============================================================================#
+train = read_h5(h5py.File(os.path.join(train_data_folder,'All_train_visible_data.h5'),'r'),dataset=['DSIFT_image','labels'],label_str='labels')
+&lt;denchmark-code&gt;train_input_pds=tf.data.Dataset.from_generator(train.gen_func_pairwise(cls='positive'),output_types=(tf.uint8,tf.float32),
+                 output_shapes=(tf.TensorShape((2,24,24,64)),tf.TensorShape((2,))))
+
+train_input_nds=tf.data.Dataset.from_generator(train.gen_func_pairwise(cls='negative'),output_types=(tf.uint8,tf.float32),
+                 output_shapes=(tf.TensorShape((2,24,24,64)),tf.TensorShape((2,))))
+
+train_balanced_ds = tf.data.experimental.sample_from_datasets([train_input_pds.repeat(),train_input_nds.repeat()], [0.5,0.5]).batch(BATCH_SIZE)
+train_dataset = train_balanced_ds.map(lambda features,labels: (tf.concat(tf.unstack(features,axis=1),axis=0)/255,
+                                    tf.cast(tf.equal(*tf.unstack(labels,axis=1)), dtype=tf.float32)),
+                                    num_parallel_calls=tf.data.experimental.AUTOTUNE).prefetch(tf.data.experimental.AUTOTUNE)
+train_dataset.with_options(dataset_options)
+&lt;/denchmark-code&gt;
+
+#==================================================================================================================================#
+#====================== Preparing the testing dataset =============================================================================#
+test = read_h5(h5py.File(os.path.join(test_data_folder,'All_test_visible_data.h5'),'r'),dataset=['DSIFT_image','labels'],label_str='labels')
+&lt;denchmark-code&gt;test_input_pds=tf.data.Dataset.from_generator(test.gen_func_pairwise(cls='positive'),output_types=(tf.uint8,tf.float32),
+                 output_shapes=(tf.TensorShape((2,24,24,64)),tf.TensorShape((2,))))
+
+test_input_nds=tf.data.Dataset.from_generator(test.gen_func_pairwise(cls='negative'),output_types=(tf.uint8,tf.float32),
+                 output_shapes=(tf.TensorShape((2,24,24,64)),tf.TensorShape((2,))))
+
+test_balanced_ds = tf.data.experimental.sample_from_datasets([test_input_pds.repeat(),test_input_nds.repeat()], [0.5,0.5]).batch(BATCH_SIZE) 
+test_dataset = test_balanced_ds.map(lambda features,labels: (tf.concat(tf.unstack(features,axis=1),axis=0)/255,tf.cast(tf.equal(*tf.unstack(labels,axis=1)), dtype=tf.float32)),num_parallel_calls=tf.data.experimental.AUTOTUNE).prefetch(tf.data.experimental.AUTOTUNE)
+
+test_dataset.with_options(dataset_options)
+&lt;/denchmark-code&gt;
+
+#==================================================================================================================================#
+with strategy.scope():
+CNN_model = build_model(num_classes=473)
+df = pd.read_csv(os.path.join(vis_model_folder,'DSIFT_Training_History.csv'),delimiter=',')
+CNN_model.load_weights(os.path.join(vis_model_folder,'training_checkpoints',f'ckpt_{1+df["val_accuracy"].argmax()}'))
+CNN_base_model = tf.keras.Sequential(CNN_model.layers[:-1])
+dnn_model = build_vis2vis_model(layer_shape=[2,2])
+CNN_base_model.trainable = False
+inputs = tf.keras.Input(shape=CNN_base_model.input_shape[1:])
+x = CNN_base_model(inputs,training=False)
+x = tf.abs(tf.keras.layers.Subtract()(tf.split(x,2,axis=0)))
+outputs = dnn_model(x)
+model = tf.keras.Model(inputs,outputs)
+model.compile(loss=tf.keras.losses.hinge,
+optimizer=tf.keras.optimizers.Adam(), metrics =['accuracy'])
+history = model.fit(x=train_dataset, epochs=EPOCHS,validation_data=test_dataset,
+steps_per_epoch=STEPS_PER_EPOCH,validation_steps=STEPS_PER_EPOCH,
+callbacks=callbacks)
+pd.DataFrame(history.history).to_csv(os.path.join(model_folder,"DSIFT_Training_History.csv"),index=False)
+`
+**
+Provide a reproducible test case that is the bare minimum necessary to generate
+the problem. If possible, please share a link to Colab/Jupyter/any notebook.
+**
+Train for 5000 steps, validate for 5000 steps
+Epoch 1/15
+5000/5000 [==============================] - 5142s 1s/step - loss: 3.5599e-04 - accuracy: 0.9999 - val_loss: 0.1393 - val_accuracy: 0.9757
+Epoch 2/15
+5000/5000 [==============================] - 5206s 1s/step - loss: 0.0346 - accuracy: 0.9971 - val_loss: 8.6923e-06 - val_accuracy: 1.0000
+Epoch 3/15
+5000/5000 [==============================] - 5217s 1s/step - loss: 3.7841e-04 - accuracy: 1.0000 - val_loss: 3.2933e-07 - val_accuracy: 1.0000
+Epoch 4/15
+5000/5000 [==============================] - 5264s 1s/step - loss: 7.6284e-04 - accuracy: 0.9999 - val_loss: 3.1577e-06 - val_accuracy: 1.0000
+Epoch 5/15
+5000/5000 [==============================] - 5335s 1s/step - loss: 0.0000e+00 - accuracy: 1.0000 - val_loss: 1.0950e-06 - val_accuracy: 1.0000
+Epoch 6/15
+5000/5000 [==============================] - 5223s 1s/step - loss: 5.6489e-04 - accuracy: 0.9999 - val_loss: 1.1722e-05 - val_accuracy: 1.0000
+Epoch 7/15
+5000/5000 [==============================] - 5353s 1s/step - loss: 1.2962e-05 - accuracy: 1.0000 - val_loss: 0.0000e+00 - val_accuracy: 1.0000
+Epoch 8/15
+5000/5000 [==============================] - 5390s 1s/step - loss: 0.0000e+00 - accuracy: 1.0000 - val_loss: 0.0000e+00 - val_accuracy: 1.0000
+Epoch 9/15
+5000/5000 [==============================] - 5487s 1s/step - loss: 0.0000e+00 - accuracy: 1.0000 - val_loss: 0.0000e+00 - val_accuracy: 1.0000
+Epoch 10/15
+5000/5000 [==============================] - 5761s 1s/step - loss: 3.3989e-04 - accuracy: 0.9999 - val_loss: 1.2558e-08 - val_accuracy: 1.0000
+Epoch 11/15
+4999/5000 [============================&gt;.] - ETA: 0s - loss: 1.1383e-08 - accuracy: 1.0000/var/spool/pbs/mom_priv/jobs/6135009.pbsserver.SC: line 26:  5302 Killed                  singularity run --nv -B ${FAST_DRIVE}:/p/work3/srini ./tensorflow_2_0_0-gpu_tcmalloc.img python /p/work3/srini/python_scripts/Vis_to_Vis_mapping.py
+Start Epilogue v2.5.3 Tue Aug 25 14:41:53 UTC 2020
+Memory usage reported in GB
+% of     user     user     user    total    total
+Node               limit      max    limit  current  current     phys
+gaffney-g05       100.00   365.00   365.00     0.02     5.57   377.33
+Memory summary:
+min  365.00 GB
+max  365.00 GB
+ave  365.00 GB
+Out of Memory condition reached, job memory usage should be reevaluated.
+** Include any logs or source code that would be helpful to
+diagnose the problem. If including tracebacks, please include the full
+traceback. Large logs and files should be attached.
+	</description>
+	<comments>
+		<comment id='1' author='s0r2637' date='2020-08-26T06:02:26Z'>
+		&lt;denchmark-link:https://github.com/s0r2637&gt;@s0r2637&lt;/denchmark-link&gt;
+
+Please share complete stand alone indented code for us to replicate the issue faced or if possible share colab gist with error faced.
+Can you verify if there is any other python code running in parallel, or anything in parallel consuming memory.
+		</comment>
+		<comment id='2' author='s0r2637' date='2020-08-26T15:18:19Z'>
+		I shared with you all the code I can.  There are small modules that I import.  It will be hard to share all those modules.  Is there anything specifically you are looking for?  As far as I know,  there weren;t any other python codes running in parallel.  I was running my tensorflow training inside a singularity container.
+		</comment>
+		<comment id='3' author='s0r2637' date='2020-08-27T05:47:05Z'>
+		&lt;denchmark-link:https://github.com/s0r2637&gt;@s0r2637&lt;/denchmark-link&gt;
+
+Please share a colab gist with the issue reported.
+[you could use &lt;denchmark-link:https://colab.sandbox.google.com/#create=true&amp;language=python3&gt;this&lt;/denchmark-link&gt;
+ link to run the code and share the Gist (File -&gt; Save a copy as Github gist) with us. Thanks!
+		</comment>
+		<comment id='4' author='s0r2637' date='2020-09-03T06:22:17Z'>
+		This issue has been automatically marked as stale because it has not had recent activity. It will be closed if no further activity occurs. Thank you.
+		</comment>
+		<comment id='5' author='s0r2637' date='2020-09-10T07:16:26Z'>
+		Closing as stale. Please reopen if you'd like to work on this further.
+		</comment>
+		<comment id='6' author='s0r2637' date='2020-09-10T07:16:32Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/42661&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/42661&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

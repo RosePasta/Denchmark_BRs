@@ -1,0 +1,226 @@
+<bug id='20059' author='cipri-tom' open_date='2018-06-15T12:17:38Z' closed_time='2018-07-07T01:36:21Z'>
+	<summary>map_and_batch slower than map + batch</summary>
+	<description>
+&lt;denchmark-h:h3&gt;System information&lt;/denchmark-h&gt;
+
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): Yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Linux Ubuntu 16.04
+TensorFlow installed from (source or binary): Docker (tensorflow/tensorflow:1.8.0-gpu-py3)
+TensorFlow version (use command below): v1.8.0-0-g93bc2e2072
+Python version: 3.5.2
+Bazel version (if compiling from source):
+GCC/Compiler version (if compiling from source):
+CUDA/cuDNN version:
+GPU model and memory: GTX 1080 Ti 11 Gb
+Exact command to reproduce: n/a
+
+&lt;denchmark-h:h3&gt;Describe the problem&lt;/denchmark-h&gt;
+
+Using map_and_batch in my use case results in a slower input pipeline than using normal map followed by batch. batch_size=512
+Here is my code. The  and  are &lt;denchmark-link:https://github.com/cipri-tom/tf-crnn/blob/15b9aa5cce440a4e4f4df0dcffc77ce4cd9b913d/src/data_handler.py#L92&gt;quite heavy&lt;/denchmark-link&gt;
+
+def parse_example(serialized_example, output_shape=None):
+    features = tf.parse_single_example(serialized_example, feature_spec)
+    label = features.pop('label')
+
+    # Replace image_raw with the decoded &amp; preprocessed version
+    image = features.pop('image_raw')
+    image = tf.image.decode_png(image, channels=1)
+    image = augment_data(image)
+    image, orig_width = padding_inputs_width(image, output_shape, ...)
+    features['image'] = image
+    features['image_width'] = orig_width
+    return features, label
+
+
+def make_input_fn(files_pattern, batch_size, output_shape):
+    shaped_parse_example = partial(parse_example, output_shape=output_shape)
+
+    def input_fn():
+        files = tf.data.Dataset.list_files(files_pattern, shuffle=True)
+        ds = files.apply(tf.contrib.data.parallel_interleave(
+            tf.data.TFRecordDataset,
+            cycle_length=4, block_length=16, sloppy=True))
+
+        # NOTE: using map_and_batch seems to decrease performance
+        ds = (ds.shuffle(buffer_size=128) # small buffer since files were also shuffled
+                .apply(tf.contrib.data.map_and_batch(
+                    shaped_parse_example, batch_size,
+                    num_parallel_batches=4, drop_remainder=True))
+
+                # separate calls version, comment the above apply
+                # .map(shaped_parse_example, num_parallel_calls=4)
+                # .apply(tf.contrib.data.batch_and_drop_remainder(batch_size))
+              )
+        features, labels = ds.prefetch(2).make_one_shot_iterator().get_next()
+        return features, labels
+
+    return input_fn
+While I use the same number of parallel stuff, I think the difference comes from the fact that the map function is heavy and when using map_and_batch only one thread is used for producing each batch.
+&lt;denchmark-h:h3&gt;How much slower ?&lt;/denchmark-h&gt;
+
+It is hard to quantify. With map_and_batch I just see lower numbers for GPU utilisation and even reaching zero at times. I tried increasing the prefetch to 4 to make up for this, but no improvement.
+Here I ran with the first input pipeline for a bit and then with the map_and_batch. You can see a difference of about 30%.
+&lt;denchmark-link:https://user-images.githubusercontent.com/2991890/41467345-733f37ec-70a6-11e8-89f7-21be1d8eda66.png&gt;&lt;/denchmark-link&gt;
+
+&lt;denchmark-h:h3&gt;Feature request&lt;/denchmark-h&gt;
+
+The reason for this issue is that the documentation for map_and_batch says it will be done automatically in future versions. I think that in its current version, this can be a regression, as shown above. I believe (though I'm most probably wrong) that there should be a parameter in map_and_batch controlling the number of threads for the map operation, and another one for the num_parallel_batches. Or along those lines...
+Edit: Python version is 3.5.2
+	</description>
+	<comments>
+		<comment id='1' author='cipri-tom' date='2018-06-15T14:19:36Z'>
+		Can you try setting num_parallel_calls=4 rather than num_parallel_batches=4? Currently your program will execute 4 * batch_size functions in parallel, which might be leading to contention.
+/cc &lt;denchmark-link:https://github.com/jsimsa&gt;@jsimsa&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='2' author='cipri-tom' date='2018-06-15T15:01:25Z'>
+		Thanks for the fast reply!
+map_and_batch() got an unexpected keyword argument 'num_parallel_calls'
+This is TF 1.8. Do I have to try the RC 1.9 ?
+		</comment>
+		<comment id='3' author='cipri-tom' date='2018-06-15T15:13:07Z'>
+		Ah yes, that argument was only added in &lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/bf228e1435da0032d2529de93661b742ee8a7048&gt;bf228e1&lt;/denchmark-link&gt;
+, so you'd need to upgrade to use it.
+As a proxy however, does it speed up your program if you cut num_parallel_batches down to 1?
+(Incidentlly, the reason we added  was because on some platforms and with some batch sizes, kicking off  computations would slow things down. The prototype automatic optimizer for  -&gt;  (&lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/bab05a2191383b3c66e9ea9ee192aef0aa36c218&gt;bab05a2&lt;/denchmark-link&gt;
+) uses  to keep the degree of parallelism the same before and after the rewrite.)
+		</comment>
+		<comment id='4' author='cipri-tom' date='2018-06-29T07:32:02Z'>
+		Thanks &lt;denchmark-link:https://github.com/mrry&gt;@mrry&lt;/denchmark-link&gt;
+ for the reply! It took me a while to come back with new results as there were other things running on the machine, so benchmarking was not feasible.
+I tried with num_parallel_batches=1 in v1.8, but didn't get anything out of it. It even seemed a bit slower, since I don't think there was any parallelism left (no num_parallel_calls in v1.8).
+I also tried with v1.9 RC map_and_batch(num_parallel_calls=4), which is supposed to replicate the .map(num_parallel_calls=4).batch(). While it is faster than the above, 1.15 steps/sec (instead of 1/s), it is not as fast as map+batch, which gets me 1.3 steps/sec. I find this a bit strange
+		</comment>
+		<comment id='5' author='cipri-tom' date='2018-06-29T16:55:32Z'>
+		That is surprising. I'll assign this to &lt;denchmark-link:https://github.com/jsimsa&gt;@jsimsa&lt;/denchmark-link&gt;
+, since he has been working on the performance of  most recently (and since our working hypothesis is that converting parallel  to  with the same degree is always at worst performance-neutral, we'll need to get to the bottom of this).
+&lt;denchmark-link:https://github.com/jsimsa&gt;@jsimsa&lt;/denchmark-link&gt;
+ The only thing I can think of here is that the  we use here:
+
+
+
+tensorflow/tensorflow/core/kernels/data/map_and_batch_dataset_op.cc
+
+
+        Lines 309 to 310
+      in
+      b7300de
+
+
+
+
+
+
+ Status copy_status = ::tensorflow::functor::DoParallelConcat( 
+
+
+
+     *dataset()-&gt;device_, tensor, offset, batch); 
+
+
+
+
+
+...might be slower than sequential concat in some cases. For example, we might be using too many threads to perform each copy, and they could be contending. I'm not convinced that multithreading that copy is always a good idea when we'd expect to have num_parallel_calls copies issuing in parallel anyway.
+&lt;denchmark-link:https://github.com/cipri-tom&gt;@cipri-tom&lt;/denchmark-link&gt;
+ We might have some difficulty reproducing your workload without more details. As a proxy, would you be able to capture a performance trace using a tool like pprof and share the results when running each version? Also, could you try running with , by adding a  to your  arguments? That would help to test my hypothesis about .
+Thanks!
+		</comment>
+		<comment id='6' author='cipri-tom' date='2018-07-07T01:36:21Z'>
+		Hi &lt;denchmark-link:https://github.com/cipri-tom&gt;@cipri-tom&lt;/denchmark-link&gt;
+, I evaluated the performance of  vs  across a wide range of configurations (varying transformation parallelism, batch size, map function cost, threadpool size) and didn't come across any configuration for which  would perform worse than .
+This is the program that I used for my evaluation:
+&lt;denchmark-code&gt;import numpy as np
+import tensorflow as tf
+import time
+
+batch_size = 1024
+num_calls = 16
+inter_op = 16
+element_size = 1
+num_iters = 16
+k = 1024 * 1024
+
+dataset = tf.data.Dataset.from_tensors((np.random.rand(
+    element_size, 4 * k), np.random.rand(4 * k, 1))).repeat()
+
+chained_dataset = dataset.map(
+    tf.matmul, num_parallel_calls=num_calls).batch(batch_size=batch_size)
+chained_iterator = chained_dataset.make_one_shot_iterator()
+chained_get_next = chained_iterator.get_next()
+
+chained_deltas = []
+with tf.Session(config=tf.ConfigProto(
+    inter_op_parallelism_threads=inter_op)) as sess:
+
+  with tf.Session(
+      config=tf.ConfigProto(
+          inter_op_parallelism_threads=inter_op)) as sess:
+    for _ in range(5):
+      sess.run(chained_get_next.op)
+    for _ in range(num_iters):
+      start = time.time()
+      sess.run(chained_get_next.op)
+      end = time.time()
+      chained_deltas.append(end - start)
+
+fused_dataset = dataset.apply(
+    tf.contrib.data.map_and_batch(
+        tf.matmul, num_parallel_calls=num_calls, batch_size=batch_size))
+fused_iterator = fused_dataset.make_one_shot_iterator()
+fused_get_next = fused_iterator.get_next()
+
+fused_deltas = []
+with tf.Session(config=tf.ConfigProto(
+    inter_op_parallelism_threads=inter_op)) as sess:
+
+  with tf.Session(
+      config=tf.ConfigProto(
+          inter_op_parallelism_threads=inter_op)) as sess:
+
+    for _ in range(5):
+      sess.run(fused_get_next.op)
+    for _ in range(num_iters):
+      start = time.time()
+      sess.run(fused_get_next.op)
+      end = time.time()
+      fused_deltas.append(end - start)
+
+print(
+    "batch size: %d, num parallel calls: %d, inter-op parallelism: %d, "
+    "element size: %d\nchained wall time: %f (median), %f (mean), %f "
+    "(stddev), %f (min), %f (max)\n  fused wall time: %f (median), %f "
+    "(mean), %f (stddev), %f (min), %f (max)\n    chained/fused: "
+    "   %.2fx (median),    %.2fx (mean)" %
+    (batch_size, num_calls, inter_op, element_size, np.median(chained_deltas),
+     np.mean(chained_deltas), np.std(chained_deltas), np.min(chained_deltas),
+     np.max(chained_deltas), np.median(fused_deltas), np.mean(fused_deltas),
+     np.std(fused_deltas), np.min(fused_deltas), np.max(fused_deltas),
+     np.median(chained_deltas) / np.median(fused_deltas),
+     np.mean(chained_deltas) / np.mean(fused_deltas)))
+&lt;/denchmark-code&gt;
+
+See if you can use it as a starting point to generate an example that reproduces the issue you have encountered.
+As a side note, since you seem to care about performance, I recommend you build TensorFlow from source with AVX, AVX2, or FMA enabled (assuming your CPU supports these). Doing so will likely benefit the performance of your pipeline.
+		</comment>
+		<comment id='7' author='cipri-tom' date='2018-07-09T13:45:24Z'>
+		&lt;denchmark-link:https://github.com/jsimsa&gt;@jsimsa&lt;/denchmark-link&gt;
+  thank you for getting back! We have things to keep the GPUs busy until next week, so I can't try anything before that. I'll get back when I get any conclusive results
+		</comment>
+		<comment id='8' author='cipri-tom' date='2018-07-31T08:19:54Z'>
+		&lt;denchmark-link:https://github.com/jsimsa&gt;@jsimsa&lt;/denchmark-link&gt;
+ Thank you for the tests and the benchmarking program! Indeed, running it with various configurations doesn't reflect any troubles with either pipeline.
+On my side, there are no conclusive results. I still see the mentioned slow-down, but the causes are very weird and most probably tied to my system/program and not to TF.
+This is because I ran one very long training on a separate and more performant machine, and during the training I saw the global_step/sec measure fluctuating by about the same amount as I previously attributed to the difference between .map().batch() and map_and_batch().
+&lt;denchmark-link:https://user-images.githubusercontent.com/2991890/43446724-e32eb9fc-94a9-11e8-9899-bec46e933afb.png&gt;&lt;/denchmark-link&gt;
+
+It is interesting that the intervals of performance drop/increase are synchronised with the epochs. In other words, each lasts ~4000 steps which is the size of one epoch, and I trained for 10 epochs. If you have any suggestions for this, they would be very welcome. Otherwise, it is safe to let this issue die 😀
+		</comment>
+		<comment id='9' author='cipri-tom' date='2018-07-31T18:01:35Z'>
+		&lt;denchmark-link:https://github.com/cipri-tom&gt;@cipri-tom&lt;/denchmark-link&gt;
+ thank you for reporting your findings ... my best guess this is related to either I/O or memory alignment ... to better understand what is going on, I would collect and compare pprof traces for epochs that are performing differently
+		</comment>
+	</comments>
+</bug>

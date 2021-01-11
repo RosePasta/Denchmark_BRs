@@ -1,0 +1,139 @@
+<bug id='39298' author='ihsuy' open_date='2020-05-08T04:50:21Z' closed_time='2020-10-15T13:13:01Z'>
+	<summary>Custom optimizer that behaves differently depending on the shapes of weights</summary>
+	<description>
+I am attempting to create a custom TensorFlow optimizer (tf.keras.optimizers.Optimizer) which treats weights of different shapes differently.
+For example, please consider a simple convolutional neural network with the following shape of weights (and biases):
+&lt;denchmark-code&gt;(3, 3, 3, 16)
+(16,)
+(3, 3, 16, 16)
+(16,)
+(2704, 64)
+(64,)
+(64, 10)
+(10,)
+&lt;/denchmark-code&gt;
+
+At the beginning of the method _resource_apply_dense(self, grad, var), I would like to transform var of different shapes all into 2 dimensional, and then perform some other operations.
+The following is the simplified logic of the desired transformation behavior:
+def custom_train_step(var):
+    if tf.rank(var) == 1:
+        # Case1
+        return tf.expand_dims(input=var, axis=0)
+    elif tf.rank(var) == 2:
+        # Case2
+        return tf.transpose(a=var)
+    elif tf.rank(var) == 4:
+        # Case3
+        var = tf.transpose(a=var, perm=[3,0,1,2])
+        return tf.reshape(var, shape=[var.shape[0], -1])
+    else:
+        # Case4 omitted
+        pass
+However, this will not work when ndim(var)&lt;4, because it seems that when TensorFlow constructs its computation graph, all 4 branches are traced including Case3. Consequently, 1d and 2d var, during tracing, will also be passed to tf.transpose(a=var, perm=(3,0,1,2)), which will result in an error:
+ValueError: Dimension must be 1 but is 4 for '{{node transpose}} = Transpose[T=DT_FLOAT, Tperm=DT_INT32](transpose/ReadVariableOp, Const)' with input shapes: [16], [4].
+(The error occurred when var is a bias tensor of shape (16,))
+I've tried directly writing the conditional statements using tf.cond, tf.case and tf.switch_case, but the error stayed. I understand this is perhaps because that custom_train_step(var) is polymorphic which made it necessary for retracing, but I can't think of a way to avoid such behavior by improving the code. (Please note again that I probably can not write 4 branches in separate methods and decorate each of them with tf.function, because this is supposed to be called inside a tf.keras training loop. Please correct me if I am wrong.)
+I would like to know if there is a workaround to achieve what I described above, or is this type of behavior not yet supported by Tensorflow?
+Any help and suggestions would be appreciated. Thanks!
+	</description>
+	<comments>
+		<comment id='1' author='ihsuy' date='2020-05-08T10:15:11Z'>
+		&lt;denchmark-link:https://github.com/ihsuy&gt;@ihsuy&lt;/denchmark-link&gt;
+
+Please provide details about what platform you are using (operating system, architecture). Also include your TensorFlow version.
+Request you to share colab link or simple standalone code to reproduce the issue in our environment.It helps us in localizing the issue faster.Thanks!
+		</comment>
+		<comment id='2' author='ihsuy' date='2020-05-08T11:53:53Z'>
+		&lt;denchmark-link:https://github.com/ravikyram&gt;@ravikyram&lt;/denchmark-link&gt;
+
+Thank you for your reply.
+I am trying to implement the custom optimizer directly on Google Colab. The TensorFlow version I currently use is 2.2.0-rc4.
+Here is a &lt;denchmark-link:https://colab.research.google.com/drive/1RimEM_msNRyadICAtlSeb7-0fH0TAZJ1?usp=sharing&gt;Toy example&lt;/denchmark-link&gt;
+.
+I would really like to know if there is a legit way to achieve what I want, or is this behavior not yet supported?
+Please let me know if any other information should be provided to help you locate the problem.
+Many Thanks!
+		</comment>
+		<comment id='3' author='ihsuy' date='2020-05-08T12:22:53Z'>
+		I have tried in colab with TF 2.2-rc4 and was able to reproduce the issue .However with TF 2.1.0 i am seeing different error message .Please, find the gist &lt;denchmark-link:https://colab.sandbox.google.com/gist/ravikyram/a636c3d5c099a7d8e0cbc00e7daa2d58/untitled870.ipynb&gt;here&lt;/denchmark-link&gt;
+.Thanks!
+		</comment>
+		<comment id='4' author='ihsuy' date='2020-05-08T15:23:58Z'>
+		&lt;denchmark-link:https://github.com/ravikyram&gt;@ravikyram&lt;/denchmark-link&gt;
+
+Thank you very much for trying to reproduce the issue in a different version.
+I notice the error you pointed out with TF2.1.0 was because of a silly mistake (unrelated to this issue) I made when defining the model. Sorry for the trouble. 
+Now it is fixed (&lt;denchmark-link:https://colab.research.google.com/drive/1RimEM_msNRyadICAtlSeb7-0fH0TAZJ1?usp=sharing&gt;Link to Gist&lt;/denchmark-link&gt;
+), and the same old error from  shows up. 
+However, the difference is that in TF2.1.0 it seems to happen after the 1st batch, but in 2.2 it happens before the training begins.
+		</comment>
+		<comment id='5' author='ihsuy' date='2020-10-12T23:46:05Z'>
+		This is a known issue due to the mixed static and dynamic shape verification being made by various ops. It's very confusing and we're looking at ways to fix it. Fortunately there are workarounds. I'll explain the issue first.
+First, tf.rank(var) always returns a Tensor, which makes the control flow dynamic (that is, it's transformed into tf.cond). As you pointed out, all branches of dynamic control flow are traced. It is at this trace time when things break up. So far I believe that matches your observations.
+Second, as you probably know, Tensor objects may have a static shape (obtained using &lt;tensor&gt;.shape), which is known at trace time. The key insight is that some ops, like tf.transpose, verify this static shape at trace time. That's what causes the error.
+There are a couple of workarounds. I'll start with the most practical one.
+First is to try using shape.ndims instead of tf.rank. shape.ndims returns a Python bool, which allows avoiding the creation of the tf.cond. You'll still support multiple ranks because the tf.function retraces. That should be ok because variables always have a static shape:
+&lt;denchmark-code&gt;    assert var.shape.ndims is not None, 'Oops, this method doesn't work.'
+    if var.shape.ndims == 1:
+        # Case1
+        return tf.expand_dims(input=var, axis=0)
+    elif var.shape.ndims == 2:
+        # Case2
+        return tf.transpose(a=var)
+    # etc.
+&lt;/denchmark-code&gt;
+
+The second will take care of unknown ranks, so it's the most complete. But also a bit more verbose.
+The reason it works is because Autograph uses lazy evaluation of Python booleans, so tf.rank is only evaluated when var.shape.ndims is None, and in that case tf.transpose doesn't do any trace-time checks.
+&lt;denchmark-code&gt;    if var.shape.ndims == 1 or (var.shape.ndims is None and tf.rank(var) == 1):
+        # Case1
+        return tf.expand_dims(input=var, axis=0)
+    elif var.shape.ndims == 2 or (var.shape.ndims is None and tf.rank(var) == 2):
+        # Case2
+        return tf.transpose(a=var)
+    # etc.
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='6' author='ihsuy' date='2020-10-15T09:46:26Z'>
+		&lt;denchmark-link:https://github.com/mdanatg&gt;@mdanatg&lt;/denchmark-link&gt;
+
+Hello! Thank you for the detailed and completed explanation on the issue.
+Following your solutions, I was able to FINALLY fix my code and make it work.
+The first solution worked immediately.
+I will apply the second solution when I encounter the scenario where it is needed.
+If possible, could you please link me to some resources explaining the inner working of TensorFlow AutoGraph at a more detailed level than &lt;denchmark-link:https://www.tensorflow.org/guide/function&gt;THIS ONE&lt;/denchmark-link&gt;
+?
+I wish, someday, I could understand TensorFlow as well as you do. It is a beautiful+efficient but intricate piece of work!
+Again, thanks!
+I will close this issue within 48 hours.
+Have a great day!
+		</comment>
+		<comment id='7' author='ihsuy' date='2020-10-15T12:34:17Z'>
+		&lt;denchmark-link:https://github.com/ihsuy&gt;@ihsuy&lt;/denchmark-link&gt;
+ here are a few links that might help:
+
+The AutoGraph reference docs - there are some aspects of tf.function they don't cover though
+The original tf.function RFC - it's an older doc, but describes the fundamental mechanics well
+There are also a few recordings of in-depth presentations on various topics, titled with "Inside TensorFlow": https://www.youtube.com/results?search_query=%22Inside+TensorFlow%22
+
+We're also looking into putting together a complete specification.
+&lt;denchmark-link:https://github.com/ccrusius&gt;@ccrusius&lt;/denchmark-link&gt;
+ FYI
+		</comment>
+		<comment id='8' author='ihsuy' date='2020-10-15T13:13:01Z'>
+		&lt;denchmark-link:https://github.com/mdanatg&gt;@mdanatg&lt;/denchmark-link&gt;
+
+Awesome.
+I will be reading them!
+Thank you!
+		</comment>
+		<comment id='9' author='ihsuy' date='2020-10-15T13:13:04Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/39298&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/39298&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,175 @@
+<bug id='3776' author='richardliaw' open_date='2019-01-14T22:24:28Z' closed_time='2020-03-05T23:32:52Z'>
+	<summary>Fault Tolerance: Ray Stop worker causes `Check failed: _s.ok() [RayletClient] Failed to wait for objects.`</summary>
+	<description>
+&lt;denchmark-h:h3&gt;Describe the problem&lt;/denchmark-h&gt;
+
+This is a non-deterministic bug. You can reproduce this with the following:
+
+install ray latest (source activate tensorflow_p36) on 2 nodes:
+
+&lt;denchmark-code&gt;provider:
+    type: aws
+    region: us-east-1
+    availability_zone: us-east-1a
+
+# How Ray will authenticate with newly launched nodes.
+auth:
+    ssh_user: ubuntu
+
+head_node:
+    InstanceType: c5.2xlarge
+    ImageId: ami-6d720012
+&lt;/denchmark-code&gt;
+
+
+start ray, use --num-cpus=4 for the head:
+
+&lt;denchmark-code&gt;source activate tensorflow_p36 &amp;&amp; ulimit -c unlimited &amp;&amp; ray start --head --redis-port=6379 --autoscaling-config=~/ray_bootstrap_config.yaml --num-cpus=4
+
+source activate tensorflow_p36 &amp;&amp; ray start --redis-address=$RAY_HEAD_IP:6379
+&lt;/denchmark-code&gt;
+
+
+
+run the following script on head.
+
+
+Kill worker with ray stop.
+
+
+Script:
+#!/usr/bin/env python
+
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
+import argparse
+import json
+import os
+import random
+import time
+
+import numpy as np
+
+import ray
+from ray.tune import Trainable, run_experiments, sample_from
+from ray import tune
+from ray.tune.schedulers import AsyncHyperBandScheduler
+
+
+class MyTrainableClass(Trainable):
+    """Example agent whose learning curve is a random sigmoid.
+
+    The dummy hyperparameters "width" and "height" determine the slope and
+    maximum reward value reached.
+    """
+
+    def _setup(self, config):
+        self.timestep = 0
+
+    def _train(self):
+        self.timestep += 1
+        v = np.tanh(float(self.timestep) / self.config["width"])
+        v *= self.config["height"]
+        time.sleep(1)
+
+        # Here we use `episode_reward_mean`, but you can also report other
+        # objectives such as loss or accuracy.
+        return {"episode_reward_mean": v}
+
+    def _save(self, checkpoint_dir):
+        path = os.path.join(checkpoint_dir, "checkpoint")
+        with open(path, "w") as f:
+            f.write(json.dumps({"timestep": self.timestep}))
+        return path
+
+    def _restore(self, checkpoint_path):
+        with open(checkpoint_path) as f:
+            self.timestep = json.loads(f.read())["timestep"]
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    ray.init(redis_address="localhost:6379")
+
+    # asynchronous hyperband early stopping, configured with
+    # `episode_reward_mean` as the
+    # objective and `training_iteration` as the time unit,
+    # which is automatically filled by Tune.
+
+    run_experiments(
+        {
+            "asynchyperband_test": {
+                "run": MyTrainableClass,
+                "stop": {
+                    "training_iteration": 50
+                },
+                "checkpoint_freq": 2,
+                "num_samples": 12,
+                "resources_per_trial": {
+                    "cpu": 2,
+                    "gpu": 0
+                },
+                "config": {
+                    "width": sample_from(
+                        lambda spec: 10 + int(90 * random.random())),
+                    "height": sample_from(
+                        lambda spec: int(100 * random.random())),
+                },
+            }
+        }, verbose=False)
+&lt;denchmark-h:h3&gt;Source code / logs&lt;/denchmark-h&gt;
+
+Error:
+&lt;denchmark-code&gt;== Status ==
+Using FIFO scheduling algorithm.
+Resources requested: 12/4 CPUs, 0/0 GPUs
+Unknown memory usage. Please run `pip install psutil` (or ray[debug]) to resolve)
+Result logdir: /home/ubuntu/ray_results/asynchyperband_test
+PENDING trials:
+ - MyTrainableClass_8_height=49,width=73:	PENDING
+ - MyTrainableClass_9_height=13,width=33:	PENDING
+ - MyTrainableClass_10_height=49,width=49:	PENDING
+ - MyTrainableClass_11_height=19,width=68:	PENDING
+RUNNING trials:
+ - MyTrainableClass_0_height=73,width=30:	RUNNING [ip-172-31-11-173 pid=2181], 46 s, 46 iter, 66.5 rew
+ - MyTrainableClass_1_height=51,width=56:	RUNNING [ip-172-31-11-173 pid=2174], 46 s, 46 iter, 34.5 rew
+ - MyTrainableClass_4_height=93,width=48:	RUNNING [ip-172-31-11-173 pid=2180], 47 s, 47 iter, 70 rew
+ - MyTrainableClass_5_height=67,width=18:	RUNNING [ip-172-31-11-173 pid=2175], 46 s, 46 iter, 66.2 rew
+ - MyTrainableClass_6_height=93,width=26:	RUNNING [pid=27720], 46 s, 46 iter, 87.7 rew
+ - MyTrainableClass_7_height=96,width=53:	RUNNING [pid=27721], 45 s, 45 iter, 66.3 rew
+TERMINATED trials:
+ - MyTrainableClass_2_height=88,width=24:	TERMINATED [pid=26802], 50 s, 50 iter, 85.3 rew
+ - MyTrainableClass_3_height=31,width=38:	TERMINATED [pid=26804], 50 s, 50 iter, 26.8 rew
+
+WARNING: Logging before InitGoogleLogging() is written to STDERR
+F0114 22:15:00.449167 27302 raylet_extension.cc:194]  Check failed: _s.ok() [RayletClient] Failed to wait for objects.: IOError: [RayletClient] Raylet connection closed.
+*** Check failure stack trace: ***
+Fatal Python error: Aborted
+
+Stack (most recent call first):
+  File "/home/ubuntu/anaconda3/envs/tensorflow_p36/lib/python3.6/site-packages/ray/worker.py", line 2329 in wait
+  File "/home/ubuntu/anaconda3/envs/tensorflow_p36/lib/python3.6/site-packages/ray/tune/ray_trial_executor.py", line 210 in get_next_available_trial
+  File "/home/ubuntu/anaconda3/envs/tensorflow_p36/lib/python3.6/site-packages/ray/tune/trial_runner.py", line 351 in _process_events
+  File "/home/ubuntu/anaconda3/envs/tensorflow_p36/lib/python3.6/site-packages/ray/tune/trial_runner.py", line 203 in step
+  File "/home/ubuntu/anaconda3/envs/tensorflow_p36/lib/python3.6/site-packages/ray/tune/tune.py", line 170 in run_experiments
+  File "example.py", line 81 in &lt;module&gt;
+Aborted (core dumped)
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='richardliaw' date='2019-01-14T22:40:14Z'>
+		Core dump here:
+&lt;denchmark-link:https://github.com/ray-project/ray/files/2757338/core.zip&gt;core.zip&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='2' author='richardliaw' date='2019-01-15T04:49:34Z'>
+		The coredump that you attached and the error that you posted is from the Python client, which probably means the Raylet died. Can you provide a coredump for the raylet process?
+		</comment>
+		<comment id='3' author='richardliaw' date='2020-03-05T23:32:52Z'>
+		Stale - please open new issue if still relevant
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,138 @@
+<bug id='4304' author='jopo666' open_date='2020-10-22T12:12:49Z' closed_time='2020-11-25T19:44:06Z'>
+	<summary>TensorBoardLogger not working as expected with accumulate_grad_batches&amp;gt;1</summary>
+	<description>
+&lt;denchmark-h:h2&gt;🐛 Bug&lt;/denchmark-h&gt;
+
+When logging inside training step to TensorBoard and using accumulate_grad_batches &gt; 1 inside pl.Trainer() the behavior is not as expected.
+With  everything looks good.
+&lt;denchmark-link:https://user-images.githubusercontent.com/49716607/96869625-65b62900-1478-11eb-85fd-c3c5d219c65e.png&gt;&lt;/denchmark-link&gt;
+
+With accumulate_grad_batches = 8 the values are reported on the same step.
+&lt;denchmark-link:https://user-images.githubusercontent.com/49716607/96869632-66e75600-1478-11eb-981b-399af7dd173c.png&gt;&lt;/denchmark-link&gt;
+
+&lt;denchmark-h:h3&gt;To Reproduce (sorry for not using colab)&lt;/denchmark-h&gt;
+
+&lt;denchmark-code&gt;import os
+
+import torch
+from torch.nn import functional as F
+from torch.utils.data import DataLoader, random_split
+
+import pytorch_lightning as pl
+from pytorch_lightning.loggers import TensorBoardLogger
+from torchvision.datasets.mnist import MNIST
+from torchvision import transforms
+
+class LitClassifier(pl.LightningModule):
+    def __init__(self, hidden_dim=128, learning_rate=1e-3):
+        super().__init__()
+        self.save_hyperparameters()
+
+        self.l1 = torch.nn.Linear(28 * 28, self.hparams.hidden_dim)
+        self.l2 = torch.nn.Linear(self.hparams.hidden_dim, 10)
+
+    def forward(self, x):
+        x = x.view(x.size(0), -1)
+        x = torch.relu(self.l1(x))
+        x = torch.relu(self.l2(x))
+        return x
+
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+        y_hat = self(x)
+        loss = F.cross_entropy(y_hat, y)
+        self.log("train_loss",loss)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        x, y = batch
+        y_hat = self(x)
+        loss = F.cross_entropy(y_hat, y)
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
+
+def run_test(accumulate_grad_batches,batch_size,num_workers):
+    dataset = MNIST('', train=True, download=True, transform=transforms.ToTensor())
+    mnist_train, mnist_val = random_split(dataset, [55000, 5000])
+    train_loader = DataLoader(mnist_train,batch_size)
+    val_loader = DataLoader(mnist_val,batch_size)
+
+    model = LitClassifier()
+
+    trainer = pl.Trainer(
+        logger=TensorBoardLogger(os.getcwd()',name='bug'),
+        accumulate_grad_batches=accumulate_grad_batches,
+        max_epochs=2
+        )
+    trainer.fit(model, train_loader, val_loader)
+
+run_test(1,32)
+run_test(8,32)
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h3&gt;Expected behavior&lt;/denchmark-h&gt;
+
+Take a mean of the values logged at same step?
+&lt;denchmark-h:h3&gt;Environment&lt;/denchmark-h&gt;
+
+
+PyTorch Version: 1.6
+OS: Linux
+How you installed PyTorch: conda
+Python version: 3.8
+Tensorboard: 2.3.0
+
+	</description>
+	<comments>
+		<comment id='1' author='jopo666' date='2020-10-22T12:13:31Z'>
+		Hi! thanks for your contribution!, great first issue!
+		</comment>
+		<comment id='2' author='jopo666' date='2020-10-23T13:46:38Z'>
+		To add something to the issue: when using DataParallel () it might cause even worse results, i.e in W&amp;B it looks like this:
+&lt;denchmark-link:https://user-images.githubusercontent.com/6958772/97011285-c2801500-1546-11eb-8362-37f2e5e1814e.png&gt;&lt;/denchmark-link&gt;
+
+I'm also logging from training_step.
+		</comment>
+		<comment id='3' author='jopo666' date='2020-10-23T21:20:19Z'>
+		The first one looks like an issue with the limitations of  since  is updated after every accumulated step, and since x-axis is the  so for every  it's logging 8 values(num accumulated batches). I tried this on Wandb the it's looking good there.
+&lt;denchmark-link:https://user-images.githubusercontent.com/30778939/97055069-a199dd00-15a3-11eb-9872-b9c4ebeb6348.png&gt;&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='4' author='jopo666' date='2020-10-24T14:01:49Z'>
+		&lt;denchmark-link:https://github.com/rohitgr7&gt;@rohitgr7&lt;/denchmark-link&gt;
+ have you checked that with or without DataParallel?
+		</comment>
+		<comment id='5' author='jopo666' date='2020-10-24T14:11:24Z'>
+		&lt;denchmark-link:https://github.com/marrrcin&gt;@marrrcin&lt;/denchmark-link&gt;
+ don't have GPUs , can't check it.
+		</comment>
+		<comment id='6' author='jopo666' date='2020-10-24T18:13:55Z'>
+		So what I've found out is the following:
+
+Logging with on_step=False and on_epoch=True in __step_end yields fine charts on the epoch level (for any kind of step).
+Logging with on_step=True and on_epoch=False in training_step_end results in messed up charts that are dependant on the accumulate_grad_batches parameter of the Trainer as in the picture:
+
+Each red box contains number of points equal to accumulate_grad_batches.
+
+It seems to me like the problem is that for the same Trainer's global_step, there are accumulate_grad_batches-calls to both train_step and backward and when you log from there, the charts are invalid. IMHO when accumulate_grad_batches is &gt; 1 then there should be some callback / on_* event just before the optimizer step happens that will have access to the losses calculated during the accumulation step.
+My current workaround to this is to store every training loss's value during the same  and only call  when global step increments - then the chart looks normal:
+&lt;denchmark-link:https://user-images.githubusercontent.com/6958772/97088721-27189e00-1633-11eb-8e25-337ec66d7175.png&gt;&lt;/denchmark-link&gt;
+
+It's a nasty workaround, I hope &lt;denchmark-link:https://github.com/tchaton&gt;@tchaton&lt;/denchmark-link&gt;
+ you will be able to fix it in more robust manner.
+		</comment>
+		<comment id='7' author='jopo666' date='2020-10-28T14:45:38Z'>
+		&lt;denchmark-link:https://github.com/tchaton&gt;@tchaton&lt;/denchmark-link&gt;
+ any update on this?
+		</comment>
+		<comment id='8' author='jopo666' date='2020-11-10T09:37:21Z'>
+		Ping &lt;denchmark-link:https://github.com/tchaton&gt;@tchaton&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='9' author='jopo666' date='2020-11-17T18:19:57Z'>
+		defining the behavior only for accumulate_grad_batches,
+avoid making general logging changes
+		</comment>
+	</comments>
+</bug>

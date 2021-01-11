@@ -1,0 +1,181 @@
+<bug id='5672' author='carter54' open_date='2020-11-03T01:32:54Z' closed_time='2020-11-04T05:34:00Z'>
+	<summary>quantized gpt2 model output seem to be wrong when batch size &amp;gt; 1</summary>
+	<description>
+
+I generated a int8 quantized gpt2 model by following the instruction in this notebook (&lt;denchmark-link:https://github.com/microsoft/onnxruntime/blob/1ce2982f65e5516067fdcaef19409279173b0d75/onnxruntime/python/tools/transformers/notebooks/Inference_GPT2_with_OnnxRuntime_on_CPU.ipynb&gt;https://github.com/microsoft/onnxruntime/blob/1ce2982f65e5516067fdcaef19409279173b0d75/onnxruntime/python/tools/transformers/notebooks/Inference_GPT2_with_OnnxRuntime_on_CPU.ipynb&lt;/denchmark-link&gt;
+)
+When I test the quantized model with batch input, some unexpected results were found.
+These are two input I tested:
+['best hotel in bay area', 'best hotel in bay area']  ( [[13466,  7541,   287, 15489,  1989], [13466,  7541,   287, 15489,  1989]] after tokenize)
+['best hotel in bayale', 'best hotel in bay area']     ( [[13466,  7541,   287, 15489,  1000], [13466,  7541,   287, 15489,  1989]] after tokenize)
+sample 2 in both batch input are the same, I just changed the last token of sample 1.
+after inputing them into quantized gpt2 model, the output of sample 2 are different...
+I was expecting same output results from sample 2 in these two input tests.
+System information
+
+OS Platform and Distribution: Win10:
+ONNX Runtime installed from: pip install
+ONNX Runtime version: 1.5.1
+Python version: 3.7.4
+
+To Reproduce
+&lt;denchmark-code&gt;from onnxruntime.transformers.gpt2_helper import Gpt2Helper, MyGPT2LMHeadModel
+from transformers import AutoConfig
+from transformers import AutoTokenizer
+import torch
+from onnxruntime.transformers.quantize_helper import QuantizeHelper
+import onnxruntime
+import numpy as np
+
+model_name_or_path = '''the model save path, I download the original gpt2 model from huggingface'''
+config = AutoConfig.from_pretrained(model_name_or_path)
+model = MyGPT2LMHeadModel.from_pretrained(model_name_or_path, config=config)
+device = torch.device("cpu")
+model.eval().to(device)
+num_attention_heads = model.config.n_head
+hidden_size = model.config.n_embd
+num_layer = model.config.n_layer
+
+# quantize model
+optimized_fp32_model_path = os.path.join(model_name_or_path, "gpt2_fp32.onnx")
+quantized_int8_model_path = os.path.join(model_name_or_path, "gpt2_int8.onnx")
+Gpt2Helper.optimize_onnx(onnx_model_path, optimized_fp32_model_path, False, model.config.num_attention_heads, model.config.hidden_size)
+QuantizeHelper.quantize_onnx_model(optimized_fp32_model_path, quantized_int8_model_path)
+
+def get_tokenizer(model_name_or_path, cache_dir):
+    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path,
+                                              cache_dir=cache_dir)
+    tokenizer.padding_side = "left"
+    tokenizer.pad_token = tokenizer.eos_token
+    # okenizer.add_special_tokens({'pad_token': '[PAD]'})
+    return tokenizer
+
+
+def get_example_inputs(prompt_text):
+    tokenizer = get_tokenizer(model_name_or_path, cache_dir)
+    encodings_dict = tokenizer.batch_encode_plus(prompt_text)
+    input_ids = torch.tensor(encodings_dict['input_ids'], dtype=torch.int64)
+
+    attention_mask = torch.tensor(encodings_dict['attention_mask'],
+                                  dtype=torch.float32)
+    position_ids = (attention_mask.long().cumsum(-1) - 1)
+    position_ids.masked_fill_(position_ids &lt; 0, 0)
+
+    # Empty Past State for generating first word
+    empty_past = []
+    batch_size = input_ids.size(0)
+    sequence_length = input_ids.size(1)
+    past_shape = [2, batch_size, num_attention_heads, 0,
+                  hidden_size // num_attention_heads]
+    for i in range(num_layer):
+        empty_past.append(
+            torch.empty(past_shape).type(torch.float32).to(device))
+
+    return input_ids, attention_mask, position_ids, empty_past
+
+def onnxruntime_inference(session, input_ids, position_ids, attention_mask, past):
+    """ Run inference of ONNX model
+    """
+    ort_inputs = {'input_ids': np.ascontiguousarray(input_ids)}
+    if past is not None:
+        for i, past_i in enumerate(past):
+            ort_inputs[f'past_{i}'] = np.ascontiguousarray(past_i)
+
+    if attention_mask is not None:
+        ort_inputs['attention_mask'] = np.ascontiguousarray(attention_mask)
+
+    if position_ids is not None:
+        ort_inputs['position_ids'] = np.ascontiguousarray(position_ids)
+
+    ort_outputs = session.run(None, ort_inputs)
+
+    return ort_outputs
+
+
+def test_generation(tokenizer, input_text, ort_session=None,
+                    num_tokens_to_produce = 30):
+
+    eos_token_id = tokenizer.eos_token_id
+    input_ids, attention_mask, position_ids, past = get_example_inputs(
+        input_text)
+    batch_size = input_ids.size(0)
+    has_eos = torch.zeros(batch_size, dtype=torch.bool)
+    all_token_ids = input_ids.clone()
+
+    for step in range(num_tokens_to_produce):
+
+        outputs = onnxruntime_inference(ort_session, input_ids, position_ids, attention_mask, past)
+
+        next_token_logits = outputs[0][:, -1, :]
+        # Greedy approach is used here. You can easily extend it to use beam search and sampling to pick next tokens.
+        next_tokens = torch.argmax(next_token_logits, dim=-1)
+
+        has_eos = has_eos | (next_tokens == eos_token_id)
+        tokens_to_add = next_tokens.masked_fill(has_eos, eos_token_id)
+        all_token_ids = torch.cat([all_token_ids, tokens_to_add.unsqueeze(-1)],
+                                  dim=-1)
+
+        # Update input_ids, attention_mask, position_ids and past
+        input_ids = tokens_to_add.clone().detach().reshape([batch_size, 1]).to(
+            device)
+        position_ids = (position_ids[:, -1] + 1).reshape(batch_size, 1)
+        attention_mask = torch.cat([attention_mask,
+                                    torch.ones([batch_size, 1]).type_as(
+                                        attention_mask)], 1).to(device)
+
+        past = []
+        for i in range(num_layer):
+            past_i = torch.from_numpy(outputs[i + 1]) if isinstance(
+                outputs[i + 1], np.ndarray) else outputs[
+                i + 1].clone().detach()
+            past.append(past_i.to(device))
+
+        if torch.all(has_eos):
+            break
+
+    for i, output in enumerate(all_token_ids):
+        print("------------")
+        print(tokenizer.decode(output, skip_special_tokens=True))
+
+quantized_int8_model_path = os.path.join(model_name_or_path, "gpt2_int8.onnx")
+tokenizer = get_tokenizer(model_name_or_path, cache_dir)
+input_text = ['best hotel in bay area', 'best hotel in bay area'] # test 1
+# input_text = ['best hotel in bayale', 'best hotel in bay area']  # test 2
+session = onnxruntime.InferenceSession(quantized_int8_model_path)
+test_generation(tokenizer, input_text, ort_session=session,
+                    num_tokens_to_produce = 30)
+&lt;/denchmark-code&gt;
+
+I tried with two input
+&lt;denchmark-code&gt;input_text = ['best hotel in bay area', 'best hotel in bay area'] # test 1
+# input_text = ['best hotel in bayale', 'best hotel in bay area']  # test 2
+&lt;/denchmark-code&gt;
+
+and debug the result by checking
+&lt;denchmark-code&gt;next_token_logits = outputs[0][:, -1, :]
+&lt;/denchmark-code&gt;
+
+after the first step, this 'next_token_logits' output of second sample in test 1 and test 2 are different.
+I also check if only one sample input
+&lt;denchmark-code&gt;input_text = ['best hotel in bay area']
+&lt;/denchmark-code&gt;
+
+the result is the same with test 1, but different with test 2.
+Expected behavior
+I was expecting the same output of the second sample in test 1 and test 2, as their input are the same.
+Additional context
+In addition, I also try this script with the onnx gpt2 model with quantization, the results are as expected:
+the 'next_token_logits' output of second sample of test 1 and test 2 are the same.
+	</description>
+	<comments>
+		<comment id='1' author='carter54' date='2020-11-03T17:11:47Z'>
+		It is a known issue that dynamic quantization does not work well on batch_size &gt; 1.
+There is per-channel quantization that could solve this problem. &lt;denchmark-link:https://github.com/yufenglee&gt;@yufenglee&lt;/denchmark-link&gt;
+ to share the status of the progress.
+		</comment>
+		<comment id='2' author='carter54' date='2020-11-04T05:34:00Z'>
+		&lt;denchmark-link:https://github.com/carter54&gt;@carter54&lt;/denchmark-link&gt;
+, batch support requires per-row quantization, which is not supported yet. We are planning to add it in 1.7 release.
+		</comment>
+	</comments>
+</bug>

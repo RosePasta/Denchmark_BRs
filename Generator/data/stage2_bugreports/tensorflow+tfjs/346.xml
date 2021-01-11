@@ -1,0 +1,89 @@
+<bug id='346' author='julianoks' open_date='2018-05-25T21:20:12Z' closed_time='2019-03-13T15:46:35Z'>
+	<summary>Gradient of tf.pow</summary>
+	<description>
+There are two issues that I'd like to point out with tf.pow's gradient function:
+First, there's bug with the gradient of tf.pow w.r.t. the exponent, whereby a non-positive base will result in a NaN for the corresponding exponent's gradient. This can be reproduced using:
+&lt;denchmark-code&gt;tf.version_core == "0.8.1";
+tf.grad(x =&gt; tf.pow(tf.scalar(0), x))(tf.scalar(2)).dataSync();
+tf.grad(x =&gt; tf.pow(tf.scalar(-2), x))(tf.scalar(2)).dataSync();
+&lt;/denchmark-code&gt;
+
+The backend pow is &lt;denchmark-link:https://github.com/tensorflow/tfjs-core/blob/master/src/kernels/webgl/binaryop_gpu.ts#L50&gt;implemented as&lt;/denchmark-link&gt;
+ , where  is an indicator function, . Despite the backend, the &lt;denchmark-link:https://github.com/tensorflow/tfjs-core/blob/master/src/ops/binary_ops.ts#L215&gt;gradient function&lt;/denchmark-link&gt;
+ takes the log of the base, which may be negative, rather than the non-negative base used in the backend, which was hit with an abs. One solution is to have an "unprotected" backend pow (which only receives non-negative bases) and have the abs and the isEven components in the tf.pow op definition, which would be cached for the backward pass. Although this takes care of the gradient for when the base is negative, we still have an issue for when the base is 0.
+When the base is 0, both the gradient of the base and the exponent will be NaN:
+&lt;denchmark-code&gt;tf.version_core == "0.8.1";
+tf.grad(x =&gt; tf.pow(x, tf.scalar(2)))(tf.scalar(0)).dataSync(); // grad of base
+tf.grad(x =&gt; tf.pow(tf.scalar(0), x))(tf.scalar(2)).dataSync(); // grad of exponent
+&lt;/denchmark-code&gt;
+
+As just explained, when the base is 0, the gradient will be NaN for the exponent because we're taking , and will be NaN for the base because we're &lt;denchmark-link:https://github.com/tensorflow/tfjs-core/blob/master/src/ops/binary_ops.ts#L206&gt;dividing by 0&lt;/denchmark-link&gt;
+. A simple solution would be to zero-out the gradient of both the base and the exponent wherever the base is 0.
+This makes sense for the gradients (for a^x when a=0) because
+
+the derivative w.r.t. the exponent will be a^x * log(a) = 0^x*log(0) = 0 * log(0)
+the derivative w.r.t. the base will be x*0^(x-1) = 0
+
+Fortunately, I believe that using the exponent's gradient is a rare use case because there's rarely a path from a variable to an exponent (am I wrong to assume this?), so fixing the gradient of the exponent wouldn't be such a high priority. However, fixing the gradient of the base should be done because it is commonly encountered, eg in regularization; if someone is using tf.pow (and not tf.square) and a parameter reaches 0, then a NaN will be produced. This will eventually propagate to variables and mess everything up.
+Would y'all be open to these changes?
+	</description>
+	<comments>
+		<comment id='1' author='julianoks' date='2018-05-26T02:37:41Z'>
+		&lt;denchmark-link:https://github.com/julianoks&gt;@julianoks&lt;/denchmark-link&gt;
+ I think you're right that there's a problem in the case that the base is 0 and the gradient is being taken with respect to the base.  Like you said, It will be  in all cases as currently computed.  However, it should only be  if the exponent is not positive.  I recommend the calculation of that gradient be changed to:
+&lt;denchmark-code&gt;dy.mul(exp.toFloat().mul(base.pow(exp - 1)));
+&lt;/denchmark-code&gt;
+
+I very easily could be missing the problem but I don't think the gradient is wrong in the first case you mentioned though.  As was pointed out, the backend is computing pow as:
+&lt;denchmark-code&gt;return (round(mod(b, 2.0)) == 0 || round(mod(b, 2.0)) == 2) ?
+      pow(abs(a), b) : sign(a) * pow(abs(a), b)
+&lt;/denchmark-code&gt;
+
+As I understand it, the reason for taking the absolute value of the base and checking the parity of the exponent is just because the behavior of the GLSL pow function is undefined when the base is negative. So, for example suppose we're doing pow(a, b) where a is negative and b is odd.  Instead of doing pow(a, b) where the result would be undefined it's actually being computed as -1 * pow(abs(a), b).  The function being computed is still a^b in all cases and the gradient with respect to the exponent is still a^b ln a.  Since non-positive values of a are outside the domain of the functiona^b ln a the gradient with respect to a should be nan where a is negative or 0.
+		</comment>
+		<comment id='2' author='julianoks' date='2018-05-26T22:00:22Z'>
+		&lt;denchmark-link:https://github.com/jgartman&gt;@jgartman&lt;/denchmark-link&gt;
+
+The forward pass only throws NaNs when the base is 0 and the exponent is non-positive, so having the gradient reflect that by throwing a NaN is reasonable. Although I agree with your suggestion to change the base's gradient from  to , to handle the case when , I find zeroing out the gradient at  appealing because it removes NaNs in a (seemingly) innocuous way (yet if the forward pass produces NaNs, it may poison upstream gradients).
+Like you mentioned, tfjs uses a "protected" version of the pow function for negative bases, effectively extending the domain of the forward pass to include negative bases, such as (-5)^2. What I was pointing out was that the domains of the forward and backwards pass are inconsistent; specifically that the exponent's gradient is NaN when the base is negative:
+&lt;denchmark-code&gt;(x =&gt; tf.pow(tf.scalar(-5),x))(tf.scalar(2)).dataSync(); // forward pass is OK
+tf.grad(x =&gt; tf.pow(tf.scalar(-5),x))(tf.scalar(2)).dataSync(); // but backwards pass returns NaN
+&lt;/denchmark-code&gt;
+
+I disagree with your final statement where you said:
+
+The function being computed is still a^b in all cases and the gradient with respect to the exponent is still a^b ln a. Since non-positive values of a are outside the domain of the function a^b ln a the gradient with respect to a should be nan where a is negative or 0.
+
+The function being computed in the forward pass is a protected version of pow, which is not a^b in all cases. I'm suggesting that the gradient function be aligned with the protected pow function used in the forward pass.
+		</comment>
+		<comment id='3' author='julianoks' date='2018-05-27T14:32:52Z'>
+		&lt;denchmark-link:https://github.com/julianoks&gt;@julianoks&lt;/denchmark-link&gt;
+  First I should clarify and correct a couple of things from my previous post.  I think you understood this but just to be clear, when I was using the notation  I was referring to the mathematical power function and when I was using  I was referring to the tfjs or GLSL implementations of that function.  My statement that the tfjs implementation matches the mathematical power function in all cases is wrong, specifically for negative bases and non integer exponents since the library doesn't support complex numbers.
+With that out of the way, I went and checked what TF does for the  gradient since maintaining consistency between the two libraries is usually a goal and it looks like they just return 0 for negative bases &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/master/tensorflow/python/ops/math_grad.py#L945&gt;https://github.com/tensorflow/tensorflow/blob/master/tensorflow/python/ops/math_grad.py#L945&lt;/denchmark-link&gt;
+..  I think that sounds like a pretty reasonable thing for us to do here, again given the lack of support for complex numbers.
+		</comment>
+		<comment id='4' author='julianoks' date='2018-05-27T15:32:32Z'>
+		&lt;denchmark-link:https://github.com/jgartman&gt;@jgartman&lt;/denchmark-link&gt;
+
+I agree that TF's python implementation of the pow gradient function would be good to follow.
+That implementation literally says , which I'm still somewhat wary of because it doesn't reflect the gradient of the implemented forward function, regardless of whether the forward function is deemed sensible or not.
+Ultimately, I don't think the gradient of the exponent is of such practical importance, although I'd prefer it to return 0's instead NaNs when the base is non-positive (like in TF python).
+ If &lt;denchmark-link:https://github.com/dsmilkov&gt;@dsmilkov&lt;/denchmark-link&gt;
+ would be willing to accept these changes, I'd be happy to make a PR.
+		</comment>
+		<comment id='5' author='julianoks' date='2018-05-27T19:40:36Z'>
+		Opened a separate issue for the forward func &lt;denchmark-link:https://github.com/tensorflow/tfjs/issues/350&gt;#350&lt;/denchmark-link&gt;
+.
+		</comment>
+		<comment id='6' author='julianoks' date='2018-10-06T14:46:16Z'>
+		&lt;denchmark-link:https://github.com/dsmilkov&gt;@dsmilkov&lt;/denchmark-link&gt;
+ Just wanted to bump this issue since I noticed it was still open and assigned to you.  Were you planning on opening a PR for this or should Julian go ahead with his proposed fix?
+		</comment>
+		<comment id='7' author='julianoks' date='2018-10-06T14:53:01Z'>
+		Thanks for bumping this up. If the proposed change will align TF.js to the behavior with TF's Python, then yes, Julian should go ahead with the proposed fix. I'm happy to review. Thanks!
+		</comment>
+		<comment id='8' author='julianoks' date='2019-03-13T15:46:35Z'>
+		This is fixed!
+		</comment>
+	</comments>
+</bug>

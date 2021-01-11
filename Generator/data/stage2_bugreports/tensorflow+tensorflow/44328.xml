@@ -1,0 +1,303 @@
+<bug id='44328' author='cschreib-ibex' open_date='2020-10-26T14:13:45Z' closed_time='2020-10-28T15:59:06Z'>
+	<summary>Tensorflow DLL leaks references to itself, preventing the DLL from unloading</summary>
+	<description>
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): Yes (see below).
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Windows 10 Pro 64bit (version 2004)
+Mobile device (e.g. iPhone 8, Pixel 2, Samsung Galaxy) if the issue happens on mobile device: N/A.
+TensorFlow installed from (source or binary): Binary.
+TensorFlow version (use command below): 2.3.1 (CPU only).
+Python version: N/A.
+Bazel version (if compiling from source): N/A.
+GCC/Compiler version (if compiling from source): N/A.
+CUDA/cuDNN version: N/A.
+GPU model and memory: N/A.
+
+Describe the current behavior
+We link to the Tensorflow DLL dynamically (i.e., using LoadLibrary() directly on tensorflow.dll, or on another DLL that itself links to Tensorflow). We use the Tensorflow C API to run some data through a model. Eventually, when processing is complete, the DLL is unlinked (i.e., using FreeLibrary() directly on tensorflow.dll, or the other DLL that itself links to Tensorflow). For some reason unknown to us, at this stage the operating system (Windows) still believes the DLL is in use (the reference count is non-zero), thus any static resource allocated internally by Tensorflow is (probably?) not freed.
+The code example below illustrates this problem.
+If, within the same process, and under certain conditions, the procedure above is repeated a second time (link again to TF, run a model, etc.), we experience an access violation error in TF_SessionRun(). We are not able to produce a sample code that reproduces this last error, as it only occurs when our software is used by a third party application (the source code of which we do not have access to). However, we noticed that the error would no longer happen if we forcefully unlink the Tensorflow DLL by repeatedly calling FreeLibrary("tensorflow.dll") until the OS holds no reference to it (this requires some 30-40 calls to FreeLibrary()!). This implies that some internal state of Tensorflow from the first "link/process/unlink" run is still in use, but is somehow invalid.
+Describe the expected behavior
+A cycle of  LoadLibrary() / run TF / FreeLibrary() should leave the Tensorflow DLL reference count unchanged (i.e., equal to zero if TF is not used anywhere else in the program). On FreeLibrary(), any internal resource held by TF should be freed (provided TF is not in use by other parts of the program). Loading the DLL again should result in a blank new internal state of TF.
+Standalone code to reproduce the issue
+#include &lt;iostream&gt;
+#include &lt;exception&gt;
+#include &lt;string&gt;
+#include &lt;windows.h&gt;
+#include &lt;tlhelp32.h&gt;
+
+// Helper function to count the number of references to tensorflow.dll
+std::size_t GetTensorflowRefCount() {
+    auto handle = GetCurrentProcessId();
+    auto s = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, handle);
+
+    std::size_t value = 0;
+    MODULEENTRY32 me32;
+    me32.dwSize = sizeof(MODULEENTRY32);
+    Module32First(s, &amp;me32);
+    do {
+        if (std::strcmp(me32.szModule, "tensorflow.dll") == 0) {
+            value = me32.GlblcntUsage;
+            break;
+        }
+    } while(Module32Next(s, &amp;me32));
+
+    CloseHandle(s);
+    return value;
+}
+
+// Manually import Tensorflow some types and functions
+typedef enum TF_Code {
+  TF_OK = 0,
+  TF_CANCELLED = 1,
+  TF_UNKNOWN = 2,
+  TF_INVALID_ARGUMENT = 3,
+  TF_DEADLINE_EXCEEDED = 4,
+  TF_NOT_FOUND = 5,
+  TF_ALREADY_EXISTS = 6,
+  TF_PERMISSION_DENIED = 7,
+  TF_UNAUTHENTICATED = 16,
+  TF_RESOURCE_EXHAUSTED = 8,
+  TF_FAILED_PRECONDITION = 9,
+  TF_ABORTED = 10,
+  TF_OUT_OF_RANGE = 11,
+  TF_UNIMPLEMENTED = 12,
+  TF_INTERNAL = 13,
+  TF_UNAVAILABLE = 14,
+  TF_DATA_LOSS = 15,
+} TF_Code;
+
+using TF_Status = void;
+using TF_Graph = void;
+using TF_SessionOptions = void;
+using TF_Session = void;
+
+TF_Code            (*TF_GetCode)(TF_Status*);
+TF_Status*         (*TF_NewStatus)();
+TF_Graph*          (*TF_NewGraph)();
+TF_SessionOptions* (*TF_NewSessionOptions)();
+TF_Session*        (*TF_NewSession)(TF_Graph*, TF_SessionOptions*, TF_Status*);
+void               (*TF_DeleteSession)(TF_Session*, TF_Status*);
+void               (*TF_DeleteSessionOptions)(TF_SessionOptions*);
+void               (*TF_DeleteGraph)(TF_Graph*);
+void               (*TF_DeleteStatus)(TF_Status*);
+
+void ImportTensorflow(HINSTANCE handle) {
+#define LOAD_FUNCTION(Function) Function = reinterpret_cast&lt;decltype(Function)&gt;(GetProcAddress(handle, #Function))
+    LOAD_FUNCTION(TF_GetCode);
+    LOAD_FUNCTION(TF_NewStatus);
+    LOAD_FUNCTION(TF_NewGraph);
+    LOAD_FUNCTION(TF_NewSessionOptions);
+    LOAD_FUNCTION(TF_NewSession);
+    LOAD_FUNCTION(TF_DeleteSession);
+    LOAD_FUNCTION(TF_DeleteSessionOptions);
+    LOAD_FUNCTION(TF_DeleteGraph);
+    LOAD_FUNCTION(TF_DeleteStatus);
+#undef LOAD_FUNCTION
+}
+
+// Helper function to throw on error
+void TFStatusCheck(TF_Status* status) {
+    if (TF_GetCode(status) != TF_OK) {
+        throw std::runtime_error("Error in tensorflow");
+    }
+}
+
+int main() {
+    // Load Tensorflow DLL and import functions
+    std::cout &lt;&lt; "initial: " &lt;&lt; GetTensorflowRefCount() &lt;&lt; std::endl;
+    auto handle = LoadLibrary("tensorflow.dll");
+    std::cout &lt;&lt; "DLL loaded: " &lt;&lt; GetTensorflowRefCount() &lt;&lt; std::endl;
+    ImportTensorflow(handle);
+    std::cout &lt;&lt; "functions imported: " &lt;&lt; GetTensorflowRefCount() &lt;&lt; std::endl;
+
+    // Create a dummy session
+    TF_Status* status = nullptr;
+    TF_Graph* graph = nullptr;
+    TF_SessionOptions* options = nullptr;
+    TF_Session* session = nullptr;
+
+    try
+    {
+        status = TF_NewStatus();
+        std::cout &lt;&lt; "TF_NewStatus: " &lt;&lt; GetTensorflowRefCount() &lt;&lt; std::endl;
+        graph = TF_NewGraph();
+        std::cout &lt;&lt; "TF_NewGraph: " &lt;&lt; GetTensorflowRefCount() &lt;&lt; std::endl;
+        options = TF_NewSessionOptions();
+        std::cout &lt;&lt; "TF_NewSessionOptions: " &lt;&lt; GetTensorflowRefCount() &lt;&lt; std::endl;
+        session = TF_NewSession(graph, options, status);
+        TFStatusCheck(status);
+        std::cout &lt;&lt; "TF_NewSession: " &lt;&lt; GetTensorflowRefCount() &lt;&lt; std::endl;
+    }
+    catch (const std::exception&amp; e)
+    {
+        std::cout &lt;&lt; e.what() &lt;&lt; std::endl;
+    }
+
+    // Free allocated resources
+    if (session) TF_DeleteSession(session, status);
+    std::cout &lt;&lt; "TF_DeleteSession: " &lt;&lt; GetTensorflowRefCount() &lt;&lt; std::endl;
+    if (options) TF_DeleteSessionOptions(options);
+    std::cout &lt;&lt; "TF_DeleteSessionOptions: " &lt;&lt; GetTensorflowRefCount() &lt;&lt; std::endl;
+    if (graph)   TF_DeleteGraph(graph);
+    std::cout &lt;&lt; "TF_DeleteGraph: " &lt;&lt; GetTensorflowRefCount() &lt;&lt; std::endl;
+    if (status)  TF_DeleteStatus(status);
+    std::cout &lt;&lt; "TF_DeleteStatus: " &lt;&lt; GetTensorflowRefCount() &lt;&lt; std::endl;
+
+    // Free DLL
+    FreeLibrary(handle);
+    std::cout &lt;&lt; "DLL unloaded: " &lt;&lt; GetTensorflowRefCount() &lt;&lt; std::endl;
+
+    return 0;
+}
+Other info / logs
+Simply compile the above on Windows with clang++ test.cpp -o test.
+Output on my computer:
+&lt;denchmark-code&gt;initial: 0
+DLL loaded: 1
+functions imported: 1
+TF_NewStatus: 1
+TF_NewGraph: 2
+TF_NewSessionOptions: 2
+2020-10-26 13:38:48.388408: I tensorflow/core/platform/cpu_feature_guard.cc:142] This TensorFlow binary is optimized with oneAPI Deep Neural Network Library (oneDNN)to use the following CPU instructions in performance-critical operations:  AVX2
+To enable them in other operations, rebuild TensorFlow with the appropriate compiler flags.
+2020-10-26 13:38:48.398942: I tensorflow/compiler/xla/service/service.cc:168] XLA service 0x1ffcd6eeec0 initialized for platform Host (this does not guarantee that XLA will be used). Devices:
+2020-10-26 13:38:48.399288: I tensorflow/compiler/xla/service/service.cc:176]   StreamExecutor device (0): Host, Default Version
+TF_NewSession: 41
+TF_DeleteSession: 40
+TF_DeleteSessionOptions: 40
+TF_DeleteGraph: 40
+TF_DeleteStatus: 40
+DLL unloaded: 39
+&lt;/denchmark-code&gt;
+
+Notice the following:
+
+TF_NewGraph generates a new reference to the DLL
+TF_NewSession generates 39(!) new references to the DLL
+TF_DeleteSession removes one reference
+We are left with 39 leaked references, which we did not create explicitly in our program.
+We were able to reproduce this with a number of TF versions (1.15, 2.1.1, 2.3.1), with or without GPU support.
+
+	</description>
+	<comments>
+		<comment id='1' author='cschreib-ibex' date='2020-10-28T15:59:05Z'>
+		This is intended behavior. Several internal shared objects in TF provide functionality while they are being loaded. This is achieved by static initializers and global data.
+We do not support unloading TF shared libraries. Doing so would lead to a lot of bugs and sudden behavior changes.
+		</comment>
+		<comment id='2' author='cschreib-ibex' date='2020-10-28T15:59:08Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/44328&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/44328&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='3' author='cschreib-ibex' date='2020-10-29T09:19:20Z'>
+		I am not sure I understand this reasoning. Static initializers and global data are destroyed when a process is terminated, and this does not lead to bugs and sudden behavior changes, because this data cannot be used afterwards anyway. The same holds for DLL unloading. From the point of view of Tensorflow, unloading the DLL should have the same effect as terminating the process, static data should be deleted automatically on unload without you having to do anything. Loading the DLL back again should have the same effect as starting a new process.
+See this simple DLL example (compile with clang++ -shared dll.cpp -o dll.dll):
+#include &lt;iostream&gt;
+#include &lt;windows.h&gt;
+
+struct foo {
+    foo() { std::cout &lt;&lt; "construct " &lt;&lt; this &lt;&lt; std::endl; }
+    ~foo() { std::cout &lt;&lt; "destruct " &lt;&lt; this &lt;&lt; std::endl; }
+    void baz() { std::cout &lt;&lt; "use " &lt;&lt; this &lt;&lt; std::endl; }
+};
+
+extern "C" {
+__declspec(dllexport) void bar() {
+    static foo tmp;
+    tmp.baz();
+}
+}
+
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReasonForCall, LPVOID lpReserved)
+{
+    return TRUE;
+}
+... and a program that uses it (compile with clang++ test_dll.cpp -o test_dll.exe):
+#include &lt;iostream&gt;
+#include &lt;string&gt;
+#include &lt;windows.h&gt;
+#include &lt;tlhelp32.h&gt;
+
+// Helper function to count the number of references to dll.dll
+std::size_t GetDLLRefCount() {
+    auto handle = GetCurrentProcessId();
+    auto s = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, handle);
+
+    std::size_t value = 0;
+    MODULEENTRY32 me32;
+    me32.dwSize = sizeof(MODULEENTRY32);
+    Module32First(s, &amp;me32);
+    do {
+        if (std::strcmp(me32.szModule, "dll.dll") == 0) {
+            value = me32.GlblcntUsage;
+            break;
+        }
+    } while(Module32Next(s, &amp;me32));
+
+    CloseHandle(s);
+    return value;
+}
+
+void (*bar)();
+
+void ImportDLL(HINSTANCE handle) {
+#define LOAD_FUNCTION(Function) Function = reinterpret_cast&lt;decltype(Function)&gt;(GetProcAddress(handle, #Function))
+    LOAD_FUNCTION(bar);
+#undef LOAD_FUNCTION
+}
+
+int main() {
+    // Load dll DLL and import funcitons
+    std::cout &lt;&lt; "initial: " &lt;&lt; GetDLLRefCount() &lt;&lt; std::endl;
+    auto handle = LoadLibrary("dll.dll");
+    std::cout &lt;&lt; "DLL loaded: " &lt;&lt; GetDLLRefCount() &lt;&lt; std::endl;
+    ImportDLL(handle);
+    std::cout &lt;&lt; "functions imported: " &lt;&lt; GetDLLRefCount() &lt;&lt; std::endl;
+
+    // Use DLL
+    bar();
+    std::cout &lt;&lt; "DLL used: " &lt;&lt; GetDLLRefCount() &lt;&lt; std::endl;
+
+    // Free DLL
+    FreeLibrary(handle);
+    std::cout &lt;&lt; "DLL unloaded: " &lt;&lt; GetDLLRefCount() &lt;&lt; std::endl;
+
+    return 0;
+}
+This prints, on my machine:
+&lt;denchmark-code&gt;initial: 0
+DLL loaded: 1
+functions imported: 1
+construct 00007FFF3BBC41D0
+use 00007FFF3BBC41D0
+DLL used: 1
+destruct 00007FFF3BBC41D0
+DLL unloaded: 0
+&lt;/denchmark-code&gt;
+
+See how the destructor of the static variable bar::tmp is automatically called when the DLL is unloaded. This is the expected behavior, and allows me to re-load the DLL afterwards if I need to, with a brand new static state as if I just started the process.
+		</comment>
+		<comment id='4' author='cschreib-ibex' date='2020-10-29T10:32:09Z'>
+		FYI, I just got around to test an alternative library to Tensorflow, PyTorch, and it does not suffer from this problem. I can load/unload their DLL as in the simple example above. This suggests to me that Tensorflow is doing something unconventional, and possibly incorrect.
+		</comment>
+		<comment id='5' author='cschreib-ibex' date='2020-11-02T19:02:50Z'>
+		TensorFlow also takes into account the security aspect of the framework. Hence, it has a much safer design, that prevents scenarios which seem to work but later would be exploitable/cause hard to debug bugs.
+If you don't care about these aspects and other frameworks allow you to use an unsafe design, by all means.
+		</comment>
+		<comment id='6' author='cschreib-ibex' date='2020-11-03T08:50:39Z'>
+		Thank you for your reply. Could you elaborate (or point me to a link/code) on that additional safety, and how this relates to not being able to unload the DLL? It might help us solve the problem on our end.
+Ironically, it was precisely Tensorflow's inability to unload that has caused us a hard-to-debug bug. To this date we also have no correct solution for it either, because our own design relies on that ability for all our dependencies.
+		</comment>
+		<comment id='7' author='cschreib-ibex' date='2020-11-03T20:03:53Z'>
+		Imagine code taking a pointer to objects from the DLL and what happens when the DLL gets unloaded
+		</comment>
+		<comment id='8' author='cschreib-ibex' date='2020-11-04T09:05:31Z'>
+		That would be a programming error, or a breach of contract. Much like using a TF_Session* after it has been deleted by TF_DeleteSession(). In both cases the user is in control of when these pointers are used, and when they are no longer valid (when deleted explicitly, or when unloading the DLL), so any misuse is solely the user's fault.
+This safety risk didn't prevent you from exposing the TF_DeleteSession() function (and other functions to delete resources), because resources should be freed when no longer used. The same goes with DLLs.
+		</comment>
+	</comments>
+</bug>

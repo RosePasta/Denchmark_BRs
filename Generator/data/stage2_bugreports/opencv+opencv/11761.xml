@@ -1,0 +1,365 @@
+<bug id='11761' author='svebert' open_date='2018-06-14T07:06:30Z' closed_time='2018-06-15T08:07:36Z'>
+	<summary>OpenCV DNN unkown layer clip_by_value when loading MobileNet from Keras</summary>
+	<description>
+
+OpenCV =&gt;  3.4.1 (Python 3.5, installed via pip3) /C++: Custom build from master June 13th 2018
+Operating System / Platform =&gt; Windows 10; 64Bit
+Compiler =&gt; python 3.5 / C++: Visual Studio 2015, vc14
+-Tensorflow =&gt;1.8.0 with gpu
+-Keras =&gt;2.2.0
+
+&lt;denchmark-h:h5&gt;Detailed description&lt;/denchmark-h&gt;
+
+Forwarding/Loading my network results in the error that ClipByValue layer is unknown.
+Python (OpenCV 3.4.1):
+&lt;denchmark-code&gt;net = cv2.dnn.readNetFromTensorflow('frozen_inference_graph.pb')
+&lt;/denchmark-code&gt;
+
+
+OpenCV(3.4.1) Error: Unspecified error (Unknown layer type ClipByValue in op conv1_relu/clip_by_value) in cv::dnn::experimental_dnn_v4::`anonymous-namespace'::TFImporter::populateNet, file C:\projects\opencv-python\opencv\modules\dnn\src\tensorflow\tf_importer.cpp, line 1582
+
+C++ (OpenCV 4.?)
+readNetFromTensorflow is working but same error like in Python occurs in forwarding
+&lt;denchmark-code&gt;m_oKeypointNet.setInput(m_oBlob);
+cv::Mat oDetectionMat = m_oKeypointNet.forward();
+&lt;/denchmark-code&gt;
+
+
+OpenCV(4.0.0-pre) Error: Unspecified error (Can't create layer "conv1_relu/clip_by_value" of type "ClipByValue") in cv::dnn::experimental_dnn_v4::LayerData::getLayerInstance, file C:\Users\SEbert\Downloads\opencv-master\modules\dnn\src\dnn.cpp, line 392
+
+&lt;denchmark-h:h5&gt;Steps to reproduce&lt;/denchmark-h&gt;
+
+Before the frozen_inference_graph.pb is loaded into readNetFromTensorflow I use several steps to convert the net to be suitable for opencv dnn:
+
+Freeze graph
+fix reshape/flatten layers
+optimze graph
+transform graph
+
+All these steps can be found in the following script. This script will create a customized mobilenet model from keras, transform the graph and compares prediction made by Keras and opencv. All these steps were mentioned in several posts on github, opencv.answers and stackoverflow.
+Actually, my issue may be related to the issue &lt;denchmark-link:https://github.com/opencv/opencv/issues/10870&gt;DNN Tensorflow import issue with Keras/Tensorflow MobileNet&lt;/denchmark-link&gt;
+. &lt;denchmark-link:https://github.com/miketsao&gt;Miketsao&lt;/denchmark-link&gt;
+ mentions to replace he RELU layer by RELU6. But I do not know how?
+import numpy as np
+import tensorflow as tf
+
+from tensorflow.python.keras.layers import Dense, Conv2D, Flatten, Input
+from tensorflow.python.keras.applications.mobilenet import MobileNet
+from tensorflow.python.keras.models import Model
+from tensorflow.python.keras.optimizers import Adadelta
+from tensorflow.python.tools import optimize_for_inference_lib
+from tensorflow.tools.graph_transforms import TransformGraph
+from tensorflow.python.keras import backend as K
+from utils.make_cv2_compatible import make_cv2_compatible
+import cv2
+
+#config tf: allow memory growth, otherwise tf crashes on gpu
+config = tf.ConfigProto()
+config.gpu_options.allow_growth = True
+sess = tf.Session(config=config)
+#customize keras session
+K.set_session(sess)
+K.set_learning_phase(0)
+
+IMAGE_SIZE_NET_INPUT = 128
+
+def create_model():
+	base_model = MobileNet(input_shape=(IMAGE_SIZE_NET_INPUT,IMAGE_SIZE_NET_INPUT,3),depth_multiplier=1,classes=1,include_top=False)
+	for layer in base_model.layers:
+		layer.trainable=False
+
+	x = base_model.output
+	x = Flatten()(x)	
+	predictions = Dense(2,activation='linear')(x)
+	model = Model(inputs=base_model.input, outputs=predictions)
+	model.compile(loss='mean_squared_error', optimizer=Adadelta())
+	return model
+	
+def create_pbtxt_compatible_with_opencv(pb_path, pbtxt_path):
+
+    # Read the graph.
+    with tf.gfile.FastGFile(pb_path, 'rb') as f:
+        graph_def = tf.GraphDef()
+        graph_def.ParseFromString(f.read())
+
+    # Remove Const nodes.
+    for i in reversed(range(len(graph_def.node))):
+        if graph_def.node[i].op == 'Const':
+            del graph_def.node[i]
+        for attr in ['T', 'data_format', 'Tshape', 'N', 'Tidx', 'Tdim',
+                     'use_cudnn_on_gpu', 'Index', 'Tperm', 'is_training',
+                     'Tpaddings']:
+            if attr in graph_def.node[i].attr:
+                del graph_def.node[i].attr[attr]
+
+    # Save as text.
+    tf.train.write_graph(graph_def, "", pbtxt_path, as_text=True)
+
+def convertForDeployment(model, bWriteIntermediate = False):
+	#get session
+	sess = K.get_session()
+	#get out/input names from model
+	output_names =  [model.output.name.split(':')[0]]
+	input_names = model.input_names
+	#freeze graph
+	graph_def = sess.graph.as_graph_def(add_shapes=True)
+	graph_def = tf.graph_util.convert_variables_to_constants(sess, graph_def,output_names)
+	make_cv2_compatible(graph_def) #needed for flatten layer
+	if(bWriteIntermediate):
+		tf.train.write_graph(graph_def, '', 'init_frozen_inference_graph.pb', as_text=False)
+
+	# Print the graph nodes
+	#print('\n'.join(node.name for node in graph_def.node))
+
+	#optimize graph
+	graph_def_opt = optimize_for_inference_lib.optimize_for_inference(graph_def,input_names,output_names,tf.int32.as_datatype_enum)
+	if(bWriteIntermediate):
+		tf.train.write_graph(graph_def_opt, '', 'opt_frozen_inference_graph.pb', as_text=False)
+	
+	#transform graph
+	input_shape = model.input.shape
+	transforms = ["fold_constants(ignore_errors=True)","fold_batch_norms(ignore_errors=True)","fold_old_batch_norms(ignore_errors=True)","remove_nodes(op=PlaceholderWithDefault)", "strip_unused_nodes(type=float, shape=\"1"+str(input_shape[1])+","+str(input_shape[2])+","+str(input_shape[3])+"\")", "sort_by_execution_order"]
+	graph_def_transformed = TransformGraph(graph_def_opt,input_names, output_names, transforms)
+	if(bWriteIntermediate):
+		tf.train.write_graph(graph_def_transformed, '', 'transf_frozen_inference_graph.pb', as_text=False)
+
+	#write resulting frozen graph
+	tf.train.write_graph(graph_def_transformed, '', 'frozen_inference_graph.pb', as_text=False)
+	#create pbtxt
+	create_pbtxt_compatible_with_opencv('frozen_inference_graph.pb','graph.pbtxt')
+
+	#compare tf and cv
+	inp = np.random.standard_normal([1, IMAGE_SIZE_NET_INPUT, IMAGE_SIZE_NET_INPUT, 3]).astype(np.float32)
+	tf_out = model.predict(inp)		
+	net = cv2.dnn.readNetFromTensorflow('frozen_inference_graph.pb')#,'graph.pbtxt')
+	net.setInput(inp.transpose(0, 3, 1, 2))
+	cv_out = net.forward()
+
+	print(np.max(np.abs(tf_out - cv_out)))
+	
+
+model = create_model()
+model.summary()
+convertForDeployment(model,False)
+the module make_cv2_compatible is the following:
+import tensorflow as tf
+from tensorflow.core import framework
+
+
+def find_all_nodes(graph_def, **kwargs):
+    for node in graph_def.node:
+        for key, value in kwargs.items():
+            if getattr(node, key) != value:
+                break
+        else:
+            yield node
+    raise StopIteration
+
+
+def find_node(graph_def, **kwargs):
+    try:
+        return next(find_all_nodes(graph_def, **kwargs))
+    except StopIteration:
+        raise ValueError(
+            'no node with attributes: {}'.format(
+                ', '.join("'{}': {}".format(k, v) for k, v in kwargs.items())))
+
+
+def walk_node_ancestors(graph_def, node_def, exclude=set()):
+    openlist = list(node_def.input)
+    closelist = set()
+    while openlist:
+        name = openlist.pop()
+        if name not in exclude:
+            node = find_node(graph_def, name=name)
+            openlist += list(node.input)
+            closelist.add(name)
+    return closelist
+
+
+def remove_nodes_by_name(graph_def, node_names):
+    for i in reversed(range(len(graph_def.node))):
+        if graph_def.node[i].name in node_names:
+            del graph_def.node[i]
+
+
+def make_shape_node_const(node_def, tensor_values):
+    print(node_def.attr['name'])
+    node_def.op = 'Const'
+    node_def.ClearField('input')
+    node_def.attr.clear()
+    node_def.attr['dtype'].type = framework.types_pb2.DT_INT32
+    tensor = node_def.attr['value'].tensor
+    tensor.dtype = framework.types_pb2.DT_INT32
+    tensor.tensor_shape.dim.add()
+    tensor.tensor_shape.dim[0].size = len(tensor_values)
+    for value in tensor_values:	 
+	    print(value)	
+	    tensor.tensor_content += value.to_bytes(4, 'little')
+    output_shape = node_def.attr['_output_shapes']
+    output_shape.list.shape.add()
+    output_shape.list.shape[0].dim.add()
+    output_shape.list.shape[0].dim[0].size = len(tensor_values)
+
+
+def make_cv2_compatible(graph_def):
+    # A reshape node needs a shape node as its second input to know how it
+    # should reshape its input tensor.
+    # When exporting a model using Keras, this shape node is computed
+    # dynamically using `Shape`, `StridedSlice` and `Pack` operators.
+    # Unfortunately those operators are not supported yet by the OpenCV API.
+    # The goal here is to remove all those unsupported nodes and hard-code the
+    # shape layer as a const tensor instead.
+    for reshape_node in find_all_nodes(graph_def, op='Reshape'):
+
+        # Get a reference to the shape node
+        shape_node = find_node(graph_def, name=reshape_node.input[1])
+
+        # Find and remove all unsupported nodes
+        garbage_nodes = walk_node_ancestors(graph_def, shape_node,
+                                            exclude=[reshape_node.input[0]])
+        remove_nodes_by_name(graph_def, garbage_nodes)
+
+        # Infer the shape tensor from the reshape output tensor shape
+        if not '_output_shapes' in reshape_node.attr:
+            raise AttributeError(
+                'cannot infer the shape node value from the reshape node. '
+                'Please set the `add_shapes` argument to `True` when calling '
+                'the `Session.graph.as_graph_def` method.')
+        output_shape = reshape_node.attr['_output_shapes'].list.shape[0]
+        output_shape = [dim.size for dim in output_shape.dim]
+        print(output_shape)
+        # Hard-code the inferred shape in the shape node
+        make_shape_node_const(shape_node, output_shape[1:])
+	</description>
+	<comments>
+		<comment id='1' author='svebert' date='2018-06-14T07:32:25Z'>
+		&lt;denchmark-link:https://github.com/svebert&gt;@svebert&lt;/denchmark-link&gt;
+, May I ask you to get a reference to ? There is already one way to fuse ReLU6 layer from Keras (see &lt;denchmark-link:https://github.com/opencv/opencv/pull/10940&gt;#10940&lt;/denchmark-link&gt;
+) as a combination of Minimum and Maximum ops. However it looks like there is one more ReLU6 subgraph.
+		</comment>
+		<comment id='2' author='svebert' date='2018-06-14T08:25:10Z'>
+		&lt;denchmark-link:https://github.com/dkurt&gt;@dkurt&lt;/denchmark-link&gt;
+: thank you for your fast answer. Please find the resulting files of my script here:
+&lt;denchmark-link:https://github.com/opencv/opencv/files/2101426/keras_mobilenet_frozen_inference_graph.zip&gt;keras_mobilenet_frozen_inference_graph.zip&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='3' author='svebert' date='2018-06-14T10:39:14Z'>
+		&lt;denchmark-link:https://github.com/svebert&gt;@svebert&lt;/denchmark-link&gt;
+, Please check a PR &lt;denchmark-link:https://github.com/opencv/opencv/pull/11763&gt;#11763&lt;/denchmark-link&gt;
+. For now you can try to implement it as a custom layer (see a tutorial &lt;denchmark-link:https://docs.opencv.org/master/dc/db1/tutorial_dnn_custom_layers.html&gt;https://docs.opencv.org/master/dc/db1/tutorial_dnn_custom_layers.html&lt;/denchmark-link&gt;
+)
+		</comment>
+		<comment id='4' author='svebert' date='2018-06-14T13:48:48Z'>
+		&lt;denchmark-link:https://github.com/dkurt&gt;@dkurt&lt;/denchmark-link&gt;
+ thank you very much. Honestly, you are the best! 
+I build my opencv with your latest commit &lt;denchmark-link:https://github.com/opencv/opencv/pull/11763&gt;#11763&lt;/denchmark-link&gt;
+ and implemented with the help of the tutorial a custom ClipByValue layer. Now, the customized mobilenet successfully forwards in C++.
+My .hpp file:
+#include &lt;opencv2/dnn.hpp&gt;
+//See https://docs.opencv.org/master/dc/db1/tutorial_dnn_custom_layers.html
+class ClCustomLayer_ClipByValue : public cv::dnn::Layer
+{
+public:
+	ClCustomLayer_ClipByValue(const cv::dnn::LayerParams &amp;params);
+	static cv::Ptr&lt;cv::dnn::Layer&gt; create(cv::dnn::LayerParams&amp; params);
+	virtual bool getMemoryShapes(const std::vector&lt;std::vector&lt;int&gt; &gt; &amp;inputs,const int requiredOutputs,std::vector&lt;std::vector&lt;int&gt; &gt; &amp;outputs,std::vector&lt;std::vector&lt;int&gt; &gt; &amp;internals) const CV_OVERRIDE;
+	virtual void forward(std::vector&lt;cv::Mat*&gt; &amp;inputs, std::vector&lt;cv::Mat&gt; &amp;outputs, std::vector&lt;cv::Mat&gt; &amp;internals) CV_OVERRIDE;
+	virtual void forward(cv::InputArrayOfArrays inputs, cv::OutputArrayOfArrays outputs, cv::OutputArrayOfArrays internals) CV_OVERRIDE;
+protected:
+	float m_fMin;
+	float m_fMax;
+};
+my .cpp file
+#include &lt;opencv2/dnn/layer.details.hpp&gt;  // CV_DNN_REGISTER_LAYER_CLASS
+
+ClCustomLayer_ClipByValue::ClCustomLayer_ClipByValue(const cv::dnn::LayerParams &amp;params) : 
+	Layer(params),
+	m_fMin(0),
+	m_fMax(std::numeric_limits&lt;float&gt;::max())
+{
+	if (params.blobs.size() &gt; 1)
+	{
+		m_fMin = params.blobs[0].at&lt;float&gt;(0);
+		m_fMax = params.blobs[1].at&lt;float&gt;(0);
+	}
+}
+cv::Ptr&lt;cv::dnn::Layer&gt; ClCustomLayer_ClipByValue::create(cv::dnn::LayerParams&amp; params) 
+{
+	return cv::Ptr&lt;cv::dnn::Layer&gt;(new ClCustomLayer_ClipByValue(params));
+}
+bool ClCustomLayer_ClipByValue::getMemoryShapes(const std::vector&lt;std::vector&lt;int&gt; &gt; &amp;inputs, const int requiredOutputs, std::vector&lt;std::vector&lt;int&gt; &gt; &amp;outputs, std::vector&lt;std::vector&lt;int&gt; &gt; &amp;internals) const
+{
+	CV_UNUSED(requiredOutputs); CV_UNUSED(internals);
+	std::vector&lt;int&gt; outShape(4);
+	outShape[0] = inputs[0][0];  // batch size
+	outShape[1] = inputs[0][1];  // number of channels
+	outShape[2] = inputs[0][2]; //width
+	outShape[3] = inputs[0][3]; //height
+	outputs.assign(1, outShape);
+	return false;
+}
+void ClCustomLayer_ClipByValue::forward(std::vector&lt;cv::Mat*&gt; &amp;inputs, std::vector&lt;cv::Mat&gt; &amp;outputs, std::vector&lt;cv::Mat&gt; &amp;)
+{
+	cv::Mat&amp; inp = *inputs[0];
+	cv::Mat&amp; out = outputs[0];
+	const float* inpData = (float*)inp.data;
+	float* outData = (float*)out.data;
+
+	const int batchSize = inp.size[0];
+	const int numChannels = inp.size[1];
+	const int inpHeight = inp.size[2];
+	const int inpWidth = inp.size[3];
+	const int outWidth = inp.size[3];
+
+	for (int h = 0; h &lt; inpHeight; ++h)
+	{
+		for (int w = 0; w &lt; inpWidth; ++w)
+		{
+			const float* posIn = inpData + h * inpWidth + w;
+			float* posOut = outData + h * outWidth + w;
+			for (int c = 0; c &lt; batchSize * numChannels; ++c)
+			{
+				if (*posIn &lt; m_fMin) //clip to min val
+				{
+					*posOut = m_fMin;
+				}
+				else if (*posIn &gt; m_fMax) //clip to max val
+				{
+					*posOut = m_fMax;
+				}
+				else
+				{
+					*posOut = *posIn;
+				}
+				posIn += inpWidth*inpHeight;
+				posOut += outWidth*inpHeight;
+			}
+		}
+	}
+}
+void ClCustomLayer_ClipByValue::forward(cv::InputArrayOfArrays, cv::OutputArrayOfArrays, cv::OutputArrayOfArrays)
+{}
+
+Before the forward function in my project, I use this:
+CV_DNN_REGISTER_LAYER_CLASS(ClipByValue, ClCustomLayer_ClipByValue);
+to register the custom layer.
+Just one question about the layerFactory:
+How do I use the params.get&lt;&gt;() function? I tried
+m_fMax = params.get&lt;float&gt;("max_value", 0);
+but it returned always 0, instead of 6.
+		</comment>
+		<comment id='5' author='svebert' date='2018-06-14T15:01:43Z'>
+		&lt;denchmark-link:https://github.com/svebert&gt;@svebert&lt;/denchmark-link&gt;
+, with &lt;denchmark-link:https://github.com/opencv/opencv/pull/11763&gt;#11763&lt;/denchmark-link&gt;
+ you no longer need a custom layer. Can you try without it?
+		</comment>
+		<comment id='6' author='svebert' date='2018-06-15T08:07:27Z'>
+		&lt;denchmark-link:https://github.com/dkurt&gt;@dkurt&lt;/denchmark-link&gt;
+: I can confirm, that with &lt;denchmark-link:https://github.com/opencv/opencv/pull/11763&gt;#11763&lt;/denchmark-link&gt;
+ and without custom layer the ClipByValue-missing-layer-error is fixed. Thanks, again 
+I got confused when rebuilding opencv and my project... Yesterday, I tested my project with an older version of tf_importer.cpp.
+Anyway, for older versions of the dnn module, it is possible to fix the ClipByValue-missing-layer-error with the custom layer posted above.
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,121 @@
+<bug id='36139' author='jmhessel' open_date='2020-01-22T19:40:02Z' closed_time='2020-01-27T22:42:33Z'>
+	<summary>Inconsistent crashing behavior with CuDNN, tensorflow RNNs, and padding</summary>
+	<description>
+System information
+
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Linux Ubuntu 16.04
+TensorFlow installed from (source or binary): pip
+TensorFlow version (use command below): v2.1.0-rc2-17-ge5bf8de 2.1.0
+Python version: Python 3.6.8
+CUDA/cuDNN version: CUDA Version: 10.1/cuDNN v7.6.5
+GPU model and memory: GTX Titan X
+
+Describe the current behavior
+CuDNN has inconsistent behavior with RNNs and fully masked sequences. In some cases, handing CuDNN a fully masked sequence works fine --- it happily returns an all zero vector without error, even if the input sequence has no valid tokens in it. This is the behavior that occurs on CPU as well. However --- in other cases, you get a CuDNN error (CUDNN_STATUS_BAD_PARAM) when handing fully padded sequences. Strangely, the thing that seems to control whether or not CuDNN error is thrown is: whether or not any of the non-fully-padded sequences in the batch have any padding.
+Describe the expected behavior
+The RNNs should return all-zero vectors for fully padded sequences on CuDNN even if none of the non-fully-padded sequences have padding. (see the below code example)
+Code to reproduce the issue
+import tensorflow as tf
+import numpy as np
+
+seq_len = 5
+vocab_size = 10
+batch_size = 2
+hidden_size = 20
+
+seq_input = tf.keras.layers.Input(seq_len, dtype=tf.int32)
+embs = tf.keras.layers.Embedding(vocab_size, hidden_size, mask_zero=True)
+rnn = tf.keras.layers.GRU(hidden_size)
+out = rnn(embs(seq_input))
+
+keras_model = tf.keras.Model(
+    inputs=seq_input,
+    outputs=out)
+
+working_input = np.array(
+    [[0, 1, 2, 3, 4], # if this sequence has a pad, CuDNN is happy
+     [0, 0, 0, 0, 0]])
+
+broken_input = np.array(
+    [[1, 2, 3, 4, 5], # if this sequence doesn't have a pad, CuDNN is sad
+     [0, 0, 0, 0, 0]])
+
+print('Computing the working input:')
+res1 = keras_model.predict(working_input)
+print(res1.shape)
+print(res1[1])
+print('Computing the broken input:')
+# this line causes the CuDNN error if running on GPU
+res2 = keras_model.predict(broken_input)
+print(res2.shape)
+print(res2[1])
+	</description>
+	<comments>
+		<comment id='1' author='jmhessel' date='2020-01-23T10:39:59Z'>
+		&lt;denchmark-link:https://github.com/jmhessel&gt;@jmhessel&lt;/denchmark-link&gt;
+
+I have tried on colab with TF version 2.1.0-rc2 and was able to reproduce the issue.Please, find the gist &lt;denchmark-link:https://colab.research.google.com/gist/ravikyram/6065ae0d608ed737aa8e373daad06a0b/untitled590.ipynb&gt;here&lt;/denchmark-link&gt;
+. Thanks!
+		</comment>
+		<comment id='2' author='jmhessel' date='2020-01-23T21:45:11Z'>
+		One of the requirement to use cuDNN implementation of GRU layer is that 
+See &lt;denchmark-link:https://www.tensorflow.org/api_docs/python/tf/keras/layers/GRU&gt;https://www.tensorflow.org/api_docs/python/tf/keras/layers/GRU&lt;/denchmark-link&gt;
+
+Therefore you may want to set  or use CPU implementation.
+Thanks!
+		</comment>
+		<comment id='3' author='jmhessel' date='2020-01-23T22:16:57Z'>
+		Thanks for the reply! Is it really the case that CuDNN RNNs don't support masking in any capacity? It seems like they behave properly in some cases (e.g., the first sequence in the example I gave) but not in others. But, even if they don't support masking at all, then shouldn't there be a check in tf.keras that disables CuDNN's RNNs if you are using masking, rather than failing silently? Am I understanding properly?
+		</comment>
+		<comment id='4' author='jmhessel' date='2020-01-23T22:19:44Z'>
+		&lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/23269&gt;#23269&lt;/denchmark-link&gt;
+ seems to suggest that there is CuDNN functionality for masking --- it looks like one just needs to convert the padding tensors into sequence lengths. I suspect this is being done internally given that the all-mask sequence does return an all-zero vector for the working example.
+		</comment>
+		<comment id='5' author='jmhessel' date='2020-01-25T19:59:24Z'>
+		This also seems to imply that you can use padding with cudnn, but only post-padding?
+&lt;denchmark-link:https://www.tensorflow.org/guide/keras/masking_and_padding&gt;https://www.tensorflow.org/guide/keras/masking_and_padding&lt;/denchmark-link&gt;
+
+# By default, this will pad using 0s; it is configurable via the
+# "value" parameter.
+# Note that you could "pre" padding (at the beginning) or
+# "post" padding (at the end).
+# We recommend using "post" padding when working with RNN layers
+# (in order to be able to use the 
+# CuDNN implementation of the layers).
+padded_inputs = tf.keras.preprocessing.sequence.pad_sequences(raw_inputs,
+                                                              padding='post')
+		</comment>
+		<comment id='6' author='jmhessel' date='2020-01-27T22:15:21Z'>
+		Hi &lt;denchmark-link:https://github.com/jmhessel&gt;@jmhessel&lt;/denchmark-link&gt;
+
+Thanks for reporting the issue.
+
+
+cuDNN kernel only support right padded input sequence. We will fallback to use generic kernel when input is left padded (pre-padding) or mix-masked. See docstring for cuDNN kernel criteria in the LSTM/GRU layer. For the working case, since the data is pre-padded, it goes to generic kernel, and nothing breaks (it doesn't invoke cuDNN kernel at all).
+
+
+There is a known bug that when the whole sequence is fully masked, cuDNN kernel will break and raise an error. This is what you see for input [0, 0, 0, 0, 0]. We are tracking the bug in #33148. You can also verify this by changing the input to [1, 0, 0, 0, 0] and it should work fine.
+
+
+I am closing this bug since the issue need to be address is in a different bug.
+		</comment>
+		<comment id='7' author='jmhessel' date='2020-01-27T22:37:58Z'>
+		Gotcha --- that makes sense. If you use pre-padded/left-padded sequences, a non CuDNN kernel is used. Otherwise, a CuDNN kernel is used. So --- if all your sequences are either full, i.e., don't require padding or fully-padded, the CuDNN kernel is used (because it appears that everything is right-padded) but then it fails because of fully empty sequences.
+BTW --- is their an easy way to check to see which kernel is being used?
+(Also --- on the off-chance someone else encountering this problem still wants to use CuDNN: in my case, all-mask sequences are not included in the loss function, so I just converted my all-mask sequences to sequences that contain a single ; this doesn't affect the loss or the gradient if these sequences are masked out later.)
+		</comment>
+		<comment id='8' author='jmhessel' date='2020-01-27T22:42:34Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/36139&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/36139&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='9' author='jmhessel' date='2020-01-27T23:11:07Z'>
+		The actual kernel is only data dependent. It is possible that one batch run with cuDNN kernel since it meets the criteria, and the following one doesn't. The kernel is assigned at ops runtime, which is too far from python API level to retrieve.
+		</comment>
+		<comment id='10' author='jmhessel' date='2020-01-27T23:14:19Z'>
+		Gotcha --- very cool :) I think I am now successfully using the cudnn kernel, because my training steps are over 2x faster 0.0
+		</comment>
+	</comments>
+</bug>

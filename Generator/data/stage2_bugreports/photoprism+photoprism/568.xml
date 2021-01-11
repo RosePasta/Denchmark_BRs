@@ -1,0 +1,368 @@
+<bug id='568' author='fnf' open_date='2020-10-25T21:46:38Z' closed_time='2020-11-23T14:32:45Z'>
+	<summary>Physically moved files cannot be indexed again</summary>
+	<description>
+I'm encountering an issue with physically moving photos around where Photoprism thinks the moved photos are duplicates, even though they've been removed from their original position. My workflow is as follows:
+&lt;denchmark-code&gt;* Copy all files from the SD card to an 'unsorted' directory
+* Re-index so that they are accessible in Photoprism
+* Edit them later and move them to the appropriate places
+* Re-index the library
+&lt;/denchmark-code&gt;
+
+The problem is that in the 2nd reindexing: the photos appear to not yet have been removed from the database when it scans the new directory. It therefore tags the moved photos as duplicates. By the end of the re-indexing the photos are no longer found at their original locations, however they could not be scanned again either.
+I've tried various methods including a complete re-scan of both the original directory and the new directory but PP doesn't recognise the new photo. My last resort would be to edit the database manually but it is not safe and inconvenient to do so every time..
+The expectation is that Photoprism would be able to detect moved files with a single re-indexing. It seemed the sidecar files might be a reason for this as they are not automatically removed when the original files are removed. I've also tried removing the sidecar completely from both directories and a clean re-indexing but that also didn't help.
+This is an example log:
+&lt;denchmark-code&gt;2020-10-25 08:27:32 INFO Indexing completed in 21 s
+2020-10-25 08:27:31 INFO purge: searching index for hidden media files
+2020-10-25 08:27:17 INFO index: skipped main raw file 2018/07/7R306756.ARW
+2020-10-25 08:27:10 INFO index: no .ppignore file found
+2020-10-25 08:27:10 INFO Indexing originals...
+2020-10-25 08:27:10 INFO Settings saved
+&lt;/denchmark-code&gt;
+
+The RAW file, along with the JPG and XMP files are in the right location. No *.json files for them are present, however the json file is recreated after a normal re-indexing. It appears that it was pulled from the database and put back to the filesystem?.
+To reproduce this issue:
+&lt;denchmark-code&gt;* Add a file to PP by indexing
+* Move the file elsewhere. The new directory might need to be named/placed in such a way that it is scanned before the old one in the directory hierarchy. In my case the old directory is a sub-directory of the new one.
+* Re-index
+&lt;/denchmark-code&gt;
+
+As a workaround, the file could be reindexed if its entry is removed from the database in the "files" set.
+	</description>
+	<comments>
+		<comment id='1' author='fnf' date='2020-10-26T05:14:59Z'>
+		Thanks! Might take a couple of days until I get to this...
+There might be an issue with our duplicates table: Files that have been deleted from the index should also be removed there, otherwise they will continue to be skipped even though the original file doesn't exist anymore.
+		</comment>
+		<comment id='2' author='fnf' date='2020-10-26T09:32:26Z'>
+		Thank you for having a look. It'd also be great to be able to force a reindexing for all hidden/duplicate files as I found that the initial thumbnail creation might fail, leaving a file indexed but hidden.
+The hidden files could be shown again by deleting their entries from the photos table with photo_quality=-1 . However for some RAW files where its JPEG counterpart had not been generated I haven't found a single query to search for them and remove from the files table.
+It seems that it could be done with searching for unique photo_id entries from the files table..
+		</comment>
+		<comment id='3' author='fnf' date='2020-10-26T09:44:05Z'>
+		Sounds like some RAWs could not be converted to JPEG, maybe because the format is not supported? In that case, we should skip indexing as the file is either broken or maybe even a random binary that happens to end with .raw.
+We might still add them to the index so that re-indexing is faster and it's easer to debug e.g. by searching for photos with quality -1. Otherwise, the index worker would try converting (sometimes very large) broken files every single time you hit the index button, which some users might report as bug by itself.
+		</comment>
+		<comment id='4' author='fnf' date='2020-10-26T18:02:43Z'>
+		All RAW files are valid as I manage them in Lightroom as well. Additionally, the number of files (as well as the listing itself) changes somewhat randomly between complete rescans so I'm inclined to believe that these were caused by random failures in converting the RAW files.
+The failures to convert RAW files/generate video thumbnails might not necessarily be a Photoprism's issue. I'd expect it to fail for spotty connections to NAS as well. When it happens, though, users are unable to rectify it from the UI.
+For this reason, I was hoping that there would be a way to force a full re-scan for erroneous files :) it would be separate from the normal fast indexing and complete indexing. I've been trying to do so by messing with the database entries.
+I might be off-base, but looking at pkg/fs/ignore.go it seems that calling ind.Start() with an option to traverse the ignored list could work.. I'm not familiar with the UI's language though so will need to learn more about it before I could make something functional.
+		</comment>
+		<comment id='5' author='fnf' date='2020-11-01T01:24:18Z'>
+		I prepared a local change that fixed most of the issues that affected me:
+&lt;denchmark-code&gt;commit 1509ab951c65b740fe1ec3a4d083ad284b28d086 (HEAD -&gt; develop)
+Author: Tu Vuong &lt;vanhtu1987@gmail.com&gt;
+Date:   Sat Oct 31 14:05:24 2020 +0000
+
+    Ensure that removed files could be re-added
+
+    Changes include:
+    - Delete purged files from the 'files' and 'photos' tables instead
+      of marking them as missing.
+    - The indexed files list is always reinitialised during indexing to
+      account for purged files after boot. This is necessary as there
+      is currently no interface to communicate purged files back to the
+      indexer.
+
+    Known issues:
+    - Moved files shall be treated as duplicates temporarily by the
+      indexer. They will be added correctly following another
+      re-indexing. This is caused by the static indexed files list
+      not being updated for purged files.
+
+diff --git a/internal/entity/file.go b/internal/entity/file.go
+index 761fc93a..f628a039 100644
+--- a/internal/entity/file.go
++++ b/internal/entity/file.go
+@@ -155,7 +155,10 @@ func (m *File) Delete(permanently bool) error {
+
+ // Purge removes a file from the index by marking it as missing.
+ func (m *File) Purge() error {
+-       return Db().Unscoped().Model(m).Updates(map[string]interface{}{"file_missing": true, "file_primary": false}).Error
++       Db().Unscoped().Delete(Photo{}, "id = ?", m.PhotoID)
++       Db().Unscoped().Delete(Files{}, "photo_id = ?", m.PhotoID)
++
++       return Db().Delete(m).Error
+ }
+
+ // AllFilesMissing returns true, if all files for the photo of this file are missing.
+diff --git a/internal/photoprism/index.go b/internal/photoprism/index.go
+index c01b908a..ce644b9f 100644
+--- a/internal/photoprism/index.go
++++ b/internal/photoprism/index.go
+@@ -36,7 +36,7 @@ func NewIndex(conf *config.Config, tensorFlow *classify.TensorFlow, nsfwDetector
+                tensorFlow:   tensorFlow,
+                nsfwDetector: nsfwDetector,
+                convert:      convert,
+-               files:        NewFiles(),
++               files:        nil,
+        }
+
+        return i
+@@ -98,6 +98,7 @@ func (ind *Index) Start(opt IndexOptions) fs.Done {
+                }()
+        }
+
++       ind.files = NewFiles()
+        if err := ind.files.Init(); err != nil {
+                log.Errorf("index: %s", err)
+        }
+&lt;/denchmark-code&gt;
+
+As patches go, this is probably worthless as it circumvents the caching for previously indexed files. It does serve what I need perfectly though.
+Another issue that I encountered was video thumbnails not being generated. I haven't been able to reproduce this issue again after clearing the cache directory but if it happens again I'll file a new ticket for this..
+		</comment>
+		<comment id='6' author='fnf' date='2020-11-07T22:59:11Z'>
+		
+Another issue that I encountered was video thumbnails not being generated. I haven't been able to reproduce this issue again after clearing the cache directory but if it happens again I'll file a new ticket for this..
+
+I've been able to reproduce the thumbnail generation issue. This was due to the "Convert to Jpeg" setting not editable in read-only mode.
+This setting affects both RAW to JPEG conversion and video thumbnail generation so having it enabled in read-only mode would allow video thumbnails to be generated into the sidecar directory. It appears that the JPEG conversion for video mode should ignore this setting.
+The check for "index.convert" setting happens before Convert.JpegConvertCommand() is called though so some refactoring might be necessary.. In the mean time I've reenabled the setting manually in the settings.yml which worked :) .
+		</comment>
+		<comment id='7' author='fnf' date='2020-11-08T16:18:54Z'>
+		Thanks for debugging this! Going to work on an "official" fix next week...
+		</comment>
+		<comment id='8' author='fnf' date='2020-11-15T09:52:19Z'>
+		This change might solve your issues. Excellent catch, thank you!
+A complete re-scan should work in any case. As you've noticed, we use a lookup table for skipping files that are already known as this significantly improves performance when files are only added or modified. This solution was not designed for situations like yours. It's better to perform a complete re-scan after major changes like moving files and/or deleting duplicates.
+		</comment>
+		<comment id='9' author='fnf' date='2020-11-15T09:53:07Z'>
+		I'll take a look at some more issues, and then start a new build for testing.
+		</comment>
+		<comment id='10' author='fnf' date='2020-11-15T10:27:43Z'>
+		&lt;denchmark-link:https://github.com/lastzero&gt;@lastzero&lt;/denchmark-link&gt;
+ Thank you for providing the patch. I've retried with commit &lt;denchmark-link:https://github.com/photoprism/photoprism/commit/e22e6c6d376faa97bcdbd8d88c0821c53a0ee075&gt;e22e6c6&lt;/denchmark-link&gt;
+ but it appears the issue remains. Moved files would firstly be treated as duplicates during a reindex then removed from the original locations:
+&lt;denchmark-code&gt;2020-11-15 10:18:39 INFO Indexing completed in 13 s
+2020-11-15 10:18:39 INFO Removed 2 files and 1 photos
+2020-11-15 10:18:39 INFO purge: searching index for hidden media files
+2020-11-15 10:18:39 INFO purge: removed 7R307158
+2020-11-15 10:18:39 INFO purge: removed file Lightroom/202011/7R307158.JPG
+2020-11-15 10:18:39 INFO purge: removed file Lightroom/202011/7R307158.ARW
+2020-11-15 10:18:33 INFO index: skipped main raw file Lightroom/Temp/7R307158.ARW
+2020-11-15 10:18:26 INFO index: no .ppignore file found
+2020-11-15 10:18:26 INFO Indexing originals...
+&lt;/denchmark-code&gt;
+
+From your comment above it sounds like this was intentional?. Unfortunately a complete rescan for my library (which consists of over 30000 photos and 1200 videos) take a couple of hours so it is less than ideal.
+I think moving files is not a very uncommon use-case. For example: files could be added to the database after they've been copied from a SD card, then they get sorted and moved to the right location. Renaming a directory would have the same effects as moving files.
+		</comment>
+		<comment id='11' author='fnf' date='2020-11-15T11:28:14Z'>
+		Does it really take several hours, or is this an assumption? When thumbs already exist, indexing should be much faster. Depends on your hardware and database as well or course.
+Would it be possible to sort / move / delete your files first, and then start indexing? Indexing and modifying files at the same time should be avoided as much as possible (that's why we don't index automatically, but only on request). Note that related files typically won't be moved at the same time by the operating system. So these operations are not atomic, and can lead to all sorts of strange side effects.
+		</comment>
+		<comment id='12' author='fnf' date='2020-11-15T12:02:31Z'>
+		Note that these lookup tables are very lean, they only contain the file name and mod time. In order to know a duplicate must be indexed, you would need to check ALL other copies. To do this, you need to perform a database lookup which is much slower than the memory operating that is happend right now. Of course we could put that info also in memory, but then show should keep it in sync with the database. All of this seems too much complexity. Refreshing the tables from the database before each run might be an acceptable tradeoff.
+		</comment>
+		<comment id='13' author='fnf' date='2020-11-15T12:08:58Z'>
+		
+Does it really take several hours, or is this an assumption? When thumbs already exist, indexing should be much faster. Depends on your hardware and database as well or course.
+
+Yes, this is on a system with a i7 8700K, GTX1080, 2 SSD drives (one for the main photos and the other for storing the caches/thumbnails). The majority of the photos already have their thumbnails created too. I have also disabled Tensorflow. With TF enabled it takes over 3 hours, with TF disabled it takes about 2 hours to re-scan the library with no new changes.
+My photos/videos library are around 500GB at the moment so it's not too surprising. On average it takes 2-4 seconds to re-index each photo (which is 42MP, the JPEF for which is 6-8MB each).
+The thumbnails/sidecar directories on my system currently consumes 26.6GB with ~228000 files and ~4800 folders. It seems to be average for a hobbyist photographer :) .
+A normal re-index is certainly much faster, the entire library can be reindexed in ~20 seconds, not including detecting new photos/purging old ones.
+I don't have any complain regarding scanning performance with PP, but forcing a complete re-scan for moved files seems less than ideal compared to maintaining my patch locally..
+
+Would it be possible to sort / move / delete your files first, and then start indexing?
+
+It is possible but it doesn't fit well to how I host PP for my family. Typically I'd add all new photos from the SD card to a directory. My family would go through them to sort. We'll then move the sorted ones (which would be marked as favourites) to another permanent location.
+The sorting won't take place right away, sometimes it'd happen months/years later, especially for my photography backlog. This is partly due to lack of time, and partly to avoid the initial enthusiasm that clouds my judgment (or perhaps I'm just being lazy :) ) .
+
+Indexing and modifying files at the same time should be avoided as much as possible (that's why we don't index automatically, but only on request).
+
+Agreed, I take care to not move the files when indexing is taking place, that's why a complete re-scan that takes a couple hours (if done every so often) would be inconvenient.
+
+To do this, you need to perform a database lookup which is much slower than the memory operating that is happend right now.
+
+I understand why it has been done that way so I wasn't meant to suggest that the caching mechanism be changed. I was suggesting that there is a checkbox that user could tick to specifically perform a re-scan for ignored/duplicated files, taking the design of the caching system into account. With this, normal indexing (with no moved/renamed files) would perform as fast whilst user is still presented an option to re-checked the skipped files.
+With the patch that I'm maintaining locally, I find the re-indexing performance to be perfectly acceptable whilst allowing detection of moved files :) it effectively forces a re-scan for all ignored/duplicate files as they are never recorded in the database.
+&lt;denchmark-link:https://user-images.githubusercontent.com/6359550/99184569-c402be80-273b-11eb-9851-8af44ea5ae3d.png&gt;&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='14' author='fnf' date='2020-11-15T12:41:44Z'>
+		This will reset the lookup table, but only if the file count changed while indexing.
+		</comment>
+		<comment id='15' author='fnf' date='2020-11-15T12:57:25Z'>
+		It seems the latest patch is unable to detect moved files as the check for resetting the lookup table is done at the end of the indexing.
+For moved files that won't work because the count of the files won't change, just their attributes (photo_quality being set to -1).
+This could be the same issue I encountered in my local patch as when the indexing is taking place, the lookup table is static. My patch worked around this issue because the files would be purged, then re-added as a new file in a subsequent rescanning.
+&lt;denchmark-code&gt; 2020-11-15 12:54:04 INFO Indexing completed in 13 s
+2020-11-15 12:54:03 INFO purge: searching index for hidden media files
+2020-11-15 12:53:57 INFO index: skipped archived main raw file Lightroom/Temp/7R307158.ARW
+2020-11-15 12:53:54 INFO index: skipped main raw file 2020/11/7R307216.ARW
+2020-11-15 12:53:54 INFO index: skipped main raw file 2020/07/7R305852.ARW
+2020-11-15 12:53:51 INFO index: no .ppignore file found
+2020-11-15 12:53:50 INFO Indexing originals...
+2020-11-15 12:53:29 INFO Indexing completed in 14 s
+2020-11-15 12:53:28 INFO Removed 2 files and 1 photos
+2020-11-15 12:53:28 INFO purge: searching index for hidden media files
+2020-11-15 12:53:28 INFO purge: removed 7R307158
+2020-11-15 12:53:28 INFO purge: removed file Lightroom/202011/7R307158.JPG
+2020-11-15 12:53:28 INFO purge: removed file Lightroom/202011/7R307158.ARW
+2020-11-15 12:53:22 INFO index: skipped main raw file Lightroom/Temp/7R307158.ARW
+2020-11-15 12:53:19 INFO index: skipped main raw file 2020/11/7R307216.ARW
+2020-11-15 12:53:19 INFO index: skipped main raw file 2020/07/7R305852.ARW
+2020-11-15 12:53:15 INFO index: no .ppignore file found
+2020-11-15 12:53:14 INFO Indexing originals...
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='16' author='fnf' date='2020-11-15T13:02:19Z'>
+		Guess you'll always end up with timing issues when moving files while indexing. It's easy when PhotoPrism peforms the move operation, essentially what our import feature is doing. It's almost impossible to know what is going on when an external application randomly moves files as there is no practical way to continuously track them:
+&lt;denchmark-link:https://user-images.githubusercontent.com/301686/99185490-82c5db00-274a-11eb-9f32-4b0ae564c1cc.gif&gt;&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='17' author='fnf' date='2020-11-15T13:05:12Z'>
+		I'll try to remove missing files from the lookup table on the fly... maybe that works! 🥳
+		</comment>
+		<comment id='18' author='fnf' date='2020-11-15T13:14:51Z'>
+		I should clarify that the issue was not due to files being moved in the middle of an indexing. It is a race condition that is hard to deal with unless on a filesystem that supports creating volume shadows/snapshots. The issue was reproduced using the following steps:
+
+Index a new file
+Rename/move the file
+Re-index (when the file would be firstly marked as a duplicate, then removed from the database)
+
+The way the database caches indexed photos by marking them with photo_quality=-1, in addition with the check for duplicates not having visibility into photos that have been marked as duplicates but actually have been moved makes it a bit difficult to detect in the same round of re-indexing.
+One way to fix this would be to store a list of photos that have been marked as duplicates in an index cycle and perform a full re-scan (for those photos only) at the end of that index cycle automatically. This allows for the normal indexing to be efficient and avoid the need to change the rest of the logics to deal with moved photos (which would be impacted by the order in which directories/files are scanned as well!).
+		</comment>
+		<comment id='19' author='fnf' date='2020-11-15T13:30:06Z'>
+		We don't "physically" delete database rows as this easily ends with a huge (meta)data loss in case the file system is not available for any reason. Also we need to wait for the end of the indexing process to really know what files are there. Taking shortcuts doesn't work well with these things.
+I'll push another change soon.
+		</comment>
+		<comment id='20' author='fnf' date='2020-11-15T13:36:11Z'>
+		
+We don't "physically" delete database rows as this easily ends with a huge (meta)data loss in case the file system is not available for any reason.
+
+The issue is that a file is marked as a duplicate because it has been seen again before PP discovers that it has disappeared from the original location.
+The issue that you described appears to be the opposite where files are removed from the database (i.e., the old location which used to contain the file was scanned first, followed by the new location which has the file) then re-added. I haven't tested to see how PP behaves in this case but it is possible that it would result in the same issue: when PP scans the file in the new location, it'd see that it has the same name as modtime as one of the files in the database (which has been marked as Archived), thus it would be ignored.
+		</comment>
+		<comment id='21' author='fnf' date='2020-11-15T14:20:40Z'>
+		Could track it down, thanks to your last description! The index simply was not updated when files were renamed. Was somehow assuming the mod time changes, when files were moved. But that is not the case. So indexing was skipped. Can you test it again with my latest changes, please? :)
+		</comment>
+		<comment id='22' author='fnf' date='2020-11-15T22:31:17Z'>
+		Thanks, it was better than before :) . It successfully detected that the RAW file was moved but the accompanying JPEG file (which lives in the same folder as the RAW file, has the same file name with a different extension, and moved at the same time) was marked as deleted. The RAW file didn't have any JPEG file and was thus marked as hidden.
+&lt;denchmark-code&gt;2020-11-15 22:28:25 INFO purge: searching index for hidden media files
+2020-11-15 22:28:19 INFO index: skipped main raw file Lightroom/Temp/7R307158.ARW
+2020-11-15 22:28:16 INFO index: skipped main raw file 2020/11/7R307216.ARW
+2020-11-15 22:28:16 INFO index: skipped main raw file 2020/07/7R305852.ARW
+2020-11-15 22:28:12 INFO index: no .ppignore file found
+2020-11-15 22:28:12 INFO Indexing originals...
+2020-11-15 22:28:04 INFO photos: found 1 results for hidden:true public:true dist:20 count:60 order:newest merged:true 11.899502ms]
+2020-11-15 22:27:56 INFO Indexing completed in 13 s
+2020-11-15 22:27:56 INFO Removed 1 files and 0 photos
+2020-11-15 22:27:56 INFO purge: searching index for hidden media files
+2020-11-15 22:27:56 INFO purge: removed file Lightroom/202011/7R307158.JPG
+2020-11-15 22:27:50 INFO index: skipped main raw file Lightroom/Temp/7R307158.ARW
+2020-11-15 22:27:50 INFO file: Lightroom/202011/7R307158.ARW was renamed to Lightroom/Temp/7R307158.ARW
+2020-11-15 22:27:47 INFO index: skipped main raw file 2020/11/7R307216.ARW
+2020-11-15 22:27:47 INFO index: skipped main raw file 2020/07/7R305852.ARW
+2020-11-15 22:27:43 INFO index: no .ppignore file found
+2020-11-15 22:27:43 INFO Indexing originals... 
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='23' author='fnf' date='2020-11-15T23:03:31Z'>
+		Small win. Need to debug this further, thanks for testing! Never really came to my attention since I don't rename files so that they are easy to backup and sync. When name, date and hash change at the same time, it's probably game over.
+		</comment>
+		<comment id='24' author='fnf' date='2020-11-15T23:11:11Z'>
+		Thanks for your support :) . I don't rename files as such but move them as part of sorting, although in the context of database management it might not make a difference.
+It is possible to place them in the final location and, as part of sorting, remove the unwanted ones instead of what I do. However, it makes it rather inconvenient to view only sorted photos/videos and, conversely, target only unsorted photos. It'd be interesting to know how the implementation of PP expects users to manage their existing photo collection. It sounds like importing photos is the main use-case?.
+		</comment>
+		<comment id='25' author='fnf' date='2020-11-15T23:30:22Z'>
+		No, I only use import for new files and uploads. Old files often have useful metadata in their file name or are sorted in folders by location. No need to rename them decades later. Fundamental technical limitations should be clearly communicated though. When there is an obvious bug, we fix it. Note that I have many meetings next week, not sure when I'll get to it.
+		</comment>
+		<comment id='26' author='fnf' date='2020-11-16T10:13:19Z'>
+		
+Old files often have useful metadata in their file name or are sorted in folders by location.
+
+Indeed, I keep photos in a certain hierarchy as they are also managed by Lightroom. PP is one of the few web-based DAMs that doesn't enforce importing which is a great advantage.
+
+Note that I have many meetings next week, not sure when I'll get to it.
+
+That is absolutely fine, thanks :) . For now I could get by using a local patch.
+		</comment>
+		<comment id='27' author='fnf' date='2020-11-17T10:18:49Z'>
+		&lt;denchmark-link:https://github.com/lastzero&gt;@lastzero&lt;/denchmark-link&gt;
+ As a side note, could I just point out that this message:
+&lt;denchmark-code&gt;2020-11-15 12:53:28 INFO purge: removed file Lightroom/202011/7R307158.ARW
+&lt;/denchmark-code&gt;
+
+is a bit scary, considering Photoprism claims to never modify original files :) I assume this doesn't mean it removes the original file, but a re-wording of that message would be nice :)
+		</comment>
+		<comment id='28' author='fnf' date='2020-11-17T11:06:49Z'>
+		&lt;denchmark-link:https://github.com/oscar-b&gt;@oscar-b&lt;/denchmark-link&gt;
+ Yes, removed from index (soft delete)... shall we improve the log message to be less scary? ;)
+		</comment>
+		<comment id='29' author='fnf' date='2020-11-20T16:28:14Z'>
+		This hopefully fixes most of the remaining issue. Still wondering how to handle the case where only one file of a group of related files (indexed as one photo with multiple files) was renamed. Should it be unstacked? Merged when the rename is reverted?
+		</comment>
+		<comment id='30' author='fnf' date='2020-11-20T22:45:11Z'>
+		I tried the latest commit but it still seems to struggle with moved files. This is the log with the RAW and its JPEG files moved to another directory:
+&lt;denchmark-code&gt;2020-11-20 22:36:44 INFO Indexing completed in 13 s
+2020-11-20 22:36:43 INFO Removed 1 files and 0 photos
+2020-11-20 22:36:43 INFO purge: searching index for hidden media files
+2020-11-20 22:36:43 INFO purge: flagged file Lightroom/202011/7R307158.JPG as deleted
+2020-11-20 22:36:37 INFO index: skipped main raw file Lightroom/Temp/7R307158.ARW
+2020-11-20 22:36:37 INFO file: renamed Lightroom/Temp/7R307158.ARW to Lightroom/Temp/7R307158.ARW
+2020-11-20 22:36:30 INFO index: no .ppignore file found
+2020-11-20 22:36:30 INFO Indexing originals... 
+&lt;/denchmark-code&gt;
+
+And the log after they've been moved back:
+&lt;denchmark-code&gt; 2020-11-20 22:37:12 INFO Indexing completed in 13 s
+2020-11-20 22:37:12 INFO purge: searching index for hidden media files
+2020-11-20 22:37:06 INFO index: skipped main raw file Lightroom/202011/7R307158.ARW
+2020-11-20 22:37:06 INFO file: renamed Lightroom/202011/7R307158.ARW to Lightroom/202011/7R307158.ARW
+2020-11-20 22:36:59 INFO index: no .ppignore file found
+2020-11-20 22:36:59 INFO Indexing originals...
+&lt;/denchmark-code&gt;
+
+The end result is that the JPEG file gets marked as hidden.
+In the DAM softwares I've used (Lightroom &amp; CaptureOne), the files are presented to the user in their current state with no assumption based on their past arrangements i.e., if a file is removed, it gets deleted from the database. If a file is moved to another directory, it is treated as a different file. It is OK to have duplicated files as well because there are better tools to detect and clean duplicates should the need arises.
+		</comment>
+		<comment id='31' author='fnf' date='2020-11-20T22:54:15Z'>
+		Thanks, going to take a look at this tomorrow!
+You only moved the JPEG and not the RAW, or both? I'd expect a RAW without JPEG to be marked as hidden as it can't be displayed directly in a browser.
+		</comment>
+		<comment id='32' author='fnf' date='2020-11-20T22:56:45Z'>
+		I moved both files as mentioned :) somehow the JPG file was marked as deleted rather than renamed/moved.
+For comparison, this is the behaviour I'd expect (with my ad-hoc patch above rebased on the latest commit, but it could be made better by having a single pass only).
+Moving the files to another directory, in the first pass PP purged the moved files from the database:
+&lt;denchmark-code&gt; 2020-11-20 22:48:12 INFO Indexing completed in 14 s
+2020-11-20 22:48:11 INFO Removed 1 files and 0 photos
+2020-11-20 22:48:11 INFO purge: searching index for hidden media files
+2020-11-20 22:48:11 INFO purge: flagged file Lightroom/202011/7R307158.JPG as deleted
+2020-11-20 22:48:04 INFO index: skipped main raw file Lightroom/Temp/7R307158.ARW
+2020-11-20 22:48:04 INFO file: renamed Lightroom/Temp/7R307158.ARW to Lightroom/Temp/7R307158.ARW
+2020-11-20 22:47:57 INFO index: no .ppignore file found
+2020-11-20 22:47:57 INFO Indexing originals...
+&lt;/denchmark-code&gt;
+
+In the 2nd pass the files are re-added:
+&lt;denchmark-code&gt;2020-11-20 22:48:41 INFO Indexing completed in 13 s
+2020-11-20 22:48:40 INFO purge: searching index for hidden media files
+2020-11-20 22:48:35 INFO index: added related jpg file 7R307158.JPG
+2020-11-20 22:48:35 INFO index: added main raw file Lightroom/Temp/7R307158.ARW
+2020-11-20 22:48:27 INFO index: no .ppignore file found
+2020-11-20 22:48:27 INFO Indexing originals...
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='33' author='fnf' date='2020-11-20T23:06:51Z'>
+		Going to be fixed soon. A hard delete from our db is not an option so that no manually entered metadata gets lost.
+		</comment>
+		<comment id='34' author='fnf' date='2020-11-21T14:56:50Z'>
+		Excellent catch! Going to take a look at some more issues and then start a new Docker build.
+Note that RAW photos remain visible in search results if the related JPEG is not deleted. Since PhotoPrism may have automatically generated a JPEG in the sidecar folder, users may not be aware of this and it may feel strange. At minimum, it's additional work to manually delete related sidecar files as well. Should find a good solution for this. Maybe automatically delete related files in the sidecar folder if the main file was removed...
+		</comment>
+		<comment id='35' author='fnf' date='2020-11-21T22:26:07Z'>
+		Fixed remaining issues when deleting and restoring RAW files with JPEG sidecar files as mentioned above.
+		</comment>
+		<comment id='36' author='fnf' date='2020-11-23T14:32:45Z'>
+		I can confirm that the issue has been fixed! Many thanks for your support :) .
+		</comment>
+	</comments>
+</bug>

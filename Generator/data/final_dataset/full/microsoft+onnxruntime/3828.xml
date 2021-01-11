@@ -1,0 +1,554 @@
+<bug_data>
+<bug id='3828' author='harrysummer' open_date='2020-05-05T20:10:52Z' closed_time='2020-05-06T07:05:17Z'>
+ 	<summary>cuDNN error when running multi-thread evaluation</summary>
+ 	<description>
+ We have some code to call the same InferenceSession in multiple threads. And we randomly see the following crashes:
+ 
+ Non-zero status code returned while running Conv node. Name:'onnx_op_2' Status Message: CUDNN error executing cudnnConvolutionForward(CudnnHandle(), &amp;alpha, s_.x_tensor, x_data, s_.filter_desc, w_data, s_.conv_desc, s_.algo, workspace.get(), s_.workspace_bytes, &amp;beta, s_.y_tensor, y_data)
+ 
+ 
+ Non-zero status code returned while running Conv node. Name:'' Status Message: CUDNN error executing cudnnAddTensor(CudnnHandle(), &amp;alpha, s_.b_tensor, b_data, &amp;alpha, s_.y_tensor, y_data)
+ 
+ We figured out this is a thread-safety problem in CUDA covolution implementation. Here are the detail explanation:
+ In the compute function of Conv, a mutex guards the following block in cuda/nn/conv.cc:
+ 
+ 
+ 
+ onnxruntime/onnxruntime/core/providers/cuda/nn/conv.cc
+ 
+ 
+         Lines 55 to 169
+       in
+       5dfc91d
+ 
+ 
+ 
+ 
+ 
+ 
+  { 
+ 
+ 
+ 
+    std::lock_guard&lt;OrtMutex&gt; lock(s_.mutex); 
+ 
+ 
+ 
+  // TODO: add a global cache if need to handle cases for multiple frames running simultaneuously with different batch_size 
+ 
+ 
+ 
+  bool input_dims_changed = (s_.last_x_dims != x_dims); 
+ 
+ 
+ 
+  bool w_dims_changed = (s_.last_w_dims != w_dims); 
+ 
+ 
+ 
+  if (input_dims_changed || w_dims_changed) { 
+ 
+ 
+ 
+  if (input_dims_changed) 
+ 
+ 
+ 
+        s_.last_x_dims = x_dims; 
+ 
+ 
+ 
+  
+ 
+ 
+ 
+  if (w_dims_changed) { 
+ 
+ 
+ 
+        s_.last_w_dims = w_dims; 
+ 
+ 
+ 
+        s_.cached_benchmark_results.clear(); 
+ 
+ 
+ 
+      } 
+ 
+ 
+ 
+  
+ 
+ 
+ 
+  const int64_t N = X-&gt;Shape()[0]; 
+ 
+ 
+ 
+  const int64_t M = W-&gt;Shape()[0]; 
+ 
+ 
+ 
+  
+ 
+ 
+ 
+  ORT_RETURN_IF_ERROR(conv_attrs_.ValidateInputShape(X, W)); 
+ 
+ 
+ 
+  
+ 
+ 
+ 
+      std::vector&lt;int64_t&gt; kernel_shape; 
+ 
+ 
+ 
+  ORT_RETURN_IF_ERROR(conv_attrs_.ComputeKernelShape(W-&gt;Shape(), kernel_shape)); 
+ 
+ 
+ 
+  auto rank = kernel_shape.size(); 
+ 
+ 
+ 
+      std::vector&lt;int64_t&gt; pads(conv_attrs_.pads); 
+ 
+ 
+ 
+  if (pads.empty()) { 
+ 
+ 
+ 
+        pads.resize(rank * 2, 0); 
+ 
+ 
+ 
+      } 
+ 
+ 
+ 
+      std::vector&lt;int64_t&gt; dilations(conv_attrs_.dilations); 
+ 
+ 
+ 
+  if (dilations.empty()) { 
+ 
+ 
+ 
+        dilations.resize(rank, 1); 
+ 
+ 
+ 
+      } 
+ 
+ 
+ 
+      std::vector&lt;int64_t&gt; strides(conv_attrs_.strides); 
+ 
+ 
+ 
+  if (strides.empty()) { 
+ 
+ 
+ 
+        strides.resize(rank, 1); 
+ 
+ 
+ 
+      } 
+ 
+ 
+ 
+  
+ 
+ 
+ 
+      std::vector&lt;int64_t&gt; y_dims; 
+ 
+ 
+ 
+      y_dims.insert(y_dims.begin(), {N, M}); 
+ 
+ 
+ 
+  ORT_RETURN_IF_ERROR(conv_attrs_.InferOutputShape&lt;true&gt;(x_shape.Slice(2), kernel_shape, 
+ 
+ 
+ 
+                                                             strides, dilations, &amp;pads, &amp;y_dims)); 
+ 
+ 
+ 
+      s_.y_dims = y_dims; 
+ 
+ 
+ 
+      Tensor* Y = context-&gt;Output(0, TensorShape(s_.y_dims)); 
+ 
+ 
+ 
+      y_data = reinterpret_cast&lt;CudaT*&gt;(Y-&gt;template MutableData&lt;T&gt;()); 
+ 
+ 
+ 
+  
+ 
+ 
+ 
+  // special case when there is a dim value of 0 in the shape. 
+ 
+ 
+ 
+  if (Y-&gt;Shape().Size() == 0) 
+ 
+ 
+ 
+  return Status::OK(); 
+ 
+ 
+ 
+  
+ 
+ 
+ 
+      std::vector&lt;int64_t&gt; x_dims_cudnn = x_dims; 
+ 
+ 
+ 
+      std::vector&lt;int64_t&gt; y_dims_cudnn = y_dims; 
+ 
+ 
+ 
+  if (rank &lt; 2) { 
+ 
+ 
+ 
+  // cudnn only takes 4D or 5D input, so pad dimensions if needed 
+ 
+ 
+ 
+        x_dims_cudnn.push_back(1); 
+ 
+ 
+ 
+        y_dims_cudnn.push_back(1); 
+ 
+ 
+ 
+        w_dims.push_back(1); 
+ 
+ 
+ 
+        pads.insert(pads.begin() + rank, 0); 
+ 
+ 
+ 
+        pads.insert(pads.end(), 0); 
+ 
+ 
+ 
+        kernel_shape.push_back(1); 
+ 
+ 
+ 
+        strides.push_back(1); 
+ 
+ 
+ 
+        dilations.push_back(1); 
+ 
+ 
+ 
+      } 
+ 
+ 
+ 
+  ORT_RETURN_IF_ERROR(s_.x_tensor.Set(x_dims_cudnn, CudnnTensor::GetDataType&lt;CudaT&gt;())); 
+ 
+ 
+ 
+  ORT_RETURN_IF_ERROR(s_.y_tensor.Set(y_dims_cudnn, CudnnTensor::GetDataType&lt;CudaT&gt;())); 
+ 
+ 
+ 
+  
+ 
+ 
+ 
+  if (w_dims_changed) 
+ 
+ 
+ 
+  ORT_RETURN_IF_ERROR(s_.filter_desc.Set(w_dims, CudnnTensor::GetDataType&lt;CudaT&gt;())); 
+ 
+ 
+ 
+  
+ 
+ 
+ 
+      cudnnConvolutionMode_t mode = CUDNN_CROSS_CORRELATION; 
+ 
+ 
+ 
+  ORT_RETURN_IF_ERROR(s_.conv_desc.Set(kernel_shape.size(), pads, strides, dilations, 
+ 
+ 
+ 
+                                           mode, CudnnTensor::GetDataType&lt;CudaT&gt;())); 
+ 
+ 
+ 
+  CUDNN_RETURN_IF_ERROR(cudnnSetConvolutionGroupCount(s_.conv_desc, gsl::narrow_cast&lt;int&gt;(conv_attrs_.group))); 
+ 
+ 
+ 
+  
+ 
+ 
+ 
+  if (has_bias) { 
+ 
+ 
+ 
+  const Tensor* B = context-&gt;Input&lt;Tensor&gt;(2); 
+ 
+ 
+ 
+  const auto&amp; b_shape = B-&gt;Shape(); 
+ 
+ 
+ 
+  ORT_RETURN_IF_NOT(b_shape.NumDimensions() == 1, "bias should be 1D"); 
+ 
+ 
+ 
+        std::vector&lt;int64_t&gt; b_dims(2 + kernel_shape.size()); 
+ 
+ 
+ 
+        b_dims[0] = 1;           // N 
+ 
+ 
+ 
+        b_dims[1] = b_shape[0];  // C 
+ 
+ 
+ 
+  for (size_t i = 0; i &lt; kernel_shape.size(); i++) b_dims[2 + i] = 1; 
+ 
+ 
+ 
+  
+ 
+ 
+ 
+  ORT_RETURN_IF_ERROR(s_.b_tensor.Set(b_dims, CudnnTensor::GetDataType&lt;CudaT&gt;())); 
+ 
+ 
+ 
+      } 
+ 
+ 
+ 
+  
+ 
+ 
+ 
+  if (!s_.cached_benchmark_results.contains(x_dims_cudnn)) { 
+ 
+ 
+ 
+        IAllocatorUniquePtr&lt;void&gt; algo_search_workspace = GetScratchBuffer&lt;void&gt;(AlgoSearchWorkspaceSize); 
+ 
+ 
+ 
+  
+ 
+ 
+ 
+  // set math type to tensor core before algorithm search 
+ 
+ 
+ 
+  if (std::is_same&lt;T, MLFloat16&gt;::value) 
+ 
+ 
+ 
+  CUDNN_RETURN_IF_ERROR(cudnnSetConvolutionMathType(s_.conv_desc, CUDNN_TENSOR_OP_MATH)); 
+ 
+ 
+ 
+  
+ 
+ 
+ 
+        cudnnConvolutionFwdAlgoPerf_t perf; 
+ 
+ 
+ 
+  int algo_count = 1; 
+ 
+ 
+ 
+  CUDNN_RETURN_IF_ERROR(cudnnFindConvolutionForwardAlgorithmEx( 
+ 
+ 
+ 
+  CudnnHandle(), 
+ 
+ 
+ 
+            s_.x_tensor, 
+ 
+ 
+ 
+            x_data, 
+ 
+ 
+ 
+            s_.filter_desc, 
+ 
+ 
+ 
+            w_data, 
+ 
+ 
+ 
+            s_.conv_desc, 
+ 
+ 
+ 
+            s_.y_tensor, 
+ 
+ 
+ 
+            y_data, 
+ 
+ 
+ 
+  1, 
+ 
+ 
+ 
+            &amp;algo_count, 
+ 
+ 
+ 
+            &amp;perf, 
+ 
+ 
+ 
+            algo_search_workspace.get(), 
+ 
+ 
+ 
+            AlgoSearchWorkspaceSize)); 
+ 
+ 
+ 
+        s_.cached_benchmark_results.insert(x_dims_cudnn, {perf.algo, perf.memory, perf.mathType}); 
+ 
+ 
+ 
+      } 
+ 
+ 
+ 
+  
+ 
+ 
+ 
+  const auto&amp; perf = s_.cached_benchmark_results.at(x_dims_cudnn); 
+ 
+ 
+ 
+  CUDNN_RETURN_IF_ERROR(cudnnSetConvolutionMathType(s_.conv_desc, perf.mathType)); 
+ 
+ 
+ 
+      s_.algo = perf.algo; 
+ 
+ 
+ 
+      s_.workspace_bytes = perf.memory; 
+ 
+ 
+ 
+    } 
+ 
+ 
+ 
+  } 
+ 
+ 
+ 
+ 
+ 
+ However, just below this block, there are calls to cuDNN API using the shared cuDNN state s_:
+ 
+ 
+ 
+ onnxruntime/onnxruntime/core/providers/cuda/nn/conv.cc
+ 
+ 
+          Line 185
+       in
+       5dfc91d
+ 
+ 
+ 
+ 
+ 
+ 
+  CUDNN_RETURN_IF_ERROR(cudnnConvolutionForward(CudnnHandle(), 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ onnxruntime/onnxruntime/core/providers/cuda/nn/conv.cc
+ 
+ 
+          Line 202
+       in
+       5dfc91d
+ 
+ 
+ 
+ 
+ 
+ 
+  CUDNN_RETURN_IF_ERROR(cudnnAddTensor(CudnnHandle(), &amp;alpha, s_.b_tensor, b_data, &amp;alpha, s_.y_tensor, y_data)); 
+ 
+ 
+ 
+ 
+ 
+ Therefore, when multi-thread evaluation hits cudnnConvolutionForward or cudnnAddTensor at the same time, the cuDNN call may fail when the shapes of tensors are different on different thread. Our solution for this is extend the mutex scope to include to two cuDNN calls.
+ 	</description>
+ 	<comments>
+ 	</comments>
+ </bug>
+<commit id='b45ce925428efce1008b40adb9603cfb57500306' author='Hariharan Seshadri' date='2020-05-06 00:05:15-07:00'>
+ 	<dmm_unit complexity='None' interfacing='None' size='None'></dmm_unit>
+ 	<modification change_type='MODIFY' old_name='onnxruntime\core\providers\cuda\nn\conv.cc' new_name='onnxruntime\core\providers\cuda\nn\conv.cc'>
+ 		<file_info nloc='185' complexity='24' token_count='1578'></file_info>
+ 		<method name='onnxruntime::cuda::Conv&lt;T&gt;::ComputeInternal' parameters='context'>
+ 				<method_info nloc='138' complexity='18' token_count='1292' nesting_level='2' start_line='37' end_line='206'></method_info>
+ 			<added_lines>170,171,172,173,174,176,177,179,180,181,182,183,184,185,186,187,188,189,190,191,192,193,194,195,196,197,198,199,200,201,202</added_lines>
+ 			<deleted_lines>169,171,172,173,174,175,177,178,180,181,182,183,184,185,186,187,188,189,190,191,192,193,194,195,196,197,198,199,200,201,202</deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines></added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ </commit>
+</bug_data>

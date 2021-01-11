@@ -1,0 +1,181 @@
+<bug id='35762' author='Bengt' open_date='2020-01-11T01:18:41Z' closed_time='2020-01-24T19:59:58Z'>
+	<summary>_ = dataset.cache() accelerates data pipeline</summary>
+	<description>
+System information
+
+Have I written custom code
+Linux Ubuntu 18.04
+TensorFlow ROCm installed from PyPI
+TensorFlow version: v2.0.0-rocm-3-g0826c3a 2.0.2
+Python version: Python 3.7.5
+CUDA/cuDNN version: None
+GPU model and memory: 2 x Radeon Vega 64
+
+Describe the current behavior
+TF.Data is quicker when one caches the whole dataset to an unused name.
+
+With dataset_*.cache(...):
+-   With _= dataset.cache(...): 10870 samples/s stdev 27 samples/s
+-   Without _= dataset.cache(...): 10563 samples/s, stdev 50 samples/s
+-   (10870 - 27) / (10563 + 50) = 1.02167153491
+Without dataset_*.cache(...):
+-   With _= dataset.cache(...): 2902 samples/s stdev 14 samples/s
+-   Without _= dataset.cache(...): 2732 samples/s, stdev 9 samples/s
+-   (10870 - 27) / (10563 + 50) = 1.05363006202
+
+Describe the expected behavior
+TF.Data is as quick as possible by default.
+Code to reproduce the issue
+My input data pipeline looks something like this:
+data_frame_valid = pd.read_csv(...)
+data_frame_invalid = pd.read_csv(...)
+dataset_valid: tf.data.Dataset = tf.data.Dataset.from_tensor_slices(...)
+dataset_invalid: tf.data.Dataset = tf.data.Dataset.from_tensor_slices(...)
+dataset: tf.data.Dataset = dataset_valid.concatenate(dataset_invalid)
+dataset = dataset.shuffle(...)
+_ = dataset.cache()  # This speeds up iterating the data by 2 - 5 %
+dataset_training = dataset.take(data_set_size_training)
+dataset_testing = dataset.skip(data_set_size_training)
+dataset_validation = dataset_testing.skip(data_set_size_validation)
+dataset_testing = dataset_testing.take(data_set_size_testing)
+# dataset_training = dataset_training.cache()  # "_ speed up" can be observed with and without
+# dataset_validation = dataset_validation.cache()  # "_ speed up" can be observed with and without
+# dataset_testing = dataset_testing.cache()  # "_ speed up" can be observed with and without
+My benchmark:
+import statistics
+
+import time
+import tensorflow as tf
+
+from pfasdr.neural.ze_discriminate_pd_np.get_data_sets_module import \
+    get_data_sets
+from pfasdr.neural.ze_discriminate_pd_np.path_templates_module import \
+    valid_file_path_template, invalid_file_path_template
+
+
+def benchmark_dataset(dataset, num_epochs=2):
+    tf.print('Iterating data set ...')
+
+    throughput_history = []
+    for index_epoch in tf.data.Dataset.range(num_epochs):
+        tf.print(f'Iterating for epoch {index_epoch}')
+        index = 0
+
+        # The actual benchmark
+        tine_start = time.perf_counter()
+        for index, _ in enumerate(dataset):
+            pass
+            # Uncomment for progress reporting
+            # if not index % 100:
+            #     print('\r' + str(index), end='')
+        time_end = time.perf_counter()
+
+        print('\r' + str(index))
+        duration = time_end - tine_start
+        throughput = index / duration
+
+        tf.print(
+            f'Iterating data set took: '
+            f'{round(duration, 2)} s in epoch number {index_epoch}. '
+            f'This makes for a throughput of {round(throughput)} 1/s'
+        )
+
+        if not index_epoch:
+            # First round uses cold caches.
+            # So do not record it.
+            continue
+        throughput_history.append(throughput)
+
+    throughput_average = statistics.mean(throughput_history)
+    throughput_deviation = statistics.stdev(throughput_history)
+    throughput_upper = throughput_average + throughput_deviation
+    throughput_lower = throughput_average - throughput_deviation
+    tf.print(f'Average dataset entry throughput {round(throughput_average)} '
+             f'with a variation of +/- {round(throughput_deviation)}, '
+             f'which means {round(throughput_upper)} (+), '
+             f'or {round(throughput_lower)} (-).')
+
+
+def main():
+    batch_size_training = 32
+    node_count = 15
+    valid_file_path = valid_file_path_template.substitute(
+        length=node_count,
+    )
+    invalid_file_path = invalid_file_path_template.substitute(
+        length=node_count,
+    )
+
+    dataset_training, dataset_validation, dataset_testing, \
+        batch_size_training, dataset_size_validation, dataset_size_evaluate,\
+        dataset_size_training \
+        = get_data_sets(
+            batch_size=batch_size_training,
+            names=list(range(node_count)),
+            invalid_file_path=invalid_file_path,
+            valid_file_path=valid_file_path,
+        )
+
+    benchmark_dataset(dataset=dataset_training, num_epochs=5)
+
+
+if __name__ == '__main__':
+    main()
+	</description>
+	<comments>
+		<comment id='1' author='Bengt' date='2020-01-11T01:25:02Z'>
+		Why _ = dataset.cache()?
+Try dataset = dataset.cache() instead.
+		</comment>
+		<comment id='2' author='Bengt' date='2020-01-11T01:37:15Z'>
+		Yes, I know assigning to _ does not make sense. I stumbled upon this behavior by mistake. I tried to invoke .cache() on one of the dataset_* subsets, which was not visible from the function handling the dataset creation. Therefore, the name assignment should have had no effect, which makes it equivalent to assigning to _. Yet, I still measured an improvement, which obviously should not be the case. Using dataset = dataset.cache() performs the same, but throws warnings, because this .cache() call is before take() calls. dataset.cache() also speeds up the pipeline, so assigning itself is optional.
+		</comment>
+		<comment id='3' author='Bengt' date='2020-01-11T01:42:07Z'>
+		The cache bahavior is designed for accelerate repeated reads from disk, not arrays in memory.
+		</comment>
+		<comment id='4' author='Bengt' date='2020-01-11T01:53:03Z'>
+		Yes, I know .cache()is not supposed to offer speed ups here at all. However, it does so in both instances (dataset_*.cache() and dataset.cache()).
+		</comment>
+		<comment id='5' author='Bengt' date='2020-01-11T01:57:58Z'>
+		Wait a minute. It seems like I got the standard deviations of the epochs down far enough to measure a difference by iterating over a dataset for long enough. However, I still have a hard time reproducing my results. Could it be that the throughput performance of an input pipeline is just not reliable up to a few percent and that I have been measuring luck of the draw by running my benchmark script a few times?
+		</comment>
+		<comment id='6' author='Bengt' date='2020-01-11T03:21:00Z'>
+		Here are some results of consecutive manual runs:
+
+without dataset_*.cache:
+
+2895 with a variation of +/- 8
+2893 with a variation of +/- 13
+2876 with a variation of +/- 17
+2844 with a variation of +/- 7
+2842 with a variation of +/- 9
+
+
+
+Which makes for a maximum difference of the means up to 2.5 % and thus does explain the measured speed up.
+
+with dataset_*.cache:
+
+10744 with a variation of +/- 29
+10711 with a variation of +/- 26
+10702 with a variation of +/- 27
+10625 with a variation of +/- 16
+10601 with a variation of +/- 45
+
+
+
+Which makes for a maximum difference of the means of about 2.05 % and thus does not explain the measured speed up.
+So it seems like I was at least possibly just measuring run-to-run differences in the case of no caching at all. The effect of the speed up seems to be really caused by the seemingly useless dataset.cache() call under the condition of data-sub-sets being cached.
+		</comment>
+		<comment id='7' author='Bengt' date='2020-01-24T19:59:58Z'>
+		Putting _ = dataset.cache() will have no effect on the input pipeline graph that ends up being created and executed, so your performance difference must be due to noise.
+		</comment>
+		<comment id='8' author='Bengt' date='2020-01-24T20:00:00Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/35762&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/35762&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,144 @@
+<bug id='28515' author='NEU-Gou' open_date='2019-05-08T09:32:38Z' closed_time='2019-05-14T09:22:23Z'>
+	<summary>min/max data missing for FusedBatchNorm op</summary>
+	<description>
+Please make sure that this is a bug. As per our GitHub Policy, we only address code/doc bugs, performance issues, feature requests and build/installation issues on GitHub. tag:bug_template
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): No
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Ubuntu 18.04
+Mobile device (e.g. iPhone 8, Pixel 2, Samsung Galaxy) if the issue happens on mobile device: N/A
+TensorFlow installed from (source or binary): binary
+TensorFlow version (use command below): r1.13
+Python version: 3.6
+Bazel version (if compiling from source):
+GCC/Compiler version (if compiling from source):
+CUDA/cuDNN version: 10
+GPU model and memory: GeForce 2080Ti
+
+You can collect some of this information using our environment capture
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/tree/master/tools/tf_env_collect.sh&gt;script&lt;/denchmark-link&gt;
+
+You can also obtain the TensorFlow version with: 1. TF 1.0:  2. TF 2.0: 
+Describe the current behavior
+I'm trying to use contrib/quantize module to perform quantize aware training and convert the trained model to quantize TFlite model. When run converter.convert(), the following error will be raised:
+&lt;denchmark-code&gt;tensorflow/lite/toco/tooling_util.cc:1702] Array conv0/batch_normalization_v1/FusedBatchNorm, which is an input to the Conv operator producing the output array conv1/re_lu/Relu, is lacking min/max data, which is necessary for quantization. If accuracy matters, either target a non-quantized output format, or run quantized training with your model from a floating point checkpoint to change the input graph to contain min/max information. If you don't care about accuracy, you can pass --default_ranges_min= and --default_ranges_max= for easy experimentation.
+Aborted (core dumped)
+&lt;/denchmark-code&gt;
+
+When adding ReLU op after the BN, it will be converted without the error massage. But in the tensorboard graph, I cannot see any differences on the FusedBatchNorm part with and without ReLU.
+Describe the expected behavior
+Convert to TFLite without error
+Code to reproduce the issue
+import tensorflow as tf
+import os
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+os.environ['CUDA_VISIBLE_DEVICES'] = ''
+
+
+def build_model(input):
+    '''build the model'''
+    with tf.name_scope('conv0'):
+        x = tf.keras.layers.Conv2D(24, kernel_size=(3, 3), padding='same', use_bias=False)(input)
+        x = tf.keras.layers.BatchNormalization(fused=True)(x)
+        #x = tf.keras.layers.ReLU()(x)
+    with tf.name_scope('conv1'):
+        x = tf.keras.layers.Conv2D(48, kernel_size=(3, 3), padding='same', use_bias=False)(x)
+        x = tf.keras.layers.BatchNormalization(fused=True)(x)
+        x = tf.keras.layers.ReLU()(x)
+    x = tf.concat((input, x), axis=-1)
+    with tf.name_scope('conv_out'):
+        x = tf.keras.layers.Conv2D(10, kernel_size=(1, 1), padding='same', use_bias=True)(x)
+        x = tf.keras.layers.ReLU()(x)
+    return x
+
+
+# build model
+tf.keras.backend.set_learning_phase(1)
+input = tf.placeholder(tf.float32, shape=(None, None, None, 3))
+x = build_model(input)
+
+# quantize
+graph = tf.get_default_graph()
+tf.contrib.quantize.create_training_graph(input_graph=graph, quant_delay=0)
+
+# save
+saver = tf.train.Saver()
+with tf.Session(graph=graph) as sess:
+    sess.run(tf.global_variables_initializer())
+    saver.save(sess, './tmp/simple/model.ckpt')
+    writer = tf.summary.FileWriter('./tmp/simple/train/', sess.graph)
+    writer.flush()
+    writer.close()
+
+
+# eval
+tf.reset_default_graph()
+tf.keras.backend.set_learning_phase(0)
+input = tf.placeholder(tf.float32, shape=(1, 32, 32, 3), name='input')
+x = build_model(input)
+x = tf.identity(x, 'output')
+
+# quantize
+graph = tf.get_default_graph()
+init_min=-6, init_max=6)
+tf.contrib.quantize.create_eval_graph(graph)
+saver = tf.train.Saver()
+with tf.Session(graph=graph) as sess:
+    sess.run(tf.global_variables_initializer())
+    saver.restore(sess, tf.train.latest_checkpoint('./tmp/simple'))
+    writer = tf.summary.FileWriter('./tmp/simple/eval/', graph)
+    writer.flush()
+    writer.close()
+
+    # freeze graph
+    graph_def = graph.as_graph_def()
+    froze_graph = tf.graph_util.convert_variables_to_constants(sess, graph_def, ['output'])
+    tf.io.write_graph(froze_graph, './tmp/simple/', 'freeze_graph.pb')
+
+# convert to TFLite
+graph_def_file = './tmp/simple/freeze_graph.pb'
+input_array = ["input"]
+converter = tf.lite.TFLiteConverter.from_frozen_graph(graph_def_file, input_array, ['output'],
+                                                      input_shapes={"input": [1, 32, 32, 3]})
+converter.allow_custom_ops = True
+converter.inference_type = tf.lite.constants.QUANTIZED_UINT8
+converter.inference_input_type = tf.lite.constants.QUANTIZED_UINT8
+converter.quantized_input_stats = {"input": (0., 255.)}
+tfmodel = converter.convert()
+open("./tmp/simple/converted_model.tflite", "wb").write(tfmodel)
+
+# load the TFLite
+interpreter = tf.lite.Interpreter(model_path="./tmp/simple/converted_model.tflite")
+interpreter.allocate_tensors()
+print("TFLite model loadded!!")
+Other info / logs
+Include any logs or source code that would be helpful to diagnose the problem. If including tracebacks, please include the full traceback. Large logs and files should be attached.
+	</description>
+	<comments>
+		<comment id='1' author='NEU-Gou' date='2019-05-09T12:05:52Z'>
+		Looks like we have come across similar issue. Please have a look on &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/27952&gt;#27952&lt;/denchmark-link&gt;
+. Let us know if it is not the same. You can also have a look on &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/21725&gt;#21725&lt;/denchmark-link&gt;
+. Thanks!
+		</comment>
+		<comment id='2' author='NEU-Gou' date='2019-05-14T09:22:23Z'>
+		Automatically closing due to lack of recent activity. Please update the issue when new information becomes available, and we will reopen the issue. Thanks!
+		</comment>
+		<comment id='3' author='NEU-Gou' date='2019-05-14T09:22:24Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=28515&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=28515&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='4' author='NEU-Gou' date='2019-05-21T10:45:39Z'>
+		anyone can help? facing the same issue?
+		</comment>
+		<comment id='5' author='NEU-Gou' date='2019-08-23T04:46:26Z'>
+		&lt;denchmark-link:https://github.com/achandraa&gt;@achandraa&lt;/denchmark-link&gt;
+
+Recently I tried to do quantization aware training and do Toco converter to Tflite model with a network having batch_norm layers. but I got the error below.
+
+In this case I need to remain the accuracy of my model. So I think set default_ranges_min/max shouln not be used. Can you or anyone can help me to solve this?
+		</comment>
+	</comments>
+</bug>

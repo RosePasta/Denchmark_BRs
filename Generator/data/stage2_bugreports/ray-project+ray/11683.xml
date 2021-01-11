@@ -1,0 +1,146 @@
+<bug id='11683' author='ijrsvt' open_date='2020-10-28T21:49:20Z' closed_time='2020-12-01T17:35:55Z'>
+	<summary>[core] Async Actor Task fails when `max_retries=-1`</summary>
+	<description>
+&lt;denchmark-h:h3&gt;What is the problem?&lt;/denchmark-h&gt;
+
+An actor task fails when the actor dies, despite having max_retries=-1 &amp; max_restart=-1
+Ray version and other system information (Python version, TensorFlow version, OS):
+&lt;denchmark-h:h3&gt;Reproduction (REQUIRED)&lt;/denchmark-h&gt;
+
+The easiest way to test this is with Serve
+
+Add the following method to python/ray/serve/controller.py::ServeController
+
+&lt;denchmark-code&gt;    def _test_crash(self):
+        os._exit(0)
+&lt;/denchmark-code&gt;
+
+
+Add the following between L44 &amp; L45 (the assert) in python/ray/serve/tests/test_standalone.py:
+
+&lt;denchmark-code&gt;    with pytest.raises(ray.exceptions.RayActorError):
+        ray.get(client._controller._test_crash.remote())
+&lt;/denchmark-code&gt;
+
+
+Run python -m pytest -sv python/ray/serve/tests/test_standalone.py::test_detached_deployment
+
+Please provide a script that can be run to reproduce the issue. The script should have no external library dependencies (i.e., use fake or mock data / environments):
+If we cannot run your script, we cannot fix your issue.
+
+ I have verified my script runs in a clean environment and reproduces the issue.
+ I have verified the issue also occurs with the latest wheels.
+
+	</description>
+	<comments>
+		<comment id='1' author='ijrsvt' date='2020-10-29T07:08:07Z'>
+		Hmm this looks like regression. Is it possible to make a reproducible script without using serve?
+Also, is it always failing?
+		</comment>
+		<comment id='2' author='ijrsvt' date='2020-10-29T07:08:45Z'>
+		cc &lt;denchmark-link:https://github.com/stephanie-wang&gt;@stephanie-wang&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/ericl&gt;@ericl&lt;/denchmark-link&gt;
+ lmk if this looks like a expected behavior
+		</comment>
+		<comment id='3' author='ijrsvt' date='2020-10-29T07:38:01Z'>
+		&lt;denchmark-link:https://github.com/rkooo567&gt;@rkooo567&lt;/denchmark-link&gt;
+  I'm not 100% if this exists outside of serve, and I've been trying to hone in on what the actual root cause is.
+		</comment>
+		<comment id='4' author='ijrsvt' date='2020-10-29T20:15:37Z'>
+		Oh actually, I think I may have seen this issue before with async actors in general, although I'm not totally sure it's the same issue. Unfortunately I forgot to open an issue earlier :( &lt;denchmark-link:https://github.com/ijrsvt&gt;@ijrsvt&lt;/denchmark-link&gt;
+ can you try with just an async actor and see if you get the same issue?
+The problem I saw before was because of the way that actor task retries are implemented. The caller includes an index with each task that it submits to the actor that is equal to the number of tasks submitted before. To figure out which tasks to retry, we also keep track of the number of tasks whose reply the caller has already received. That way, the actor knows which index to start executing from if it fails and restarts. There's more information about the algorithm &lt;denchmark-link:https://github.com/ray-project/ray/blob/master/src/ray/core_worker/transport/direct_actor_transport.h#L143&gt;here&lt;/denchmark-link&gt;
+.
+However, this assumes that task replies are received in the same order that they are executed in. And async actors can execute tasks in a different order.
+		</comment>
+		<comment id='5' author='ijrsvt' date='2020-11-04T08:03:19Z'>
+		A similar issue I noticed is (&lt;denchmark-link:https://gist.github.com/ijrsvt/855b49330a54327a72bcbf2f0cbe9926&gt;full stack trace&lt;/denchmark-link&gt;
+):
+&lt;denchmark-code&gt;[2020-11-03 23:56:12,441 I 37317 3152835] direct_actor_transport.cc:165: Resetting caller starts at for actor df5a1a8201000000 from 10322 to 10322
+[2020-11-03 23:56:12,441 C 37317 3152835] direct_actor_transport.cc:263:  Check failed: task_spec.ActorCounter() &gt;= queue.caller_starts_at actor counter 10321 10322
+&lt;/denchmark-code&gt;
+
+This is reproducable with this &lt;denchmark-link:https://gist.github.com/ijrsvt/b59fbc281b0b0d557ca3e7610d51b575&gt;script&lt;/denchmark-link&gt;
+ 
+		</comment>
+		<comment id='6' author='ijrsvt' date='2020-11-04T19:51:16Z'>
+		Yes that was the same issue that I saw earlier. I can think of two options to fix right now:
+
+Force the caller to process an actor's replies in the order of initial submission. Probably not desirable since it could block the results of later tasks.
+The caller should always set the index at which to restart task submission to the first task that it hasn't received a reply for yet. So if it submits tasks 1 2 3, and receives a reply for 1 and 3, then the caller should resubmit both 2 and 3 if the actor restarts.
+
+		</comment>
+		<comment id='7' author='ijrsvt' date='2020-11-13T00:06:14Z'>
+		I will work on this issue. (as it blocks Serve fault tolerance)
+		</comment>
+		<comment id='8' author='ijrsvt' date='2020-11-13T00:08:39Z'>
+		Great! Feel free to add me as a reviewer.
+		</comment>
+		<comment id='9' author='ijrsvt' date='2020-11-18T21:59:38Z'>
+		I'm thinking about some modified version of approach two:
+
+The caller should always set the index at which to restart task submission to the first task that it hasn't received a reply for yet. So if it submits tasks 1 2 3, and receives a reply for 1 and 3, then the caller should resubmit both 2 and 3 if the actor restarts.
+
+The caller keep tracks of all the returned tasks that had received replies and are not num_completed_tasks+1. Caller will resend these tasks on actor restarts, but mark a flag skip_execution in the request payload. The actor will receive these skip_execution task, run through them only for book keeping and skip actually running the task.
+Thoughts? &lt;denchmark-link:https://github.com/stephanie-wang&gt;@stephanie-wang&lt;/denchmark-link&gt;
+, &lt;denchmark-link:https://github.com/edoakes&gt;@edoakes&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='10' author='ijrsvt' date='2020-11-18T22:14:24Z'>
+		
+The caller keep tracks of all the returned tasks that had received replies and are not num_completed_tasks+1. Caller will resend these tasks on actor restarts, but mark a flag skip_execution in the request payload. The actor will receive these skip_execution task, run through them only for book keeping and skip actually running the task.
+
+Actually I think we already have this field that lets the actor know the highest seq number that the caller has received a reply for (&lt;denchmark-link:https://github.com/ray-project/ray/blob/master/src/ray/core_worker/transport/direct_actor_transport.h#L365&gt;handler code&lt;/denchmark-link&gt;
+). So I'd recommend reusing that.
+I think we can contain all of the changes to the sender's side. Potentially something like this:
+
+next_reply_seq_no: the lowest seq no that we haven't heard a reply back for yet
+received_seq_nos: an ordered list of the seq nos that we've heard back from that are greater than next_reply_seq_no
+
+		</comment>
+		<comment id='11' author='ijrsvt' date='2020-11-18T23:36:07Z'>
+		Let me try to work this through see if I got the idea:
+Caller sends four tasks and the actor restarted when processing the last task 3:
+&lt;denchmark-code&gt;0 1 2 3
+x - x -
+&lt;/denchmark-code&gt;
+
+
+0 and 2 are completed
+1 and 3 are not.
+
+Now the caller find out actor was restarted:
+&lt;denchmark-code&gt;next_send_position = 4
+num_completed_tasks = 1
+caller_starts_at = 1
+// new fields
+next_reply_seq_no = 1
+received_seq_nos = [2]
+&lt;/denchmark-code&gt;
+
+So the caller re-send task 1 with seqno 0 and mark client_processed_up_to to 1 (which correspond to the original task 2 minus caller_starts_at 1) so the receiver will skip task 2 and expect for seqno 2 to arrive. Caller will now resend task 3 with seqno 2. And new tasks will be seqno 3,4,5....
+Yeah I think this can work! Thanks
+		</comment>
+		<comment id='12' author='ijrsvt' date='2020-11-20T03:35:16Z'>
+		Actually this won't work because the tasks that were resent might not arrive in the same order. So if task 3 are retried, it tells the actor to ignore all tasks up to 2 or 4, then task 1 will get cancelled.
+If we resend task 2 but tells the actor the client processed up to 2, then the task 1 still won't be processed when it arrives later.
+		</comment>
+		<comment id='13' author='ijrsvt' date='2020-11-20T04:17:09Z'>
+		New design:
+
+client keep track of all out_of_order_completed_task_ids
+in SendPendingTasks (on actor restarts): client send a new RPC call to the actor to ignore these task ids
+in the actor side, these tasks are only tracked for seqno and won't be executed.
+
+The rationale for this design:
+
+We cannot piggyback any task specific data (like client_procesed_up_to) on PushActorTask RPC because each ActorTask is independent.
+out_of_order_completed_task_ids are global knowledge. We should just eat the cost of sending another RPC call on actor restart.
+
+		</comment>
+		<comment id='14' author='ijrsvt' date='2020-11-20T13:48:09Z'>
+		I see. What about just resending the tasks that were already completed? That way, we don't need to modify the receiver logic at all and we can just save the out-of-order task specs on the sender side. I can actually see an argument for this approach since it follows the same execution semantics that are provided during normal execution, that the execution order follows submission order.
+I'm fine with modifying the receiver logic if it's necessary but I'd prefer not to since it's nice to keep it free of any recovery logic.
+		</comment>
+	</comments>
+</bug>

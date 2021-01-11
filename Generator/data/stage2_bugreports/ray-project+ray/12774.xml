@@ -1,0 +1,164 @@
+<bug id='12774' author='rkooo567' open_date='2020-12-11T03:00:30Z' closed_time='2020-12-11T09:57:47Z'>
+	<summary>[Core] Possible deadlock from plasma store object creation?</summary>
+	<description>
+&lt;denchmark-h:h3&gt;What is the problem?&lt;/denchmark-h&gt;
+
+I can consistently reproduce
+&lt;denchmark-code&gt;2020-12-10 18:56:27,704	WARNING worker.py:1032 -- The node with node id bf16d3f2114bd2507dacdf7fb05f3a1d176e5d36 has been marked dead because the detector has missed too many heartbeats from it. This can happen when a raylet crashes unexpectedly or has lagging heartbeats.
+
+&lt;/denchmark-code&gt;
+
+from the script below (streaming shuffle). It seems to happen even when we don't configure the object spilling feature. So it is probably related to our new plasma store creation mechanism.
+&lt;denchmark-h:h3&gt;Reproduction (REQUIRED)&lt;/denchmark-h&gt;
+
+Please provide a short code snippet (less than 50 lines if possible) that can be copy-pasted to reproduce the issue. The snippet should have no external library dependencies (i.e., use fake or mock data / environments):
+import time
+import typing
+import json
+import ray
+import numpy as np
+from typing import List
+import threading
+
+from ray.cluster_utils import Cluster
+
+c = Cluster()
+c.add_node(
+    num_cpus=16,
+    object_store_memory=3e9,
+    _system_config={
+        "automatic_object_spilling_enabled": True,
+        "max_io_workers": 4,
+        "object_spilling_config": json.dumps(
+            {"type": "filesystem", "params": {"directory_path": "/tmp/spill"}},
+            separators=(",", ":")
+        )
+    })
+time.sleep(10)
+print("Start!")
+ray.init(address=c.address)
+
+streaming_shuffle = True
+partition_size = int(20e6)
+num_partitions = 90
+rows_per_partition = partition_size // (8 * 2)
+
+@ray.remote
+class Counter:
+    def __init__(self):
+        self.num_map = 0
+        self.num_reduce = 0
+
+    def inc(self):
+        self.num_map += 1
+        print("Num map tasks finished", self.num_map)
+
+    def inc2(self):
+        self.num_reduce += 1
+        print("Num reduce tasks finished", self.num_reduce)
+
+    def finish(self):
+        pass
+
+counter = Counter.remote()
+
+
+# object store peak memory: O(partition size)
+# heap memory: O(partition size)
+@ray.remote(num_returns=num_partitions)
+def shuffle_map(i) -&gt; List[np.ndarray]:
+    start = time.perf_counter()
+    outputs = [
+        np.ones((rows_per_partition // num_partitions, 2), dtype=np.int64)
+        for _ in range(num_partitions)
+    ]
+    import sys
+    counter.inc.remote()
+    print(f"map executed!!: {time.perf_counter() - start}")
+    return outputs
+
+
+# object store peak memory: O(partition size / num partitions)
+# heap memory: O(partition size / num partitions)
+@ray.remote(num_returns=num_partitions)
+def shuffle_map_streaming(i) -&gt; List["ObjectRef[np.ndarray]"]:
+    outputs = [
+        ray.put(np.ones((rows_per_partition // num_partitions, 2), dtype=np.int64))
+        for _ in range(num_partitions)
+    ]
+    counter.inc.remote()
+    return outputs
+
+
+# object store peak memory: O(partition size * 2)
+# heap memory: O(partition size)
+@ray.remote
+def shuffle_reduce(*inputs) -&gt; np.ndarray:
+    print("reduce start!")
+    start = time.perf_counter()
+    counter.inc2.remote()
+    result = np.concatenate(inputs)
+    print(f"reduce executed!!: {time.perf_counter() - start}")
+    return result
+
+
+# object store peak memory: O(partition size / num partitions)
+# heap memory: O(partition size) -- TODO can be reduced too
+@ray.remote
+def shuffle_reduce_streaming(*inputs) -&gt; np.ndarray:
+    # Process in a background thread because otherwise ray.get will block the worker, which leads to unbound number of worker growth.
+    import threading
+    output = []
+    def process(inputs, output=None):
+        out = None
+        for chunk in inputs:
+            if out is None:
+                out = ray.get(chunk)
+            else:
+                out = np.concatenate([out, ray.get(chunk)])
+        counter.inc2.remote()
+        output.append(out)
+    t = threading.Thread(target=process, args=(inputs,), kwargs={"output": output})
+    t.start()
+    t.join()
+    return output[0]
+
+
+if streaming_shuffle:
+    shuffle_map = shuffle_map_streaming
+    shuffle_reduce = shuffle_reduce_streaming
+
+start = time.time()
+shuffle_map_out = [shuffle_map.remote(i) for i in range(num_partitions)]
+print("start map")
+shuffle_reduce_out = [
+    shuffle_reduce.remote(
+        *[shuffle_map_out[i][j] for i in range(num_partitions)])
+    for j in range(num_partitions)
+]
+print("start shuffle.")
+
+total_rows = 0
+ready, unready = ray.wait(shuffle_reduce_out)
+while unready:
+    ready, unready = ray.wait(unready)
+    for output in ready:
+        total_rows += ray.get(output).shape[0]
+delta = time.time() - start
+
+ray.get(counter.finish.remote())
+time.sleep(1)
+print("Shuffled", total_rows * 8 * 2, "bytes in", delta, "seconds")
+ray.shutdown()
+
+ I have verified my script runs in a clean environment and reproduces the issue.
+ I have verified the issue also occurs with the latest wheels.
+
+	</description>
+	<comments>
+		<comment id='1' author='rkooo567' date='2020-12-11T09:55:15Z'>
+		I decided to make  not thread-safe but always use , so that we can keep the single thread structure for raylets. Making local_object_manager thread-safe adds too much complexity. For fields that should be shared by plasma store and local object manager, I will create another thread-safe class (that encapsulates pinned objects). I will include the change into &lt;denchmark-link:https://github.com/ray-project/ray/pull/12773&gt;#12773&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

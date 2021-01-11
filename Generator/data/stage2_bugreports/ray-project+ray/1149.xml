@@ -1,0 +1,80 @@
+<bug id='1149' author='robertnishihara' open_date='2017-10-20T22:10:43Z' closed_time='2020-03-05T23:07:21Z'>
+	<summary>Hanging when using distributed actor handles.</summary>
+	<description>
+When using distributed actor handles, I sometimes see calls hang when there are lots of tasks using the same actor handle. For example, the following script seems to hang.
+import ray
+import time
+
+ray.init()
+
+@ray.remote
+class StatusActor(object):
+    def __init__(self):
+        self.counter = 0
+
+    def inc_status(self):
+        self.counter += 1
+
+    def get_status(self):
+        return self.counter
+
+@ray.remote
+def run_incrementer(status_actor):
+    while True:
+        status_actor.inc_status.remote()
+        time.sleep(1)
+
+status_actor = StatusActor.remote()
+[run_incrementer.remote(status_actor) for _ in range(100)]
+
+time.sleep(2)
+
+ray.get(status_actor.get_status.remote())  # This line usually hangs.
+What could be happening is that the status_actor.get_status.remote() is getting starved because it is not prioritized and new tasks continually arrive at the actor which are prioritized.
+However, if it were as simple as that, I would expect it to eventually return when I replace the while True: line with for i in range(100):. But doing so, it still seems to hang. Inspecting the task table (with a different driver), I see
+tt = ray.global_state.task_table()
+states = [v['State'] for k, v in tt.items()]
+[(s, states.count(s)) for s in set(states)]  # [(16, 32), (8, 18), (4, 3582)]
+There should actually be 10000 tasks, so something is going wrong.
+EDIT: Ok it actually returned after a pretty long time (5 or so minutes) and printed 16. Then subsequent calls to ray.get(status_actor.get_status.remote()) return immediately and print 10000.
+&lt;denchmark-link:https://github.com/stephanie-wang&gt;@stephanie-wang&lt;/denchmark-link&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='robertnishihara' date='2017-11-16T20:36:58Z'>
+		The issue seems to be that the tasks that call methods on the actor are getting scheduled before the actor process, so the order ends up being:
+
+Wait for all tasks to finish submitting tasks.
+Schedule the actor.
+Schedule the first task on the actor, which is usually the get_status call from the driver.
+
+You can see this easily if you call ray.get on the status_actor before submitting the tasks to make sure that the actor is scheduled before passing the handle. The script should then exit almost immediately.
+I'm not sure about the best way to handle this. Perhaps we should introduce a dependency on the actor's first task (the __init__ method) for forked handles?
+		</comment>
+		<comment id='2' author='robertnishihara' date='2017-11-17T06:01:10Z'>
+		Oh that's very interesting. Hm, are you suggesting basically making the invocations of run_incrementer dependent on the actors __init__ task?
+When an actor handle A is passed to a task T, there seem to be a couple of options:
+
+Don't introduce any dependencies (current behavior).
+Make T depend on the actor creation event.
+Make T depend on the actor's __init__ task.
+Make T depend on the most recent task issued using the handle A.
+
+Options 2, 3, and 4 all solve the above problem.
+I think either 1, 2, or 4 make sense (maybe 2 makes the most sense). However 2 will not be possible until we start treating actor creation as a task.
+We already have 4 in some sense because the first method invoked on the actor from within T will depend on the last task issued using A.
+This could be a use case for "execution edges" outside of actor methods, right?
+		</comment>
+		<comment id='3' author='robertnishihara' date='2019-12-07T01:04:33Z'>
+		I think I'm seeing something like this kind of behavior in my code. I have an actor that stores a buffer of training samples, a couple of (remote actor) workers which are pushing samples to the buffer, and the main script pulls samples out of the buffer. After a while of working properly, and only sometimes, the workers (one at a time - ie they don't stop working at the same time) will hang seemingly on calling buffer.push_samples.remote(). The main training script continues to run fine, pulling samples from the buffer.
+Any recommendations for mitigations here?
+		</comment>
+		<comment id='4' author='robertnishihara' date='2019-12-07T18:19:15Z'>
+		I was able to reproduce this with a simple example, which I posted in &lt;denchmark-link:https://github.com/ray-project/ray/issues/6392&gt;#6392&lt;/denchmark-link&gt;
+.
+		</comment>
+		<comment id='5' author='robertnishihara' date='2020-03-05T23:07:21Z'>
+		Stale
+		</comment>
+	</comments>
+</bug>

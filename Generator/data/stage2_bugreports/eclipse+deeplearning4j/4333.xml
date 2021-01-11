@@ -1,0 +1,168 @@
+<bug id='4333' author='AlexDBlack' open_date='2017-11-28T08:24:14Z' closed_time='2017-11-30T09:13:45Z'>
+	<summary>Workspaces + global pooling issue</summary>
+	<description>
+I haven't isolated it yet, but this fails currently, on CUDA 8, but passes on native.
+&lt;denchmark-code&gt;    @Test
+    public void testMaskingCnnDim2() {
+        Nd4j.getExecutioner().setProfilingMode(OpExecutioner.ProfilingMode.SCOPE_PANIC);
+        //Test masking, where mask is along dimension 2
+
+        int minibatch = 3;
+        int depthIn = 3;
+        int depthOut = 4;
+        int nOut = 5;
+        int height = 5;
+        int width = 4;
+
+        PoolingType[] poolingTypes =
+                        new PoolingType[] {PoolingType.SUM, PoolingType.AVG, PoolingType.MAX, PoolingType.PNORM};
+
+        for (PoolingType pt : poolingTypes) {
+            System.out.println(pt);
+            MultiLayerConfiguration conf = new NeuralNetConfiguration.Builder().weightInit(WeightInit.XAVIER)
+//                            .trainingWorkspaceMode(WorkspaceMode.NONE)
+//                            .inferenceWorkspaceMode(WorkspaceMode.NONE)
+                            .convolutionMode(ConvolutionMode.Same).seed(12345L).list()
+                            .layer(0, new ConvolutionLayer.Builder().nIn(depthIn).nOut(depthOut).kernelSize(2, width)
+                                            .stride(1, width).activation(Activation.TANH).build())
+                            .layer(1, new org.deeplearning4j.nn.conf.layers.GlobalPoolingLayer.Builder().poolingType(pt)
+                                            .build())
+                            .layer(2, new OutputLayer.Builder(LossFunctions.LossFunction.MCXENT)
+                                            .activation(Activation.SOFTMAX).nIn(depthOut).nOut(nOut).build())
+                            .pretrain(false).backprop(true).build();
+
+            MultiLayerNetwork net = new MultiLayerNetwork(conf);
+            net.init();
+
+            INDArray inToBeMasked = Nd4j.rand(new int[] {minibatch, depthIn, height, width});
+
+            //Shape for mask: [minibatch, width]
+            INDArray maskArray = Nd4j.create(new double[][] {{1, 1, 1, 1, 1}, {1, 1, 1, 1, 0}, {1, 1, 1, 0, 0}});
+
+            //Multiply the input by the mask array, to ensure the 0s in the mask correspond to 0s in the input vector
+            // as would be the case in practice...
+            Nd4j.getExecutioner().exec(new BroadcastMulOp(inToBeMasked, maskArray, inToBeMasked, 0, 2));
+
+
+            net.setLayerMaskArrays(maskArray, null);
+
+            INDArray outMasked = net.output(inToBeMasked);
+            net.clearLayerMaskArrays();
+
+            for (int i = 0; i &lt; minibatch; i++) {
+                System.out.println(i);
+                int numSteps = height - i;
+                INDArray subset = inToBeMasked.get(NDArrayIndex.interval(i, i, true), NDArrayIndex.all(),
+                                NDArrayIndex.interval(0, numSteps), NDArrayIndex.all());
+                assertArrayEquals(new int[] {1, depthIn, height - i, width}, subset.shape());
+
+                INDArray outSubset = net.output(subset);
+                INDArray outMaskedSubset = outMasked.getRow(i);
+
+                assertEquals(outSubset, outMaskedSubset);
+            }
+        }
+    }
+&lt;/denchmark-code&gt;
+
+There was a previous issue fixed here: &lt;denchmark-link:https://github.com/deeplearning4j/deeplearning4j/issues/4337&gt;https://github.com/deeplearning4j/deeplearning4j/issues/4337&lt;/denchmark-link&gt;
+
+However, one issue remains...
+At this point:
+Setting workspace mode = NONE allows the test to pass. But scope panic does not pick up the issue.
+	</description>
+	<comments>
+		<comment id='1' author='AlexDBlack' date='2017-11-29T06:08:35Z'>
+		Update: isolated to this... fails on CUDA only, with single workspace mode only...
+&lt;denchmark-code&gt;    @Test
+    public void debug6() {
+        Nd4j.getRandom().setSeed(12345);
+
+        Nd4j.getExecutioner().setProfilingMode(OpExecutioner.ProfilingMode.SCOPE_PANIC);
+        int depthIn = 2;
+        int depthOut = 2;
+        int nOut = 2;
+        int width = 3;
+
+        PoolingType pt = PoolingType.SUM;
+        MultiLayerConfiguration conf = new NeuralNetConfiguration.Builder().weightInit(WeightInit.XAVIER)
+                .convolutionMode(ConvolutionMode.Same).seed(12345L).list()
+                .layer(0, new ConvolutionLayer.Builder().nIn(depthIn).nOut(depthOut).kernelSize(2, width)
+                        .stride(1, width).activation(Activation.TANH).build())
+                .layer(1, new org.deeplearning4j.nn.conf.layers.GlobalPoolingLayer.Builder().poolingType(pt)
+                        .build())
+                .layer(2, new OutputLayer.Builder(LossFunctions.LossFunction.MCXENT)
+                        .activation(Activation.SOFTMAX).nIn(depthOut).nOut(nOut).build())
+                .pretrain(false).backprop(true).build();
+
+        MultiLayerNetwork net = new MultiLayerNetwork(conf.clone());
+        net.init();
+        net.getLayerWiseConfigurations().setTrainingWorkspaceMode(WorkspaceMode.SEPARATE);
+        net.getLayerWiseConfigurations().setInferenceWorkspaceMode(WorkspaceMode.SEPARATE);
+
+//        //No workspace: passes
+//        net.getLayerWiseConfigurations().setTrainingWorkspaceMode(WorkspaceMode.NONE);
+//        net.getLayerWiseConfigurations().setInferenceWorkspaceMode(WorkspaceMode.NONE);
+
+//        //Single workspace: passes
+//        net.getLayerWiseConfigurations().setTrainingWorkspaceMode(WorkspaceMode.SINGLE);
+//        net.getLayerWiseConfigurations().setInferenceWorkspaceMode(WorkspaceMode.SINGLE);
+
+        INDArray in = Nd4j.rand(new int[]{1, 2, 5, 3});
+        INDArray out1 = net.output(in);
+        INDArray out2 = net.output(in);
+
+        assertEquals(out1, out2);
+    }
+&lt;/denchmark-code&gt;
+
+Edit: Strangely enough: switch SCOPE_PANIC to ANY_PANIC, and test passes :/
+Progress, of sorts: Debugging diff
+&lt;denchmark-code&gt;diff --git a/deeplearning4j-nn/src/main/java/org/deeplearning4j/nn/layers/convolution/ConvolutionLayer.java b/deeplearning4j-nn/src/main/java/org/deeplearning4j/nn/layers/convolution/ConvolutionLayer.java
+index 9ecc8eb..798f106 100644
+--- a/deeplearning4j-nn/src/main/java/org/deeplearning4j/nn/layers/convolution/ConvolutionLayer.java
++++ b/deeplearning4j-nn/src/main/java/org/deeplearning4j/nn/layers/convolution/ConvolutionLayer.java
+@@ -440,6 +440,10 @@ public class ConvolutionLayer extends BaseLayer&lt;org.deeplearning4j.nn.conf.layer
+         }
+
+         INDArray activation = afn.getActivation(z, training);
++
++//        System.out.println("Input to conv: " + Arrays.toString(input.dup().data().asFloat()));      //Uncommented: This allows test to pass
++//        System.out.println("Out from conv: " + Arrays.toString(activation.dup().data().asFloat())); //Uncommented: This *also* allows test to pass :/
++
+         return activation;
+     }
+
+diff --git a/deeplearning4j-nn/src/main/java/org/deeplearning4j/nn/layers/pooling/GlobalPoolingLayer.java b/deeplearning4j-nn/src/main/java/org/deeplearning4j/nn/layers/pooling/GlobalPoolingLayer.java
+index c5edb84..ec403e7 100644
+--- a/deeplearning4j-nn/src/main/java/org/deeplearning4j/nn/layers/pooling/GlobalPoolingLayer.java
++++ b/deeplearning4j-nn/src/main/java/org/deeplearning4j/nn/layers/pooling/GlobalPoolingLayer.java
+@@ -181,6 +181,9 @@ public class GlobalPoolingLayer extends AbstractLayer&lt;org.deeplearning4j.nn.conf
+             }
+         }
+
++        System.out.println("Input to GP: " + Arrays.toString(input.dup().data().asFloat()));
++        System.out.println("Out from GP: " + Arrays.toString(reduced2d.dup().data().asFloat()));
++
+         if (collapseDimensions) {
+             //Standard/common case
+             return reduced2d;
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-code&gt;Input to GP: [0.44458508, 0.24589466, 0.7098535, 0.062372483, 0.7247814, 0.5472798, 0.3119939, 0.88916945, 0.7496499, 0.11359246]
+Out from GP: [2.1874871, 2.6116855]
+Input to GP: [0.11556071, 0.24589466, 0.7098535, 0.062372483, 0.7247814, 0.4358391, 0.3119939, 0.88916945, 0.7496499, 0.11359246]
+Out from GP: [1.8584627, 2.5002449]
+&lt;/denchmark-code&gt;
+
+Note the difference here in 2 of the entries, for conv activations (input to pooling).
+		</comment>
+		<comment id='2' author='AlexDBlack' date='2017-11-30T09:13:45Z'>
+		Fixed here: &lt;denchmark-link:https://github.com/deeplearning4j/deeplearning4j/pull/4349&gt;https://github.com/deeplearning4j/deeplearning4j/pull/4349&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='3' author='AlexDBlack' date='2018-09-24T05:43:52Z'>
+		This thread has been automatically locked since there has not been any recent activity after it was closed. Please open a new issue for related bugs.
+		</comment>
+	</comments>
+</bug>

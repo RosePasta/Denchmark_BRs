@@ -1,0 +1,151 @@
+<bug id='10144' author='zmonoid' open_date='2020-08-16T19:45:42Z' closed_time='2020-08-16T19:59:47Z'>
+	<summary>Ray got stuck on requesting more resources but actually needs less</summary>
+	<description>
+&lt;denchmark-h:h3&gt;Ray got stuck on requesting more resources but actually needs less.&lt;/denchmark-h&gt;
+
+Since my script only need one GPU, so I set:
+&lt;denchmark-code&gt;export CUDA_VISIBLE_DEVICES=0
+&lt;/denchmark-code&gt;
+
+My script is given below, it shows the following warning and program stuck here:
+
+INFO trainable.py:251 -- Trainable.setup took 21.559 seconds. If your trainable is slow to initialize, consider setting reuse_actors=True to reduce actor creation overheads.
+2020-08-17 03:33:33,853 WARNING worker.py:1134 -- The actor or task with ID ffffffffffffffff2512146c0100 is pending and cannot currently be scheduled. It requires {GPU: 0.100000}, {CPU: 1.000000} for execution and {GPU: 0.100000}, {CPU: 1.000000} for placement, but this node only has remaining {node:node_ip: 1.000000}, {GPUType:X: 1.000000}, {CPU: 19.000000}, {memory: 78.271484 GiB}, {object_store_memory: 25.878906 GiB}. In total there are 0 pending tasks and 5 pending actors on this node. This is likely due to all cluster resources being claimed by actors. To resolve the issue, consider creating fewer actors or increase the resources available to this Ray cluster. You can ignore this message if this Ray cluster is expected to auto-scale
+
+&lt;denchmark-code&gt;ray: 0.8.7
+python: 3.6.7
+pytorch: 1.4.0
+os: ubuntu16.04
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h3&gt;Reproduction (REQUIRED)&lt;/denchmark-h&gt;
+
+Please provide a script that can be run to reproduce the issue. The script should have no external library dependencies (i.e., use fake or mock data / environments):
+If we cannot run your script, we cannot fix your issue.
+
+[ . ] I have verified my script runs in a clean environment and reproduces the issue.
+[ . ] I have verified the issue also occurs with the latest wheels.
+
+Below is a minimal example for reproduction:
+import os
+os.environ['CUDA_VISIBLE_DEVICES']='0'
+import ray
+from ray import tune
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+@ray.remote(num_gpus=0.1)
+class Actor:
+    def __init__(self, rank):
+        self.network = nn.Sequential(
+            nn.Linear(32, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128)
+        )
+
+        self.network.to(0)
+        self.rank = rank
+
+    def sample(self):
+        x = torch.randn(32, 32).to(0)
+        y = torch.randn(32, 10).to(0)
+        z = self.network(x)
+        return z.detach(), y, self.rank
+
+
+class Agent:
+    def __init__(self):
+        self.network = nn.Sequential(
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, 10)
+        )
+        self.network.to(0)
+
+        self.optimizer = torch.optim.Adam(self.network.parameters(), 1e-3)
+    
+    def train(self, z, y):
+        z = self.network(z)
+        loss = F.mse_loss(z, y)
+        
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        return loss.detach()
+
+class Trainer(tune.Trainable):
+
+    def _setup(self, config):
+        
+        self.actors = [Actor.remote(rank=rank) for rank in range(5)]
+        self.agent = Agent()
+        self.sample_ops = [a.sample.remote() for a in self.actors]
+
+    def _train(self):
+        done_id, self.sample_ops = ray.wait(self.sample_ops)
+        data = ray.get(done_id)
+        z, y, rank = data[0]
+        loss = self.agent.train(z, y)
+        self.sample_ops.append(self.actors[rank].sample.remote())
+        return dict(loss=loss.item())
+
+
+if __name__ == '__main__':
+    ray.init()
+    tune.run(
+        Trainer,
+        name='test',
+        verbose=1,
+        stop=lambda trial_id, result: result['training_iteration'] &gt; 100,
+        resources_per_trial={"gpu": 1},
+    )
+    print("Done")
+	</description>
+	<comments>
+		<comment id='1' author='zmonoid' date='2020-08-16T19:49:00Z'>
+		How many GPUs does Agent need? If 0, then the right way to do this is:
+if __name__ == '__main__':
+	NUM_WORKERS = 5
+    ray.init()
+    tune.run(
+        Trainer,
+        name='test',
+        verbose=1,
+        stop=lambda trial_id, result: result['training_iteration'] &gt; 100,
+        resources_per_trial={"gpu": 0, "extra_gpu": 0.1 * NUM_WORKERS},
+    )
+    print("Done")
+		</comment>
+		<comment id='2' author='zmonoid' date='2020-08-16T19:50:04Z'>
+		Here is some documentation - &lt;denchmark-link:https://docs.ray.io/en/latest/tune/api_docs/trainable.html#advanced-resource-allocation&gt;https://docs.ray.io/en/latest/tune/api_docs/trainable.html#advanced-resource-allocation&lt;/denchmark-link&gt;
+
+I am thinking about adding a guide for resource management in Tune. Let me know if you'd find that useful
+		</comment>
+		<comment id='3' author='zmonoid' date='2020-08-16T19:51:43Z'>
+		&lt;denchmark-link:https://github.com/richardliaw&gt;@richardliaw&lt;/denchmark-link&gt;
+  needs around 0.5 gpu, each  needs 0.1 gpu. In total the script needs less than 1 gpu.
+		</comment>
+		<comment id='4' author='zmonoid' date='2020-08-16T19:56:24Z'>
+		Got it; then try this:
+&lt;denchmark-code&gt;if __name__ == '__main__':
+	NUM_WORKERS = 5
+    ray.init()
+    tune.run(
+        Trainer,
+        name='test',
+        verbose=1,
+        stop=lambda trial_id, result: result['training_iteration'] &gt; 100,
+        resources_per_trial={"gpu": 0.5, "extra_gpu": 0.1 * NUM_WORKERS},
+    )
+    print("Done")
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='5' author='zmonoid' date='2020-08-16T19:59:41Z'>
+		&lt;denchmark-link:https://github.com/richardliaw&gt;@richardliaw&lt;/denchmark-link&gt;
+ Thanks for your answer! It works.
+		</comment>
+	</comments>
+</bug>

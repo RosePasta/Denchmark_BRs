@@ -1,0 +1,188 @@
+<bug id='2401' author='EdeMeijer' open_date='2016-11-29T20:22:29Z' closed_time='2016-12-14T14:07:31Z'>
+	<summary>OOM issues when training on Spark</summary>
+	<description>
+Hi guys,
+I'd like to address some OOM issues I've been having when training on Spark (for weeks). The model I'm training requires about 10-15GB of RAM when training locally and it remains stable when doing so. However, on Spark, after every split, memory usage on the executors increases consistently, ultimately leading to killed containers. My jobs usually finish because Yarn will recover from a few failures, but it only works because I'm trowing 53GB of off-heap memory at the executors (as much as I can reasonably get from a 61GB instance). It feels like a memory leak, maybe in JavaCPP, but it only manifests itself when training on Spark. I did some Googling and &lt;denchmark-link:https://github.com/deeplearning4j/nd4j/issues/1251&gt;deeplearning4j/nd4j#1251&lt;/denchmark-link&gt;
+ sounds very similar to my issue, although I'm not doing any explicit caching/persistence since I'm using DL4j and &lt;denchmark-link:https://deeplearning4j.org/spark#caching&gt;https://deeplearning4j.org/spark#caching&lt;/denchmark-link&gt;
+ says I probably shouldn't touch that. At any rate, I really don't feel that my model and data justify more than a few dozen gigs of RAM.
+I'll try to give you as much info as possible.
+Model
+I'm doing regression on time series. I'm using an LSTM computation graph with 12 individual output vertices. There's 4 input features, 2 hidden layers of 100 nodes, and 12 separate output vertices, which was needed to be able to use different masks per output. I'm using the Adam updater and truncated BPTT of length 200.
+Data
+My training set consists of about 39000 example time series of an average length of 200 time steps (0 - 400 ish), depending on the age of the data. It's split in 13 files per example (1 input, 12 output), and I'm merging everything into MultiDataSet objects with 150 examples per set (my batch size) before saving them to binary files. This way I end up with about 260 binary MultiDataSet files of about 6.5MB each. I then package and upload these binary files to HDFS on the Spark cluster for training. I'm also using a validation set constructed in a similar way, which is about 20% of the size of the training set. After every epoch, I calculate the score on the validation set The whole training set in binary form weighs in at about 1.6GB.
+Cluster
+I'm currently using 8 instances in my cluster. First is the Hadoop/Yarn manager, the second one is a dedicated node for drivers, and the other 6 are for executors. The driver node has 31GB of memory and can easily run 2 drivers at the same time, never running out of memory. I'm usually running 2 jobs at the same time, and using 3 executors for every job. The executor nodes are EC2 nodes of type r3.2xlarge (61GB memory, 8 VCPUs).
+Submitting jobs
+I'm building the Jars on the master node of the cluster, and run spark-submit on there as well. The spark-submit call looks like this (it's run in a shell script, but the idea should be clear):
+&lt;denchmark-code&gt;# 4GB executor heap
+# 54GB executor overhead
+# 53GB executor nd4j (max physical bytes)
+# 40GB executor nd4j (max bytes)
+# 2GB driver heap
+# 7GB driver overhead
+# 6GB driver nd4j (max physical bytes)
+# 4GB driver nd4j (max bytes)
+spark-submit \
+  --master yarn \
+  --deploy-mode cluster \
+  --num-executors $2 \
+  --executor-cores 1 \
+  --executor-memory 4G \
+  --driver-cores 1 \
+  --driver-memory 2G \
+  --conf 'spark.executor.extraJavaOptions=-Dorg.bytedeco.javacpp.maxphysicalbytes=56908316672 -Dorg.bytedeco.javacpp.maxbytes=42949672960' \
+  --conf 'spark.driver.extraJavaOptions=-Dorg.bytedeco.javacpp.maxphysicalbytes=6442450944 -Dorg.bytedeco.javacpp.maxbytes=4294967296' \
+  --conf spark.yarn.executor.memoryOverhead=55296 \
+  --conf spark.yarn.driver.memoryOverhead=7168 \
+  --conf spark.locality.wait=0 \
+  --conf spark.yarn.jar=hdfs:///jars/spark-assembly-1.6.3-hadoop2.6.0.jar \
+  --conf spark.executorEnv.OMP_NUM_THREADS=4 \
+  --conf spark.yarn.am.nodeLabelExpression=driver \
+  --class io.buybrain.sparktest.RunJob \
+  /home/ubuntu/buybrain/sparktest/target/sparktest-0.0.1-bin.jar \
+  $1
+&lt;/denchmark-code&gt;
+
+
+A typical output of a job that's been running for a while can be found here &lt;denchmark-link:https://gist.github.com/EdeMeijer/b2896ac59d3eb1b277a22b22653511a3&gt;https://gist.github.com/EdeMeijer/b2896ac59d3eb1b277a22b22653511a3&lt;/denchmark-link&gt;
+. In this particular example, it OOMed 4 times, with the following message:
+&lt;denchmark-code&gt;16/11/29 15:33:53 WARN scheduler.TaskSetManager: Lost task 2.0 in stage 67.0 (TID 155, c1-node7): java.lang.OutOfMemoryError: Cannot allocate new PointerPointer(4), totalBytes = 246612274, physicalBytes = 56940978176
+...
+16/11/29 15:41:01 WARN scheduler.TaskSetManager: Lost task 1.0 in stage 72.0 (TID 167, c1-node4): java.lang.OutOfMemoryError: Cannot allocate new FloatPointer(2115000), totalBytes = 216501938, physicalBytes = 56772976640
+...
+16/11/29 17:37:30 WARN scheduler.TaskSetManager: Lost task 0.0 in stage 203.0 (TID 471, c1-node4): java.lang.OutOfMemoryError: Cannot allocate new FloatPointer(30000), totalBytes = 246688990, physicalBytes = 56909864960
+...
+16/11/29 18:14:04 WARN scheduler.TaskSetManager: Lost task 1.0 in stage 242.0 (TID 566, c1-node4): java.lang.OutOfMemoryError: Cannot allocate new FloatPointer(2235000), totalBytes = 228985178, physicalBytes = 56925831168
+&lt;/denchmark-code&gt;
+
+Note here that one of the nodes (c1-node4) OOMed 3 times, while another one did so just 1 time and the 3rd node didn't OOM at all. That last node's executor process, as we speak, is using about 43GB of memory. I see this value a lot, and it's suspiciously close to my maxbytes value of 40GB (which seems to be some sort of high water mark when looking at the JavaCPP source code). Still, it has about 10GB of headroom at this point, so no reason to suddenly OOM. The ones that do easily go past this point.
+If required, I'm willing to supply code and data that can be used to reproduce the issue, but that's gonna take some work. I'm hoping someone has an idea what might cause this issue and maybe we can work it out. I believe that my training job should be able to run on instances with less memory without OOMing, which would save me some money too :)
+Thanks.
+	</description>
+	<comments>
+		<comment id='1' author='EdeMeijer' date='2016-11-29T20:29:19Z'>
+		I was thinking that maybe all I need to do is to drastically decrease the JavaCPP GC high water mark (maxbytes) and increase the time it is allowed to GC before allocating new memory (I know there's an option for that).
+		</comment>
+		<comment id='2' author='EdeMeijer' date='2016-11-29T23:18:02Z'>
+		Could you provide some the total parameter count for your model? And the configuration you are using for ParameterAveragingTrainingMaster? And are you on v0.7.0?
+I agree that you shouldn't need anywhere near that amount of memory (assuming the parameter count isn't absurd). Otherwise I'm not sure yet could be causing increasing memory usage as training progresses.
+		</comment>
+		<comment id='3' author='EdeMeijer' date='2016-11-30T00:21:18Z'>
+		If you're giving it 40~50 GB of RAM to use, there are cases when it will get used up. That's perfectly normal.
+		</comment>
+		<comment id='4' author='EdeMeijer' date='2016-11-30T08:19:49Z'>
+		&lt;denchmark-link:https://github.com/AlexDBlack&gt;@AlexDBlack&lt;/denchmark-link&gt;
+ I'm on 0.7.0 and the total parameter count is 124412. I suppose with an LSTM these will get unrolled during backprop, so should we multiply it with the BPTT length for memory requirements? Still would be less than 100MB.
+&lt;denchmark-link:https://github.com/saudet&gt;@saudet&lt;/denchmark-link&gt;
+ I'm only giving it that much because I couldn't get it to work reliably otherwise. I'm trying a new run right now with the same maxphysicalbytes setting, but maxbytes at 15GB instead of 40 to see if it will stick to that point.
+		</comment>
+		<comment id='5' author='EdeMeijer' date='2016-11-30T09:51:43Z'>
+		Okay, I've been running 2 new jobs for a while now (so 2 x 3 executors) with maxbytes set to 15GB and maxphysicalbytes still on 53GB. My theory was that memory usage would stick pretty close to the maxbytes value, and it turns out that it does, but there's something interesting.
+Job 1 memory
+&lt;denchmark-code&gt; epoch | node 1 | node 2 | node 3
+-------+--------+--------+--------
+   0   |  17GB  |  17GB  |  17GB
+   1   |  17GB  |  17GB  |  17GB
+   2   |  17GB  |  17GB  |  17GB
+   3   |  17GB  |  17GB  |  17GB
+   4   |  17GB  |  17GB  |  17GB
+   5   |  17GB  |  17GB  |  17GB
+   6   |  17GB  |  17GB  |  17GB
+   7   |  17GB  |  17GB  |  17GB
+&lt;/denchmark-code&gt;
+
+Looks good right?
+Job 2 memory
+&lt;denchmark-code&gt; epoch | node 1 | node 2 | node 3
+-------+--------+--------+--------
+   0   |  17GB  |  17GB  |  17GB
+   1   |  32GB  |  17GB  |  17GB
+   2   |  32GB  |  17GB  |  32GB
+   3   |  32GB  |  17GB  |  32GB
+   4   |  32GB  |  17GB  |  32GB
+   5   |  32GB  |  17GB  |  32GB
+   6   |  32GB  |  17GB  |  32GB
+&lt;/denchmark-code&gt;
+
+Now that's interesting. Apparently, once in a while when a new epoch starts (I kept an eye on the logs and the memory usage, it really happens when the new epoch starts), it looks like a whole new pool of memory is allocated without cleaning up the old one, effectively doubling the memory usage. The memory usage values are consistently a multiple of 15GB + 2GB overhead, give or take a few hundred MB.
+These jobs will keep running for a while and I'll keep an eye on the memory usage. I'm wondering if one of the executors that's now at 32GB will jump to 47GB at some point, which is still within the maxphysicalbytes limits. I'll keep you informed.
+		</comment>
+		<comment id='6' author='EdeMeijer' date='2016-11-30T13:23:44Z'>
+		Okay, I'm now 5 hours and about 25 epochs in for both jobs. The good news, no more OOMs. However, by now 3 out of 6 executors are on 32GB and the other 3 on 17GB. So right now the conclusion is that I'd need to over-provision my machines with 100% extra memory compared than what seems to be actually needed. What do you think?
+		</comment>
+		<comment id='7' author='EdeMeijer' date='2016-11-30T14:16:14Z'>
+		Each node has only one JVM running? Could you get the value of Pointer.totalBytes() when memory usage jumps like that?
+		</comment>
+		<comment id='8' author='EdeMeijer' date='2016-11-30T14:22:41Z'>
+		Yeah, just one JVM (well, one YARN container and one executor, so I'm assuming also just one JVM). So, if Pointer.totalBytes() returns around 15GB, there's a potential memory leak, and if it returns around 30GB  there's some GC issue, am I correct? What would be the best way to get this value on the executor in the same process as DL4j uses?
+		</comment>
+		<comment id='9' author='EdeMeijer' date='2016-11-30T14:34:40Z'>
+		Log the value on every iteration of the main loop in your application? If it's around 15GB, then yes it means the memory isn't accounted by JavaCPP anymore, but the memory isn't getting released either for some reason.
+		</comment>
+		<comment id='10' author='EdeMeijer' date='2016-11-30T14:52:01Z'>
+		
+Log the value on every iteration of the main loop in your application?
+
+Wouldn't that give me the memory usage of the driver? It's the executors that are the problem.
+		</comment>
+		<comment id='11' author='EdeMeijer' date='2016-11-30T15:46:55Z'>
+		Now, of course I could create an RDD of 3 items, split it in 3 partitions and let a map operation do the logging... I'll see if I can get something like that to work.
+		</comment>
+		<comment id='12' author='EdeMeijer' date='2016-11-30T22:58:21Z'>
+		Okay, I was able to take some measurements during training. I measured executor memory usage by dispatching an RDD with a map operation in which I gathered statistics. To make sure I hit every node, I just created 100 partitions. Like this:
+int partitions = 100;
+List&lt;Integer&gt; dummy = new ArrayList&lt;&gt;(partitions);
+for (int p = 0; p &lt; partitions; p ++) {
+    dummy.add(p);
+}
+List&lt;Tuple2&lt;String, Long&gt;&gt; memoryMeasurements = sc.parallelize(dummy).repartition(partitions).map(x -&gt; {
+    String hostname = InetAddress.getLocalHost().getHostName();
+    long bytes = Pointer.totalBytes();
+    return new Tuple2&lt;&gt;(hostname, bytes);
+}).collect();
+
+// Deduplicate the result, as we get multiple measurements per host because of the redundancy
+Map&lt;String, Long&gt; memoryPerHost = new HashMap&lt;&gt;();
+for (Tuple2&lt;String, Long&gt; memInfo : memoryMeasurements) {
+    memoryPerHost.put(memInfo._1(), memInfo._2());
+}
+
+log.info("=========== MEMORY USAGE ====================================");
+for (Map.Entry&lt;String, Long&gt; entry : memoryPerHost.entrySet()) {
+    log.info(String.format("MEMORY USAGE FOR %s = %d bytes", entry.getKey(), entry.getValue()));
+}
+This worked, and I was able to construct an overview of memory usage per node over time, during training. Here's a screenshot of the result:
+&lt;denchmark-link:https://camo.githubusercontent.com/a7fc06350b75eaeb3bdb140314df56244f123077b4f6b33f858db94c9b209d6c/68747470733a2f2f692e696d67736166652e6f72672f663538303938616264322e706e67&gt;&lt;/denchmark-link&gt;
+
+Nodes 8, 5 and 7 all hit the 32GB issue while the rest stayed at 17GB. I marked in red at which epoch the issue began per node. However, you can see that both the 17GB nodes and the 32GB nodes all keep peeking at around 15GB (although most of the time it's actually much lower, not sure how that works, but probably some GC activity). I'm afraid that there's indeed a problem with cleaning up JavaCPP memory when training on Spark.
+		</comment>
+		<comment id='13' author='EdeMeijer' date='2016-12-02T01:52:56Z'>
+		That's a pretty strange issue. Thanks for all the info. Is this something that happens only with Spark? If it's something we can reproduce locally, I'd take it from there. :)
+		</comment>
+		<comment id='14' author='EdeMeijer' date='2016-12-02T07:41:13Z'>
+		Well.. I haven't done a lot of non-spark training recently, so I can't be sure. I can try to reproduce it on my local machine, but it might take a while. Or maybe not so long, as apparently on average it happens about 50% of the time and quite early on. At any rate, I understand that you'd need something to reproduce it with so I'll work on that.
+		</comment>
+		<comment id='15' author='EdeMeijer' date='2016-12-02T16:30:42Z'>
+		I haven't been able to work on reproducing it yet, but because of my findings about the 'double memory' requirement, I've now at least been able to deploy my training cluster on machines with half the memory I was using before. Setting maxbytes to 10GB and maxphysicalbytes to 24GB does the job. Still, after the first epoch, one of the workers happily upped it memory usage from 12GB to 22GB, so it's still happening, but at least I know how to provision for it. I'll give reproducing this with as little dependencies as possible a shot next week.
+		</comment>
+		<comment id='16' author='EdeMeijer' date='2016-12-06T11:26:56Z'>
+		&lt;denchmark-link:https://github.com/EdeMeijer&gt;@EdeMeijer&lt;/denchmark-link&gt;
+ just to confirm re: this issue: &lt;denchmark-link:https://github.com/deeplearning4j/deeplearning4j/issues/2435&gt;https://github.com/deeplearning4j/deeplearning4j/issues/2435&lt;/denchmark-link&gt;
+
+Are you using StatsListener at all with your Spark training, as per &lt;denchmark-link:https://deeplearning4j.org/visualization#sparkui&gt;https://deeplearning4j.org/visualization#sparkui&lt;/denchmark-link&gt;
+ ?
+		</comment>
+		<comment id='17' author='EdeMeijer' date='2016-12-06T11:35:30Z'>
+		Nope, I'm not (yet)
+		</comment>
+		<comment id='18' author='EdeMeijer' date='2016-12-14T14:07:31Z'>
+		Well, I've kept an eye on memory usage for the last week, and the problem resolved itself apparently. I'm not going to go through the effort to pinpoint the exact commit that fixed it, but it's been stable for about a week now while first it happened consistently in a matter of minutes after training started. I'm going to close this issue.
+		</comment>
+		<comment id='19' author='EdeMeijer' date='2016-12-14T22:41:22Z'>
+		Thanks for the update. Still not sure on the cause or fix for that - but if it's consistently working now - great.
+		</comment>
+		<comment id='20' author='EdeMeijer' date='2019-01-20T07:46:22Z'>
+		This thread has been automatically locked since there has not been any recent activity after it was closed. Please open a new issue for related bugs.
+		</comment>
+	</comments>
+</bug>

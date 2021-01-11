@@ -1,0 +1,148 @@
+<bug id='23904' author='artsobolev' open_date='2018-11-21T18:05:43Z' closed_time='2018-11-26T21:49:10Z'>
+	<summary>New instances of iterator.make_initializer do not release previously allocated memory</summary>
+	<description>
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): Yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Linux Ubuntu 16.04
+Mobile device (e.g. iPhone 8, Pixel 2, Samsung Galaxy) if the issue happens on mobile device: NA
+TensorFlow installed from (source or binary): binary
+TensorFlow version (use command below): v1.12.0-0-ga6d8ffae09 1.12.0
+Python version: 3.5.2
+Bazel version (if compiling from source): NA
+GCC/Compiler version (if compiling from source): NA
+CUDA/cuDNN version: 9.0.176 / 7.3.0.29
+GPU model and memory: GeForce GTX 1080 Ti
+
+Describe the current behavior
+Consider the following setup (see the code below)
+
+Create a dataset using tf.data.Dataset.from_tensor_slices
+Use it to initialize a tf.data.Iterator.from_structure iterator
+Repeat the previous step several times in a single session
+
+Observed behavior: memory consumption grows linearly with number of iterations
+Describe the expected behavior
+Memory consumption should be bounded for any number of iterations.
+Code to reproduce the issue
+import tensorflow as tf
+import numpy as np
+import os
+import psutil
+
+n_samples = 1000*1000
+dim = 100
+batch_size = 50
+
+raw_data = np.zeros((n_samples, dim)).astype(np.float32)
+dataset = tf.data.Dataset.from_tensor_slices(raw_data).batch(batch_size)
+iterator = tf.data.Iterator.from_structure(tf.float32, [None, dim])
+
+process = psutil.Process(os.getpid())
+def mem():
+    return process.memory_info().rss / 1024 ** 3.
+
+sess = tf.Session()
+for i in range(20):
+    sess.run(iterator.make_initializer(dataset))
+    print('Epoch {}, mem.: {:.2f}Gb'.format( i, mem() ))
+Output:
+&lt;denchmark-code&gt;Epoch 0, mem.: 1.34Gb
+Epoch 1, mem.: 1.71Gb
+Epoch 2, mem.: 2.09Gb
+Epoch 3, mem.: 2.46Gb
+Epoch 4, mem.: 2.83Gb
+Epoch 5, mem.: 3.20Gb
+Epoch 6, mem.: 3.58Gb
+Epoch 7, mem.: 3.95Gb
+Epoch 8, mem.: 4.32Gb
+Epoch 9, mem.: 4.69Gb
+Epoch 10, mem.: 5.07Gb
+Epoch 11, mem.: 5.44Gb
+Epoch 12, mem.: 5.81Gb
+Epoch 13, mem.: 6.18Gb
+Epoch 14, mem.: 6.56Gb
+Epoch 15, mem.: 6.93Gb
+Epoch 16, mem.: 7.30Gb
+Epoch 17, mem.: 7.67Gb
+Epoch 18, mem.: 8.05Gb
+Epoch 19, mem.: 8.42Gb
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='artsobolev' date='2018-11-26T18:54:25Z'>
+		&lt;denchmark-link:https://github.com/artsobolev&gt;@artsobolev&lt;/denchmark-link&gt;
+ I think the root cause here is lower-level than the  implementation. For example, the following simpler program exhibits similar growth:
+import tensorflow as tf
+import numpy as np
+import os
+import psutil
+
+n_samples = 1000*1000
+dim = 100
+batch_size = 50
+
+raw_data = tf.constant(np.zeros((n_samples, dim)).astype(np.float32))
+
+process = psutil.Process(os.getpid())
+def mem():
+    return process.memory_info().rss / 1024 ** 3.
+
+sess = tf.Session()
+for i in range(20):
+    # Creates a new "Add" op in a loop and run a "new" subgraph each iteration.
+    sess.run(tf.add(raw_data, raw_data))
+    print('Epoch {}, mem.: {:.2f}Gb'.format( i, mem() ))
+...and gives me this output:
+&lt;denchmark-code&gt;Epoch 0, mem.: 0.95Gb
+Epoch 1, mem.: 1.32Gb
+Epoch 2, mem.: 1.69Gb
+Epoch 3, mem.: 2.06Gb
+Epoch 4, mem.: 2.44Gb
+Epoch 5, mem.: 2.81Gb
+Epoch 6, mem.: 3.18Gb
+Epoch 7, mem.: 3.56Gb
+Epoch 8, mem.: 3.93Gb
+Epoch 9, mem.: 4.30Gb
+Epoch 10, mem.: 4.67Gb
+Epoch 11, mem.: 5.05Gb
+Epoch 12, mem.: 5.42Gb
+Epoch 13, mem.: 5.79Gb
+Epoch 14, mem.: 6.16Gb
+Epoch 15, mem.: 6.54Gb
+Epoch 16, mem.: 6.91Gb
+Epoch 17, mem.: 7.28Gb
+Epoch 18, mem.: 7.65Gb
+Epoch 19, mem.: 8.03Gb
+&lt;/denchmark-code&gt;
+
+There are two issues that conspire to create the problem:
+
+Each time we call iterator.make_initializer(dataset) (or tf.add()) in the loop, some new ops are created. These new ops aren't found in the session's cache of previously executed subgraphs, so it "reoptimizes" the computation and stores a new "optimized" subgraph inside the session. This new subgraph accounts for the memory growth.
+Every time we use the same large constant in a different subgraph, a copy of that constant's data is made and stored in the subgraph. That accounts for why the memory growth is so severe in this case, because the raw_data tensor is approximately 400MB in size.
+
+Issue (1) is pretty fundamental, and with the shift to eager execution and away from sessions in TF 2.0, it's unlikely to be fixed for existing code (new eager code won't have this problem, since there's no "graph" that will accumulate this state). Issue (2) is potentially fixable, but will require some internal changes to the  code to intern the values of (large) constants. I'm assigning this to &lt;denchmark-link:https://github.com/asimshankar&gt;@asimshankar&lt;/denchmark-link&gt;
+ to make the call on whether the latter is worth doing.
+		</comment>
+		<comment id='2' author='artsobolev' date='2018-11-26T21:49:10Z'>
+		Thanks for the report &lt;denchmark-link:https://github.com/artsobolev&gt;@artsobolev&lt;/denchmark-link&gt;
+
+As &lt;denchmark-link:https://github.com/mrry&gt;@mrry&lt;/denchmark-link&gt;
+ pointed out, here we are adding operations to the graph in each iteration of the loop, which is causing memory growth. Interning the constants as &lt;denchmark-link:https://github.com/mrry&gt;@mrry&lt;/denchmark-link&gt;
+ suggested would help (significantly in this case due to the large constants), but we'll still be constantly adding nodes to the graph so there will still be an increase in memory footprint.
+For the example in &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/23904#issue-383237718&gt;#23904 (comment)&lt;/denchmark-link&gt;
+, I think what you want is to create the initializer operation outside the loop, so:
+init = iterator.make_initializer(dataset)
+sess = tf.Session()
+for i in range(20):
+    sess.run(init)
+    print('Epoch {}, mem.: {:.2f}Gb'.format( i, mem() ))
+That way there is no growth in the graph.
+I'm tempted to close this out since adding nodes to a graph is bound to increase memory.
+With TF 2.0, it won't be easy to run into this situation.
+Interning constants will help and is something worth looking into in general, but not specific to this issue.
+Please feel free to reopen if I have misunderstood.
+		</comment>
+	</comments>
+</bug>

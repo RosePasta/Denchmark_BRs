@@ -1,0 +1,113 @@
+<bug id='4429' author='zhuango' open_date='2020-07-01T08:52:50Z' closed_time='2020-07-02T11:05:16Z'>
+	<summary>allowed_start_transitions and allowed_end_transitions don't actually enforce their constraints</summary>
+	<description>
+I working on a project that uses &lt;denchmark-link:https://github.com/allenai/allennlp/blob/master/allennlp/nn/util.py#L403&gt;viterbi_decode &lt;/denchmark-link&gt;
+ function in allennlp.nn.util. viterbi_decode function has / parameters, which aim to enable viterbi decoding process to take the start/end timestep restriction into account. But how it works confuses me.
+Follows are what I learned from viterbi_decode code. path_score is initialized with tag_sequence[0] which is a zero vector when has_start_end_restrictions is true. When calculating the score for the first time step through a topk op on path_score + transition_matrix, the state of previous timestep (paths) is depend on transition_matrix and not restricted on "start".
+For an extreme case, the first timestep cannot be any state and allowed_start_transitions are all -inf. Normally, the score of the first timestep is -inf vector because no state is allowed at first timestep. But topk op on path_score + transition_matrix  could still get non-inf score and non-start _paths_of previous time step. Because there are potentials bigger than -inf and those corresponding previous states will be append to paths which is not "start" state. The allowed_start_transitions is not working ?
+So it confuses me. Please help me to understand how does the allowed_start_transitions/allowed_end_transitions  actually work.
+	</description>
+	<comments>
+		<comment id='1' author='zhuango' date='2020-07-01T15:41:34Z'>
+		I'm going to give you a minimal explanation, but feel free to ask more questions if this isn't enough.
+The place to look for an example for how this is used is our SRL model: &lt;denchmark-link:https://github.com/allenai/allennlp-models/blob/11c6814a1de2908ab34794640411c1c5f879705d/allennlp_models/structured_prediction/models/srl.py#L370-L372&gt;here&lt;/denchmark-link&gt;
+ and &lt;denchmark-link:https://github.com/allenai/allennlp-models/blob/11c6814a1de2908ab34794640411c1c5f879705d/allennlp_models/structured_prediction/models/srl.py#L419-L439&gt;here&lt;/denchmark-link&gt;
+. There, you will see that we set all allowed transitions to have a score of  in the transition matrix, and all disallowed transitions to have a score of .  Because we're adding log probabilities inside of , a score of  means that any path through that transition will get a score of , or a probability of .
+		</comment>
+		<comment id='2' author='zhuango' date='2020-07-02T03:32:13Z'>
+		Hi &lt;denchmark-link:https://github.com/matt-gardner&gt;@matt-gardner&lt;/denchmark-link&gt;
+, Thanks for your explanation very much. I'm just working on SRL model. As you mentioned, disallowed transitions will have a score of float('-inf'). Following is a simple example that confuses me:
+Transition matrix (add allowed_start_transitions/allowed_end_transitions, &lt;denchmark-link:https://github.com/allenai/allennlp/blob/master/allennlp/nn/util.py#L467-L496&gt;code&lt;/denchmark-link&gt;
+):
+&lt;denchmark-link:https://user-images.githubusercontent.com/5491519/86305844-3cf9f180-bc45-11ea-8de4-5f751e5173c8.png&gt;&lt;/denchmark-link&gt;
+
+Predictions/transposed tag_sequence matrix (append start and end zero_sentinel, and extra_tags_sentinel, &lt;denchmark-link:https://github.com/allenai/allennlp/blob/master/allennlp/nn/util.py#L509-L515&gt;code&lt;/denchmark-link&gt;
+):
+&lt;denchmark-link:https://user-images.githubusercontent.com/5491519/86306212-3f108000-bc46-11ea-8e27-72df6cd49ec9.png&gt;&lt;/denchmark-link&gt;
+
+In the above example, 'start' cannot transfer to '0' and '1' cannot transfer to '1'.
+path_scores is initialized with tag_sequence[0] which is zero vector. Follow this &lt;denchmark-link:https://github.com/allenai/allennlp/blob/master/allennlp/nn/util.py#L528-L555&gt;code&lt;/denchmark-link&gt;
+, when run into the first timestep：
+&lt;denchmark-code&gt;timestep = 1
+summed_potentials = path_scores[timestep -1] + transition_matrix = path_scores[0] + transition_matrix = transition_matrix 
+&lt;/denchmark-code&gt;
+
+So,
+&lt;denchmark-code&gt;scores = [0.0, 0.0, -inf, 0.0] (top1 of each column)
+paths = [0, 0, 0, 0]
+path_scores[1] = tag_sequence[timestep, :] + scores = [0.8, 0.2, -inf, -inf]
+path_indices[1] = paths  = [0, 0, 0, 0]
+&lt;/denchmark-code&gt;
+
+However, as I understand, with the restriction " 'start' cannot transfer to '0' ", path_scores[1][0] should be -inf because 1st timestep cannot be state '0'. And path_indices[1], 1st timestep's previous state should always be 'start' state. That is what confuses me. Do I miss something? Look forward to your replay. Thanks.
+		</comment>
+		<comment id='3' author='zhuango' date='2020-07-02T03:56:35Z'>
+		What you're missing is the broadcasting that's happening.  Your set of equations for summed_potentials is wrong, because it doesn't account for the .unsqueeze() that happens, and the associated broadcasting.  I'd recommend stepping through the execution of that code with your toy example to see exactly what happens; it's more complicated than it looks at first glance.
+		</comment>
+		<comment id='4' author='zhuango' date='2020-07-02T04:32:14Z'>
+		Thanks &lt;denchmark-link:https://github.com/matt-gardner&gt;@matt-gardner&lt;/denchmark-link&gt;
+, I notice the broadcasting. And I checked the toy example above. Following is my code and I expect to get path ([1, 0], 0.3). But the path it got is [,1], even I set allowed_start_transitions=[-math.inf, 0.0] meaning first timestep cannot be 0.
+&lt;denchmark-code&gt;import math
+import torch
+from allennlp.nn.util import viterbi_decode
+
+t_m = torch.Tensor([
+    [0.0, 0.0], 
+    [0.0, -math.inf]])
+start_allowed = torch.Tensor([-math.inf, 0.0])
+
+predictions = torch.Tensor([
+        [0.8, 0.2], 
+        [0.1, 0.9]])
+
+res = viterbi_decode(predictions, t_m, allowed_start_transitions=start_allowed)
+# output: ([0, 1], 1.7)
+# expected output : ([1, 0], 0.3)
+print(res)
+&lt;/denchmark-code&gt;
+
+And I try another extreme case, start_allowed = [-math.inf, -math.inf]. I got same output ([0, 1], 1.7).
+&lt;denchmark-code&gt;import math
+import torch
+from allennlp.nn.util import viterbi_decode
+
+t_m = torch.Tensor([
+    [0.0, 0.0], 
+    [0.0, -math.inf]])
+**start_allowed = torch.Tensor([-math.inf, -math.inf])**
+
+predictions = torch.Tensor([
+        [0.8, 0.2], 
+        [0.1, 0.9]])
+
+res = viterbi_decode(predictions, t_m, allowed_start_transitions=start_allowed)
+# output: ([0, 1], 1.7)
+# expected output : ([*, *], -inf)
+print(res)
+&lt;/denchmark-code&gt;
+
+After I change &lt;denchmark-link:https://github.com/allenai/allennlp/blob/master/allennlp/nn/util.py#L514&gt;this line&lt;/denchmark-link&gt;
+ to
+&lt;denchmark-code&gt;# Only allow the 'start' state before the first timestep.
+start_sentinel = torch.ones(1, num_tags) * -math.inf
+start_sentinel[0][-2] = 0.0
+tag_sequence = torch.cat([start_sentinel, tag_sequence, zero_sentinel], 0)
+&lt;/denchmark-code&gt;
+
+The code above seems to run as expected and outputs: ([1, 0], 0.3) and ([,], -inf)
+		</comment>
+		<comment id='5' author='zhuango' date='2020-07-02T08:57:42Z'>
+		Ok, sorry for being obtuse earlier, I was trying to go too fast through the issues, and assumed the code was right and didn't pay enough attention to the points you made.  With your additional explanations, I now understand and agree with what you're saying.  I went back and looked at when that code got added, and I think it just never did what it was supposed to.
+Can you submit a PR to change those sentinel values?
+		</comment>
+		<comment id='6' author='zhuango' date='2020-07-02T11:05:16Z'>
+		Sorry, I just find that the reason for the output in my last post is that I neglect the .  and  work well when tag_observations is set at &lt;denchmark-link:https://github.com/allenai/allennlp/blob/master/allennlp/nn/util.py#L510&gt;this line&lt;/denchmark-link&gt;
+. &lt;denchmark-link:https://github.com/allenai/allennlp/blob/master/allennlp/nn/util.py#L520-L523&gt;These lines&lt;/denchmark-link&gt;
+ and &lt;denchmark-link:https://github.com/allenai/allennlp/blob/master/allennlp/nn/util.py#L549-L552&gt;these lines&lt;/denchmark-link&gt;
+ can keep the first and the last state to be "start" and "end", respectively, and make  and  work. Although the extreme case still fails, nobody would do that in practice. Thanks for your attention on this issue. I am really appreciated!
+		</comment>
+		<comment id='7' author='zhuango' date='2020-07-02T11:30:57Z'>
+		Hmm, ok, I see now where I also missed something :).  Looks like this code could use some better comments in general, because the logic is not obvious.  I looked at it several times over the course of this discussion and missed things each time.
+		</comment>
+	</comments>
+</bug>

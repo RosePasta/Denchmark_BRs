@@ -1,0 +1,114 @@
+<bug id='6532' author='AlexDBlack' open_date='2018-10-05T02:29:43Z' closed_time='2019-01-17T00:34:30Z'>
+	<summary>Libnd4j: broadcast weighted cosine distance &amp; mean_pairwssqerr losses incorrect</summary>
+	<description>
+For the cosine distance loss, we are applying the weights array incorrectly.
+Here's TF test case plus output:
+&lt;denchmark-code&gt;tf.reset_default_graph()
+sess = tf.Session()
+inArr = tf.constant([[-0.3, -0.2, -0.1], [0, 0.1, 0.2]])
+label = tf.constant([[1.0, 2.0, 3.0], [-1.0, 2.0, 1.0]])
+w = tf.constant([[0],[1]])
+cosine_loss = tf.losses.cosine_distance(labels=label, predictions=inArr, weights=w, axis=1)
+print(sess.run([cosine_loss]))
+[0.60000002]
+&lt;/denchmark-code&gt;
+
+Here's libnd4j:
+&lt;denchmark-code&gt;        INDArray arr = Nd4j.create(new double[][]{{-0.3, -0.2, -0.1}, {0, 0.1, 0.2}});
+        INDArray label = Nd4j.create(new double[][]{{1.0, 2.0, 3.0}, {-1.0, 2.0, 1.0}});
+        INDArray w = Nd4j.create(new double[][]{{0},{1}});
+        INDArray out = Nd4j.scalar(0.0);
+
+        CustomOp op = DynamicCustomOp.builder("cosine_distance_loss")
+                .addInputs(arr, w, label)
+                .addOutputs(out)
+                .addIntegerArguments(2, 1) //weighted mean, dimension 1
+                .build();
+        Nd4j.getExecutioner().exec(op);
+        System.out.println(out);
+&lt;/denchmark-code&gt;
+
+Output: 0.2000
+The difference is that we do the reduction then multiply by the broadcast array.
+&lt;denchmark-link:https://github.com/deeplearning4j/deeplearning4j/blob/8b8d7cd1c712acef3730f9efd08386fa7823704a/libnd4j/include/ops/declarable/generic/loss/cosineDistance.cpp#L57-L72&gt;https://github.com/deeplearning4j/deeplearning4j/blob/8b8d7cd1c712acef3730f9efd08386fa7823704a/libnd4j/include/ops/declarable/generic/loss/cosineDistance.cpp#L57-L72&lt;/denchmark-link&gt;
+
+In the [2,3] input case, we sum to [2,1] then multiply by [2,3] to give [2,3] again.
+Instead: we should broadcast the weights to [2,1] and multiply to keep [2,1] and then divide by sum of the 2 elements (1.0 in this case), not sum of 6 elements (3.0 in this case).
+This also impacts the 3 - "weighted_sum_by_nonzero_weights" case.
+	</description>
+	<comments>
+		<comment id='1' author='AlexDBlack' date='2018-10-05T05:12:07Z'>
+		Looks like mean pairwise squared error has a similar problem for the same reason.
+Weights should either be a scalar or a vector of size [minibatch] i.e., label.size(0).
+&lt;denchmark-link:https://www.tensorflow.org/api_docs/python/tf/losses/mean_pairwise_squared_error&gt;https://www.tensorflow.org/api_docs/python/tf/losses/mean_pairwise_squared_error&lt;/denchmark-link&gt;
+
+&lt;denchmark-code&gt;tf.reset_default_graph()
+sess = tf.Session()
+inArr = tf.constant([[-0.3, -0.2, -0.1], [0, 0.1, 0.2]])
+label = tf.constant([[1.0, 2.0, 3.0], [-1.0, 2.0, 1.0]])
+w = tf.constant([[0],[1]])
+mpwse = tf.losses.mean_pairwise_squared_error(labels=label, predictions=inArr, weights=w)
+print(sess.run([mpwse]))
+[4.2866659]
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-code&gt;        INDArray arr = Nd4j.create(new double[][]{{-0.3, -0.2, -0.1}, {0, 0.1, 0.2}});
+        INDArray label = Nd4j.create(new double[][]{{1.0, 2.0, 3.0}, {-1.0, 2.0, 1.0}});
+        INDArray w = Nd4j.create(new double[][]{{0},{1}});
+        INDArray out = Nd4j.scalar(0.0);
+
+        CustomOp op = DynamicCustomOp.builder("mean_pairwssqerr_loss")
+                .addInputs(arr, w, label)
+                .addOutputs(out)
+                //No iArgs - doesn't support different reduction modes
+                .build();
+        Nd4j.getExecutioner().exec(op);
+        System.out.println(out);
+&lt;/denchmark-code&gt;
+
+Output: 2.8578
+(note exactly 1.5x smaller than expected)
+&lt;denchmark-link:https://github.com/deeplearning4j/deeplearning4j/blob/8b8d7cd1c712acef3730f9efd08386fa7823704a/libnd4j/include/ops/declarable/generic/loss/meanPairWsSqErr.cpp#L50-L57&gt;https://github.com/deeplearning4j/deeplearning4j/blob/8b8d7cd1c712acef3730f9efd08386fa7823704a/libnd4j/include/ops/declarable/generic/loss/meanPairWsSqErr.cpp#L50-L57&lt;/denchmark-link&gt;
+
+EDIT: this also impacts the scalar weight case. So w = tf.constant(1) vs. INDArray w = Nd4j.trueScalar(1)
+TF gives 5.9066658 vs. libnd4j 3.9378
+		</comment>
+		<comment id='2' author='AlexDBlack' date='2018-12-07T10:16:19Z'>
+		There were two errors: the first is default reduce with TF is weighted_sum_by_nonzero_weights, so in our case call for .addIntegerArguments(3, 1) //weighted_sum_by_nonzero_weights,, dimension 1
+instead, or use proper reduction (tf.losses.Reduction.MEAN).
+Also there was a bug with proper counting sum of non-zero weights.
+		</comment>
+		<comment id='3' author='AlexDBlack' date='2018-12-10T13:38:07Z'>
+		Hi, Alex
+Mistakes have been corrected:
+
+cosine distance: weights should broadcast to losses, but they were broadcasted to predictions.
+mean pairwise squared error: after some tensorflow update they began to use another formula for calculation, namely instead of dividing by N^2, they divide by N(N-1)  now, where N - is number of non-zero weights.
+
+All corrections are made in shyrma_grad branch.
+		</comment>
+		<comment id='4' author='AlexDBlack' date='2018-12-10T15:47:04Z'>
+		by the way
+
+Weights should either be a scalar or a vector of size [minibatch] i.e., label.size(0).
+
+not necessary
+as we all already know - tf documentation is not so good.
+actual requirements to weights array are
+
+weights array should be scalar or have the same rank as labels/prediction array
+shapes of weights and labels/predictions arrays should be broadcastable
+
+		</comment>
+		<comment id='5' author='AlexDBlack' date='2018-12-10T23:13:30Z'>
+		Thanks guys. I've been meaning to get back to loss functions, will test these once they are in master.
+
+instead of dividing by N^2, they divide by N(N-1) now
+
+Good catch. For mean pairwise squared error, that makes sense, probably a bug fix (there's N(N-1) pairs of outputs so that seems correct)
+		</comment>
+		<comment id='6' author='AlexDBlack' date='2019-02-16T00:36:50Z'>
+		This thread has been automatically locked since there has not been any recent activity after it was closed. Please open a new issue for related bugs.
+		</comment>
+	</comments>
+</bug>

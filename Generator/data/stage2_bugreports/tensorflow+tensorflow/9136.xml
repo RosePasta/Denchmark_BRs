@@ -1,0 +1,121 @@
+<bug id='9136' author='jdonier' open_date='2017-04-11T12:47:39Z' closed_time='2017-04-20T20:42:34Z'>
+	<summary>Issues when using Queues + tf.train.Server</summary>
+	<description>
+NOTE: Issues that are not bugs or feature requests will be closed. Please ask usage questions on StackOverflow.
+&lt;denchmark-h:h3&gt;You must complete this information or else your issue will be closed&lt;/denchmark-h&gt;
+
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow)?: Yes
+TensorFlow installed from (source or binary)?: binary
+TensorFlow version: 1.0.0 CPU / 1.0.1 (CPU and GPU enabled) / 1.1.0rc1 (CPU)
+Bazel version (if compiling from source):
+CUDA/cuDNN version: N/A
+GPU Model and Memory: N/A
+Exact command to reproduce: cf below.
+
+This problem has been reproduced on both Linux and various Mac OS machines.
+&lt;denchmark-h:h3&gt;Describe the problem clearly&lt;/denchmark-h&gt;
+
+We seem to experience issues when using both queues + tf.train.Server. When executed in a simple python 3.5.3 console, the following script hangs:
+&lt;denchmark-code&gt;import tensorflow as tf
+import time
+
+cluster = tf.train.ClusterSpec({"cpu1" : ['localhost:2222']})
+server = tf.train.Server(cluster, job_name="cpu1", task_index=0)
+
+with tf.Graph().as_default() as graph:
+    # Queue
+    input_queue = tf.train.input_producer(tf.constant([0.], dtype=tf.float32))
+
+    # Useless variable
+    variable = tf.Variable(1., dtype=tf.float32, trainable=False, name="variable")
+
+    # Session and queue runners
+    session = tf.Session(target=server.target)
+    session.run(tf.global_variables_initializer())
+    tf.train.start_queue_runners(session)
+
+print(session.run(variable))  # this works
+print(session.run(tf.assign(variable, 2)))  # this also works, but only if called directly
+
+# any pause between creating and running the session breaks it
+time.sleep(1)
+
+print(session.run(variable))  # retrieving a variable still works, but...
+print(session.run(tf.assign(variable, 3)))  # ... assigning a variable will make the program hang.
+&lt;/denchmark-code&gt;
+
+It outputs:
+&lt;denchmark-code&gt;1
+2
+2
+&lt;/denchmark-code&gt;
+
+and then hangs forever. The problem vanishes when either commenting the input_queue=... line, or when writing session = tf.Session() instead of passing the server.target.
+The problems seems to happen not only with variable assignments, but also saving the model using tf.train.Saver().save(session, 'my_model') for instance (and possibly other operations). Note that reading a variable works fine.
+In the example script, the time.sleepcommand simulates a pause between creating the session and running it to set a variable. The same effect is achieved, for example, when splitting session creation and running code across two Jupyter notebook cells. When executing the whole code in one cell, it works fine.
+&lt;denchmark-h:h3&gt;Source Code / Logs&lt;/denchmark-h&gt;
+
+The source code to reproduce the problem is displayed above. I have attached a traceback using gdb, which shows that the program is hanging while trying to acquire a lock.
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/files/913097/tf-issue-gdb-bt.txt&gt;tf-issue-gdb-bt.txt&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/files/913102/tf-issue-gdb-stack-threads.txt&gt;tf-issue-gdb-stack-threads.txt&lt;/denchmark-link&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='jdonier' date='2017-04-14T18:09:20Z'>
+		Thanks for the detailed report and stacktraces, this helps a lot and is much appreciated.
+&lt;denchmark-link:https://github.com/mrry&gt;@mrry&lt;/denchmark-link&gt;
+ pointed out that we might have a bug when graphs are extended in a distributed session while some operations (in this case the enqueue operation) are in progress (See &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/87cdfafd44ff5e332fd820608783432fea83a4c9/tensorflow/core/distributed_runtime/master_session.cc#L1038&gt;master_session.cc:1038&lt;/denchmark-link&gt;
+ - that code predates the queue runners).
+&lt;denchmark-link:https://github.com/suharshs&gt;@suharshs&lt;/denchmark-link&gt;
+ : Would you have the bandwidth to look into that TODO?
+&lt;denchmark-link:https://github.com/jdonier&gt;@jdonier&lt;/denchmark-link&gt;
+ : In the mean time, a workaround for you would be to ensure that the graph isn't modified after the queue runners are started. For example, your snippet above could be rewritten as:
+import tensorflow as tf
+import time
+
+cluster = tf.train.ClusterSpec({"cpu1" : ['localhost:2222']})
+server = tf.train.Server(cluster, job_name="cpu1", task_index=0)
+
+with tf.Graph().as_default() as graph:
+    # Queue
+    input_queue = tf.train.input_producer(tf.constant([0.], dtype=tf.float32))
+
+    # Useless variable
+    variable = tf.Variable(1., dtype=tf.float32, trainable=False, name="variable")
+
+    # Session and queue runners
+    session = tf.Session(target=server.target)
+    session.run(tf.global_variables_initializer())
+
+    # CHANGE FROM PREVIOUS SNIPPET: Assign operations
+    assign2 = tf.assign(variable, 2)
+    assign3 = tf.assign(variable, 3)
+
+    tf.train.start_queue_runners(session)
+
+print(session.run(variable))
+print(session.run(assign2))
+
+# Freely sleep
+time.sleep(1)
+
+print(session.run(variable))
+print(session.run(assign3))
+FYI &lt;denchmark-link:https://github.com/jhseu&gt;@jhseu&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/saeta&gt;@saeta&lt;/denchmark-link&gt;
+ who might like to know about this too.
+		</comment>
+		<comment id='2' author='jdonier' date='2017-04-14T18:44:28Z'>
+		&lt;denchmark-link:https://github.com/asimshankar&gt;@asimshankar&lt;/denchmark-link&gt;
+ the reason why I want to modify the graph after the queue runners are started is to change some parameters during / after training (e.g. the training rate during training, or dropout rates between training and inference) so this needs to be done after the queue runners have been started. I guess I could define them as placeholders but it's a bit weird to have to feed these values for every computation...
+About the problem with model saving: I was creating a tf.train.Saver() at saving time, which was causing the problem, consistent with your explanation. It all works fine if I define it when I create the graph -- so thanks a lot!
+		</comment>
+		<comment id='3' author='jdonier' date='2017-04-18T23:59:21Z'>
+		I have a change coming soon that should fix this. (Thanks &lt;denchmark-link:https://github.com/mrry&gt;@mrry&lt;/denchmark-link&gt;
+ and &lt;denchmark-link:https://github.com/asimshankar&gt;@asimshankar&lt;/denchmark-link&gt;
+ for flagging!)
+		</comment>
+	</comments>
+</bug>

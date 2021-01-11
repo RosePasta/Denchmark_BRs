@@ -1,0 +1,295 @@
+<bug id='8551' author='iamhatesz' open_date='2020-05-22T08:04:21Z' closed_time='2020-10-08T19:22:39Z'>
+	<summary>[rllib] Zero-padded records in RNN sequences are being processed</summary>
+	<description>
+&lt;denchmark-h:h3&gt;What is the problem?&lt;/denchmark-h&gt;
+
+Ray: 0.8.5
+PyTorch: 1.5
+Inside a forward function of an RNN model I receive 0-padded sequences. This is fine to make calculations easier, but once the output is calculated, the records for 0-padded inputs are not being discarded. This silently fails with current PyTorch logits-based action distributions (&lt;denchmark-link:https://github.com/ray-project/ray/issues/8532&gt;#8532&lt;/denchmark-link&gt;
+), because categorical distribution from [0,0] will simply be [0.5, 0.5], but when given [0,0] as probs, PyTorch fails with:
+&lt;denchmark-code&gt;RuntimeError: invalid multinomial distribution (encountering probability entry &lt; 0)
+&lt;/denchmark-code&gt;
+
+because of nans present when building distribution from all zeros vector.
+IMO, after returning an output from an RNN model, the output should be filtered based on seq_lens and records that were calculated from padded inputs should be completely discarded. What do you think? Am I missing something?
+&lt;denchmark-h:h3&gt;Reproduction (REQUIRED)&lt;/denchmark-h&gt;
+
+import random
+
+import gym
+import numpy as np
+import ray
+from ray.rllib.models import ModelCatalog, ActionDistribution
+from ray.rllib.models.modelv2 import ModelV2
+from ray.rllib.models.torch.torch_action_dist import TorchCategorical, TorchDistributionWrapper
+from ray.rllib.models.torch.torch_modelv2 import TorchModelV2
+from ray.rllib.policy.rnn_sequencing import add_time_dimension
+from ray.rllib.utils import override
+from ray.tune import register_env, tune
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class TorchCategoricalFromProbs(TorchCategorical):
+    @override(ActionDistribution)
+    def __init__(self, inputs, model=None, temperature=1.0):
+        if temperature != 1.0:
+            assert temperature &gt; 0.0, \
+                "Categorical `temperature` must be &gt; 0.0!"
+            inputs /= temperature
+        TorchDistributionWrapper.__init__(self, inputs, model)
+        self.dist = torch.distributions.categorical.Categorical(
+            probs=self.inputs)
+
+
+class SimpleEnv(gym.Env):
+    observation_space = gym.spaces.Discrete(2)
+    action_space = gym.spaces.Discrete(2)
+
+    def reset(self):
+        return self.observation_space.sample()
+
+    def step(self, action):
+        return self.observation_space.sample(), 0.1, random.choice([True, False, False, False, False, False, False, False, False, False]), {}
+
+
+class SimpleModel(TorchModelV2, nn.Module):
+    def __init__(self, obs_space, action_space, num_outputs, model_config, name):
+        TorchModelV2.__init__(
+            self, obs_space, action_space, num_outputs, model_config, name
+        )
+        nn.Module.__init__(self)
+
+        self.fc = nn.Linear(2, 128)
+        self.lstm = nn.LSTM(128, 256, batch_first=True)
+        self.action_head = nn.Linear(256, 2)
+        self.value_head = nn.Linear(256, 1)
+
+        self._value_out = None
+
+    @override(ModelV2)
+    def forward(self, input_dict, state, seq_lens):
+        if isinstance(seq_lens, np.ndarray):
+            seq_lens = torch.tensor(seq_lens).int()
+
+        features = F.relu(self.fc(input_dict['obs']))
+        decision, new_state = self.lstm(
+            add_time_dimension(features, seq_lens, framework='torch'), (state[0].unsqueeze(0), state[1].unsqueeze(0))
+        )
+        action = F.softmax(self.action_head(decision), dim=-1)
+        value = self.value_head(decision)
+        self._value_out = value.reshape(-1)
+        return action.reshape([-1, self.num_outputs]), [new_state[0].squeeze(0), new_state[1].squeeze(0)]
+
+    @override(ModelV2)
+    def get_initial_state(self):
+        return [
+            self.fc.weight.new(1, self.model_config['lstm_cell_size']).zero_().squeeze(0),
+            self.fc.weight.new(1, self.model_config['lstm_cell_size']).zero_().squeeze(0),
+        ]
+
+    @override(ModelV2)
+    def value_function(self) -&gt; torch.Tensor:
+        assert self._value_out is not None, f"must call forward() first"
+        return self._value_out
+
+
+if __name__ == '__main__':
+    register_env('SimpleEnv', lambda env_config: SimpleEnv())
+    ModelCatalog.register_custom_model('SimpleModel', SimpleModel)
+    ModelCatalog.register_custom_action_dist('TorchCategoricalFromProbs', TorchCategoricalFromProbs)
+
+    ray.init(local_mode=True)
+
+    tune.run(
+        'PPO',
+        config={
+            'env': 'SimpleEnv',
+            'use_pytorch': True,
+            'model': {
+                'custom_model': 'SimpleModel',
+                'custom_action_dist': 'TorchCategoricalFromProbs',
+                'max_seq_len': 5
+            },
+        }
+    )
+
+ I have verified my script runs in a clean environment and reproduces the issue.
+ I have verified the issue also occurs with the latest wheels.
+
+	</description>
+	<comments>
+		<comment id='1' author='iamhatesz' date='2020-05-24T06:05:11Z'>
+		cc &lt;denchmark-link:https://github.com/sven1977&gt;@sven1977&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='2' author='iamhatesz' date='2020-05-24T12:21:44Z'>
+		&lt;denchmark-link:https://github.com/ericl&gt;@ericl&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/sven1977&gt;@sven1977&lt;/denchmark-link&gt;
+
+In my investigation I found a problem with:
+            def reduce_mean_valid(t):
+                return torch.sum(t * valid_mask) / num_valid
+function in PPOLoss class. If t contains nans, even on invalid fields, the sum will be a nan as well. And the nans are present because we are building distribution from all zeros vector of probs.
+		</comment>
+		<comment id='3' author='iamhatesz' date='2020-07-17T21:02:15Z'>
+		Yeah, you are absolutely right. This was a PPO torch LSTM bug that has already been fixed recently (a week or so ago).
+Could you check again with the latest master? I'm still seeing this in APPO as well and will fix it there as well right now.
+If you don't want to upgrade and just patch your current version, replace the above code snippet in rllib/agents/ppo/ppo_torch_policy.py with:
+&lt;denchmark-code&gt;            def reduce_mean_valid(t):
+                return torch.sum(t[valid_mask]) / num_valid
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='4' author='iamhatesz' date='2020-07-17T21:06:55Z'>
+		Still fails. I'll take a closer look ...
+		</comment>
+		<comment id='5' author='iamhatesz' date='2020-07-17T21:37:50Z'>
+		Yes, I figured out later that the problem lays somewhere deeper, and fixing only this line of code didn't help...
+		</comment>
+		<comment id='6' author='iamhatesz' date='2020-07-18T18:39:12Z'>
+		Strange, when I remove the nn.Softmax entirely and replace probs= with logits= in your custom distribution, it works just fine now.
+		</comment>
+		<comment id='7' author='iamhatesz' date='2020-07-18T18:52:49Z'>
+		&lt;denchmark-link:https://github.com/sven1977&gt;@sven1977&lt;/denchmark-link&gt;
+ yes, this problem becomes visible only with probs, because then we create distribution from all zeros probs, which is obviously not supported in PyTorch. But this happens due to the processing of zero padded timesteps. When we use logits, this also happens, but silently - so the padding timesteps are being processed, but they shouldn't.
+In &lt;denchmark-link:https://github.com/ray-project/ray/issues/8532&gt;#8532&lt;/denchmark-link&gt;
+ I suggested models to be configurable, whether they output probs or logits. I am still open to PR that, but I need this ticket to be solved first. Otherwise, models outputting probs will be always failing (e.g. there are models where the output can be calculated only for valid inputs, and will output zeros for zeros input).
+		</comment>
+		<comment id='8' author='iamhatesz' date='2020-07-19T09:42:21Z'>
+		Yeah, I got it running with your softmax + probs-inputs style of doing the model and dist.
+Bottom line is: In the loss, we need to make sure that the zero-pads from the collected batch (I think it's only train_batch[SampleBatch.ACTION_DIST_INPUTS] that's causing these problems) must be masked all before(!) even any KL are calculated. This was the underlying problem: The backprop through the KL was causing all grads to be NaN, then the optimizer update screwed up all Model weights and this caused NaNs in the consecutive action sample forward passes (which then made torch.distributions complain about probs being &lt; 0 (even though they were not &lt; 0.0, they were simply NaN)).
+Anyways. Can you try this loss function here instead in your PPO (replace some code in ppo_torch_policy.py with the below)? This should fix it (worked on my end).
+I'll create a PR right now. ...
+&lt;denchmark-code&gt;class PPOLoss:
+    def __init__(self,
+                 dist_class,
+                 model,
+                 value_targets,
+                 advantages,
+                 actions,
+                 prev_logits,
+                 prev_actions_logp,
+                 vf_preds,
+                 curr_action_dist,
+                 value_fn,
+                 cur_kl_coeff,
+                 valid_mask,
+                 entropy_coeff=0,
+                 clip_param=0.1,
+                 vf_clip_param=0.1,
+                 vf_loss_coeff=1.0,
+                 use_gae=True):
+
+        # We now mask everything even before we have to do the torch.mean (this makes sure no grads get screwed up in the KL calculations).
+        #if valid_mask is not None:
+        #    num_valid = torch.sum(valid_mask)
+        #    def reduce_mean_valid(t):
+        #        #is_nan = torch.isnan(t)
+        #        #t[is_nan] = 0.0
+        #        #return t.sum() / (~is_nan).float().sum()
+        #        return torch.sum(t[valid_mask]) / num_valid
+
+        #else:
+
+        #    def reduce_mean_valid(t):
+        #        return torch.mean(t)
+
+        if valid_mask is not None:
+            prev_logits = prev_logits[valid_mask]
+            prev_actions_logp = prev_actions_logp[valid_mask]
+            actions = actions[valid_mask]
+            advantages = advantages[valid_mask]
+            value_targets = value_targets[valid_mask]
+            vf_preds = vf_preds[valid_mask]
+            value_fn = value_fn[valid_mask]
+
+        prev_dist = dist_class(prev_logits, model)
+        # Make loss functions.
+        logp_ratio = torch.exp(
+            curr_action_dist.logp(actions) - prev_actions_logp)
+        action_kl = prev_dist.kl(curr_action_dist)
+        #self.mean_kl = reduce_mean_valid(action_kl)
+        self.mean_kl = torch.mean(action_kl)
+
+        curr_entropy = curr_action_dist.entropy()
+        #self.mean_entropy = reduce_mean_valid(curr_entropy)
+        self.mean_entropy = torch.mean(curr_entropy)
+
+        surrogate_loss = torch.min(
+            advantages * logp_ratio,
+            advantages * torch.clamp(logp_ratio, 1 - clip_param,
+                                     1 + clip_param))
+        #self.mean_policy_loss = reduce_mean_valid(-surrogate_loss)
+        self.mean_policy_loss = torch.mean(-surrogate_loss)
+
+        if use_gae:
+            vf_loss1 = torch.pow(value_fn - value_targets, 2.0)
+            vf_clipped = vf_preds + torch.clamp(value_fn - vf_preds,
+                                                -vf_clip_param, vf_clip_param)
+            vf_loss2 = torch.pow(vf_clipped - value_targets, 2.0)
+            vf_loss = torch.max(vf_loss1, vf_loss2)
+            #self.mean_vf_loss = reduce_mean_valid(vf_loss)
+            self.mean_vf_loss = torch.mean(vf_loss)
+            #loss = reduce_mean_valid(
+            #    -surrogate_loss + cur_kl_coeff * action_kl +
+            #    vf_loss_coeff * vf_loss - entropy_coeff * curr_entropy)
+            loss = torch.mean(
+                -surrogate_loss + cur_kl_coeff * action_kl +
+                vf_loss_coeff * vf_loss - entropy_coeff * curr_entropy)
+        else:
+            self.mean_vf_loss = 0.0
+            #loss = reduce_mean_valid(-surrogate_loss +
+            #                         cur_kl_coeff * action_kl -
+            #                         entropy_coeff * curr_entropy)
+            loss = torch.mean(-surrogate_loss +
+                                     cur_kl_coeff * action_kl -
+                                     entropy_coeff * curr_entropy)
+        print(loss)
+        self.loss = loss
+
+
+def ppo_surrogate_loss(policy, model, dist_class, train_batch):
+    logits, state = model.from_batch(train_batch)
+
+    mask = None
+    if state:
+        max_seq_len = torch.max(train_batch["seq_lens"])
+        mask = sequence_mask(train_batch["seq_lens"], max_seq_len)
+        mask = torch.reshape(mask, [-1])
+        action_dist = dist_class(logits[mask], model)
+    else:
+        action_dist = dist_class(logits, model)
+
+    policy.loss_obj = PPOLoss(
+        dist_class,
+        model,
+        train_batch[Postprocessing.VALUE_TARGETS],
+        train_batch[Postprocessing.ADVANTAGES],
+        train_batch[SampleBatch.ACTIONS],
+        train_batch[SampleBatch.ACTION_DIST_INPUTS],
+        train_batch[SampleBatch.ACTION_LOGP],
+        train_batch[SampleBatch.VF_PREDS],
+        action_dist,
+        model.value_function(),
+        policy.kl_coeff,
+        mask,
+        entropy_coeff=policy.entropy_coeff,
+        clip_param=policy.config["clip_param"],
+        vf_clip_param=policy.config["vf_clip_param"],
+        vf_loss_coeff=policy.config["vf_loss_coeff"],
+        use_gae=policy.config["use_gae"],
+    )
+
+    return policy.loss_obj.loss
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='9' author='iamhatesz' date='2020-07-20T13:06:09Z'>
+		&lt;denchmark-link:https://github.com/sven1977&gt;@sven1977&lt;/denchmark-link&gt;
+ I've just retested this on my original problem (the one from which I derived the script above) and looks like it's working! I can spend more time testing this once you complete your PR and I will start mine in &lt;denchmark-link:https://github.com/ray-project/ray/issues/8532&gt;#8532&lt;/denchmark-link&gt;
+.
+		</comment>
+	</comments>
+</bug>

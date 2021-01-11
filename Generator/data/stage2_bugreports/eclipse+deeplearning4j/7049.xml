@@ -1,0 +1,137 @@
+<bug id='7049' author='geokats' open_date='2019-01-21T14:59:15Z' closed_time='2019-02-01T10:50:27Z'>
+	<summary>ND4J: JVM crash with workspaces + ND4J ops (pullRows, sum)</summary>
+	<description>
+&lt;denchmark-h:h4&gt;Issue Description&lt;/denchmark-h&gt;
+
+When trying to fit a computation graph using a custom DataSetIterator I am getting a fatal error caused by pullRowsGeneric called by reverseTimeSeries inside a bidirectional LSTM layer.
+Here is a gist containing code to reproduce the error along with the error log I get:
+&lt;denchmark-link:https://gist.github.com/Geokats/327a808ab8c6d08690eb966633620678&gt;https://gist.github.com/Geokats/327a808ab8c6d08690eb966633620678&lt;/denchmark-link&gt;
+
+&lt;denchmark-h:h4&gt;Version Information&lt;/denchmark-h&gt;
+
+I am using the snapshot version on Ubuntu 16.04.5 LTS 64-bit system.
+Aha! Link: &lt;denchmark-link:https://skymindai.aha.io/features/ND4J-42&gt;https://skymindai.aha.io/features/ND4J-42&lt;/denchmark-link&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='geokats' date='2019-01-29T01:21:08Z'>
+		I'm not able to reproduce this. I ran your network and data pipeline code for over 6000 iterations, and did not run into any issues. Though this was Windows 10, not Linux.
+Can you pull the latest snapshots ("mvn -U package -DskipTests``` or similar) and try again on your local machine?
+		</comment>
+		<comment id='2' author='geokats' date='2019-01-29T19:44:17Z'>
+		It persists even after updating to the latest snapshots.
+I don't know if it is of any help, but I have noticed that the error only occurs when the batch given to the graph is of odd size. (in my code this happens on the last batch which is of size 5)
+Also if the labels are removed from the DataSet the error disappears.
+		</comment>
+		<comment id='3' author='geokats' date='2019-01-30T02:51:42Z'>
+		OK, I've been able to reproduce this on Linux (Kubunti 17.10 to be precise) using nd4j-native backend. It still runs perfectly fine on Windows.
+I'll see if I can isolate it further.
+		</comment>
+		<comment id='4' author='geokats' date='2019-01-30T05:44:02Z'>
+		Looks like a bug in GCC:
+
+// Some platforms will occasionally send nonstandard spurious SI_KERNEL codes.
+// One way to get this is via unaligned SIMD loads.
+
+
+https://reviews.llvm.org/D12659
+
+Unaligned memory access easily happens with views, but I suppose it's the compiler's job to make sure that doesn't happen when we're not calling any intrinsics manually.
+		</comment>
+		<comment id='5' author='geokats' date='2019-01-30T05:50:23Z'>
+		&lt;denchmark-link:https://github.com/geokats&gt;@geokats&lt;/denchmark-link&gt;
+ what's your CPU model name?
+		</comment>
+		<comment id='6' author='geokats' date='2019-01-30T05:51:41Z'>
+		&lt;denchmark-link:https://github.com/AlexDBlack&gt;@AlexDBlack&lt;/denchmark-link&gt;
+ what happens if you use avx2 nd4j-native? Does the problem still persist?
+		</comment>
+		<comment id='7' author='geokats' date='2019-01-30T05:53:44Z'>
+		The CPU is "Intel(R) Core(TM) i5-6200U CPU @ 2.30GHz"
+		</comment>
+		<comment id='8' author='geokats' date='2019-01-30T05:59:00Z'>
+		Aha, same question then: what happens with avx2 binary? These CPUs should be fine with unaligned accesses
+		</comment>
+		<comment id='9' author='geokats' date='2019-01-30T06:01:31Z'>
+		Sure, they all have instructions to deal with it, as long as the compiler figures it out.
+		</comment>
+		<comment id='10' author='geokats' date='2019-01-30T07:37:05Z'>
+		Right, and avx2 compilation mode should force the compiler to use those when applicable.
+		</comment>
+		<comment id='11' author='geokats' date='2019-01-31T01:06:25Z'>
+		This appears to be workspace related somehow; disabling workspaces and this works (though possibly the workspace is just changing data alignment enough to trigger this...).
+EDIT: This is sufficient to reproduce it:
+&lt;denchmark-code&gt;        WorkspaceConfiguration initialConfig = WorkspaceConfiguration.builder().initialSize(10 * 1024L * 1024L)
+                .policyAllocation(AllocationPolicy.STRICT).policyLearning(LearningPolicy.NONE).build();
+        MemoryWorkspace workspace = Nd4j.getWorkspaceManager().getAndActivateWorkspace(initialConfig, "WS");
+
+        for( int j=0; j&lt;100; j++ ){
+
+            try(MemoryWorkspace ws = workspace.notifyScopeEntered()) {
+
+                for (int x = 0; x &lt; 10; x++) {
+                    System.out.println("Start iteration (" + j + "," + x + ")");
+                    INDArray in = Nd4j.create(DataType.FLOAT, new long[]{5, 50, 13}, 'f');
+                    INDArray reshape = in.reshape('f', 250, 13);
+                    int[] idx = new int[13];
+                    for (int i = 0; i &lt; idx.length; i++) {
+                        idx[i] = 12 - i;  //Gives values 12, ..., 0
+                    }
+
+                    INDArray out = Nd4j.create(DataType.FLOAT, new long[]{250, 13}, 'f');
+                    INDArray pullRows = Nd4j.pullRows(reshape, out, 0, idx); //JVM crash here
+                    pullRows.dup();
+                    Nd4j.create(DataType.BYTE, x+1);        //NOTE: no crash if set to FLOAT/HALF, No crash if removed entirely; same crash for BOOL/UBYTE
+                    System.out.println("End iteration (" + j + "," + x + ")");
+                }
+            }
+        }
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='12' author='geokats' date='2019-01-31T03:41:47Z'>
+		Easy fix then.
+		</comment>
+		<comment id='13' author='geokats' date='2019-02-01T08:07:54Z'>
+		I'm seeing what I assume is the exact same issue, this time with sum op:
+Same symptoms, the 1 byte array creation + workspaces is required to reproduce.
+This time however it's reproducible for me on Windows (native).
+&lt;denchmark-code&gt;    @Test
+    public void test(){
+        WorkspaceConfiguration initialConfig = WorkspaceConfiguration.builder().initialSize(10 * 1024L * 1024L)
+                .policyAllocation(AllocationPolicy.STRICT).policyLearning(LearningPolicy.NONE).build();
+        MemoryWorkspace workspace = Nd4j.getWorkspaceManager().getAndActivateWorkspace(initialConfig, "WS");
+
+        for( int j=0; j&lt;100; j++ ){
+
+            try(MemoryWorkspace ws = workspace.notifyScopeEntered()) {
+
+                for (int x = 0; x &lt; 10; x++) {
+                    System.out.println("Start iteration (" + j + "," + x + ")");
+                    INDArray arr = Nd4j.linspace(1,10,10, DataType.DOUBLE).reshape(1,10);
+                    INDArray sum = arr.sum(true, 1);
+                    Nd4j.create(DataType.BOOL, x+1);        //NOTE: no crash if set to FLOAT/HALF, No crash if removed entirely; same crash for BOOL/UBYTE
+                    System.out.println("End iteration (" + j + "," + x + ")");
+                }
+            }
+        }
+    }
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-link:https://gist.github.com/AlexDBlack/147a7cb6b61c3fe010790b4a94921dff&gt;https://gist.github.com/AlexDBlack/147a7cb6b61c3fe010790b4a94921dff&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='14' author='geokats' date='2019-02-01T10:53:55Z'>
+		&lt;denchmark-link:https://github.com/geokats&gt;@geokats&lt;/denchmark-link&gt;
+ Fix has been merged, it should be available on snapshots in a few hours.
+Thanks for reporting.
+		</comment>
+		<comment id='15' author='geokats' date='2019-02-02T16:37:11Z'>
+		Works like a charm now.
+Thank you everyone for your help!
+		</comment>
+		<comment id='16' author='geokats' date='2019-03-04T16:58:05Z'>
+		This thread has been automatically locked since there has not been any recent activity after it was closed. Please open a new issue for related bugs.
+		</comment>
+	</comments>
+</bug>

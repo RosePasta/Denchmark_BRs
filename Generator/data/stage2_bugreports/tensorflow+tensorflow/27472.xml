@@ -1,0 +1,202 @@
+<bug id='27472' author='andersjohanandreassen' open_date='2019-04-03T17:42:24Z' closed_time='2019-04-25T22:30:50Z'>
+	<summary>10x performance loss when using eager execution with tf.keras.fit(tf.data.Dataset)</summary>
+	<description>
+Please make sure that this is a bug. As per our GitHub Policy, we only address code/doc bugs, performance issues, feature requests and build/installation issues on GitHub. tag:bug_template
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): Yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Ubuntu 18.04.2 LTS (Bionic Beaver)
+Mobile device (e.g. iPhone 8, Pixel 2, Samsung Galaxy) if the issue happens on mobile device: N/A
+TensorFlow installed from (source or binary): source
+TensorFlow version (use command below): 2.0.0-alpha0
+Python version: 3.6.7
+Bazel version (if compiling from source): N/A
+GCC/Compiler version (if compiling from source): N/A
+CUDA/cuDNN version: N/A
+GPU model and memory: N/A
+
+You can collect some of this information using our environment capture &lt;denchmark-link:https://github.com/tensorflow/tensorflow/tree/master/tools/tf_env_collect.sh&gt;script&lt;/denchmark-link&gt;
+
+You can also obtain the TensorFlow version with
+python -c "import tensorflow as tf; print(tf.GIT_VERSION, tf.VERSION)"
+Describe the current behavior
+When training tf.keras.fit(dataset) with eager execution, where dataset is a tf.data.Dataset, I am finding a ~10x performance loss as compared to turning off eager execution.
+Describe the expected behavior
+In the code attached below, I have tested training with and without eager execution, and with and without tf.data.Dataset.
+Here are the training times for one epoch of training on a 4 core CPU:
+Eager               + tf.data.Dataset : 219s  - 22ms/step
+Without Eager + tf.data.Dataset : 25s  - 3ms/step
+Eager               + numpy dataset : 26s  - 259us/sample
+Without Eager + numpy dataset : 26s  - 257us/sample
+Code to reproduce the issue
+Provide a reproducible test case that is the bare minimum necessary to generate the problem.
+import tensorflow as tf
+import numpy as np
+
+use_eager     = True
+use_TFDataset = True
+
+if not use_eager:
+    tf.compat.v1.disable_eager_execution()
+
+# Build dataset
+n_data = 10**5
+my_data = np.random.random((n_data,10,1))
+my_targets = np.random.randint(0,2,(n_data,1))
+data = ({'x_input':my_data}, {'target':my_targets})
+
+# Create tf.data.Dataset
+BATCH_SIZE = 10
+dataset = tf.data.Dataset.from_tensor_slices(data)
+dataset = dataset.batch(BATCH_SIZE)
+dataset = dataset.prefetch(1)
+
+#Build model
+x_input = tf.keras.layers.Input((None,1), name='x_input')
+RNN = tf.keras.layers.SimpleRNN(100, name='RNN')(x_input)
+hidden = tf.keras.layers.Dense(100, name='hidden')(RNN)
+dense = tf.keras.layers.Dense(1, name='target')(hidden)
+my_model = tf.keras.models.Model(inputs = [x_input], outputs = [dense])
+my_model.compile(optimizer='SGD', loss = 'binary_crossentropy')
+
+# Train model
+if use_TFDataset:
+    my_model.fit(dataset, epochs = 1, steps_per_epoch=n_data//BATCH_SIZE) # divide by BATCH_SIZE to keep the number of training steps the same
+else:
+    my_model.fit(x = my_data, y = my_targets, epochs = 1, batch_size= BATCH_SIZE)
+Other info / logs
+Include any logs or source code that would be helpful to diagnose the problem. If including tracebacks, please include the full traceback. Large logs and files should be attached.
+	</description>
+	<comments>
+		<comment id='1' author='andersjohanandreassen' date='2019-04-18T22:45:38Z'>
+		I could reproduce the issue with 2.0.0-alpha0. Even-though the time/step is little different from what you have listed above but the trend is similar. Thanks!
+		</comment>
+		<comment id='2' author='andersjohanandreassen' date='2019-04-25T20:57:20Z'>
+		I'm not able to reproduce your 22 ms/step results. I tweaked your example (just to add some extra logging):
+&lt;denchmark-code&gt;import functools
+import multiprocessing
+import timeit
+
+import numpy as np
+import tensorflow as tf
+
+use_eager     = True
+use_TFDataset = True
+
+# Explicitly set since 1.x and 2.0 have different defaults
+if use_eager:
+  tf.compat.v1.enable_eager_execution()
+else:
+  tf.compat.v1.disable_eager_execution()
+
+# Build dataset
+n_data = int(1e5)
+my_data = np.random.random((n_data,10,1))
+my_targets = np.random.randint(0,2,(n_data,1))
+data = ({'x_input':my_data}, {'target':my_targets})
+
+# Create tf.data.Dataset
+BATCH_SIZE = 10
+dataset = tf.data.Dataset.from_tensor_slices(data)
+dataset = dataset.batch(BATCH_SIZE)
+dataset = dataset.prefetch(1)
+
+#Build model
+x_input = tf.keras.layers.Input((None,1), name='x_input')
+RNN = tf.keras.layers.SimpleRNN(100, name='RNN')(x_input)
+hidden = tf.keras.layers.Dense(100, name='hidden')(RNN)
+dense = tf.keras.layers.Dense(1, name='target')(hidden)
+my_model = tf.keras.models.Model(inputs = [x_input], outputs = [dense])
+my_model.compile(optimizer='SGD', loss = 'binary_crossentropy')
+
+# Fit on one step to create a train_fn
+my_model.fit(dataset, epochs = 1, steps_per_epoch=1)
+
+TIME_IN_GRAPH = 0.
+def time_call(fn):
+  @functools.wraps(fn)
+  def timed_fn(*args, **kwargs):
+    fn_start_time = timeit.default_timer()
+    outputs = fn(*args, **kwargs)
+    call_time = timeit.default_timer() - fn_start_time
+    global TIME_IN_GRAPH
+    TIME_IN_GRAPH += call_time
+    return outputs
+  return timed_fn
+
+my_model.train_function = time_call(my_model.train_function)
+
+
+st = timeit.default_timer()
+
+# Train model
+if use_TFDataset:
+  my_model.fit(dataset, epochs = 1, steps_per_epoch=n_data//BATCH_SIZE) # divide by BATCH_SIZE to keep the number of training steps the same
+else:
+  my_model.fit(x = my_data, y = my_targets, epochs = 1, batch_size= BATCH_SIZE)
+run_time = timeit.default_timer() - st
+print("CPU count: {}".format(multiprocessing.cpu_count()))
+print("{:.1f} us / sample".format(run_time / n_data * 1e6))
+print("{:.1f}% of time spent in tf runtime".format(TIME_IN_GRAPH / run_time * 100))
+&lt;/denchmark-code&gt;
+
+And when I run in colab with tf-nightly-2.0-preview I get:
+&lt;denchmark-code&gt;10000/10000 [==============================] - 43s 4ms/step - loss: 0.7020
+CPU count: 2
+429.8 us / sample
+66.3% of time spent in tf runtime
+&lt;/denchmark-code&gt;
+
+and with use_eager=False:
+&lt;denchmark-code&gt;10000/10000 [==============================] - 32s 3ms/step - loss: 7.7126
+CPU count: 2
+320.2 us / sample
+82.9% of time spent in tf runtime
+&lt;/denchmark-code&gt;
+
+The % in runtime is measuring the time actually spent running the step; the other part is overhead from other bookkeeping in the run loop code. So you can see that the actual time to run the ops is very similar, and the eager path is just spending more time in Python. There are plans to optimize the run code, but 1-1.5 ms/step isn't terribly onerous so other things have taken priority.
+In general, it's hard to get good performance on tiny models because overheads dominate. If you increase the batch size to 100 you get:
+&lt;denchmark-code&gt;1000/1000 [==============================] - 7s 7ms/step - loss: 7.6920
+CPU count: 2
+70.6 us / sample
+77.9% of time spent in tf runtime
+&lt;/denchmark-code&gt;
+
+and batch_size=1000
+&lt;denchmark-code&gt;100/100 [==============================] - 4s 40ms/step - loss: 0.8114
+CPU count: 2
+40.5 us / sample
+90.7% of time spent in tf runtime
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='3' author='andersjohanandreassen' date='2019-04-25T22:02:29Z'>
+		If I install tensorflow with !pip install tensorflow==2.0.0-alpha0 in colab, I get similar performance to what I reported in the original post with use_eager=True:
+&lt;denchmark-code&gt;10000/10000 [==============================] - 185s 19ms/step - loss: 0.6997
+CPU count: 2
+1853.4 us / sample
+&lt;/denchmark-code&gt;
+
+However, if I install tensorflow with !pip install tf-nightly-2.0-preview which (as of Apr. 25) gives me tf version 2.0.0-dev20190424 I get the same performance as you with use_eager=True
+&lt;denchmark-code&gt;10000/10000 [==============================] - 35s 3ms/step - loss: 0.6998
+CPU count: 2
+349.6 us / sample
+&lt;/denchmark-code&gt;
+
+So it seems like this problem somehow must have been fixed between the version in 2.0.0-alpha0 and  2.0.0-dev20190424.
+		</comment>
+		<comment id='4' author='andersjohanandreassen' date='2019-04-25T22:30:49Z'>
+		So setting run_eagerly=use_eager in compile causes the 10x drop in tf-nightly-2.0-preview. (You'll have to remove the monkey patch on the execution function in my example, because it goes through a different path.)
+For context, when eager execution is enabled (in the global tensorflow context), keras will still try to encapsulate the model in a Graph and then use that Graph to create an eager function. However if it can't do that it will fall back to a pure eager mode. (That's what run_eagerly=True forces) So presumably what happened is that since the 2.0 preview was cut whatever was forcing the model out of pure eager mode has been fixed, so it can now take advantage of the fast path.
+I set the middle dense layer to have 1000000 units, and the difference dropped to ~20%, because at that point there is a lot more time spend doing matmuls in the c++ backend to amortize the extra overhead from not having a graph.
+I'm going to go ahead and close this since it seems to be fixed now. Thanks for the report!
+		</comment>
+		<comment id='5' author='andersjohanandreassen' date='2019-04-25T22:30:53Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=27472&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=27472&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

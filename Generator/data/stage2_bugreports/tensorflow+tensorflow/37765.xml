@@ -1,0 +1,211 @@
+<bug id='37765' author='DEKHTIARJonathan' open_date='2020-03-20T23:58:02Z' closed_time='2020-12-03T01:51:06Z'>
+	<summary>[Bug] TF 2.2.0rc0 fails with AMP and Horovod 0.19.1 in Keras compile &amp; fit</summary>
+	<description>
+With the recent changes in the Tensorflow Keras Optimizer API and Horovod. We did some testing and found that the following configuration was now broken:
+
+Tensorflow 2.2.0rc0
+Horovod 0.19.1
+AMP + Keras Model Compile &amp; Fit
+
+&lt;denchmark-link:https://github.com/sanjoy&gt;@sanjoy&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/pkanwar23&gt;@pkanwar23&lt;/denchmark-link&gt;
+ could we make sure to fix this one before TF 2.2.0 gets officially published ? It's still an RC release for now :)
+If needed you can use this docker container which contains the right set of dependency and based on the public TF2.2.0rc0 container:
+docker pull born2data/tensorflow:hvd-0.19.1_tf_2.2.0rc0
+Code to reproduce:
+mpirun \
+    -np 2 \
+    -H localhost:2 \
+    -bind-to none \
+    -map-by slot \
+    -x NCCL_DEBUG=VERSION \
+    -x LD_LIBRARY_PATH \
+    -x PATH \
+    -mca pml ob1 -mca btl ^openib \
+    --allow-run-as-root \
+    python main.py
+import tensorflow as tf
+import horovod.tensorflow.keras as hvd
+
+# Horovod: initialize Horovod.
+hvd.init()
+
+# Horovod: pin GPU to be used to process local rank (one GPU per process)
+gpus = tf.config.experimental.list_physical_devices('GPU')
+for gpu in gpus:
+    tf.config.experimental.set_memory_growth(gpu, True)
+if gpus:
+    tf.config.experimental.set_visible_devices(gpus[hvd.local_rank()], 'GPU')
+
+(mnist_images, mnist_labels), _ = \
+    tf.keras.datasets.mnist.load_data(path='mnist-%d.npz' % hvd.rank())
+
+dataset = tf.data.Dataset.from_tensor_slices(
+    (tf.cast(mnist_images[..., tf.newaxis] / 255.0, tf.float32),
+             tf.cast(mnist_labels, tf.int64))
+)
+dataset = dataset.repeat().shuffle(10000).batch(128)
+
+policy = tf.keras.mixed_precision.experimental.Policy('mixed_float16', 128)
+tf.keras.mixed_precision.experimental.set_policy(policy)
+
+mnist_model = tf.keras.Sequential([
+    tf.keras.layers.Conv2D(32, [3, 3], activation='relu'),
+    tf.keras.layers.Conv2D(64, [3, 3], activation='relu'),
+    tf.keras.layers.MaxPooling2D(pool_size=(2, 2)),
+    tf.keras.layers.Dropout(0.25),
+    tf.keras.layers.Flatten(),
+    tf.keras.layers.Dense(128, activation='relu'),
+    tf.keras.layers.Dropout(0.5),
+    tf.keras.layers.Dense(10, activation='softmax')
+])
+
+# Horovod: adjust learning rate based on number of GPUs.
+opt = tf.optimizers.Adam(0.001)
+
+# Horovod: add Horovod DistributedOptimizer.
+opt = hvd.DistributedOptimizer(opt)
+
+# Horovod: Specify `experimental_run_tf_function=False` to ensure TensorFlow
+# uses hvd.DistributedOptimizer() to compute gradients.
+mnist_model.compile(loss=tf.losses.SparseCategoricalCrossentropy(),
+                    optimizer=opt,
+                    metrics=['accuracy'],
+                    experimental_run_tf_function=False)
+
+callbacks = [
+    # Horovod: broadcast initial variable states from rank 0 to all other processes.
+    # This is necessary to ensure consistent initialization of all workers when
+    # training is started with random weights or restored from a checkpoint.
+    hvd.callbacks.BroadcastGlobalVariablesCallback(0),
+]
+
+# Train the model.
+# Horovod: adjust number of steps based on number of GPUs.
+mnist_model.fit(
+    dataset,
+    steps_per_epoch=500 // hvd.size(),
+    callbacks=callbacks,
+    epochs=24,
+    verbose=1 if hvd.rank() == 0 else 0
+)
+Error:
+    /usr/local/lib/python3.6/dist-packages/tensorflow/python/keras/engine/training.py:503 train_function  *
+        outputs = self.distribute_strategy.run(
+    /usr/local/lib/python3.6/dist-packages/tensorflow/python/distribute/distribute_lib.py:951 run  **
+        return self._extended.call_for_each_replica(fn, args=args, kwargs=kwargs)
+    /usr/local/lib/python3.6/dist-packages/tensorflow/python/distribute/distribute_lib.py:2290 call_for_each_replica
+        return self._call_for_each_replica(fn, args, kwargs)
+    /usr/local/lib/python3.6/dist-packages/tensorflow/python/distribute/distribute_lib.py:2649 _call_for_each_replica
+        return fn(*args, **kwargs)
+    /usr/local/lib/python3.6/dist-packages/tensorflow/python/keras/engine/training.py:473 train_step  **
+        _minimize(tape, self.optimizer, loss, self.trainable_variables)
+    /usr/local/lib/python3.6/dist-packages/tensorflow/python/keras/engine/training.py:1739 _minimize
+        optimizer.apply_gradients(zip(gradients, trainable_variables))
+    /usr/local/lib/python3.6/dist-packages/tensorflow/python/keras/mixed_precision/experimental/loss_scale_optimizer.py:232 apply_gradients
+        args=(grads_and_vars, name, all_reduce_sum_gradients))
+    /usr/local/lib/python3.6/dist-packages/tensorflow/python/distribute/distribute_lib.py:2420 merge_call
+        return self._merge_call(merge_fn, args, kwargs)
+    /usr/local/lib/python3.6/dist-packages/tensorflow/python/distribute/distribute_lib.py:2427 _merge_call
+        return merge_fn(self._strategy, *args, **kwargs)
+    /usr/local/lib/python3.6/dist-packages/tensorflow/python/keras/mixed_precision/experimental/loss_scale_optimizer.py:256 _apply_gradients_cross_replica  **
+        control_flow_ops.no_op)
+    /usr/local/lib/python3.6/dist-packages/tensorflow/python/framework/smart_cond.py:54 smart_cond
+        return true_fn()
+    /usr/local/lib/python3.6/dist-packages/tensorflow/python/keras/mixed_precision/experimental/loss_scale_optimizer.py:248 apply_fn
+        all_reduce_sum_gradients))
+    /usr/local/lib/python3.6/dist-packages/tensorflow/python/distribute/distribute_lib.py:2290 call_for_each_replica
+        return self._call_for_each_replica(fn, args, kwargs)
+    /usr/local/lib/python3.6/dist-packages/tensorflow/python/distribute/distribute_lib.py:2649 _call_for_each_replica
+        return fn(*args, **kwargs)
+    /usr/local/lib/python3.6/dist-packages/tensorflow/python/keras/mixed_precision/experimental/loss_scale_optimizer.py:262 _apply_gradients
+        name, all_reduce_sum_gradients)
+    /usr/local/lib/python3.6/dist-packages/horovod/_keras/__init__.py:73 apply_gradients
+        raise Exception('`apply_gradients()` was called without a call to '
+
+    Exception: `apply_gradients()` was called without a call to `get_gradients()` or `_aggregate_gradients`. If you're using TensorFlow 2.0, please specify `experimental_run_tf_function=False` in `compile()`.
+Please let me know how I can help
+CC: &lt;denchmark-link:https://github.com/nluehr&gt;@nluehr&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/reedwm&gt;@reedwm&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/tgaddair&gt;@tgaddair&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/cliffwoolley&gt;@cliffwoolley&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/omalleyt12&gt;@omalleyt12&lt;/denchmark-link&gt;
+ @houtoms
+	</description>
+	<comments>
+		<comment id='1' author='DEKHTIARJonathan' date='2020-03-21T00:05:14Z'>
+		Hmmm this is probably because LossScaleOptimizer doesn't define _HAS_ALL_REDUCE_SUM_GRAD. We should set _HAS_ALL_REDUCE_SUM_GRAD to True if the inner optimizer has set it to true.
+		</comment>
+		<comment id='2' author='DEKHTIARJonathan' date='2020-03-21T00:05:19Z'>
+		JFYI. &lt;denchmark-link:https://github.com/reedwm&gt;@reedwm&lt;/denchmark-link&gt;
+ By changing the loss_scale_optimizer.py as the following can solve the problem. But we are not sure if this is just a WAR.
+class LossScaleOptimizer(optimizer_v2.OptimizerV2):
+ ...
+ _HAS_ALL_REDUCE_SUM_GRAD = True
+ def _aggregate_gradients(self, grads_and_vars):
+   return self._optimizer._aggregate_gradients(grads_and_vars)
+ ...
+		</comment>
+		<comment id='3' author='DEKHTIARJonathan' date='2020-03-21T00:06:41Z'>
+		&lt;denchmark-link:https://github.com/reedwm&gt;@reedwm&lt;/denchmark-link&gt;
+ any chance we can get this small fix inside 2.2.0 ?
+		</comment>
+		<comment id='4' author='DEKHTIARJonathan' date='2020-03-21T00:06:44Z'>
+		Ah we commented at the same time. Yeah that would fix it but it should be set to True only if the inner optimizer defined it.
+I will fix.
+		</comment>
+		<comment id='5' author='DEKHTIARJonathan' date='2020-03-21T00:06:56Z'>
+		I will try very hard to cherrypick but I cannot promise anything
+		</comment>
+		<comment id='6' author='DEKHTIARJonathan' date='2020-03-21T00:07:24Z'>
+		Awesome, thanks a lot. Let us know if we can do anything to help ya
+		</comment>
+		<comment id='7' author='DEKHTIARJonathan' date='2020-03-24T20:19:43Z'>
+		&lt;denchmark-link:https://github.com/reedwm&gt;@reedwm&lt;/denchmark-link&gt;
+ Any good news ?
+		</comment>
+		<comment id='8' author='DEKHTIARJonathan' date='2020-03-24T20:47:58Z'>
+		In trying to fix this by adding , the mixed precision CentralStorageStrategy tests broke. We realized the  parameter has issues with CentralStorageStrategy. As a result, the the parameter was renamed to  in &lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/75ae7742abc027b001a5f3d7c020bb4504cc0f78&gt;75ae774&lt;/denchmark-link&gt;
+. The attribute has also been renamed to . You will have to make these changes in the Horovod optimizer.
+I'll disable the central storage tests, then add the _HAS_AGGREGATE_GRAD attribute, which should fix this.
+		</comment>
+		<comment id='9' author='DEKHTIARJonathan' date='2020-03-25T20:05:46Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/37765&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/37765&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='10' author='DEKHTIARJonathan' date='2020-03-25T20:57:24Z'>
+		This is not closed until &lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/bcfc1ba6798ced6889f579644c2c79515832d098&gt;bcfc1ba&lt;/denchmark-link&gt;
+ is cherrypicked into 2.2
+		</comment>
+		<comment id='11' author='DEKHTIARJonathan' date='2020-03-25T21:03:43Z'>
+		Thanks &lt;denchmark-link:https://github.com/reedwm&gt;@reedwm&lt;/denchmark-link&gt;
+ for your quick help.  appreciated ;)
+		</comment>
+		<comment id='12' author='DEKHTIARJonathan' date='2020-03-27T22:53:39Z'>
+		&lt;denchmark-link:https://github.com/reedwm&gt;@reedwm&lt;/denchmark-link&gt;
+ It seems we still get  error.
+Don't we need
+def _aggregate_gradients(self, grads_and_vars):
+   return self._optimizer._aggregate_gradients(grads_and_vars)
+in class LossScaleOptimizer to pass the gradients aggregation to the wrapped optimizer? After I add these two lines, the problem is gone.
+		</comment>
+		<comment id='13' author='DEKHTIARJonathan' date='2020-03-28T01:35:08Z'>
+		Good point, we need to define _aggregate_gradients if the LossScaleOptimizer wraps the DistributedOptimizer, as is done in the example. If the LossScaleOptimizer wraps the DistributedOptimizer, everything should work fine.
+I'll try to cherry-pick the fix in, but 2.2rc2 is already released so there's a good chance I won't be able to. Also try testing with that fix in and let me know if there are any other fixes that are needed.
+		</comment>
+		<comment id='14' author='DEKHTIARJonathan' date='2020-04-14T21:04:42Z'>
+		&lt;denchmark-link:https://pypi.org/project/tensorflow/2.2.0rc3/#files&gt;2.2.0-rc3&lt;/denchmark-link&gt;
+ is now released, @houtoms can you please check ?
+		</comment>
+		<comment id='15' author='DEKHTIARJonathan' date='2020-12-03T01:51:08Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/37765&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/37765&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

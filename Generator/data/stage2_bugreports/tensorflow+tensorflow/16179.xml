@@ -1,0 +1,255 @@
+<bug id='16179' author='iliTheFallen' open_date='2018-01-17T06:43:45Z' closed_time='2018-06-10T18:33:00Z'>
+	<summary>ProfilerHook and loading libcupti.so cause Ubuntu to completely freeze</summary>
+	<description>
+
+OS Platform and Distribution: Ubuntu 14.04 LTE
+TensorFlow version: 1.14
+Bazel version: 0.9.0
+CUDA/cuDNN version: 8.0/7.0.5
+GPU model and memory: GeForce GTX1060 - 6070MB
+Exact command to reproduce: python3.4 -m music_modeling
+--
+
+I added "ProfilerHook" to Estimator for recording GPU memory consumption; but it always causes my Ubuntu to freeze indefinitely and Ubuntu never makes away with it.
+Here is the source code:
+&lt;denchmark-code&gt;import tensorflow as tf
+
+from tensorflow.python.layers.core import dense
+from tensorflow.python import debug as tf_debug
+
+from data.music_data_reader import MusicDataReader
+from model.tf_msa_rnn import dynamic_msa_rnn
+
+
+FLAGS = tf.app.flags.FLAGS
+tf.app.flags.DEFINE_string("mode", tf.estimator.ModeKeys.TRAIN,
+                           """"Is training or testing mode""")
+tf.app.flags.DEFINE_string("model_dir", './msa_model',
+                           """"Directory in where checkpoints are stored""")
+tf.app.flags.DEFINE_integer("batch_size", 20,
+                            """Number of samples in a batch""")
+tf.app.flags.DEFINE_integer("num_epochs", 100,
+                            """"How many times the whole training set has to be fed into network""")
+tf.app.flags.DEFINE_string("log_directory", './log_dir',
+                           """"Directory in where logs and checkpoints are stored""")
+# *************************************
+# *************************************Configuration options for the network
+# *************************************
+tf.app.flags.DEFINE_integer("num_units", 30,
+                            """"# of hidden units in an LSTM cell""")
+tf.app.flags.DEFINE_integer("num_msa_feats", 10,
+                            """"# of MS features to be learned""")
+tf.app.flags.DEFINE_integer("signal_len", 100,
+                            """"Length of the signal at a time to be processed by 
+                                multi-scale analyzer
+                            """)
+tf.app.flags.DEFINE_integer("dim_pitch", 88,
+                            """"# of hidden units in an LSTM cell""")
+# *************************************
+# *************************************Configuration options for dataset
+# *************************************
+tf.app.flags.DEFINE_string("dir_path",
+                           './music_samples/MuseData',
+                           """"Absolute path to the music files for reading training/testing samples""")
+tf.app.flags.DEFINE_integer("pitch_low",
+                            21,
+                            """"Low pitch value""")
+tf.app.flags.DEFINE_integer("pitch_high",
+                            109,
+                            """"High pitch value""")
+tf.app.flags.DEFINE_float("dt",
+                          0.3,
+                          """"Not sure yet...""")
+
+
+def loss_fn(y_pred, y_true):
+    '''
+
+    :param y_pred: Logits predicted by the model
+    :param y_true: Correct values corresponding each prediction
+    :return:
+    '''
+
+    y_pred = tf.log(tf.nn.softmax(y_pred, name="probs_tensor"))  # [BSxMTxOS] -- Probabilities
+    p_trun = y_pred[:, 0:-1, ...]  # x'[1], x'[2], ..., x'[N-1]
+    t_trun = y_true[:, 1:, ...]  # x[1], x[2], ..., x[N-1]
+    loss = tf.reduce_sum(p_trun*t_trun, axis=2)  # [BSxMT] -- Dot product between 3rd dimensions
+    loss = tf.reduce_mean(loss, name="piano_roll_loss")  # loss function -- returns a scalar
+    tf.summary.scalar("loss_fn", loss)  # Add summary for the loss
+    loss = tf.Print(loss, [loss], "Loss: ")
+    return loss
+
+
+def model_fn(features,
+             mode=tf.estimator.ModeKeys.TRAIN,
+             params=None):
+
+    print("Creating Model...")
+    input_ph = tf.reshape(features['input_ph'], [FLAGS.batch_size, params['max_seq'], FLAGS.dim_pitch])
+    seq_len_ph = tf.reshape(features['seq_len_ph'], [FLAGS.batch_size])
+    outputs, state = dynamic_msa_rnn(FLAGS.batch_size,
+                                     input_ph,
+                                     seq_len_ph,
+                                     params['max_seq'],
+                                     FLAGS.signal_len,
+                                     [20, 10],  # Number of filters per layer
+                                     [11, 13],  # Kernel size for each layer
+                                     [3],  # Pooling size for each layer
+                                     FLAGS.num_msa_feats,
+                                     FLAGS.num_units,
+                                     activation=tf.nn.tanh,
+                                     initializer=tf.glorot_normal_initializer())  # [BSxMTxOS], [BSxSS]
+    # Create fully connected layer to generate output for piano keys
+    outs = dense(outputs,
+                 FLAGS.dim_pitch,
+                 kernel_initializer=tf.glorot_normal_initializer())  # BSxMTxID
+    loss = loss_fn(outs, features['input_ph'])
+    print("Creating Estimator Spec for %s ..." % mode)
+    # For training
+    if mode == tf.estimator.ModeKeys.TRAIN:
+        optimizer = tf.train.AdamOptimizer()
+        train_op = optimizer.minimize(loss, global_step=tf.train.get_global_step())
+        return tf.estimator.EstimatorSpec(mode=mode,
+                                          loss=loss,
+                                          train_op=train_op)
+    # For evaluation
+    eval_metric_ops = {
+        "accuracy": tf.metrics.accuracy(
+            labels=tf.argmax(features['input_ph'][:, 1:, ...], axis=-1),
+            predictions=tf.argmax(outs[:, 0:-1, ...], axis=-1)
+        )
+    }
+    return tf.estimator.EstimatorSpec(mode=mode,
+                                      loss=loss,
+                                      eval_metric_ops=eval_metric_ops)
+
+
+def do_train(tr_data, vl_data):
+
+    # Create Estimator
+    sess_conf = tf.ConfigProto(allow_soft_placement=True, log_device_placement=False)
+    sess_conf.gpu_options.allow_growth = True
+    config = tf.estimator.RunConfig(model_dir=FLAGS.model_dir,  # CheckpointSaverHook
+                                    save_checkpoints_steps=100,  # CheckpointSaverHook
+                                    log_step_count_steps=10,  # SummarySaverHook
+                                    session_config=sess_conf)
+    music_classifier = tf.estimator.Estimator(model_fn,
+                                              config=config,
+                                              params={'max_seq': tr_data.max_seq})
+    # Prepare input data
+    tr_input_fn = tf.estimator.inputs.numpy_input_fn(
+        {'input_ph': tr_data.data, 'seq_len_ph': tr_data.seq_len},
+        batch_size=FLAGS.batch_size,
+        num_epochs=FLAGS.num_epochs,
+        num_threads=1,
+        shuffle=True
+    )
+    # Extra Hooks
+    logging_hook = tf.train.LoggingTensorHook(
+        tensors={'probabilities': 'probs_tensor'},
+        every_n_secs=60
+    )
+    # debugging_hook = tf_debug.LocalCLIDebugHook(thread_name_filter="MainThread$", dump_root="./dump")
+    profiler_hook = tf.train.ProfilerHook(save_steps=1,
+                                          output_dir="./profile",
+                                          show_dataflow=False,
+                                          show_memory=True)
+    # Train
+    music_classifier.train(tr_input_fn, hooks=[profiler_hook])
+    print("Training is over...")
+
+
+def do_test(te_data):
+
+    print("Start testing...")
+
+
+def main(_):
+
+    if FLAGS.mode == tf.estimator.ModeKeys.TRAIN:
+        tr_data = MusicDataReader(FLAGS.dir_path,
+                                  'train',
+                                  (FLAGS.pitch_low, FLAGS.pitch_high),
+                                  FLAGS.dt)
+        vl_data = MusicDataReader(FLAGS.dir_path,
+                                  'valid',
+                                  (FLAGS.pitch_low, FLAGS.pitch_high),
+                                  FLAGS.dt)
+        print("Number of training samples: %d" % tr_data.data_num)
+        print("Number of validation samples: %d" % vl_data.data_num)
+        do_train(tr_data, vl_data)
+    else:
+        te_data = MusicDataReader(FLAGS.dir_path,
+                                  'test',
+                                  (FLAGS.pitch_low, FLAGS.pitch_high),
+                                  FLAGS.dt,)
+        print("Number of testing samples: %d" % te_data.data_num)
+        do_test(te_data)
+
+
+if __name__ == "__main__":
+    tf.app.run(main=main)
+&lt;/denchmark-code&gt;
+
+I cannot attach the output of my console for it is impossible due to the indefinite freezing of my Ubuntu. All I can say is that it tells me that it loads libcupti.so and computes a step of training process. Then, everything totally messes up.
+Thank you for your support in advance.
+	</description>
+	<comments>
+		<comment id='1' author='iliTheFallen' date='2018-01-17T21:40:05Z'>
+		&lt;denchmark-link:https://github.com/ispirmustafa&gt;@ispirmustafa&lt;/denchmark-link&gt;
+, &lt;denchmark-link:https://github.com/martinwicke&gt;@martinwicke&lt;/denchmark-link&gt;
+, it seems like there is a deadlock when using the ProfilerHook. On the other hand the documentation of ProfilerHook implies it was designed for monitored session, so perhaps it is not supported. Please take a look.
+		</comment>
+		<comment id='2' author='iliTheFallen' date='2018-01-18T07:14:42Z'>
+		&lt;denchmark-link:https://github.com/aselle&gt;@aselle&lt;/denchmark-link&gt;
+ I've checked out the source code and it creates a  wrapped with 3-4 more different session wrappers in a nested fashion.
+Oh Btw. Upon request, I can use my phone in order to capture a screenshot for you to see the output of execution.
+		</comment>
+		<comment id='3' author='iliTheFallen' date='2018-02-06T07:36:32Z'>
+		Nagging Awaiting TensorFlower: It has been 14 days with no activity and the awaiting tensorflower label was assigned. Please update the label and/or status accordingly.
+		</comment>
+		<comment id='4' author='iliTheFallen' date='2018-02-08T13:39:47Z'>
+		Hi,
+I have the same problem in Tensorflow 1.5, when I try to use ProfilerHook, and I launch:
+my_model.train(...)
+my jupyter notebook kernel dies instantaneously. Is there a workaround I can use ?
+Thanks
+		</comment>
+		<comment id='5' author='iliTheFallen' date='2018-02-23T13:58:18Z'>
+		Nagging Awaiting TensorFlower: It has been 14 days with no activity and the awaiting tensorflower label was assigned. Please update the label and/or status accordingly.
+		</comment>
+		<comment id='6' author='iliTheFallen' date='2018-03-10T13:12:16Z'>
+		Nagging Awaiting TensorFlower: It has been 14 days with no activity and the awaiting tensorflower label was assigned. Please update the label and/or status accordingly.
+		</comment>
+		<comment id='7' author='iliTheFallen' date='2018-03-25T12:36:03Z'>
+		Nagging TensorFlower: It has been 14 days with no activity and the awaiting tensorflower label was assigned. Please update the label and/or status accordingly.
+		</comment>
+		<comment id='8' author='iliTheFallen' date='2018-03-28T01:09:14Z'>
+		Assigning to &lt;denchmark-link:https://github.com/ispirmustafa&gt;@ispirmustafa&lt;/denchmark-link&gt;
+ who worked on ProfilerHook.
+Also &lt;denchmark-link:https://github.com/iliTheFallen&gt;@iliTheFallen&lt;/denchmark-link&gt;
+, can you provide a short example that reproduces the problem? It's very difficult to debug long examples, so try making the example as short as possible.
+		</comment>
+		<comment id='9' author='iliTheFallen' date='2018-04-05T01:30:18Z'>
+		&lt;denchmark-link:https://github.com/iliTheFallen&gt;@iliTheFallen&lt;/denchmark-link&gt;
+, it sounds like the machine might be running out of RAM. Do you know if that is happening?
+Using profiling &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/r1.7/tensorflow/python/training/basic_session_run_hooks.py#L878&gt;turns on FULL_TRACE&lt;/denchmark-link&gt;
+, which will take some extra memory. You could try turning the trace level down (by &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/r1.7/tensorflow/python/training/basic_session_run_hooks.py#L878&gt;editing the code&lt;/denchmark-link&gt;
+) to one of the lower levels, like &lt;denchmark-link:https://www.tensorflow.org/api_docs/python/tf/RunOptions&gt;SOFTWARE_TRACE&lt;/denchmark-link&gt;
+.
+		</comment>
+		<comment id='10' author='iliTheFallen' date='2018-04-19T18:59:18Z'>
+		Nagging Assignee &lt;denchmark-link:https://github.com/ispirmustafa&gt;@ispirmustafa&lt;/denchmark-link&gt;
+: It has been 14 days with no activity and this issue has an assignee. Please update the label and/or status accordingly.
+		</comment>
+		<comment id='11' author='iliTheFallen' date='2018-05-04T18:41:48Z'>
+		It has been 14 days with no activity and the awaiting response label was assigned. Is this still an issue?
+		</comment>
+		<comment id='12' author='iliTheFallen' date='2018-05-27T02:56:12Z'>
+		It has been 36 days with no activity and the awaiting response label was assigned. Is this still an issue?
+		</comment>
+		<comment id='13' author='iliTheFallen' date='2018-06-10T18:50:10Z'>
+		We are closing this issue for now due to lack of activity. Please comment if this is still an issue for you. Thanks!
+		</comment>
+	</comments>
+</bug>

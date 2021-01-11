@@ -1,0 +1,101 @@
+<bug id='17106' author='ankitvgupta' open_date='2018-02-18T10:26:50Z' closed_time='2018-03-26T18:37:45Z'>
+	<summary>Bug: tf.dynamic_partition appears to produce bad outputs on GPU (0s appended) (TF 1.5/1.6)</summary>
+	<description>
+&lt;denchmark-h:h3&gt;System information&lt;/denchmark-h&gt;
+
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): Yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Linux Ubuntu 16
+TensorFlow installed from (source or binary): Pip installed 1.5 and 1.6rc0
+TensorFlow version (use command below): 1.5 and 1.6rc0
+Python version: 3.6
+Bazel version (if compiling from source): N/A
+GCC/Compiler version (if compiling from source): N/A
+CUDA/cuDNN version: 9
+GPU model and memory: nvidia k80
+Exact command to reproduce:
+
+&lt;denchmark-code&gt;import tensorflow as tf
+import numpy as np
+x  = tf.constant(np.random.randn(3072))
+inds = [0]*189 + [1]*184 + [2]*184 + [3]*191 + [4]*192 + [5]*195 + [6]*195 + [7]*195 + [8]*188 + [9]*195 + [10]*188 + [11]*202 + [12]*194 + [13]*194 + [14]*194 + [15]*192
+assert(len(inds) == 3072)
+partitioned = tf.dynamic_partition(x, inds, 16)
+sess = tf.InteractiveSession()
+res = sess.run(partitioned)
+print(res[-1].shape) # This should be (192,) but is (198,)
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h3&gt;Describe the problem&lt;/denchmark-h&gt;
+
+There appears to be a bug with tf.dynamic_partition. When I run the above commands, I see that there are some extra 0s appended to the final partitioned value, and its shape is incorrect - I'm not sure why.
+I checked that this problem does not appear to occur with Tensorflow 1.4, but does occur with Tensorflow 1.5/1.6rc0 on their GPU versions. It does NOT appear to have any issue in the CPU version of Tensorflow 1.5/1.6rc0. I was able to reproduce the error on two separate computers with GPUs.
+This  be related to &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/16872&gt;#16872&lt;/denchmark-link&gt;
+.
+&lt;denchmark-h:h3&gt;Source code / logs&lt;/denchmark-h&gt;
+
+Include any logs or source code that would be helpful to diagnose the problem. If including tracebacks, please include the full traceback. Large logs and files should be attached. Try to provide a reproducible test case that is the bare minimum necessary to generate the problem.
+	</description>
+	<comments>
+		<comment id='1' author='ankitvgupta' date='2018-02-22T02:31:41Z'>
+		Thanks for the report.
+The GPU kernel for dynamic partition was introduced in TensorFlow 1.5 via &lt;denchmark-link:https://github.com/tensorflow/tensorflow/pull/13905&gt;#13905&lt;/denchmark-link&gt;
+ - seems like there is a bug. &lt;denchmark-link:https://github.com/codrut3&gt;@codrut3&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/ekelsen&gt;@ekelsen&lt;/denchmark-link&gt;
+ - mind taking a look?
+(This problem isn't visible in TensorFlow 1.4 since it didn't have a GPU kernel for the DynamicPartition op and thus that would always execute on CPU. The CPU kernel is seemingly fine)
+		</comment>
+		<comment id='2' author='ankitvgupta' date='2018-02-22T16:32:38Z'>
+		I've also run into a problem with dynamic partition for TensorFlow 1.5. I'll try to illustrate it as best as I can in code below.
+&lt;denchmark-code&gt;padding_mask = tf.where(tf.not_equal(Zs, 0))
+dxyzs = tf.expand_dims(xyzs, axis=2) - tf.expand_dims(xyzs, axis=1)
+dxyzs = tf.gather_nd(dxyzs, padding_mask)
+dist_tensor = tf.norm(dxyzs, axis=-1)
+gauss = tf_gauss(dist_tensor, gauss_params)
+harmonics = tf_spherical_harmonics(dxyzs, dist_tensor, l_max)
+channel_scatter = tf.gather(tf.equal(tf.expand_dims(Zs, axis=-1), elements), padding_mask[:,0])
+channel_scatter = tf.where(channel_scatter, tf.ones_like(channel_scatter)), tf.zeros_like(channel_scatter)))
+channel_gauss = tf.expand_dims(gauss, axis=-2) * tf.expand_dims(channel_scatter, axis=-1)
+channel_harmonics = tf.expand_dims(harmonics, axis=-2) * tf.expand_dims(channel_scatter, axis=-1)
+embeds = tf.reshape(tf.einsum('ijkg,ijkl-&gt;ikgl', channel_gauss, channel_harmonics), [tf.shape(padding_mask)[0], -1])
+partition_idx = tf.cast(tf.where(tf.equal(tf.expand_dims(tf.gather_nd(Zs, padding_mask), axis=-1), tf.expand_dims(elements, axis=0)))[:,1], tf.int32)
+embeds = tf.dynamic_partition(embeds, partition_idx, num_elements)
+mol_idx = tf.dynamic_partition(padding_mask, partition_idx, num_elements)
+&lt;/denchmark-code&gt;
+
+So dxyzs is gathered according to padding_mask on line 3 which gives them the same first dimension sizes. The rest of the code here preserves that same first dimension up through the einsum on line 11. Line 12 defines my partitioning indices for dynamic partition which is then used for both lines 12 and 13. So embeds and mol_idx should each be a list of tensors where every tensor in embeds has the same size first dimension as every corresponding tensor in mol_idx.
+The issue is that the last tensor in embeds and mol_idx do not always (but sometimes do) have the same first dimension. This never occurs for me with any of the other tensors in each list. I haven't figured out whether or not the one with the wrong dimension size is from embeds or mol_idx (or both) for sure since these sizes will vary based on the batch, but I very strongly suspect it is from mol_idx based on typical sizes when the error does not occur. One possible cause may be the difference in dtypes. embeds contains tensors of either float32 or float64, and mol_idx contains tensors of int32. I haven't checked whether this occurs if mol_idx is int64 yet.
+The same problem does not happen in Tensorflow &lt;=1.4, and putting the dynamic partition ops on the cpu manually does fix this issue for me. Hope this helps.
+		</comment>
+		<comment id='3' author='ankitvgupta' date='2018-02-22T17:08:34Z'>
+		Hi &lt;denchmark-link:https://github.com/ankitvgupta&gt;@ankitvgupta&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/jeherr&gt;@jeherr&lt;/denchmark-link&gt;
+,
+Thank you for reporting the bug(s)! I will look into it, but I am a bit busy right now and it might take me a couple days to figure out what is happening.
+		</comment>
+		<comment id='4' author='ankitvgupta' date='2018-02-23T02:21:09Z'>
+		This is due to a bug in CUB that is fixed by updating to the latest version.  This will happen soon and be shortly after.
+		</comment>
+		<comment id='5' author='ankitvgupta' date='2018-02-23T22:42:36Z'>
+		A fix to update CUB has been submitted internally and should sync to github shortly.
+The 1.6 final release will contain this updated CUB version I believe, which will fix the problem.
+		</comment>
+		<comment id='6' author='ankitvgupta' date='2018-02-23T23:13:47Z'>
+		&lt;denchmark-link:https://github.com/asimshankar&gt;@asimshankar&lt;/denchmark-link&gt;
+ Thanks so much! This is great news. Any estimate on when the final 1.6 release will be?
+		</comment>
+		<comment id='7' author='ankitvgupta' date='2018-03-10T13:11:57Z'>
+		Nagging Assignee &lt;denchmark-link:https://github.com/ekelsen&gt;@ekelsen&lt;/denchmark-link&gt;
+: It has been 14 days with no activity and this issue has an assignee. Please update the label and/or status accordingly.
+		</comment>
+		<comment id='8' author='ankitvgupta' date='2018-03-25T12:34:20Z'>
+		Nagging Assignee &lt;denchmark-link:https://github.com/ekelsen&gt;@ekelsen&lt;/denchmark-link&gt;
+: It has been 14 days with no activity and this issue has an assignee. Please update the label and/or status accordingly.
+		</comment>
+		<comment id='9' author='ankitvgupta' date='2018-03-26T18:37:45Z'>
+		Closing since this was fixed by 1.6.0's final release thanks to the upgrade to the CUB library version.
+Please feel free t reopen if I'm mistaken.
+Thanks
+		</comment>
+	</comments>
+</bug>

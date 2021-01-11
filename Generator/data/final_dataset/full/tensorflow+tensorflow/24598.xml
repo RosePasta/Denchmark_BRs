@@ -1,0 +1,135 @@
+<bug_data>
+<bug id='24598' author='ufukcbicici' open_date='2018-12-27T11:53:09Z' closed_time='2018-12-28T00:12:24Z'>
+ 	<summary>Potential tf.boolean_mask bug when the mask array is empty</summary>
+ 	<description>
+ System information
+ 
+ OS Platform and Distribution : Windows 10
+ TensorFlow installed from (source or binary): Binary
+ TensorFlow version (use command below): 1.11.0
+ Python version: 3.6.6
+ CUDA/cuDNN version: V8.0.60
+ GPU model and memory: Geforce GTX 1070 8GB
+ 
+ 
+ I have actually experiencing almost the similar problem like in thread:  &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/24585&gt;#24585&lt;/denchmark-link&gt;
+ 
+ Again, I want to partition a minibatch into different parts, process them in parallel using different computation units and then stitch them back together. However this time I used  instead of  for the partition operation, since the latter runs into problems when one of the partitions is empty. This code is below (it is copy&amp;paste reproducible):
+ &lt;denchmark-code&gt;import tensorflow as tf
+ import numpy as np
+ 
+ 
+ def build_conv_layer(input, filter_size, num_of_input_channels, num_of_output_channels, name_suffix=""):
+     # OK
+     conv_weights = tf.Variable(
+         tf.truncated_normal([filter_size, filter_size, num_of_input_channels, num_of_output_channels],
+                             stddev=0.1, dtype=tf.float32))
+     # OK
+     conv_biases = tf.Variable(
+         tf.constant(0.1, shape=[num_of_output_channels], dtype=tf.float32))
+     conv = tf.nn.conv2d(input, conv_weights, strides=[1, 1, 1, 1], padding='SAME')
+     relu = tf.nn.relu(tf.nn.bias_add(conv, conv_biases))
+     pool = tf.nn.max_pool(relu, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1], padding='SAME')
+     return pool
+ 
+ 
+ batch_size = 250
+ child_count = 3
+ channel_count = 32
+ 
+ dataTensor = tf.placeholder(tf.float32, shape=(None, 28, 28, 1), name="dataTensor")
+ indices_tensor = tf.placeholder(name="indices_tensor", dtype=tf.int32)
+ batch_size_tensor = tf.placeholder(name="batch_size_tensor", dtype=tf.int32)
+ 
+ condition_indices_list = []
+ partition_list = []
+ mask_list = []
+ for child_index in range(child_count):
+     mask_indices = tf.reshape(indices_tensor[:, child_index], [-1])
+     condition_indices = tf.boolean_mask(tf.range(batch_size_tensor), mask_indices)
+     partition = tf.boolean_mask(dataTensor, mask_indices)
+     mask_list.append(mask_indices)
+     condition_indices_list.append(condition_indices)
+     partition_list.append(partition)
+ 
+ transformed_list = [build_conv_layer(input=part, filter_size=5, num_of_input_channels=1, num_of_output_channels=32)
+                     for part in partition_list]
+ squared_list = [tf.square(part) for part in partition_list]
+ stitched_conv_transform = tf.dynamic_stitch(indices=condition_indices_list, data=transformed_list)
+ stitched_square_transform = tf.dynamic_stitch(indices=condition_indices_list, data=squared_list)
+ sum = tf.reduce_sum(stitched_square_transform)
+ grads = tf.gradients(sum, dataTensor)
+ 
+ sess = tf.Session()
+ samples = np.random.uniform(size=(batch_size, 28, 28, 1))
+ indices_arr = np.zeros(shape=(batch_size, child_count), dtype=np.int32)
+ indices_arr[:, 0] = 1
+ indices_arr[-2] = np.array([0, 1, 0])
+ indices_arr[-1] = np.array([0, 1, 0])
+ 
+ feed_dict = {dataTensor: samples,
+              batch_size_tensor: batch_size,
+              # indices_tensor: np.argmax(np.random.uniform(size=(GlobalConstants.EVAL_BATCH_SIZE, child_count)), axis=1)}
+              indices_tensor: indices_arr}
+ outputs = []
+ outputs.extend(mask_list)
+ outputs.extend(transformed_list)
+ outputs.extend(squared_list)
+ outputs.append(stitched_conv_transform)
+ outputs.append(stitched_square_transform)
+ outputs.append(sum)
+ outputs.append(grads)
+ 
+ init = tf.global_variables_initializer()
+ sess.run(init)
+ for i in range(10000):
+     results = sess.run(outputs, feed_dict=feed_dict)
+     assert np.allclose(results[-1][0], 2.0*samples)
+     print("{0} runned.".format(i))
+ &lt;/denchmark-code&gt;
+ 
+ To my disappointment, tf.boolean_mask runs into a similar problem, when indices_arr  contains no references to at least one partition and it produces an empty array for that partition as the result. The for loop in the end runs correctly a few times but then the program crashes with the following error:
+ 
+ InternalError (see above for traceback): WhereOp: Could not launch cub::DeviceReduce::Sum to count number of true / nonzero indices.  temp_storage_bytes: 1, status: invalid configuration argument
+ [[{{node boolean_mask/Where}} = WhereT=DT_INT32, _device="/job:localhost/replica:0/task:0/device:GPU:0"]]
+ [[{{node DynamicStitch/_49}} = _Recvclient_terminated=false, recv_device="/job:localhost/replica:0/task:0/device:CPU:0", send_device="/job:localhost/replica:0/task:0/device:GPU:0", send_device_incarnation=1, tensor_name="edge_259_DynamicStitch", tensor_type=DT_FLOAT, _device="/job:localhost/replica:0/task:0/device:CPU:0"]]
+ 
+ I think this is the same error underlying the problem in &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/24585&gt;#24585&lt;/denchmark-link&gt;
+  where it crashes when  receives an empty index array since they could be using the same mechanism in the cub library (or whatever cub is). The  error also occurs after a few succesfull iterations like this one. What could be the reason here?
+ 	</description>
+ 	<comments>
+ 		<comment id='1' author='ufukcbicici' date='2018-12-27T22:16:21Z'>
+ 		I was able to run your code snippet successfully on cpu however interestingly it failed computing on gpu.
+ 		</comment>
+ 		<comment id='2' author='ufukcbicici' date='2018-12-27T23:39:30Z'>
+ 		Indeed this is a bug, fixed by pinning Where to the CPU. I'm submitting a patch soon.
+ 		</comment>
+ 		<comment id='3' author='ufukcbicici' date='2018-12-28T06:12:11Z'>
+ 		Thank you &lt;denchmark-link:https://github.com/alextp&gt;@alextp&lt;/denchmark-link&gt;
+  . How can I get the fix now?
+ 		</comment>
+ 	</comments>
+ </bug>
+<commit id='961e9f4505dff0c5a91d12b1f4e476b3cf2d295d' author='Alexandre Passos' date='2018-12-27 16:10:57-08:00'>
+ 	<dmm_unit complexity='1.0' interfacing='1.0' size='0.0'></dmm_unit>
+ 	<modification change_type='MODIFY' old_name='tensorflow\core\kernels\where_op.cc' new_name='tensorflow\core\kernels\where_op.cc'>
+ 		<file_info nloc='211' complexity='16' token_count='1442'></file_info>
+ 		<method name='tensorflow::WhereCPUOp::Compute' parameters='context'>
+ 				<method_info nloc='41' complexity='1' token_count='265' nesting_level='2' start_line='128' end_line='189'></method_info>
+ 			<added_lines>140,141,142,143</added_lines>
+ 			<deleted_lines>140,141</deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines>373,374,375,376,377,378</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='tensorflow\core\kernels\where_op.h' new_name='tensorflow\core\kernels\where_op.h'>
+ 		<file_info nloc='23' complexity='0' token_count='125'></file_info>
+ 		<modified_lines>
+ 			<added_lines></added_lines>
+ 			<deleted_lines>30</deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ </commit>
+</bug_data>

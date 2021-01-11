@@ -1,0 +1,175 @@
+<bug id='40187' author='AlexanderJLiu' open_date='2020-06-05T10:28:36Z' closed_time='2020-08-28T04:14:05Z'>
+	<summary>When using batch normalization layer in distributed training, saved model couldn't be used to predict or serve in tfserving</summary>
+	<description>
+System information
+
+Have I written custom code: YES
+OS Platform and Distribution: WIN 10
+TensorFlow installed from: pip
+TensorFlow version: 2.2.0
+Python version:3.7.7
+CPU ONLY
+
+Describe the current behavior
+When using batch normalization layer (eithor SyncBatchNormalization or BatchNormalization)  in MultiWorkerMirroredStrategy distributed training, training process works well, and model could be saved as well.
+But when I tried to load the model (keras.models.load_model) to predict, it would raise error. And when I tried to use saved_model_cli run or tfserving for predicting, it will hang and get no response.
+Standalone code to reproduce the issue
+Note that I don't know how to use MultiWorkerMirroredStrategy in colab, so I just give the reproduce steps here, and it's very easy.
+
+Training Code (worker.py)
+
+import os
+import json
+
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+from absl import app, flags
+import numpy as np
+
+FLAGS = flags.FLAGS
+flags.DEFINE_string("logs", "logs", "logs dir")
+flags.DEFINE_integer("index", 0, "worker index")
+
+
+class ThreeLayerMLP(keras.Model):
+    def __init__(self, name=None):
+        super().__init__(name=name)
+        self.dense_1 = layers.Dense(32, activation='relu', name='dense_1')
+        self.bn = layers.experimental.SyncBatchNormalization()
+        self.dense_2 = layers.Dense(16, activation='relu', name='dense_2')
+        self.pred_layer = layers.Dense(
+            1,
+            activation='sigmoid',
+            name='predictions',
+        )
+
+    def call(self, inputs, training=None):
+        print(inputs.shape)
+        x = self.dense_1(inputs)
+        x = self.bn(x)
+        x = self.dense_2(x)
+        return self.pred_layer(x)
+
+
+def prepare_data():
+    np.random.seed(0)
+    x_train, y_train = (
+        np.random.random((6000, 32)),
+        np.random.randint(2, size=(6000, 1)),
+    )
+
+    x_val, y_val = (
+        np.random.random((1000, 32)),
+        np.random.randint(2, size=(1000, 1)),
+    )
+
+    return ((x_train, y_train), (x_val, y_val))
+
+
+def main(argv):
+    del argv  # Unused args
+    tf_config = {
+        "cluster": {
+            "worker": ["localhost:12345", "localhost:12346"],
+        },
+        "task": {
+            "index": FLAGS.index,
+            "type": "worker"
+        }
+    }
+    os.environ["TF_CONFIG"] = json.dumps(tf_config)
+    print(json.loads(os.environ["TF_CONFIG"]))
+
+    # distributed strategy
+    strategy = tf.distribute.experimental.MultiWorkerMirroredStrategy()
+    BATCH_SIZE_PER_REPLICA = 64
+    BATCH_SIZE = BATCH_SIZE_PER_REPLICA * strategy.num_replicas_in_sync
+    print('Number of devices: %d' % strategy.num_replicas_in_sync)
+
+    with strategy.scope():
+        model = ThreeLayerMLP(name='3_layer_mlp')
+        model.compile(
+            loss=tf.keras.losses.BinaryCrossentropy(),
+            optimizer=keras.optimizers.RMSprop(),
+            metrics=["AUC"],
+        )
+
+    tensorboard_callback = tf.keras.callbacks.TensorBoard(
+        log_dir=FLAGS.logs,
+        histogram_freq=1,
+        update_freq='batch',
+    )
+
+    checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
+        filepath=os.path.join(FLAGS.logs, "checkpoints", "ckpt"), )
+
+    ((x_train, y_train), (x_val, y_val)) = prepare_data()
+
+    model.fit(
+        x_train,
+        y_train,
+        epochs=1,
+        batch_size=BATCH_SIZE,
+        validation_data=(x_val, y_val),
+        callbacks=[tensorboard_callback, checkpoint_callback],
+    )
+
+    model_dir = os.path.join(FLAGS.logs, "models", str(FLAGS.index))
+    model.save(model_dir)
+
+
+if __name__ == '__main__':
+    app.run(main)
+
+Distributed training: open 2 terminal with tensorflow 2.2.0 installed, and execute the command below:
+
+python worker.py --index=0
+python worker.py --index=1
+
+Model load and predict code:
+
+from tensorflow import keras
+import numpy as np
+
+
+def main():
+    model = keras.models.load_model('logs/models/0')
+    model.summary()
+    x_test, y_test = prepare_test_data()
+    print(model.predict(x_test))
+
+def prepare_test_data():
+    x_test, y_test = (
+        np.random.random((10, 32)),
+        np.random.randint(2, size=(10, 1)),
+    )
+
+    return x_test, y_test
+
+if __name__ == '__main__':
+    main()
+execute the code above and will raise error:
+tensorflow.python.framework.errors_impl.InvalidArgumentError: Cannot assign a device for operation 3_layer_mlp/StatefulPartitionedCall/StatefulPartitionedCall/sync_batch_normalization/Cast/allreduce/CollectiveReduce: {{node 3_layer_mlp/StatefulPartitionedCall/StatefulPartitionedCall/sync_batch_normalization/Cast/allreduce/CollectiveReduce}} was explicitly assigned to /job:worker/replica:0/task:0/device:CPU:0 but available devices are [ /job:localhost/replica:0/task:0/device:CPU:0, /job:localhost/replica:0/task:0/device:XLA_CPU:0 ]. Make sure the device specification refers to a valid device.
+         [[3_layer_mlp/StatefulPartitionedCall/StatefulPartitionedCall/sync_batch_normalization/Cast/allreduce/CollectiveReduce]] [Op:__inference_predict_function_1439]
+
+saved_model_cli:
+
+saved_model_cli run --dir logs/models/0 --tag_set serve --signature_def serving_default --input_expr "input_1=np.random.random((1,32))"
+after execute the command above, the process will hang and get no response. The same behavior occur when sending http predict request to tfserving.
+If I remove the batchnormalization layer, erverything will back to normal.
+	</description>
+	<comments>
+		<comment id='1' author='AlexanderJLiu' date='2020-08-28T04:13:57Z'>
+		It seems that this problem has gone in the latest nightly version(20200827).
+Thanks for your good work, I'll close this issue.
+		</comment>
+		<comment id='2' author='AlexanderJLiu' date='2020-08-28T04:14:06Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/40187&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/40187&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

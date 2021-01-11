@@ -1,0 +1,281 @@
+<bug id='11411' author='ahaider3' open_date='2017-07-10T15:50:23Z' closed_time='2018-03-26T20:14:33Z'>
+	<summary>Fetching data in Distributed Tensorflow has too much latency</summary>
+	<description>
+&lt;denchmark-h:h3&gt;System information&lt;/denchmark-h&gt;
+
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow):
+
+&lt;denchmark-link:https://gist.github.com/ahaider3/ae4f6d2d790d963a93b346bb0138a41d&gt;https://gist.github.com/ahaider3/ae4f6d2d790d963a93b346bb0138a41d&lt;/denchmark-link&gt;
+
+The above is a simple benchmark which tests the overhead of distributed TF. It fetches a configurable sized variable from the parameter server and does a matmul on the worker. It also does a matmul from a locally stored variable on the worker. The time difference between these two operations would be the overhead I am measuring.
+
+
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04):
+Linux Redhat
+
+
+TensorFlow installed from (source or binary):
+source
+
+
+TensorFlow version (use command below):
+tensorflow 1.2
+
+
+Python version:
+python 2.7.7
+
+
+Exact command to reproduce:
+
+
+python matmul_benchmark.py --num_features=256 --batch_size=128 --num_hidden=64 --job_name=ps &amp;
+python matmul_benchmark.py --num_features=256 --batch_size=128 --num_hidden=64 --job_name=worker
+By increasing batch_size, the timing difference between local/remote computation eventually becomes negligible.
+However, for small batch sizes the overhead can become 2x/3x:
+For example, here are two runs for different model/dataset sizes:
+
+128 features, batch size of 32, hidden layer size of 256  returns:
+Local GEMM Time:  0.0002624  Network Fetch GEMM Time: 0.0006798
+
+
+256 features, batch size of 128, hidden layer size of 128  returns:
+Local GEMM Time: 0.0002995 Network Fetch GEMM Time: 0.0006124
+
+&lt;denchmark-h:h3&gt;Describe the problem&lt;/denchmark-h&gt;
+
+Distributed tensorflow introduces overhead due to its communication stack. By overhead I mean the additional time required for workers to receive data from parameter servers when compared to doing the same computation without fetching any remote data.
+This is a problem because due to this overhead I have to use 2/3 nodes to just provide performance on-par with non-distributed (single process) tensorflow. The number of nodes required to be on-par with single process TF increases further when I use gpus.
+Fetching small variables provides a constant overhead which limits scaling and efficiency .
+This overhead creates two issues in Distributed Tensorflow:
+
+I have to add several workers just to equal the performance of a single process.
+The overhead of fetching model parameters doesn't scale but the amount of computation does
+decrease as I add more workers. Thus, once I get to a moderately small batch size for each worker I can't scale because the constant overhead of fetching remote model parameters.
+
+There have been several issues posted with distributed tensorflow. &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/6116&gt;#6116&lt;/denchmark-link&gt;
+ is an improvement to large tensor transfer while this problem exists for small tensors. &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/4498&gt;#4498&lt;/denchmark-link&gt;
+ might have been caused by CPU performance bottleneck and not network. However for my problem, network transfer is definitely the bottleneck. I have tried using RDMA and have seen minimal benefit.
+&lt;denchmark-h:h3&gt;Source code / logs&lt;/denchmark-h&gt;
+
+&lt;denchmark-link:https://gist.github.com/ahaider3/ae4f6d2d790d963a93b346bb0138a41d&gt;https://gist.github.com/ahaider3/ae4f6d2d790d963a93b346bb0138a41d&lt;/denchmark-link&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='ahaider3' date='2017-07-10T18:31:54Z'>
+		This is a known issue (&lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/4498&gt;#4498&lt;/denchmark-link&gt;
+, &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/6116&gt;#6116&lt;/denchmark-link&gt;
+, &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/11196&gt;#11196&lt;/denchmark-link&gt;
+) with several workarounds:
+
+Wait until #7466 is merged, which gives roughly 2-3x speedup to gRPC large tensor transport.
+Use alternative communication protocol, such as grpc+verbs or grpc+mpi. This requires RDMA capable hardware.
+Refactor your code and try to use intra-process communication.
+
+		</comment>
+		<comment id='2' author='ahaider3' date='2017-07-10T22:07:59Z'>
+		I am mostly interested in the performance of small tensors. I have tried grpc+verbs and haven't seen any significant benefits. I will try with MPI.
+		</comment>
+		<comment id='3' author='ahaider3' date='2017-07-11T02:03:36Z'>
+		I see both of your model size and batch size is small (128/256?). What's the time spent on computation each round before fetching model parameters from PS? If it only spends tens to hundreds of microseconds, I don't think the current distributed runtime could reach a performance on par to that of a single process, as there's a fixed overhead on setting up interprocess communication.
+		</comment>
+		<comment id='4' author='ahaider3' date='2017-07-11T16:03:56Z'>
+		Without fetching model parameters it only takes a few hundred microseconds. Yes, that's the problem I have. My compute time per iteration is low and so going to distributed requires double/triple the time per iteration due to the fixed overhead.
+I didn't see much benefit when I was testing with grpc+verbs, but that was with larger tensors. Is there a difference between grpc+mpi or grpc+verbs when compared to grpc besides the actual communication protocol? Are tensors still serialized in the same manner? The actual communication across the network is not the bottleneck from my testing.
+		</comment>
+		<comment id='5' author='ahaider3' date='2017-07-11T16:11:19Z'>
+		If you are in doubt, you could try my own GPU Direct patch &lt;denchmark-link:https://github.com/tensorflow/tensorflow/pull/11392&gt;#11392&lt;/denchmark-link&gt;
+ which is theoretically of the lowest latency. It does neither memory copy nor serialization. Btw if your computation is not that complicated, you should avoid using GPU; copying data from/to GPU adds nontrivial overhead in your communication pipeline.
+		</comment>
+		<comment id='6' author='ahaider3' date='2017-07-11T19:42:04Z'>
+		I'm also interested in this issue, with the application of training small feedforward nets (say 200-100-50-4) as quickly as possible. Note this only has ~100KB of parameters. I'd like to run on an algorithmic minibatch size of 8K, split up among as many workers as possible (so 8 workers means each handles 1K examples per iteration). As I add more workers, the batch size per worker gets smaller, which makes connection overhead more significant (per Amdahl's law).
+I'm working on training these on CPU, storing the variables on a parameter server. I've found the connection overhead destroys parallelism, as this issue points out. The particular problem here is not low throughput for transferring large parameters, it is high latency in moving even very small amounts of data. My guess is this comes from connection setup time, and that steps such as serialization and extra copies do not help.
+I have not tried gprc+verbs or grpc+mpi, and I don't expect them to help significantly as my understanding is these protocols do the same connection establishment and then just move the tensors themselves (tiny amounts of data in my case!) through fast networking. Is this a valid understanding? Is there anywhere (docs or code) that I can learn more about network protocol involved in fetching tensors from parameter server?
+I implemented the same model with data parallelism using MPI (instead of TensorFlow's networking stack) to allreduce the gradients and found hugely better performance (running at 2 nodes results in a ~1.8x speedup instead of a slowdown).
+&lt;denchmark-link:https://github.com/byronyi&gt;@byronyi&lt;/denchmark-link&gt;
+ Is their any way to avoid tensor serialization on CPU?
+		</comment>
+		<comment id='7' author='ahaider3' date='2017-07-11T20:23:42Z'>
+		&lt;denchmark-link:https://github.com/eamartin&gt;@eamartin&lt;/denchmark-link&gt;
+ In my patch, tensors are transferred in terms of direct memory access (DMA) of the underlying tensor buffer, so there is no serialization nor memory copy. It is titled "GPU Direct RDMA", but certainly works for CPU as well.
+		</comment>
+		<comment id='8' author='ahaider3' date='2017-07-12T23:55:54Z'>
+		Thanks for helping our friend &lt;denchmark-link:https://github.com/byronyi&gt;@byronyi&lt;/denchmark-link&gt;
+.
+		</comment>
+		<comment id='9' author='ahaider3' date='2017-07-13T00:03:00Z'>
+		Can we pause on closing this until the mentioned patch is actually merged? We have not yet confirmed that serialization or memcpy's caused the overhead. Other culprits could be multiple network roundtrips causing extra latency (and killing bandwidth in the small tensor limit).
+		</comment>
+		<comment id='10' author='ahaider3' date='2017-07-13T00:59:40Z'>
+		Take a look at &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/10530&gt;#10530&lt;/denchmark-link&gt;
+ and you may find something that interests you.
+Let me know if you have further questions; I am more than willing to help you out.
+		</comment>
+		<comment id='11' author='ahaider3' date='2017-07-13T07:53:35Z'>
+		I run the script provided by@yaroslavvb in &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/4498&gt;#4498&lt;/denchmark-link&gt;
+, result for  is
+&lt;denchmark-code&gt;Local rate:       15962.31 MB per second
+Distributed rate: 335.68 MB per second
+&lt;/denchmark-code&gt;
+
+and grpc+verbs is
+&lt;denchmark-code&gt;Local rate:       15514.35 MB per second
+Distributed rate: 1306.15 MB per second
+&lt;/denchmark-code&gt;
+
+I'm using a 56Gbps ib network.
+		</comment>
+		<comment id='12' author='ahaider3' date='2017-07-13T09:58:36Z'>
+		I just ran a &lt;denchmark-link:https://gist.github.com/shamoya/731a81a1fe3d12a2b098f8163eaab7dd/&gt;similar script&lt;/denchmark-link&gt;
+ in a 40Gbps RoCE setup for my GDR patch, and here's the result:
+&lt;denchmark-code&gt;Adding data in 100 MB chunks
+Local rate: 5243.48 MB per second
+Distributed rate: 2679.18 MB per second
+&lt;/denchmark-code&gt;
+
+Numbers for grpc and grpc+verbs are similar to what you got (~300 MB/s and ~1300MB/s).
+To try out the result in your own environment, do change the host to one of the IB interface address you actually use, as my patch will not work for localhost or 127.0.0.1.
+		</comment>
+		<comment id='13' author='ahaider3' date='2017-07-13T23:29:12Z'>
+		&lt;denchmark-link:https://github.com/suiyuan2009&gt;@suiyuan2009&lt;/denchmark-link&gt;
+ I am not seeing that benefit from  on my ib network. Are your results with an updated patch? I am running with TF 1.2.0.
+Here are tests with different chunk sizes:
+For 100 MB chunks with grpc:
+
+Local rate:       19761.24 MB per second
+Distributed rate: 339.71 MB per second
+
+For 512 KB chunks with grpc:
+
+Local rate:       3538.90 MB per second
+Distributed rate: 616.97 MB per second
+
+So decreasing the chunk size by 200x only increases throughput by 2x. I think the problem of large tensors is important, but small tensor transfer is also slow.
+		</comment>
+		<comment id='14' author='ahaider3' date='2017-07-14T00:25:54Z'>
+		&lt;denchmark-link:https://github.com/byronyi&gt;@byronyi&lt;/denchmark-link&gt;
+ Please be sure to add  to your commit message in &lt;denchmark-link:https://github.com/tensorflow/tensorflow/pull/11392&gt;#11392&lt;/denchmark-link&gt;
+.
+		</comment>
+		<comment id='15' author='ahaider3' date='2017-07-14T08:54:12Z'>
+		&lt;denchmark-link:https://github.com/ahaider3&gt;@ahaider3&lt;/denchmark-link&gt;
+ , I built from official master branch, I'll try &lt;denchmark-link:https://github.com/byronyi&gt;@byronyi&lt;/denchmark-link&gt;
+ 's branch. I find there is not much difference between benchmark scripts which run distributed tensorflow on same machine or different machines. The script in &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/4498&gt;#4498&lt;/denchmark-link&gt;
+ performs bettern on different machines than on a single machine, weird.
+		</comment>
+		<comment id='16' author='ahaider3' date='2017-07-14T09:30:20Z'>
+		I find that when test with small data(10MB for example), grpc+rdma 's performance is very bad, speed decreases from 1300MB/s to less than 1000MB/s(300MB/s or 900MB/s, not stable).
+		</comment>
+		<comment id='17' author='ahaider3' date='2017-07-14T09:41:58Z'>
+		&lt;denchmark-link:https://github.com/ahaider3&gt;@ahaider3&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/suiyuan2009&gt;@suiyuan2009&lt;/denchmark-link&gt;
+ There is an important patch &lt;denchmark-link:https://github.com/tensorflow/tensorflow/pull/10531&gt;#10531&lt;/denchmark-link&gt;
+ got merged after the 1.2 release, so it is expected that the current master is faster than 1.2 for  runtime.
+		</comment>
+		<comment id='18' author='ahaider3' date='2017-07-14T11:22:39Z'>
+		I find assign is much slow than assign_add, but I think assign should be as fast as assign_add at least.
+		</comment>
+		<comment id='19' author='ahaider3' date='2017-07-14T22:05:29Z'>
+		&lt;denchmark-link:https://github.com/suiyuan2009&gt;@suiyuan2009&lt;/denchmark-link&gt;
+
+I've noticed this issue, too. I'm testing my GDR patch using the &lt;denchmark-link:https://gist.github.com/yaroslavvb/e196107b5e0afc834652bd3153030c42&gt;benchmark_grpc_recv.py&lt;/denchmark-link&gt;
+ script (courtesy &lt;denchmark-link:https://github.com/yaroslavvb&gt;@yaroslavvb&lt;/denchmark-link&gt;
+).
+For assign, 3 measurements in a row:
+&lt;denchmark-code&gt;Local rate:       6944.22 MB/s
+Distributed rate: 2690.64 MB/s
+---
+Local rate:       5084.81 MB/s
+Distributed rate: 2910.57 MB/s
+---
+Local rate:       5864.24 MB/s
+Distributed rate: 2588.69 MB/s
+&lt;/denchmark-code&gt;
+
+For assign_add:
+&lt;denchmark-code&gt;Local rate:       16558.85 MB/s
+Distributed rate: 3248.83 MB/s
+---
+Local rate:       9952.02 MB/s
+Distributed rate: 3681.21 MB/s
+---
+Local rate:       16090.50 MB/s
+Distributed rate: 3418.83 MB/s
+&lt;/denchmark-code&gt;
+
+But the variance of these measurements (running on the same machine) seems to be just as large as the throughput gap. So I would rather not take it as a serious issue or a performance bug.
+		</comment>
+		<comment id='20' author='ahaider3' date='2017-08-09T18:22:30Z'>
+		&lt;denchmark-link:https://github.com/eamartin&gt;@eamartin&lt;/denchmark-link&gt;
+ As GDR is available in current master &lt;denchmark-link:https://github.com/tensorflow/tensorflow/pull/11392&gt;#11392&lt;/denchmark-link&gt;
+, would you mind to try again? It does no tensor serialisation nor memory copies for tensor data.
+Since all three extension protocol still use grpc heavily for the control plane, &lt;denchmark-link:https://github.com/ahaider3&gt;@ahaider3&lt;/denchmark-link&gt;
+ you might not see much difference as your computation is way too fast compared to the fixed overhead of setting up each tensor transmission (it is rather a latency issue, not a throughput one). I personally would try to port grpc from HTTP2 to RDMA, but it will be a patch unlikely to be accepted by the grpc project as indicated &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/2916#issuecomment-253924638&gt;here&lt;/denchmark-link&gt;
+.
+&lt;denchmark-link:https://github.com/jart&gt;@jart&lt;/denchmark-link&gt;
+ Any comments?
+		</comment>
+		<comment id='21' author='ahaider3' date='2017-08-16T09:21:17Z'>
+		&lt;denchmark-link:https://github.com/caffe2/caffe2/tree/master/caffe2/contrib/gloo&gt;https://github.com/caffe2/caffe2/tree/master/caffe2/contrib/gloo&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://github.com/facebookincubator/gloo#benchmarking&gt;https://github.com/facebookincubator/gloo#benchmarking&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='22' author='ahaider3' date='2017-08-17T22:47:13Z'>
+		I ran the tests again using TF 1.2 with the different extension protocols that I can run on my system. In my case, I can only use grpc+verbs.
+I found minimal to no benefit from using this protocol for my small model. I am measuring the throughput of fetching a parameter and then doing a GEMM.
+
+128 features; 32 batch size; 256 hidden layer size
+grpc:  192.81 MB/sec
+grpc+verbs: 179.18 MB/sec
+
+This was the average of three runs. I would conclude that these protocols are limited by GRPC because of the latency it introduces, as suggested by &lt;denchmark-link:https://github.com/byronyi&gt;@byronyi&lt;/denchmark-link&gt;
+ .
+There has been interesting work by Uber to make communication all-around more efficient: &lt;denchmark-link:https://github.com/uber/horovod&gt;https://github.com/uber/horovod&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://github.com/jart&gt;@jart&lt;/denchmark-link&gt;
+ what do you think about uber's method for distributed training.
+		</comment>
+		<comment id='23' author='ahaider3' date='2017-08-17T23:13:44Z'>
+		Horovod uses NCCL 2, which supports InfiniBand but not RoCE. See &lt;denchmark-link:https://github.com/uber/horovod/issues/5&gt;here&lt;/denchmark-link&gt;
+.
+		</comment>
+		<comment id='24' author='ahaider3' date='2017-11-03T13:30:27Z'>
+		I report the same problem as &lt;denchmark-link:https://github.com/ahaider3&gt;@ahaider3&lt;/denchmark-link&gt;
+ that small mini-batch on small model is terrible for distributed training using cpu.
+When I train a deep&amp;wide model with about 15 feas, embedding_size=32, I tried the 2/3/4 machine of ps+worker and ends up with the same speed as one machine of all in one process.
+Only after increasing embedding_size to 256 give a 2x speed up with 4 machine.
+		</comment>
+		<comment id='25' author='ahaider3' date='2017-12-20T19:10:03Z'>
+		It has been 14 days with no activity and this issue has an assignee.Please update the label and/or status accordingly.
+		</comment>
+		<comment id='26' author='ahaider3' date='2018-01-04T19:07:54Z'>
+		It has been 14 days with no activity and this issue has an assignee.Please update the label and/or status accordingly.
+		</comment>
+		<comment id='27' author='ahaider3' date='2018-01-24T13:25:09Z'>
+		Nagging Assignee: It has been 14 days with no activity and this issue has an assignee. Please update the label and/or status accordingly.
+		</comment>
+		<comment id='28' author='ahaider3' date='2018-02-08T19:33:48Z'>
+		Nagging Assignee: It has been 14 days with no activity and this issue has an assignee. Please update the label and/or status accordingly.
+		</comment>
+		<comment id='29' author='ahaider3' date='2018-02-23T14:12:27Z'>
+		Nagging Assignee: It has been 14 days with no activity and this issue has an assignee. Please update the label and/or status accordingly.
+		</comment>
+		<comment id='30' author='ahaider3' date='2018-03-10T13:20:03Z'>
+		Nagging Assignee &lt;denchmark-link:https://github.com/jart&gt;@jart&lt;/denchmark-link&gt;
+: It has been 14 days with no activity and this issue has an assignee. Please update the label and/or status accordingly.
+		</comment>
+		<comment id='31' author='ahaider3' date='2018-03-25T12:40:35Z'>
+		Nagging Assignee &lt;denchmark-link:https://github.com/jart&gt;@jart&lt;/denchmark-link&gt;
+: It has been 14 days with no activity and this issue has an assignee. Please update the label and/or status accordingly.
+		</comment>
+		<comment id='32' author='ahaider3' date='2018-03-26T08:33:11Z'>
+		I think we should close this issue as it appears to be resolved?
+		</comment>
+		<comment id='33' author='ahaider3' date='2018-03-26T20:14:33Z'>
+		Thanks for the tip. Closing now that PR is merged. &lt;denchmark-link:https://github.com/tensorflow/tensorflow/pull/11392&gt;#11392&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

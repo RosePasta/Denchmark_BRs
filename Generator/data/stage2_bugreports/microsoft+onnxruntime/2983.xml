@@ -1,0 +1,116 @@
+<bug id='2983' author='erikbrntsn' open_date='2020-02-06T13:47:49Z' closed_time='2020-03-24T01:36:13Z'>
+	<summary>Error using output of one model as input for another</summary>
+	<description>
+I have two nested/sequential models i.e. I want to call model2.Run(model1.Run(data))
+With the call to model2.Run I get "Arithmetic operation resulted in an overflow". I dont believe it is really related to &lt;denchmark-link:https://github.com/microsoft/onnxruntime/issues/713&gt;#713&lt;/denchmark-link&gt;
+ as the output of model1 is a 1x64x56x64 float tensor which should not give any memory problems.
+The overflow happens here
+&lt;denchmark-code&gt;return new MemoryHandle((void*)((int)_dataBufferPointer + elementIndex * _elementWidth)); //could not use Unsafe.Add
+&lt;/denchmark-code&gt;
+
+with _dataBufferPointer=0x000002c542065060, elementIndex=0
+The output dimensions of model1 are the same as the input dimensions for model2.
+I am using onnxruntime in a c# application through the nuget package (version 1.1.1).
+I am missing something?
+If this is intentionally not supported, would it be possible to output a more user friendly error message?
+	</description>
+	<comments>
+		<comment id='1' author='erikbrntsn' date='2020-02-06T19:19:53Z'>
+		Can you share the model please ?
+		</comment>
+		<comment id='2' author='erikbrntsn' date='2020-02-06T19:24:36Z'>
+		Also, are you able to run both the models individually ?
+		</comment>
+		<comment id='3' author='erikbrntsn' date='2020-02-07T08:07:55Z'>
+		I just tried a few things and doing the following works:
+&lt;denchmark-code&gt;model2.Run(Fix(model1.Run(data), model2))
+
+private static List&lt;NamedOnnxValue&gt; Fix(IDisposableReadOnlyCollection&lt;DisposableNamedOnnxValue&gt; t, InferenceSession model)
+{
+    var q = t.First().AsTensor&lt;float&gt;();
+    var dims = q.Dimensions;
+    var data = q.ToArray();
+    var tensor = new DenseTensor&lt;float&gt;(data, dims);
+    var name = model.InputMetadata.Keys.First();
+    return new List&lt;NamedOnnxValue&gt; { NamedOnnxValue.CreateFromTensor(name, tensor) };
+}
+&lt;/denchmark-code&gt;
+
+So yes, both models work individually.
+		</comment>
+		<comment id='4' author='erikbrntsn' date='2020-02-11T10:54:38Z'>
+		I have created a minimal model that reproduces the problem:
+&lt;denchmark-link:https://github.com/microsoft/onnxruntime/files/4185375/models.zip&gt;models.zip&lt;/denchmark-link&gt;
+
+Run the following in a c# application after having loaded the models:
+&lt;denchmark-code&gt;head.Run(base.Run(data))
+&lt;/denchmark-code&gt;
+
+The two models are implemented in PyTorch like this:
+&lt;denchmark-code&gt;class BaseModel(nn.Module):
+    def __init__(self):
+        super(BaseModel, self).__init__()
+        self.conv = torch.nn.Conv2d(1, 64, kernel_size=3, stride=1, padding=1)
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+class Head(nn.Module):
+    def __init__(self):
+        super(Head, self).__init__()
+        self.conv = torch.nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1)
+
+    def forward(self, x):
+        return self.conv(x)
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='5' author='erikbrntsn' date='2020-03-11T06:03:34Z'>
+		Hi,
+I finally got around to investigating this. I used your sample models (thanks) and there are several takeaways:
+
+
+The output (tensor) of Run() is of type DisposableNamedOnnxValue and the input tensor of Run() is of type NamedOnnxValue. DisposableNamedOnnxValue is a derived class of NamedOnnxValue and hence Run() accepts the output of another Run(). Unfortunately, there is logic in the Run() to pin managed memory buffer in the NamedOnnxValue which doesn't play well with DisposableNamedOnnxValue since DisposableNamedOnnxValue just maintains a wrapper over the native memory containing the output of Run().
+
+
+We could support an input to Run() containing DisposableNamedOnnxValue  by adding some guard logic to prevent pinning in that case and directly re-using the native memory but chances of that being useful are very low because both NamedOnnxValue and DisposableNamedOnnxValue are bound to "feed names" and hence validation of the input will eventually fail unless we run into the very rare chance that the output name of one model exactly matches the input name of the next model. Even in your toy example, even though the shapes match the names are different.
+
+
+As it stands, you can get it to work with something like this -
+
+
+&lt;denchmark-code&gt;                var container1 = new List&lt;NamedOnnxValue&gt;();
+                var tensorIn = new DenseTensor&lt;float&gt;(....);
+                var nov1 = NamedOnnxValue.CreateFromTensor("input", tensorIn);
+                container1.Add(nov1);
+                var res1 = session1.Run(container1); // This is not disposed
+
+                var container2 = new List&lt;NamedOnnxValue&gt;();
+                var nov2 = NamedOnnxValue.CreateFromTensor("input", res1.First().AsTensor&lt;float&gt;().ToDenseTensor()); // .ToDenseTensor() copies contents over
+                container2.Add(nov2 );
+                var res2 = session.Run(container2);
+&lt;/denchmark-code&gt;
+
+
+
+The above will work but is not optimal -
+i) It will create another managed buffer and copy over the contents of the results of the first run
+ii) It will create another OrtValue instance (for the new input) before calling into native code. Ideally we should be able to re-use the OrtValue instance created from the output of the first Run()
+
+
+There is a PR by @fs-eire (#3171) that will eventually solve it. It introduces a new class PinnedOnnxValue that can help re-use the underlying OrtValue value instances and there are several Run() overloads that will take in PinnedOnnxValues. You can use PinnedOnnxValue for the output of the first Run() and use the same for the input of the next Run() and that will solve the problem.
+
+
+CC: &lt;denchmark-link:https://github.com/jignparm&gt;@jignparm&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='6' author='erikbrntsn' date='2020-03-12T19:04:06Z'>
+		Synced offline with &lt;denchmark-link:https://github.com/fs-eire&gt;@fs-eire&lt;/denchmark-link&gt;
+. After discussing, we felt DisposableNamedOnnxValue inputs in Run() should be accommodated as DisposableNamedOnnxValue is NamedOnnxValue (it is a derived class). Adjusted the PR contents accordingly.
+		</comment>
+		<comment id='7' author='erikbrntsn' date='2020-03-24T08:01:39Z'>
+		Thank you guys!
+		</comment>
+	</comments>
+</bug>

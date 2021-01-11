@@ -1,0 +1,204 @@
+<bug id='40830' author='ivankochin' open_date='2020-06-26T13:00:42Z' closed_time='2020-09-15T16:28:34Z'>
+	<summary>The tenorflow_framework shared object contains public HWLOC symbols. which causes HWLOC unexpected behavior it links dynamically with some other library.</summary>
+	<description>
+System information
+
+Have I written custom code: No
+OS Platform and Distribution: Ubuntu 16.04, Fedora 30 (and possibly any other Linux)
+TensorFlow installed from: C binary package (libtensorflow-cpu-linux-x86_64-1.14.0.tar.gz)
+TensorFlow version (use command below): 1.14.0
+Python version: Not applicable
+
+Describe the current behavior
+When I run nm libtensorflow_framework.so.1.14.0 | grep T | grep hwloc on Linux, I get the following output:
+&lt;denchmark-code&gt;...
+00000000012d9fc0 T hwloc_bitmap_copy
+00000000012d9fb0 T hwloc_bitmap_dup
+00000000012da6e0 T hwloc_bitmap_fill
+00000000012dbc20 T hwloc_bitmap_first
+00000000012dbc90 T hwloc_bitmap_first_unset
+00000000012d9ea0 T hwloc_bitmap_free
+...
+00000000012e78a0 T hwloc_topology_insert_group_object
+00000000012e7a50 T hwloc_topology_insert_misc_object
+00000000012e7110 T hwloc_topology_is_thissystem
+00000000012e7b00 T hwloc_topology_load
+00000000012e5bf0 T hwloc_topology_reconnect
+00000000012e8330 T hwloc_topology_restrict
+...
+&lt;/denchmark-code&gt;
+
+And many other publicly available HWLOC interfaces that are included in tenorflow_framework.so as public symbols.
+So when some application linked with TensorFlow and some other library that dynamically links with HWLOC, then part of HWLOC interfaces calls located inside libhwloc.so but other interfaces located inside tensorflow_framework.so shared object.
+Libraries dependencies structure:
+&lt;denchmark-link:https://user-images.githubusercontent.com/22097249/85857265-2de8ee80-b7c2-11ea-823e-600e2840f4e6.png&gt;&lt;/denchmark-link&gt;
+
+For example, when the library("Some Lib" on the scheme) call hwloc_topology_init then it goes to the HWLOC library located inside tensorflow_framework.so. But when it calls the hwloc_topology_get_complete_cpuset method, then it goes to the shared HWLOC library. This means that we have two instances of HWLOC library which are divided between two shared objects.
+This situation causes HWLOC unexpected behavior inside other libraries (e.g. the "Some Lib" library on the scheme).
+Describe the expected behavior
+The expected behavior is to not deliver any HWLOC interfaces as part of public interface of the TensorFlow shared object.
+Standalone code to reproduce the issue:
+To reproduce this issue, we need at least two source code files: for the application and for the library.
+some_lib.cpp:
+#include &lt;iostream&gt;
+#include &lt;hwloc.h&gt;
+
+void print_bitmap(hwloc_const_bitmap_t bitmap) {
+    if (bitmap == NULL) {
+        printf("mask is: NULL\n");
+        return;
+    }
+    char* buf = new char[256];
+    hwloc_bitmap_snprintf(buf, 256, bitmap);
+    printf("mask is: %s\n", buf);
+    delete [] buf;
+}
+
+extern void print_topology_info() {
+    hwloc_topology_t topology;
+    hwloc_cpuset_t   process_cpu_affinity_mask;
+    hwloc_nodeset_t  process_node_affinity_mask;
+
+    // Parse topology
+    hwloc_topology_init( &amp;topology );
+    hwloc_topology_load( topology );
+
+    // Getting process affinity mask
+    process_cpu_affinity_mask  = hwloc_bitmap_alloc();
+    process_node_affinity_mask = hwloc_bitmap_alloc();
+
+    hwloc_get_cpubind(topology, process_cpu_affinity_mask, 0);
+    hwloc_cpuset_to_nodeset(topology, process_cpu_affinity_mask, process_node_affinity_mask);
+
+    print_bitmap(process_cpu_affinity_mask);
+    print_bitmap(process_node_affinity_mask);
+    printf("Complete:\n");
+    print_bitmap(hwloc_topology_get_complete_cpuset(topology));
+    print_bitmap(hwloc_topology_get_complete_nodeset(topology));
+    printf("Allowed:\n");
+    print_bitmap(hwloc_topology_get_allowed_cpuset(topology));
+    print_bitmap(hwloc_topology_get_allowed_nodeset(topology));
+}
+application.cpp:
+&lt;denchmark-code&gt;#include &lt;iostream&gt;
+
+extern void print_topology_info();
+
+int main() {
+    print_topology_info();
+}
+&lt;/denchmark-code&gt;
+
+Build steps:
+&lt;denchmark-code&gt;# another compiler is also applicable
+g++ -c -fpic some_lib.cpp
+g++ -shared -o some_lib.so some_lib.o -lhwloc
+
+g++ application.cpp -o some_app -ltensorflow some_lib.so
+&lt;/denchmark-code&gt;
+
+Output:
+&lt;denchmark-code&gt;mask is: 0x000000ff
+mask is: 0x0
+Complete:
+mask is: NULL
+mask is: 0x00000001
+Allowed:
+mask is: 0x000000ff
+mask is: 0x00000001
+&lt;/denchmark-code&gt;
+
+Expected output:
+&lt;denchmark-code&gt;mask is: 0x000000ff
+mask is: 0xf...f
+Complete:
+mask is: 0x000000ff
+mask is: 0xf...f
+Allowed:
+mask is: 0x000000ff
+mask is: 0xf...f
+&lt;/denchmark-code&gt;
+
+Other info/logs :
+Proofs of different HWLOC interfaces location:
+Here is some information that was obtained via GDB during application debugging:
+Shared objects location:
+&lt;denchmark-code&gt;0x00007fffecdf1430  0x00007fffece1869a - tbbbind -&gt; hwloc
+0x00007fffed750e80  0x00007fffee5971b4 - libtensorflow_framework.so.1 (static hwloc)
+&lt;/denchmark-code&gt;
+
+Method addresses (can be easily correlated with corresponding shared object):
+&lt;denchmark-code&gt;0x7fffecdf66a0 &lt;hwloc_topology_init&gt; - tbbbind -&gt; hwloc
+0x7fffecdf80c0 &lt;hwloc_topology_load&gt; - tbbbind -&gt; hwloc
+0x7fffecdfe2a0 &lt;hwloc_get_cpubind&gt;   - tbbbind -&gt; hwloc
+0x7fffeef4d6c8 &lt;hwloc_cpuset_to_nodeset(hwloc_topology_t, hwloc_const_cpuset_t, hwloc_nodeset_t)&gt; - libtensorflow_framework.so.1 (static hwloc)
+0x7fffeef4d644 &lt;hwloc_topology_get_complete_cpuset(hwloc_topology_t)&gt; - libtensorflow_framework.so.1 (static hwloc)
+0x7fffeef4d686 &lt;hwloc_topology_get_complete_nodeset(hwloc_topology_t)&gt; - libtensorflow_framework.so.1 (static hwloc)
+0x7fffeef4d665 &lt;hwloc_topology_get_allowed_cpuset(hwloc_topology_t)&gt; - libtensorflow_framework.so.1 (static hwloc)
+0x7fffeef4d6a7 &lt;hwloc_topology_get_allowed_nodeset(hwloc_topology_t)&gt; - libtensorflow_framework.so.1 (static hwloc)
+&lt;/denchmark-code&gt;
+
+Workaround:
+Add -lhwloc flag to application compilation string to directly link the HWLOC shared object. After this change, all HWLOC interfaces will be located within the HWLOC shared object.
+	</description>
+	<comments>
+		<comment id='1' author='ivankochin' date='2020-07-20T17:29:35Z'>
+		Can you try with master/2.2/1.15 instead of 1.14? 1.14 has been released in a somewhat broken state and is no longer in the support window
+		</comment>
+		<comment id='2' author='ivankochin' date='2020-07-20T19:04:21Z'>
+		Paul was working on this before he left. He added hwloc dependency instead of libnuma.
+&lt;denchmark-link:https://github.com/guptapriya&gt;@guptapriya&lt;/denchmark-link&gt;
+ do you know who works with tensorflow sig-networking, and multi-CPU efforts?
+I think the main question is if we need the hwloc symbols exported by TF libraries to be used by ops/kernels, potentially collectives?
+		</comment>
+		<comment id='3' author='ivankochin' date='2020-07-27T07:15:29Z'>
+		&lt;denchmark-link:https://github.com/mihaimaruseac&gt;@mihaimaruseac&lt;/denchmark-link&gt;
+ looks like TensorFlow 1.15 does not contain such public symbols and I cannot reproduce this issue with this version of the TensorFlow library.
+		</comment>
+		<comment id='4' author='ivankochin' date='2020-07-27T15:40:44Z'>
+		Thank you &lt;denchmark-link:https://github.com/ivankochin&gt;@ivankochin&lt;/denchmark-link&gt;
+ for checking. Can your application use 1.15?
+		</comment>
+		<comment id='5' author='ivankochin' date='2020-07-27T16:47:05Z'>
+		&lt;denchmark-link:https://github.com/mihaimaruseac&gt;@mihaimaruseac&lt;/denchmark-link&gt;
+ ,
+I am a member of the team that develops the library that links with HWLOC dynamically. In the scheme below our library may be associated with the "Some Lib" element.
+We have no dependency on the TensorFlow library, but one of our customers affected by this unexpected behavior with Tensorflow 1.14, and the customer isn't able to update the TensorFlow version now.
+		</comment>
+		<comment id='6' author='ivankochin' date='2020-07-27T16:51:04Z'>
+		Unfortunately we cannot update TF 1.14 either as it is outside the support window, per our patch policy.
+		</comment>
+		<comment id='7' author='ivankochin' date='2020-08-01T08:16:58Z'>
+		&lt;denchmark-link:https://github.com/gunan&gt;@gunan&lt;/denchmark-link&gt;
+ - I think &lt;denchmark-link:https://github.com/dubey&gt;@dubey&lt;/denchmark-link&gt;
+ is works with the SIG networking, among others.
+		</comment>
+		<comment id='8' author='ivankochin' date='2020-08-03T17:38:13Z'>
+		&lt;denchmark-link:https://github.com/dubey&gt;@dubey&lt;/denchmark-link&gt;
+ could you take a look at this issue? Should we be exporting hwloc symbols?
+		</comment>
+		<comment id='9' author='ivankochin' date='2020-08-05T18:34:25Z'>
+		Hi Gunan, I checked with Ayush, he is not deeply involved in the NUMA effort as well as SIG networking.
+Is there any way to check if this hwloc symbols is used by anyone? Maybe removing it and see it breaks?
+		</comment>
+		<comment id='10' author='ivankochin' date='2020-08-05T18:39:54Z'>
+		Goldie, Could you help us find the SIG networking contact for this issue?
+		</comment>
+		<comment id='11' author='ivankochin' date='2020-09-15T01:05:05Z'>
+		&lt;denchmark-link:https://github.com/gunan&gt;@gunan&lt;/denchmark-link&gt;
+ It is an issue that has been fixed a long time ago (since 1.15 I think). See &lt;denchmark-link:https://github.com/tensorflow/tensorflow/pull/29807&gt;#29807&lt;/denchmark-link&gt;
+ for more details.
+		</comment>
+		<comment id='12' author='ivankochin' date='2020-09-15T16:28:33Z'>
+		Thank you very much for the information &lt;denchmark-link:https://github.com/byronyi&gt;@byronyi&lt;/denchmark-link&gt;
+ And as far as I can see, the report is about 1.14. So, the solution is to use a newer version of TF.
+		</comment>
+		<comment id='13' author='ivankochin' date='2020-09-15T16:28:36Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/40830&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/40830&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

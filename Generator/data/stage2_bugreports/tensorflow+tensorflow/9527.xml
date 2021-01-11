@@ -1,0 +1,322 @@
+<bug id='9527' author='fxsuper' open_date='2017-04-29T00:28:11Z' closed_time='2018-06-02T07:04:49Z'>
+	<summary>tf.while_loop much slower than static graph?</summary>
+	<description>
+I'm running on TF 1.1, and I've used tf.while_loop + TensorArray to implement dynamic unrolling of a type of recurrence that I previously unrolled statically through python code. The difference in speed is very dramatic, with forward inference being about 200x slower when dynamically unrolled, and backprop about 2x slower. Is this expected? Are there any tricks for optimization that I'm missing? This is on CPU. Performance gap on GPU is even larger.
+	</description>
+	<comments>
+		<comment id='1' author='fxsuper' date='2017-04-29T05:29:16Z'>
+		Have you tried the official API of dynamic unrolling tf.nn.dynamic_rnn ? Maybe comparing the speed of your implementation and official one can provide the insights.
+		</comment>
+		<comment id='2' author='fxsuper' date='2017-04-29T13:46:28Z'>
+		The code I'm implementing has nothing to do with RNNs. It's a sequence of geometric transformations.
+		</comment>
+		<comment id='3' author='fxsuper' date='2017-04-30T21:26:44Z'>
+		&lt;denchmark-link:https://github.com/fxsuper&gt;@fxsuper&lt;/denchmark-link&gt;
+, could you include some of your code that demonstrates this problem? Specifically from your general description it is only possible to guess what your two versions look I imagine if the amount of work required by each "iteration" is tiny, you might see the same behavior. I would also recommend asking on StackOverflow, because there are many more users of TensorFlow asking there, and this is mainly a forum for bugs and feature requests. Thanks.
+		</comment>
+		<comment id='4' author='fxsuper' date='2017-05-02T14:09:27Z'>
+		Sure, I've tried to simplify the code as much as possible below (sorry I realize it's still a bit long). This simpler version shows a 3x difference in training and ~500x difference in inference. And yes I'm aware that GitHub is not meant for help and debugging, but I thought the speed gap was large enough for this to almost be a bug or at least a feature request.
+Static version
+&lt;denchmark-code&gt;import numpy as np
+import numpy.random as npr
+import tensorflow as tf
+from tensorflow.python.ops.nn import l2_normalize
+npr.seed(0)
+batch_size = 32
+num_steps = 1000
+inputs = tf.constant(npr.rand(num_steps * 3, batch_size, 3), dtype=tf.float32)
+var = tf.Variable([1, 1, 1], dtype=tf.float32)
+
+id_mat = np.identity(3, dtype='float32')
+init = []
+for row in id_mat:
+    r = tf.tile(row[np.newaxis], [batch_size, 1])
+    init.append(r)
+
+for d in tf.unstack(inputs):
+    a, b, c = init[-3:]                                                 
+    m = tf.transpose(tf.stack([c, tf.cross(b, c), b]), perm=[1, 2, 0])
+    p = l2_normalize(tf.squeeze(tf.matmul(m, tf.expand_dims(d, 2))), 1)
+    init.append(p)
+
+final = tf.stack(init[2:-1])
+    
+loss = tf.reduce_sum(tf.reduce_sum(final, axis=[0, 1]) * var)
+train = tf.train.GradientDescentOptimizer(0.5).minimize(loss)
+
+sess = tf.Session()
+tf.global_variables_initializer().run(session=sess)
+
+final.eval(session=sess) # ~0.0007 secs
+train.run(session=sess) # ~0.12 secs
+&lt;/denchmark-code&gt;
+
+Dynamic version
+&lt;denchmark-code&gt;import collections
+import numpy as np
+import numpy.random as npr
+import tensorflow as tf
+from tensorflow.python.ops.nn import l2_normalize
+npr.seed(0)
+batch_size = 32
+num_steps = 1000
+inputs = tf.constant(npr.rand(num_steps * 3, batch_size, 3), dtype=tf.float32)
+var = tf.Variable([1, 1, 1], dtype=tf.float32)
+
+Triplet = collections.namedtuple('Triplet', 'a, b, c')
+id_mat = np.identity(3, dtype='float32')
+init = Triplet(*[tf.tile(row[np.newaxis], [batch_size, 1]) for row in id_mat])
+
+def extend(tri, inputs):
+    m = tf.transpose(tf.stack([tri.c, tf.cross(tri.b, tri.c), tri.b]), perm=[1, 2, 0])
+    p = l2_normalize(tf.squeeze(tf.matmul(m, tf.expand_dims(inputs, 2))), 1)
+    return p
+
+i = tf.constant(1)
+s = inputs.get_shape().as_list()[0]
+ta = tf.TensorArray(tf.float32, size=s)
+
+def body(i, tri, ta):
+    p = extend(tri, inputs[i - 1])
+    return [i + 1, Triplet(tri.b, tri.c, p), ta.write(i, p)]
+
+_, _, final_ta = tf.while_loop(lambda i, _1, _2: i &lt; s, body, 
+                               [i, init, ta.write(0, init.c)],
+                               parallel_iterations=1, swap_memory=False) 
+
+final = final_ta.stack()
+
+loss = tf.reduce_sum(tf.reduce_sum(final, axis=[0, 1]) * var)
+train = tf.train.GradientDescentOptimizer(0.5).minimize(loss)
+
+sess = tf.Session()
+tf.global_variables_initializer().run(session=sess)
+
+final.eval(session=sess) # ~0.37 secs
+train.run(session=sess) # ~0.37 secs
+&lt;/denchmark-code&gt;
+
+Note that increasing the number of parallel_iterations only makes things worse, likely because the computation is very sequential.
+		</comment>
+		<comment id='5' author='fxsuper' date='2017-05-02T18:36:46Z'>
+		It looks like your code samples are missing some imports so I'm not able to run them; could you edit the code you posted so it runs as-is? That said, as &lt;denchmark-link:https://github.com/aselle&gt;@aselle&lt;/denchmark-link&gt;
+ mentioned, it looks like each script isn't doing much (according to the comments that report subsecond runtime), so the time is probably dominated by overhead rather than the actual calculation.
+		</comment>
+		<comment id='6' author='fxsuper' date='2017-05-03T00:53:06Z'>
+		I updated the code with all the necessary imports. As for the calculations, yes the individual calculations are small (a few matrix multiplies and cross products), although I'm not sure if it's really all that different from an RNN, at least on the backprop side. A training step is taking 0.37 sec which is about the amount of time taken by a decent sized LSTM.
+		</comment>
+		<comment id='7' author='fxsuper' date='2017-05-06T18:18:34Z'>
+		Like &lt;denchmark-link:https://github.com/skye&gt;@skye&lt;/denchmark-link&gt;
+ says, it is probably due to the loop overhead. Not sure if there's much you can do here.
+CC &lt;denchmark-link:https://github.com/tfboyd&gt;@tfboyd&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/yuanbyu&gt;@yuanbyu&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='8' author='fxsuper' date='2017-05-17T20:31:28Z'>
+		The first call to session.run sets up a lot of internal objects and isn't appropriate for timing.
+call it 1-5 times to warm up, and then call it 10-100 times and get the average of those remaining run calls.
+		</comment>
+		<comment id='9' author='fxsuper' date='2017-05-17T20:47:51Z'>
+		&lt;denchmark-link:https://github.com/ebrevdo&gt;@ebrevdo&lt;/denchmark-link&gt;
+ that is indeed what I do. I just didn't want to clutter the code above, but the numbers reported are averages of many runs after it's been warmed up.
+		</comment>
+		<comment id='10' author='fxsuper' date='2017-05-17T21:53:54Z'>
+		Why only 1 parallel iteration?  Try increasing it.
+&lt;denchmark-link:#&gt;…&lt;/denchmark-link&gt;
+
+
+On May 17, 2017 1:48 PM, "fxsuper" ***@***.***&gt; wrote:
+ @ebrevdo &lt;https://github.com/ebrevdo&gt; that is indeed what I do. I just
+ didn't want to clutter the code above, but the numbers reported are
+ averages of many runs after it's been warmed up.
+
+ —
+ You are receiving this because you were mentioned.
+ Reply to this email directly, view it on GitHub
+ &lt;#9527 (comment)&gt;,
+ or mute the thread
+ &lt;https://github.com/notifications/unsubscribe-auth/ABtimyfbk63G5wZaUHOXm1pfCnmLX3GKks5r610XgaJpZM4NMF3P&gt;
+ .
+
+
+
+		</comment>
+		<comment id='11' author='fxsuper' date='2017-05-17T21:58:12Z'>
+		I did; it only made things worse.
+		</comment>
+		<comment id='12' author='fxsuper' date='2017-06-16T23:45:30Z'>
+		Automatically closing due to lack of recent activity. Since this issue is old at this point, please reopen the issue if it still occurs when tried with the latest version of Tensorflow. Thank you.
+		</comment>
+		<comment id='13' author='fxsuper' date='2017-06-17T12:39:39Z'>
+		Please reopen this. Nothing has changed in the latest release, and 500x difference in inference speed seems very much like a performance bug to me.
+		</comment>
+		<comment id='14' author='fxsuper' date='2017-06-19T20:42:02Z'>
+		Try replacing the inputs from a tf.constant to a tf.Variable.  the static
+graph is probably being optimized away via constant folding, and the
+dynamic one is not.  if your input is not a tf.constant but a placeholder
+or Variable, then both the static and dynamic graphs will have to execute
+all operations at each session.run.
+&lt;denchmark-link:#&gt;…&lt;/denchmark-link&gt;
+
+
+On Mon, Jun 19, 2017 at 1:37 PM, Skye Wanderman-Milne &lt; ***@***.***&gt; wrote:
+ Reopened #9527 &lt;#9527&gt;.
+
+ —
+ You are receiving this because you were mentioned.
+ Reply to this email directly, view it on GitHub
+ &lt;#9527 (comment)&gt;,
+ or mute the thread
+ &lt;https://github.com/notifications/unsubscribe-auth/ABtimwbYplAnuIncaofNrwmgRMeety5Wks5sFtvwgaJpZM4NMF3P&gt;
+ .
+
+
+
+		</comment>
+		<comment id='15' author='fxsuper' date='2017-06-22T15:11:31Z'>
+		Thanks for the suggestion. Everything does slow down, but the gap remains. For training, it's now more like 4x difference in speed (dynamic at 2.5 sec vs. static at 0.6 sec per iteration). For forward pass, the gap has shrunk but is still about 4x (dynamic at 0.45 sec vs. static at 0.12 sec per iteration).
+I should say that in my actual model, where this is only a part of a larger pipeline, the slowdown I see is more substantial. This component takes about 20% of training time when static, but slows down the entire pipeline by a factor of 3 when dynamic, so more like an 11x slowdown.
+		</comment>
+		<comment id='16' author='fxsuper' date='2017-06-27T14:21:45Z'>
+		Unsure if this is the place to write this info, but I have been working on a comparison of different unfolding methods with LSTMs, and I am getting about 2x slower training speeds when using dynamic_rnn versus manually unrolling the graph statically in python, and about 1.5x slower training speeds when using static_rnn versus unrolling the graph statically in python. Given that I am using dynamic_rnn in a traditional use case, I find this surprising considering that most of the internet claims that dynamic_rnn is the better option of the three. I am basing these results on both GPU and CPU testing, with a training set size of 200 and 2,000 epochs
+Having trouble pasting the code, so here is the file. Relevant code is from lines 83 to 131.
+&lt;denchmark-link:https://github.com/TheButlah/LSTM/blob/a9f54879640c75c32903e2331a5478044879ff34/model.py&gt;https://github.com/TheButlah/LSTM/blob/a9f54879640c75c32903e2331a5478044879ff34/model.py&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='17' author='fxsuper' date='2017-06-27T18:44:44Z'>
+		static_rnn with sequence_length= passed in will generally outperform manual
+unroll if the unroll size is bigger than *all* of your sequence lengths.
+ this is not the case for BPTT.  when using BPTT, do not pass the
+sequence_length argument to static_rnn since you usually  want to calculate
+all time steps.  that argument is more useful when doing static unroll for
+seq2seq or other nontrivial architectures.
+
+dynamic_rnn is as performant as static unroll for large batch sizes and
+depths; but not for smaller batch sizes and depths.  what are your batch
+size and depth?
+
+furthermore, if you have very large sequence lengths, dynamic_rnn can copy
+activations to CPU from the GPU to allow you to train much bigger graphs
+(if you pass swap_memory=True).  static unrolling would just lead to GPU
+OOM in these cases.  again this is more useful for large batch size, depth,
+and sequence length values.
+&lt;denchmark-link:#&gt;…&lt;/denchmark-link&gt;
+
+
+On Tue, Jun 27, 2017 at 7:22 AM, Ryan Butler ***@***.***&gt; wrote:
+ Unsure if this is the place to write this info, but I have been working on
+ a comparison of different unfolding methods with LSTMs, and I am getting
+ about 2x slower training speeds when using dynamic_rnn versus manually
+ unrolling the graph statically in python, and about 1.5x slower training
+ speeds when using static_rnn versus unrolling the graph statically in
+ python. Given that I am using dynamic_rnn in a traditional use case, I find
+ this unexpected considering that most of the internet claims that
+ dynamic_rnn is the better option of the three.
+
+ `with tf.variable_scope('Unrolled') as scope:
+ lstm_cell = tf.contrib.rnn.BasicLSTMCell(num_units=cell_size) # This
+ defines the cell structure
+ initial_state = lstm_cell.zero_state(batch_size=batch_size,
+ dtype=tf.float32) # Initial state
+
+             self._sequence_lengths = tf.random_uniform(
+                 shape=(batch_size,), minval=1, maxval=num_steps+1, dtype=tf.int32
+             )  # , trainable=False, validate_shape=False, collections=[], name='Sequence-Lengths')
+
+             def traditional_bptt():
+                 """Calls the lstm cell with the state and output for each time until num_steps."""
+                 state = initial_state
+                 # Unroll the graph num_steps back into the "past"
+                 for i in range(num_steps):
+                     if i &gt; 0: scope.reuse_variables()  # Reuse the variables created in the 1st LSTM cell
+                     output, state = lstm_cell(  # Step the LSTM through the sequence
+                         self._hot[i, ...] if time_major else self._hot[:, i, ...],
+                         state
+                     )
+                 return output
+
+             def dynamic_bptt():
+                 """Uses dynamic_rnn to unroll the graph."""
+                 outputs, states = tf.nn.dynamic_rnn(
+                     lstm_cell, self._hot,
+                     sequence_length=self._sequence_lengths,
+                     initial_state=initial_state,
+                     time_major=time_major,
+                     scope=scope
+                 )
+                 return outputs[-1, ...] if time_major else outputs[:, -1, ...]
+
+             def static_bptt():
+                 """Uses static_rnn to unroll the graph"""
+                 inputs = tf.unstack(self._hot, axis=0 if time_major else 1)
+
+                 outputs, states = tf.nn.static_rnn(
+                     lstm_cell, inputs,
+                     sequence_length=self._sequence_lengths,
+                     initial_state=initial_state,
+                     scope=scope
+                 )
+                 return outputs[-1]
+
+             # Emulate a switch statement
+             final_output = {
+                 'traditional': traditional_bptt,
+                 'dynamic': dynamic_bptt,
+                 'static': static_bptt
+             }.get(bptt_method)()
+
+ `
+
+ —
+ You are receiving this because you were mentioned.
+ Reply to this email directly, view it on GitHub
+ &lt;#9527 (comment)&gt;,
+ or mute the thread
+ &lt;https://github.com/notifications/unsubscribe-auth/ABtim5MDn21ejaFTjEgzd_UUs5jQkZFUks5sIRAygaJpZM4NMF3P&gt;
+ .
+
+
+
+		</comment>
+		<comment id='18' author='fxsuper' date='2017-06-28T20:43:40Z'>
+		I need to accept variable length sequences, so I am essentially comparing dyamic_rnn vs static_rnn vs using a python loop and then a per-timestep mask on the loss function. I have tested using batch sizes of 200 on both 10 and 100 long sequences of one-hot embedded vectors (10 'words' in dictionary). What do you define as larger batch sizes and timesteps? I get the logic behind the GPU swap thing, but I don't think that really warrants this 2x-2.5x slowdown even when swapping is set to be off. I also just wrote a custom, simpler version of dynamic_rnn that doesn't use TensorArrays or tf.where and it performs ~25% faster than dynamic_rnn; still not as fast as manual unrolls in python however. Also, according to my tests, static_rnn with sequence length passed in does not outperform manual unrolling because the tf.cond calls are tremendously expensive. With a batch size of 200 and 100 timesteps, supplying static_rnn with a sequence length vector filled with the value 10, dynamic_rnn takes ~90 seconds, static_rnn takes ~70 seconds, and manual unrolling takes ~30 seconds, even though manual unrolling strictly speaking is wasting 90/100 = 90% of its timesteps.
+		</comment>
+		<comment id='19' author='fxsuper' date='2017-07-05T20:54:55Z'>
+		Can you provide examples/gists of your manual unrolling code, how you're calling static_rnn, and also your custom dynamic_rnn which doesn't use TensorArrays?
+It's true that if you don't care about the final state or properly zeroing out your outputs (both require using tf.where) then you can get faster performance.  You disable this by passing sequence_length=None to dynamic_rnn.  You can also use tf.contrib.cudnn_rnn if you've got very performance critical code.  I'm trying to understand if tf.where isthe only source of slowdown compared to your streamlined versions.
+		</comment>
+		<comment id='20' author='fxsuper' date='2017-12-22T07:32:31Z'>
+		It has been 14 days with no activity and the awaiting tensorflower label was assigned. Please update the label and/or status accordingly.
+		</comment>
+		<comment id='21' author='fxsuper' date='2018-01-17T19:16:22Z'>
+		Nagging Awaiting Response: It has been 14 days with no activityand the awaiting response label was assigned. Is this still an issue?
+		</comment>
+		<comment id='22' author='fxsuper' date='2018-01-30T13:23:23Z'>
+		I tried a graph traversal using both while_loop with auto JIT option on and simply while under eager mode. It seems eager while runs faster. And my implementation is slower than existing method in sklearn based on cython, although I tried to use matrix manipulation as much as possible to gain efficiency from GPU.
+		</comment>
+		<comment id='23' author='fxsuper' date='2018-02-14T13:24:09Z'>
+		Nagging Awaiting Response: It has been 14 days with no activityand the awaiting response label was assigned. Is this still an issue?
+		</comment>
+		<comment id='24' author='fxsuper' date='2018-02-17T08:28:24Z'>
+		Yes it is. I am still waiting for new opinions. I guess while_loop could not be compiled or optimised in general situations. I also tried implementing DBSCAN using tf. Same algorithm with tf is just a bit better than using numpy, but much worse than the built in implementation in scikit, with cython. It is disappointing to see my friend's matlab implementation is faster than mine.
+		</comment>
+		<comment id='25' author='fxsuper' date='2018-03-04T13:04:53Z'>
+		Nagging Awaiting Response: It has been 14 days with no activityand the awaiting response label was assigned. Is this still an issue?
+		</comment>
+		<comment id='26' author='fxsuper' date='2018-03-19T15:13:49Z'>
+		Nagging Awaiting Response: It has been 14 days with no activityand the awaiting response label was assigned. Is this still an issue?
+		</comment>
+		<comment id='27' author='fxsuper' date='2018-04-17T12:45:16Z'>
+		It has been 14 days with no activity and the awaiting response label was assigned. Is this still an issue?
+		</comment>
+		<comment id='28' author='fxsuper' date='2018-05-02T18:46:14Z'>
+		It has been 29 days with no activity and the awaiting response label was assigned. Is this still an issue?
+		</comment>
+		<comment id='29' author='fxsuper' date='2018-05-17T18:55:06Z'>
+		It has been 89 days with no activity and the awaiting response label was assigned. Is this still an issue?
+		</comment>
+		<comment id='30' author='fxsuper' date='2018-06-02T07:17:22Z'>
+		We are closing this issue for now due to lack of activity. Please comment if this is still an issue for you. Thanks!
+		</comment>
+	</comments>
+</bug>

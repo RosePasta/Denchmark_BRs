@@ -1,0 +1,114 @@
+<bug id='17204' author='yaroslavvb' open_date='2018-02-23T01:49:40Z' closed_time='2018-04-03T22:10:03Z'>
+	<summary>HtoD takes 2.5x longer than D2H</summary>
+	<description>
+I'm noticing that HtoD copies are taking significantly longer than DtoH.
+IE, doing sess.run(gpu_var) vs sess.run(assign_gpu_var, feed_dict={gpu_var.initial_value: arr})
+100MB tensor takes 8ms on V100 to fetch (12.5GB/sec), but 21.67ms to feed (4.5 GB/sec)
+Benchmark
+&lt;denchmark-link:https://github.com/diux-dev/cluster/blob/db10c890530e7ded9e4a933596803e3ae0de1db0/yuxin_numpy/square_minimize_cpu_pipeline.py&gt;https://github.com/diux-dev/cluster/blob/db10c890530e7ded9e4a933596803e3ae0de1db0/yuxin_numpy/square_minimize_cpu_pipeline.py&lt;/denchmark-link&gt;
+
+Is there a way to make it faster? (something to do with memory pinning?)
+&lt;denchmark-link:https://user-images.githubusercontent.com/23068/36574018-6e853e74-17f8-11e8-80dd-7509e7c643a2.png&gt;&lt;/denchmark-link&gt;
+
+TensorFlow:
+version: 1.5.0
+: v1.5.0-0-g37aa430d84
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/37aa430d84&gt;37aa430&lt;/denchmark-link&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='yaroslavvb' date='2018-02-23T01:49:49Z'>
+		cc &lt;denchmark-link:https://github.com/zheng-xq&gt;@zheng-xq&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='2' author='yaroslavvb' date='2018-02-23T18:45:00Z'>
+		&lt;denchmark-link:https://wolfr.am/sEh9TuuR&gt;https://wolfr.am/sEh9TuuR&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://user-images.githubusercontent.com/23068/36610893-9555b374-1886-11e8-86bb-15d0cac793d6.png&gt;&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='3' author='yaroslavvb' date='2018-02-23T20:12:07Z'>
+		H2D seems to take expected time when source data lives in TensorFlow CPU variable rather than numpy array (8ms instead of 20ms), so I suspect the difference is due to memory pinning.
+I tried feeding page-locked numpy array created using PyCUDA (&lt;denchmark-link:https://github.com/diux-dev/cluster/blob/master/yuxin_numpy/d2h_benchmark_pycuda.py&gt;code&lt;/denchmark-link&gt;
+) but it made no difference in speed. I wonder if TensorFlow is smart enough to check if incoming numpy arrays are page-locked already, or if memory-&gt;page-locked memory is happening regardless
+&lt;denchmark-code&gt;  import pycuda.driver as drv
+  drv.init()
+  print("%d device(s) found." % drv.Device.count())
+  current_dev = drv.Device(0) #device we are working on
+  ctx = current_dev.make_context() #make a working context
+  ctx.push()
+  np_array = drv.pagelocked_zeros((args.dim,), dtype=np.float32)
+  ...
+  sess.run(params.initializer, feed_dict={params.initial_value:np_array})
+
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='4' author='yaroslavvb' date='2018-02-23T21:58:03Z'>
+		TensorFlow has its heuristics to determine whether a host memory should be page locked or not. Variables or any op that will be sent to device automatically gets page locked memory.
+However, I don't think the heuristics treats memory feeds as page locked. For high-performance models, it is recommended to go through a reader-op, instead of feeding a large amount of data.
+		</comment>
+		<comment id='5' author='yaroslavvb' date='2018-02-23T22:42:45Z'>
+		&lt;denchmark-link:https://github.com/zheng-xq&gt;@zheng-xq&lt;/denchmark-link&gt;
+ the application here is setting network parameters rather than reading data. Parameters come from external application (Ray)  and the goal is to get those values into corresponding TensorFlow parameter variables as fast as possible (cc &lt;denchmark-link:https://github.com/mrry&gt;@mrry&lt;/denchmark-link&gt;
+)
+		</comment>
+		<comment id='6' author='yaroslavvb' date='2018-02-25T03:07:16Z'>
+		OK, I suspect it actually recognizes numpy arrays to be page-locked. I tried fetching GPU tensor as numpy, writing my own data into that numpy array, and feeding it back, and it's about 1.8x faster than a regular 64-byte aligned numpy array
+&lt;denchmark-link:https://github.com/diux-dev/cluster/blob/41b318a5e5248b8e236c31c323be6d7777fa6133/yuxin_numpy/tf_numpy_benchmark.py&gt;tf_numpy_benchmark.py&lt;/denchmark-link&gt;
+
+&lt;denchmark-code&gt;python tf_numpy_benchmark.py --allocator=numpy --benchmark=feed_gpu_variable
+feed_gpu_variable             :   1.5 GB/sec, min: 65.37, median: 70.27, mean: 69.33
+
+python tf_numpy_benchmark.py --allocator=tf --benchmark=feed_gpu_variable
+feed_gpu_variable             :   5.4 GB/sec, min: 18.52, median: 20.10, mean: 20.23
+
+python tf_numpy_benchmark.py --allocator=tfgpu --benchmark=feed_gpu_variable
+feed_gpu_variable             :  10.1 GB/sec, min:  9.89, median:  9.94, mean:  9.97
+
+
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='7' author='yaroslavvb' date='2018-02-25T19:13:39Z'>
+		BTW, PyTorch doesn't seem to have this limitation, I can take a regular numpy array, and load it onto GPU as fast as numpy array in page-locked memory
+&lt;denchmark-link:https://github.com/diux-dev/cluster/blob/c396df42b7d13387b3be767f18f59e012bfd0277/yuxin_numpy/tf_numpy_benchmark.py&gt;benchmark v2&lt;/denchmark-link&gt;
+
+&lt;denchmark-code&gt;python tf_numpy_benchmark.py --allocator=tfgpu --benchmark=pytorchgpu_from_numpy
+pytorch_from_numpy            :  11.1 GB/sec, min:  9.05, median:  9.09, mean:  9.09
+
+python tf_numpy_benchmark.py --allocator=numpy --benchmark=pytorchgpu_from_numpy
+pytorch_from_numpy            :   7.8 GB/sec, min: 12.78, median: 12.85, mean: 12.87
+
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='8' author='yaroslavvb' date='2018-02-26T17:41:24Z'>
+		To summarize, getting numpy array onto GPU memory is about 4x faster in PyTorch than in TensorFlow
+&lt;denchmark-code&gt;python tf_numpy_benchmark.py --benchmark=pytorchgpu_from_numpy --allocator=numpy --num-iters=101
+pytorch_from_numpy            :   8.1 GB/sec, min: 12.34, median: 12.52, mean: 12.53
+
+python tf_numpy_benchmark.py --benchmark=feed_gpu_tensor --allocator=numpy --num-iters=101
+feed_gpu_tensor               :   1.8 GB/sec, min: 56.98, median: 68.01, mean: 67.06
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='9' author='yaroslavvb' date='2018-02-27T00:38:58Z'>
+		TensorFlow H2D becomes much faster if I enable tcmalloc.
+&lt;denchmark-code&gt;sudo apt-get install -y google-perftools
+export LD_PRELOAD="/usr/lib/libtcmalloc.so.4"
+python tf_numpy_benchmark.py --benchmark=feed_gpu_tensor --allocator=numpy --num-iters=51
+feed_gpu_tensor               :   7.9 GB/sec, min: 12.73, median: 13.07, mean: 13.00
+&lt;/denchmark-code&gt;
+
+Theory -- something in TensorFlow is sensitive to memory properties (posix_memalign flags?), and triggers an additional CPU memory copy before calling cudaMemCopyAsync. On other hand, PyTorch is not sensitive to this, and calls cudaMemCopyAsync right away. Hard to check because enabling cpu profiler also makes the slowness disappear, classical heisenbug
+		</comment>
+		<comment id='10' author='yaroslavvb' date='2018-04-03T21:35:07Z'>
+		&lt;denchmark-link:https://github.com/mrry&gt;@mrry&lt;/denchmark-link&gt;
+ WDYT?
+		</comment>
+		<comment id='11' author='yaroslavvb' date='2018-04-03T22:10:02Z'>
+		Closing because this issue seems to be resolved by 64-byte aligning input data.
+		</comment>
+	</comments>
+</bug>

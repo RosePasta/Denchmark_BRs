@@ -1,0 +1,166 @@
+<bug id='10828' author='FabianSchuetze' open_date='2020-09-16T17:05:40Z' closed_time='2020-09-16T17:48:07Z'>
+	<summary>Conv_filter option doesn't seem to work with DDPG  [rllib]</summary>
+	<description>
+&lt;denchmark-h:h3&gt;What is the problem?&lt;/denchmark-h&gt;
+
+The conv_filter option of ddpg.DEFAULT_CONFIG does not seem to be working.
+Below, is a little example where I try to set up the a  for a vision-based  environment. The first three classes are basically taken from  &lt;denchmark-link:https://github.com/ray-project/ray/blob/master/rllib/env/atari_wrappers.py&gt;Rllib's Atari Wrappers&lt;/denchmark-link&gt;
+ to create an  environment with a customizable vision-based observation space. In particular, I set the dimension of the observation space to  and stack 4 frames. As demonstration, I would like to work with  a convolution feature extractor of . The  is instantiated below:
+import copy
+from collections import deque
+import ray
+import cv2
+import gym
+import numpy as np
+from ray.rllib.agents import ddpg
+from ray.tune.registry import register_env
+
+class VisonWrapper(gym.Env):
+
+    def __init__(self, env_config):
+        super(VisonWrapper, self).__init__()
+        self._config = env_config
+        self.env = gym.make(env_config['name'])
+        self.env.reset()
+        size = self.env.render(mode='rgb_array').shape
+        self.observation_space = gym.spaces.Box(0, 255, size, dtype=np.float32)
+        self.env.reset()
+        self.action_space = self.env.action_space
+        self.img_deque = deque(maxlen=4)
+
+    def _get_last_frame(self):
+        img = self.env.render(mode='rgb_array')
+        return img
+
+    def reset(self):
+        self.env.reset()
+        return self._get_last_frame()
+
+    def step(self, action):
+        _, reward, done, info = self.env.step(action)
+        state = self._get_last_frame()
+        return state, reward, done, info
+
+
+class WarpFrame(gym.ObservationWrapper):
+    def __init__(self, env, dim):
+        """Warp frames to the specified size (dim x dim)."""
+        gym.ObservationWrapper.__init__(self, env)
+        self.width = dim
+        self.height = dim
+        self.observation_space = gym.spaces.Box(
+            low=0,
+            high=255,
+            shape=(self.height, self.width, 1),
+            dtype=np.uint8)
+
+    def observation(self, frame):
+        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        frame = cv2.resize(
+            frame, (self.width, self.height), interpolation=cv2.INTER_AREA)
+        return frame[:, :, None]
+
+
+class FrameStack(gym.Wrapper):
+    def __init__(self, env):
+        """Stack k last frames."""
+        gym.Wrapper.__init__(self, env)
+        self.k = 4
+        self.frames = deque([], maxlen=4)
+        shp = env.observation_space.shape
+        self.observation_space = gym.spaces.Box(
+            low=0,
+            high=255,
+            shape=(shp[0], shp[1], shp[2] * self.k),
+            dtype=env.observation_space.dtype)
+
+    def reset(self):
+        ob = self.env.reset()
+        for _ in range(self.k):
+            self.frames.append(ob)
+        return self._get_ob()
+
+    def step(self, action):
+        ob, reward, done, info = self.env.step(action)
+        self.frames.append(ob)
+        return self._get_ob(), reward, done, info
+
+    def _get_ob(self):
+        assert len(self.frames) == self.k
+        return np.concatenate(self.frames, axis=2)
+
+def register(env_config):
+    resized = env_config['dim']
+    return FrameStack(WarpFrame(VisonWrapper(env_config), resized))
+
+if __name__ == "__main__":
+    ray.init(num_cpus=1)
+    env_config = {'name':'Pendulum-v0', 'dim': 150}
+    config = copy.deepcopy(ddpg.DEFAULT_CONFIG)
+    register_env('MyEnv', register)
+    config['env'] = 'MyEnv'
+    config['env_config'] = env_config
+    config['model']['dim'] = 150
+    config['framework'] = 'torch'
+    atari_shape = [[32, [8, 8], 4], [64, [4, 4], 2], [64, [3, 3], 1]]
+    config['model']['conv_filters'] = atari_shape
+    trainer = ddpg.DDPGTrainer(env='MyEnv', config=config)
+However, the model layout shows:
+In [6]: trainer.get_policy().model                                                                       
+Out[6]: 
+TorchNoopModel_as_DDPGTorchModel(
+  (policy_model): Sequential(
+    (action_0): SlimFC(
+      (_model): Sequential(
+        (0): Linear(in_features=90000, out_features=400, bias=True)
+        (1): ReLU()
+      )
+    )
+    (action_1): SlimFC(
+      (_model): Sequential(
+        (0): Linear(in_features=400, out_features=300, bias=True)
+        (1): ReLU()
+      )
+    )
+    (action_out): SlimFC(
+      (_model): Sequential(
+        (0): Linear(in_features=300, out_features=1, bias=True)
+      )
+    )
+    (action_out_squashed): _Lambda()
+  )
+  (q_model): Sequential(
+    (q_hidden_0): SlimFC(
+      (_model): Sequential(
+        (0): Linear(in_features=90001, out_features=400, bias=True)
+        (1): ReLU()
+      )
+    )
+    (q_hidden_1): SlimFC(
+      (_model): Sequential(
+        (0): Linear(in_features=400, out_features=300, bias=True)
+        (1): ReLU()
+      )
+    )
+    (q_out): SlimFC(
+      (_model): Sequential(
+        (0): Linear(in_features=300, out_features=1, bias=True)
+      )
+    )
+  )
+)
+The top input size is 90000 for the policy module, which equals the flattened dimension of the environment's observation space. Does somebody have an idea how I can create a actor and critic with a shared convultional layer?
+I am grateful for any hints and suggestions!
+If we cannot run your script, we cannot fix your issue.
+
+ I have verified my script runs in a clean environment and reproduces the issue.
+ I have verified the issue also occurs with the latest wheels.
+
+Ray Version: 0.8.7
+	</description>
+	<comments>
+		<comment id='1' author='FabianSchuetze' date='2020-09-16T17:48:07Z'>
+		Sorry; after having read the DDPG docstring, I realize that conv_filters option is indeed not intended to work.
+		</comment>
+	</comments>
+</bug>

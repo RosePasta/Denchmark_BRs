@@ -1,0 +1,193 @@
+<bug id='1644' author='liusongxiang' open_date='2020-03-05T06:31:51Z' closed_time='2020-04-07T14:20:08Z'>
+	<summary>Bugs: tacotron2 tts attention visualization for version 0.7.0</summary>
+	<description>
+&lt;denchmark-link:https://github.com/kamo-naoyuki&gt;@kamo-naoyuki&lt;/denchmark-link&gt;
+
+I tried to use espnet2 tacotron2 model to conduct TTS on LJSpeech. The whole pipeline is ok with some minor modifications in the TEMPLATE/tts.sh, and the sysnthesis performance is also acceptable (currently use Griffin-Lim to generate).
+But I found that there are bugs for attention weight visualization using  &lt;denchmark-link:https://github.com/espnet/espnet/blob/v.0.7.0/espnet2/torch_utils/calculate_all_attentions.py#L13&gt;https://github.com/espnet/espnet/blob/v.0.7.0/espnet2/torch_utils/calculate_all_attentions.py#L13&lt;/denchmark-link&gt;
+ .
+Because decoder runs iteratively, the hook function will overwritten what is in the outputs and only remain the last attention vector.
+I made some small modifications to make it work properly, as follows:
+# 1. Register forward_hook fn to save the output from specific layers
+    outputs = defaultdict(list)   # MODIFIED
+    handles = {}
+    for name, modu in model.named_modules():
+
+        def hook(module, input, output, name=name):
+            # TODO(kamo): Should unify the interface?
+            if isinstance(module, MultiHeadedAttention):
+                outputs[name] = output
+            else:
+                c, w = output
+                outputs[name].append(w)   # MODIFIED
+
+        if isinstance(modu, AbsAttention):
+            handle = modu.register_forward_hook(hook)  
+            handles[name] = handle
+
+    # 2. Just forward one by one sample.
+    # Batch-mode can't be used to keep requirements small for each models.
+    keys = []
+    for k in batch:
+        if not k.endswith("_lengths"):
+            keys.append(k)
+
+    return_dict = defaultdict(list)    # MODIFIED
+    for ibatch in range(bs):
+        # *: (B, L, ...) -&gt; (1, L2, ...)
+        _sample = {
+            k: batch[k][ibatch, None, : batch[k + "_lengths"][ibatch]]
+            if k + "_lengths" in batch
+            else batch[k][ibatch, None]
+            for k in keys
+        }
+    
+        # *_lengths: (B,) -&gt; (1,)
+        _sample.update(
+            {
+                k + "_lengths": batch[k + "_lengths"][ibatch, None]
+                for k in keys
+                if k + "_lengths" in batch
+            }
+        )
+        model(**_sample)
+        
+
+        # Derive the attention results
+        for name, output in outputs.items():
+            output = torch.stack(output).squeeze()   # MODIFIED
+            return_dict[name].append(output)
+        outputs.clear()   # MODIFIED
+The modifications are noted by MODIFIED flags. Since I am not sure whether these modifications will affect other functionalities e.g ASR, I just post it here for your reference if you need it.
+	</description>
+	<comments>
+		<comment id='1' author='liusongxiang' date='2020-03-05T11:45:53Z'>
+		
+and the sysnthesis performance is also acceptable (currently use Griffin-Lim to generate).
+
+I 'm relieved to hear that since I didn't test tts part yet. Really helpful!
+I'll be busy, so maybe my reply will be late, but I'll be back surely after 2-3weeks. Please wait and if you find other bugs, please stack it also.
+		</comment>
+		<comment id='2' author='liusongxiang' date='2020-03-10T16:06:25Z'>
+		
+Because decoder runs iteratively, the hook function will overwritten what is in the outputs and only remain the last attention vector.
+
+Do you mean same module is invoked multiple times  in a forward()?
+If so, how about the following?
+_name = name
+idx = 0
+while _name in outputs:
+    idx += 1
+    _name = f"{name}_{idx}"
+if not isinstance(module, MultiHeadedAttention):
+    outputs[_name] = output
+else:
+    c, w = output
+    outputs[_name] = w
+...
+
+outputs.clear()  # &lt;= This is necessary 
+		</comment>
+		<comment id='3' author='liusongxiang' date='2020-03-10T17:27:18Z'>
+		On my point of view, even during training, Tacotron2 model use iterative way to compute predicted mel-spec (Plz see
+&lt;denchmark-link:https://github.com/espnet/espnet/blob/v.0.7.0/espnet/nets/pytorch_backend/tacotron2/decoder.py#L359&gt;https://github.com/espnet/espnet/blob/v.0.7.0/espnet/nets/pytorch_backend/tacotron2/decoder.py#L359&lt;/denchmark-link&gt;
+). At every step, the attention module is called once (of course, it has only the unique name). So at the end of one forward pass, only the attention weights at the last step is keeped in outputs[name].
+I don't think the way you mentioned above will solve this issue.
+Tx!
+		</comment>
+		<comment id='4' author='liusongxiang' date='2020-03-11T00:35:18Z'>
+		Thanks, I see. I forgot it, but my code solve this problem. It avoid to register values as same key.
+The problem of your version is stack(). The output tensor is supposed to be 2-3 dimension and 3 dimension is comes from MultiHeadedAttention , but stack() creates 4 dim tensor if MultiHeadedAttention is called twice or more.
+		</comment>
+		<comment id='5' author='liusongxiang' date='2020-03-11T02:02:16Z'>
+		Sorry, my mistake, your code does solve the issue.
+I did a small test to verify this:
+class AbsAttention(nn.Module):
+    def __init__(self):
+        super().__init__()
+    
+    def forward(self):
+        # c and w
+        return torch.ones(1, 2), torch.ones(1, 2)
+
+class TTSModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.rnn = nn.LSTMCell(2,2)
+        self.att_model = AbsAttention()
+        
+    def forward(self):
+        x = torch.rand(1, 2)
+        h, c= torch.zeros(1, 2), torch.zeros(1, 2)
+        att_ws = []
+        for i in range(10):
+            h, c = self.rnn(x, (h, c))
+            _, att_w = self.att_model()
+            att_ws.append(att_w)
+        att_ws = torch.stack(att_ws, dim=1)
+        return
+
+model = TTSModel()
+    
+# 1. Register forward_hook fn to save the output from specific layers
+outputs = {}
+handles = {}
+for name, modu in model.named_modules():
+    
+    def hook(module, input, output, name=name):
+        _name = name
+        idx = 0
+        while _name in outputs:
+            idx += 1
+            _name = f"{name}_{idx}"
+        if isinstance(module, AbsAttention):
+            c, w = output
+            outputs[_name] = w
+
+    if isinstance(modu, AbsAttention):
+        handle = modu.register_forward_hook(hook)
+        handles[name] = handle
+
+return_dict = defaultdict(list)
+for ibatch in range(4):
+    model()
+    print(outputs)
+    # Derive the attention results
+    for name, output in outputs.items():
+        return_dict[name].append(output)
+    print(return_dict)
+    outputs.clear()
+
+# 3. Remove all hooks
+for _, handle in handles.items():
+    handle.remove()
+    
+return_dict = defaultdict(list)
+for ibatch in range(4):
+    model()
+#     print(outputs)
+    # Derive the attention results
+    for name, output in outputs.items():
+        return_dict[name].append(output)
+#     print(return_dict)
+    outputs.clear()
+
+# 3. Remove all hooks
+for _, handle in handles.items():
+    handle.remove()
+The only thing to do is collate the return_dict such that the plot module can directly use it.
+Thanks for your reply.
+BTW, in this line in your code, I think if not should be if?
+if not isinstance(module, MultiHeadedAttention):
+    outputs[_name] = output
+		</comment>
+		<comment id='6' author='liusongxiang' date='2020-03-11T02:19:37Z'>
+		
+BTW, in this line in your code, I think if not should be if?
+if not isinstance(module, MultiHeadedAttention):
+    outputs[_name] = output
+
+Oh, sorry, yes, should be if, thanks.
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,393 @@
+<bug id='30561' author='pandrey-fr' open_date='2019-07-10T13:25:50Z' closed_time='2019-08-26T07:28:23Z'>
+	<summary>Eager execution drastically increases `tf.keras.Model.fit` runtimes</summary>
+	<description>
+System information
+
+
+Have I written custom code: yes
+
+
+OS Platform and Distribution: Linux Mint 19.1
+
+
+TensorFlow installed from: source
+
+
+TensorFlow version: v2.0.0-beta1-0-g8e423e3d56
+
+
+Python version: 3.6.8
+
+
+Bazel version: 0.26.0
+
+
+GCC version: 7.4.0
+
+
+CUDA/cuDNN version: 10.0 / 7.5
+
+
+GPU model and memory: Nvidia Quadro P1000 - 4 GB GDDR5
+
+
+Describe the current behavior
+My issue regards a performance degradation induced by enabling Eager execution, in a context when no Eager tensor should be created, apart from the model's weights (to which I do not need access). As of now, my installation (compiled from source based on yesterday's status of the r2.0 branch) does not have TF 2.0 behaviours enabled by default, thus I compared the run-times for a supervised learning task depending on whether I enable_v2_behavior or simply enable_resource_variables. It turns out the former yields a significant decrease in performance.
+On my initial example (which I do not include as it relies on custom data and model layers), the run time went from two minutes to five. In Eager mode, the first epoch was really slow, while the following ones proved increasingly fast, stabilizing at 11 / 12 seconds (19 ms/step). By contrast, without eager, all epochs ran at the same speed, for 8 / 9 seconds (15 ms/step).
+I reproduced this issue on an example that uses mock data (i.e. properly-shaped randomly-generated values, since learning performance is not at stake here) and uses exclusively layers taken from tensorflow.keras (no custom bits), whose code I present below. As it happens, not enabling Eager execution results in a 13m49s runtime, while enabling it increases it to 19m17s, i.e. an increase of about 40 percent.
+The task at hand consists in fitting a binary classifier that takes variable-length sequences of vectors as input. For this, I set up a tensorflow.data.Dataset instance (which, for simplification, contains random data in the provided code) based on pre-generated numpy arrays of data, and use the padded_batches method to format my inputs as desired. In the mock example, the model consists of a layer of 100 LSTM cells with inputs masking (due to length variability) and default tanh activation topped with a single feed-forward unit with sigmoid activation.
+Describe the expected behavior
+I can understand that Eager execution would create a slight overhead, however here it proves huge, while no mechanism whatsoever requires it. I do not know what can be done about it per se, but if such an overhead is to be expected, I think it would be nice to be able to disable Eager in 2.0. And I mean properly disabling it, not using tf.compat instructions that are bound to be wiped out at some point.
+Alternatively, I believe that it could be great to enable using "old-style" (not Eager) tensors as layer weights through, e.g., a boolean option, so that in the settings when accessing those weights (as Eager tensors) is not required (which, I believe, is a majority of cases, especially when some keras methods allow to effectively pull out the weights as numpy arrays), no overhead would be implied by a (seemingly) useless Eager declaration.
+Of course, I might be missing an existing feature allowing to do so, in which case I would be most glad to be pointed to a way to optimize run times when Eager execution is enabled (maybe by enforcing the isolation of the operations in a compiled graph?).
+Code to reproduce the issue
+&lt;denchmark-code&gt;# coding: utf-8
+
+"""Test script to measure runtime performances on mock data.
+
+Set up the EAGER constant on line 18 to toggle the use of
+Eager execution (provided it is not enabled by default,
+otherwise change the instructions on lines 31 and 33).
+Then, call `python3 &lt;this_script.py&gt;` to run it.
+"""
+
+import os
+import time
+
+import numpy as np
+import tensorflow as tf
+
+
+EAGER = False
+
+
+def main(eager):
+    """Set up and fit a model on mock data, with or without Eager execution.
+
+    The model consists of a layer of 100 LSTM cells topped with
+    a single dense unit with sigmoid activation. Its fitting is
+    bound not to yield actual accuracy improvements, as the data
+    used is purely random, but aims at measuring performances as
+    to runtime.
+    """
+    if eager:
+        tf.enable_v2_behavior()
+    else:
+        tf.enable_resource_variables()
+    # Set up the classifier model using custom embedding units.
+    inputs = tf.keras.Input((None, 100), dtype=tf.float32)
+    lengths = tf.keras.Input((), dtype=tf.int64)
+    mask = tf.sequence_mask(lengths)
+    output = tf.keras.layers.LSTM(100)(inputs, mask=mask)
+    output = tf.keras.layers.Dense(1, activation='sigmoid')(output)
+    model = tf.keras.Model([inputs, lengths], output)
+    # Set up the training and validation data.
+    dataset = setup_mock_dataset()
+    train, valid = dataset.take(500), dataset.skip(500)
+    # Fit the model.
+    model.compile('adam', 'binary_crossentropy', ['accuracy'])
+    history = model.fit(
+        train.repeat(), steps_per_epoch=500, epochs=10,
+        validation_data=valid.repeat(), validation_steps=100
+    )
+
+
+def setup_mock_dataset(n_batches=600, batch_size=32):
+    """Return a tf.data.Dataset yielding batches of random data.
+
+    The input data consists of a couple of tensors, one with
+    zero-padded sequences of vectors of size 100, the other
+    with the true sequence lengths. The target data consists
+    of sequence-wise binary values.
+    """
+    # Generate some random (mock) input and target data.
+    n_samples = n_batches * batch_size
+    lengths = 1 + np.random.choice(100, size=n_samples, replace=True)
+    inputs = np.random.normal(size=(lengths.sum(), 100))
+    targets = np.random.choice(2, size=(n_samples, 1), replace=True)
+    # Set up a generator yielding shuffled training samples.
+    def generator():
+        """Yield individual training samples."""
+        nonlocal inputs, targets, lengths, n_samples
+        start = 0
+        for i in range(n_samples):
+            end = start + lengths[i]
+            yield (inputs[start:end], lengths[i]), targets[i]
+            start = end
+    # Set up a tensorflow Dataset based on the previous.
+    output_shapes = (
+        (tf.TensorShape((None, 100)), tf.TensorShape(())), tf.TensorShape(1)
+    )
+    dataset = tf.data.Dataset.from_generator(
+        generator, ((tf.float32, tf.int64), tf.int64), output_shapes
+    )
+    # Have the dataset output data batches, and return it.
+    return dataset.padded_batch(batch_size, output_shapes)
+
+
+if __name__ == '__main__':
+    start = time.clock()
+    main(EAGER)
+    duration = time.clock() - start
+    min, sec = duration // 60, duration % 60
+    print('TOTAL DURATION: %im%i' % (min, sec))
+
+&lt;/denchmark-code&gt;
+
+Additional logs
+Here are the script's print outs:
+
+With Eager execution enabled:
+
+&lt;denchmark-code&gt;Epoch 1/10
+2019-07-10 15:58:59.009116: I tensorflow/stream_executor/platform/default/dso_loader.cc:42] Successfully opened dynamic library libcublas.so.10.0
+500/500 [==============================] - 83s 165ms/step - loss: 0.6983 - accuracy: 0.5009 - val_loss: 0.6990 - val_accuracy: 0.5034
+Epoch 2/10
+500/500 [==============================] - 72s 144ms/step - loss: 0.6712 - accuracy: 0.5904 - val_loss: 0.7125 - val_accuracy: 0.4931
+Epoch 3/10
+500/500 [==============================] - 72s 143ms/step - loss: 0.6056 - accuracy: 0.6841 - val_loss: 0.7604 - val_accuracy: 0.4947
+Epoch 4/10
+500/500 [==============================] - 72s 144ms/step - loss: 0.4445 - accuracy: 0.8073 - val_loss: 0.9025 - val_accuracy: 0.5031
+Epoch 5/10
+500/500 [==============================] - 72s 145ms/step - loss: 0.2502 - accuracy: 0.9169 - val_loss: 1.1817 - val_accuracy: 0.5069
+Epoch 6/10
+500/500 [==============================] - 72s 144ms/step - loss: 0.1250 - accuracy: 0.9699 - val_loss: 1.4860 - val_accuracy: 0.5091
+Epoch 7/10
+500/500 [==============================] - 72s 145ms/step - loss: 0.0724 - accuracy: 0.9859 - val_loss: 1.6498 - val_accuracy: 0.5047
+Epoch 8/10
+500/500 [==============================] - 72s 143ms/step - loss: 0.0537 - accuracy: 0.9891 - val_loss: 1.7936 - val_accuracy: 0.5038
+Epoch 9/10
+500/500 [==============================] - 72s 143ms/step - loss: 0.0351 - accuracy: 0.9948 - val_loss: 1.8995 - val_accuracy: 0.5066
+Epoch 10/10
+500/500 [==============================] - 72s 144ms/step - loss: 0.0297 - accuracy: 0.9949 - val_loss: 2.0393 - val_accuracy: 0.5041
+TOTAL DURATION: 19m17
+&lt;/denchmark-code&gt;
+
+
+Without enabling Eager execution:
+
+&lt;denchmark-code&gt;Epoch 1/10
+500/500 [==============================] - 46s 91ms/step - loss: 0.6989 - acc: 0.5006 - val_loss: 0.6999 - val_acc: 0.4894
+Epoch 2/10
+500/500 [==============================] - 45s 91ms/step - loss: 0.6708 - acc: 0.5932 - val_loss: 0.7138 - val_acc: 0.4875
+Epoch 3/10
+500/500 [==============================] - 45s 90ms/step - loss: 0.6048 - acc: 0.6849 - val_loss: 0.7705 - val_acc: 0.4975
+Epoch 4/10
+500/500 [==============================] - 45s 90ms/step - loss: 0.4453 - acc: 0.8104 - val_loss: 0.9408 - val_acc: 0.4950
+Epoch 5/10
+500/500 [==============================] - 46s 92ms/step - loss: 0.2518 - acc: 0.9169 - val_loss: 1.2647 - val_acc: 0.5009
+Epoch 6/10
+500/500 [==============================] - 46s 91ms/step - loss: 0.1206 - acc: 0.9726 - val_loss: 1.5996 - val_acc: 0.4994
+Epoch 7/10
+500/500 [==============================] - 45s 91ms/step - loss: 0.0766 - acc: 0.9839 - val_loss: 1.8580 - val_acc: 0.4975
+Epoch 8/10
+500/500 [==============================] - 46s 91ms/step - loss: 0.0569 - acc: 0.9884 - val_loss: 1.9623 - val_acc: 0.4975
+Epoch 9/10
+500/500 [==============================] - 46s 92ms/step - loss: 0.0476 - acc: 0.9897 - val_loss: 2.0733 - val_acc: 0.4966
+Epoch 10/10
+500/500 [==============================] - 46s 91ms/step - loss: 0.0316 - acc: 0.9946 - val_loss: 2.2490 - val_acc: 0.5044
+TOTAL DURATION: 13m49
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='pandrey-fr' date='2019-07-11T09:04:56Z'>
+		I ran some additional tests using a distinct TF installation (on the same system), namely version 2.0b1 installed from binary using pip. To do so, I marginally adjusted the script posted above, with the first few lines of main changed to:
+&lt;denchmark-code&gt;if not eager:
+    tf.compat.v1.disable_eager_execution()
+&lt;/denchmark-code&gt;
+
+When I disable eager, I have, again, stable run-times at each epoch (which are, for some reason, much faster than those reported yesterday: 51 ms/step, 25s/epoch, total duration of 9m42s). When I enable eager... well,  warnings show up repeatedly during the first epoch (see issues &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/29525&gt;#29525&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/30263&gt;#30263&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/30533&gt;#30533&lt;/denchmark-link&gt;
+ etc.), and then all epochs are slow (406 ms/step at first epoch, around 380 ms/step at each of the following ones, so around 190s/epoch for a total duration of 33m39s). With the grappler issue, it seems that Eager is not the only mechanism at fault in this specific case; but:
+I also ran my "true" script (with custom data and network layers subclassing tf.keras.layers.Layers - which I unfortunately cannot share), and I can see that it also runs faster with this TF installation. When enabling Eager, epochs 2-10 have similar runtimes as when disabling it (which is nice), but the first epoch is way slower (180s against 10s).
+I guess this is because in Eager mode, a separate graph is create for each and every training batch, creating a huge overhead at the first epoch, while the use of those same batches in the following epochs allows the re-use of these graphs. This is, however, senseless since all batches have the same TensorSpec, and a single graph should be able to cover them all (as it does when Eager execution is disabled). Is there any way how I can force a similar behaviour when Eager is enabled? I know this is when tf.function is supposed to be useful, but I cannot enforce it within built-in keras layers, can I?
+		</comment>
+		<comment id='2' author='pandrey-fr' date='2019-07-11T11:31:55Z'>
+		I am able to reproduce the issue on Colab with tensorflow 2.0.0.beta1. Thanks!
+		</comment>
+		<comment id='3' author='pandrey-fr' date='2019-07-11T18:10:36Z'>
+		&lt;denchmark-link:https://github.com/robieta&gt;@robieta&lt;/denchmark-link&gt;
+: Is this related to some of the recent performance investigations you're working on?
+		</comment>
+		<comment id='4' author='pandrey-fr' date='2019-07-11T18:20:07Z'>
+		Possibly. The fact that the first epoch is slower in eager is very surprising.
+		</comment>
+		<comment id='5' author='pandrey-fr' date='2019-07-12T15:19:03Z'>
+		The constant folding error has seemingly been fixed as of today's nightly build (see issue &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/29525&gt;#29525&lt;/denchmark-link&gt;
+), I was therefore able to re-run the mock example with TF 2.0b1 nightly (from july 12th). I decreased the number of epochs to 5 to gain time, as it appears that all following epochs run at the same speed as the fifth one.
+Here are the logs:
+
+with Eager disabled:
+
+&lt;denchmark-code&gt;Epoch 1/5
+2019-07-12 17:04:59.837656: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamic library libcublas.so.10.0
+500/500 [==============================] - 26s 52ms/step - loss: 0.6995 - accuracy: 0.4968 - val_loss: 0.6974 - val_accuracy: 0.4947
+Epoch 2/5
+500/500 [==============================] - 33s 66ms/step - loss: 0.6701 - accuracy: 0.6006 - val_loss: 0.7088 - val_accuracy: 0.4863
+Epoch 3/5
+500/500 [==============================] - 25s 49ms/step - loss: 0.6020 - accuracy: 0.6903 - val_loss: 0.7582 - val_accuracy: 0.4772
+Epoch 4/5
+500/500 [==============================] - 25s 50ms/step - loss: 0.4443 - accuracy: 0.8114 - val_loss: 0.8911 - val_accuracy: 0.4919
+Epoch 5/5
+500/500 [==============================] - 25s 50ms/step - loss: 0.2510 - accuracy: 0.9200 - val_loss: 1.1380 - val_accuracy: 0.5019
+TOTAL DURATION: 5m14
+&lt;/denchmark-code&gt;
+
+
+with Eager enabled:
+
+&lt;denchmark-code&gt;Epoch 1/5
+W0712 17:07:55.431549 140457053927232 deprecation.py:323] From /home/pandrey/Documents/tfnightly/lib/python3.6/site-packages/tensorflow_core/python/keras/optimizer_v2/optimizer_v2.py:460: BaseResourceVariable.constraint (from tensorflow.python.ops.resource_variable_ops) is deprecated and will be removed in a future version.
+Instructions for updating:
+Apply a constraint manually following the optimizer update step.
+2019-07-12 17:07:56.198978: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamic library libcublas.so.10.0
+500/500 [==============================] - 72s 145ms/step - loss: 0.6988 - accuracy: 0.4942 - val_loss: 0.6949 - val_accuracy: 0.5069
+Epoch 2/5
+500/500 [==============================] - 58s 117ms/step - loss: 0.6697 - accuracy: 0.5954 - val_loss: 0.7051 - val_accuracy: 0.4941
+Epoch 3/5
+500/500 [==============================] - 59s 117ms/step - loss: 0.5952 - accuracy: 0.7014 - val_loss: 0.7517 - val_accuracy: 0.4959
+Epoch 4/5
+500/500 [==============================] - 59s 117ms/step - loss: 0.4256 - accuracy: 0.8236 - val_loss: 0.8976 - val_accuracy: 0.5072
+Epoch 5/5
+500/500 [==============================] - 58s 117ms/step - loss: 0.2332 - accuracy: 0.9242 - val_loss: 1.1507 - val_accuracy: 0.5016
+TOTAL DURATION: 9m56
+&lt;/denchmark-code&gt;
+
+As you can see, the epochs' runtimes are still about twice as high with Eager enabled than with Eager disabled... I also have a deprecation warning regarding resource variables whose relatedness to the issue I cannot state.
+		</comment>
+		<comment id='6' author='pandrey-fr' date='2019-08-01T17:24:27Z'>
+		Just to give a quick update on this. (I know you've been waiting very patiently.) There are a bunch of tiny host to device transfers in the v2 path that seem to be blocking the main computation. I haven't been able to diagnose the underlying cause yet.
+cc &lt;denchmark-link:https://github.com/qlzh727&gt;@qlzh727&lt;/denchmark-link&gt;
+ who is our resident RNN expert.
+		</comment>
+		<comment id='7' author='pandrey-fr' date='2019-08-02T06:54:27Z'>
+		Thank you for the update (and your work in general; Github issues are bound to be a complain space, but there are so many great things about tensorflow that it would be a shame not to mention it). I will keep waiting :-)
+		</comment>
+		<comment id='8' author='pandrey-fr' date='2019-08-06T18:30:04Z'>
+		Can you try with the latest nightly? This should be fixed by: &lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/640b5f2513bc3c6537bd635cd9dcca4148cb5b26&gt;640b5f2&lt;/denchmark-link&gt;
+ (and an analogous fix for custom layers / autograph &lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/f03540a63d0e03a210b03b8689e60d384d91833a&gt;f03540a&lt;/denchmark-link&gt;
+ was also added)
+To briefly summarize what was going on, we were specifying the number of RNN steps twice: once in the while loop cond, and once in the max steps. while_loop reconciles those two by placing a logical_and op but in practice it would only ever see and(True, True) or and(False, False). So the GPU was blocking waiting for all of the info needed for the predicate to arrive and resulted in stalled training. We are working in parallel to make the v2 runtime interact better with control flow in general (Ideally it would handle the above optimally regardless), but the two changes above should do a reasonable job for both builtin and custom rnns until the broader runtime changes land.
+		</comment>
+		<comment id='9' author='pandrey-fr' date='2019-08-07T08:42:26Z'>
+		Hi,
+I installed the current nightly 2.0 build with GPU enabled using pip:
+&lt;denchmark-code&gt;&gt;&gt;&gt; tf.version.VERSION
+'2.0.0-dev20190731'
+&gt;&gt;&gt; tf.version.GIT_VERSION
+'v1.12.1-7529-g3e0ad8a004'
+&lt;/denchmark-code&gt;
+
+And ran a series of test using the same scripts as before.
+Mock script
+This is the script I shared, with mock data being processed by a LSTM.
+With Eager enabled, I can indeed see a great performance improvement compared to previous tests: with GPU enabled, the first epoch runs in 23 seconds and each of the following ones in 8 seconds each, while with CPU only the first epoch takes 30 seconds to complete and the following ones 21 seconds each.
+I however have a warning message showing up repeatedly during the first epoch:
+W tensorflow/core/grappler/optimizers/implementation_selector.cc:310] Skipping optimization due to error while loading function libraries: Invalid argument: Functions '__inference___backward_cudnn_lstm_with_fallback_618_2088_specialized_for_training_Adam_gradients_gradients_lstm_StatefulPartitionedCall_grad_StatefulPartitionedCall_at___inference_keras_scratch_graph_3555' and '__inference___backward_standard_lstm_2424_3034' both implement 'lstm_c1c4be15-b33a-462d-a312-bd8c7c49da68' but their signatures do not match.
+With Eager disabled, the script does not run, and I get the following error stack:
+&lt;denchmark-code&gt;W0807 09:53:49.171155 140492685502272 deprecation.py:323] From /home/pandrey/Documents/tfnightly/lib/python3.6/site-packages/tensorflow_core/python/keras/optimizer_v2/optimizer_v2.py:468: BaseResourceVariable.constraint (from tensorflow.python.ops.resource_variable_ops) is deprecated and will be removed in a future version.
+Instructions for updating:
+Apply a constraint manually following the optimizer update step.
+2019-08-07 09:53:49.183543: W tensorflow/c/c_api.cc:326] Operation '{name:'lstm/StatefulPartitionedCall' id:76 op device:{} def:{{{node lstm/StatefulPartitionedCall}} = StatefulPartitionedCall[Tin=[DT_FLOAT, DT_FLOAT, DT_FLOAT, DT_RESOURCE, DT_RESOURCE, DT_RESOURCE, DT_BOOL], Tout=[DT_FLOAT, DT_FLOAT, DT_FLOAT, DT_FLOAT, DT_FLOAT, ..., DT_VARIANT, DT_VARIANT, DT_VARIANT, DT_FLOAT, DT_INT32], _gradient_op_type="PartitionedCall-252", config="", config_proto="\n\007\n\003GPU\020\001\n\007\n\003CPU\020\0012\005*\0010J\0008\001", executor_type="", f=__forward_standard_lstm_2916[]](input_1, lstm/zeros, lstm/zeros_1, lstm/kernel, lstm/recurrent_kernel, lstm/bias, SequenceMask/Less)}}' was changed by setting attribute after it was run by a session. This mutation will have no effect, and will trigger an error in the future. Either don't modify nodes after running them or create a new session.
+Traceback (most recent call last):
+  File "/home/pandrey/Documents/tfnightly/lib/python3.6/site-packages/tensorflow_core/python/client/session.py", line 1356, in _do_call
+    return fn(*args)
+  File "/home/pandrey/Documents/tfnightly/lib/python3.6/site-packages/tensorflow_core/python/client/session.py", line 1339, in _run_fn
+    self._extend_graph()
+  File "/home/pandrey/Documents/tfnightly/lib/python3.6/site-packages/tensorflow_core/python/client/session.py", line 1379, in _extend_graph
+    tf_session.ExtendSession(self._session)
+tensorflow.python.framework.errors_impl.InvalidArgumentError: Node 'training/Adam/gradients/gradients/lstm/StatefulPartitionedCall_grad/StatefulPartitionedCall': Connecting to invalid output 5 of source node lstm/StatefulPartitionedCall which has 5 outputs
+&lt;/denchmark-code&gt;
+
+Conclusion: the performance with Eager is far better than before, but it would seem there still are issues with the LSTM implementation (which might be due to the interaction with Adam? I will run some more tests with another optimizer after posting this first wave of test reports).
+Actual script and data
+This is the script I cannot share, with custom layers on a task whose specification is similar to the mock one. I first ran tets using an actual dataset (interfaced with a tf.data.Dataset), as I did in every previous performance report regarding that script.
+With Eager enabled, the first epoch is still slow (102 ~ 104 seconds), while the following ones run at either 10 or 13 seconds per epoch depending on GPU availability. Compared to previous tests, the first epoch is nearly 80 seconds faster, while the rest runs at similar speed. With Eager disabled, all epochs run at either 9 or 13 seconds depending on GPU availability.
+Conclusion: the performance is similar to previous tests, save for a reduced but still important runtime overhead during the first epoch when Eager execution is enabled.
+Actual script with mock data
+At this point, I came to wonder whether this was related to the actual network computations or to the dataset mechanisms. In order to partly disentangle those two aspects, I ran a third round of tests, using my actual custom model, but mock data (with the exact same function as in the shared mock script).
+In this setting, all epochs run in 5~6 seconds (whether Eager is enabled or not, and with no significant change when GPU is available), save, again, for the first one with Eager enabled, which takes 11 seconds to complete.
+Conclusion: most of the overhead runtime during the first fitting epoch with Eager execution enabled seems to come from the handling of the Dataset. When using a mock-data in-memory Dataset, the overhead is greatly reduced although still existent.
+		</comment>
+		<comment id='10' author='pandrey-fr' date='2019-08-07T08:49:35Z'>
+		I tried running the mock script with various optimizers, it does not change a thing to the lstm-related warning and errors showing up (save for a reported faulty node names, obviously).
+		</comment>
+		<comment id='11' author='pandrey-fr' date='2019-08-11T17:59:39Z'>
+		The behavior that you're seeing is a mix of bugs and expected behavior. But in any case I think an explanation is in order.
+One very minor point that I noticed is that mask = tf.sequence_mask(lengths) should actually be mask = tf.keras.layers.Lambda(lambda x: tf.sequence_mask(x))(lengths). There is some fallback logic to auto wrap it in a layer, but it only works for builtin functions and can be less than ideal for complex transformations (since it makes a layer per op) so it's good to get in the habit of always using Layers. Interestingly, this revealed a different issue in how keras was handling connectivity which has since been fixed. Ok, on to the RNNs!
+It appears that somewhere along the line you switched from the v1 to v2 API in tf. (I'm guessing moving from your home built version to the 2.0 nightly) For most layers it's a negligible difference, but LSTM and GRU are special. In tf 1.x, if you want CuDNN you have to use the tf.keras.layers.CuDNNLSTM / CuDNNGRU classes, while tf.keras.layers.LSTM / GRU gets you an rnn using raw tf ops. (This is the context of the initially reported slowdown, where the Non-CuDNN version was slow in v2.) On the other hand, the LSTM in v2 will look at the particular structure of your LSTM and automatically use CuDNN if possible. (The CuDNN LSTM is only applicable to a subset of LSTMs.)
+The automatic switching only works in v2 due to some deep quirks with the v1 runtime, and we hadn't considered the case that someone would trigger it in v1 since it was only part of the v2 API. But of course comparing v1 and v2 is a very natural thing to try. The fix is that (except for Estimator which I won't go into) the v2 LSTM will not attempt the CuDNN swap if it detects that it is being run in a v1 environment.
+&lt;denchmark-link:https://colab.sandbox.google.com/gist/robieta/7a00e418036fdc02821f29b96e3a5871/lstm_demo.ipynb&gt;https://colab.sandbox.google.com/gist/robieta/7a00e418036fdc02821f29b96e3a5871/lstm_demo.ipynb&lt;/denchmark-link&gt;
+
+This means that the layer won't crash, but v2 will seem much faster than v1 simply because only v2 is using CuDNN. (you can always use tf.compat.v1.keras.layers.CuDNNLSTM for the more direct comparison, of course.)
+		</comment>
+		<comment id='12' author='pandrey-fr' date='2019-08-13T21:01:02Z'>
+		
+One very minor point that I noticed is that mask = tf.sequence_mask(lengths) should actually be mask = tf.keras.layers.Lambda(lambda x: tf.sequence_mask(x))(lengths). There is some fallback logic to auto wrap it in a layer, but it only works for builtin functions and can be less than ideal for complex transformations (since it makes a layer per op) so it's good to get in the habit of always using Layers.
+
+Thank you for the advice! I will make sure to be more careful about that in the future. Using lambdas has always felt counter-intuitive as it is rather unpythonic, but with your explanation I know understand why lambda layers should be used to wrap one-liners that do not require actual sub-classing :)
+
+It appears that somewhere along the line you switched from the v1 to v2 API in tf. (I'm guessing moving from your home built version to the 2.0 nightly)
+
+Actually, not in the context of this issue. The home built version I used to run the initial tests was based on the 2.0 github branch, which weirdly did not have Eager enabled by default (but did have the 2.0 API, including the version submodule stating it was a 2.0 installation). At any rate, each time I reported a Eager / non-Eager comparison, it was using one installation and using an Eager [en|dis]sabling command (tf.compat.v1.disable_eager_execution() in all recent posts).
+
+In tf 1.x, if you want CuDNN you have to use the tf.keras.layers.CuDNNLSTM / CuDNNGRU classes, while tf.keras.layers.LSTM / GRU gets you an rnn using raw tf ops. (This is the context of the initially reported slowdown, where the Non-CuDNN version was slow in v2.) On the other hand, the LSTM in v2 will look at the particular structure of your LSTM and automatically use CuDNN if possible. (The CuDNN LSTM is only applicable to a subset of LSTMs.)
+
+Based on the previous point, I do not quite understand how this would apply in my case, but perhaps your point is that my home built may have been using that v1 behavior, explaining the apparent improvement related to using the nightly build? In any case, that is an interesting thing to know about :)
+
+But of course comparing v1 and v2 is a very natural thing to try.
+
+I get the point. That being said, my issue is, at the moment, with the disabling of Eager execution in v2 improving run-times (and, in other contexts, memory usage, but this is a separate issue). I can see that, possibly due to a faulty versioning of my initial installation, the difference is not as drastic as initially reported, but I still encounter significant overheads, which partly seem to be related to the handling of Dataset objects.
+This is just to, perhaps, clarify a bit where the issue appears to stand now - thank you for doing the same and providing me with a better understanding of some of the mechanisms at stake!
+		</comment>
+		<comment id='13' author='pandrey-fr' date='2019-08-26T07:28:23Z'>
+		Now that version 2.0 rc0 is out (congrats!), I re-ran the tests on the shared mock script (with the tf.sequence_mask line now wrapped with a Lambda layer) using it, and am overall very pleased with the results, although there might still be a few things to look at.
+Mock script and data
+With Eager execution enabled, the training is faster than ever, with a first epoch running in 11 seconds and subsequent ones in 7 seconds. Is the slight initial over-time due to the model building mechanics? In other words, is it something to expect in general? At any rate, it is way less significant than in previous beta versions, which is really neat.
+I still get, however, the previously-reported grappler warning about signatures from LSTM backend functions not matching:
+&lt;denchmark-code&gt;W tensorflow/core/grappler/optimizers/implementation_selector.cc:310] Skipping optimization due to error while loading function libraries: Invalid argument: Functions '__inference___backward_standard_lstm_7463_8060' and '__inference___backward_cudnn_lstm_with_fallback_5855_7312_specialized_for_StatefulPartitionedCall_at___inference_distributed_function_8216' both implement 'lstm_919b145d-75ed-47c1-a8cd-5f2737a5edbe' but their signatures do not match.
+&lt;/denchmark-code&gt;
+
+With Eager disabled, the code now runs again (which it did not when I tested a previous nightly build), although there is an initial warning about an invalid lstm nodes modification through a while loop (see below). The times are about 25 seconds per epoch, as before - I am thus happy to see that execution with Eager enabled has not only closed the gap with non-Eager execution, but actually surpassed it as far as this example model is concerned, which I guess relies on the work done on LSTM layers. Many thanks and congratulations for that!
+&lt;denchmark-code&gt;W tensorflow/c/c_api.cc:326] Operation '{name:'lstm/while' id:262 op device:{} def:{{{node lstm/while}} = While[T=[DT_INT32, DT_INT32, DT_INT32, DT_VARIANT, DT_FLOAT, ..., DT_VARIANT, DT_VARIANT, DT_VARIANT, DT_VARIANT, DT_VARIANT], _lower_using_switch_merge=true, _num_original_outputs=59, body=lstm_while_body_123[], cond=lstm_while_cond_122[], output_shapes=[[], [], [], [], [?,100], ..., [], [], [], [], []], parallel_iterations=32](lstm/while/loop_counter, lstm/while/maximum_iterations, lstm/time, lstm/TensorArrayV2_1, lstm/zeros_like, lstm/zeros, lstm/zeros_1, lstm/strided_slice_1, lstm/TensorArrayUnstack/TensorListFromTensor, lstm/TensorArrayUnstack_1/TensorListFromTensor, lstm/kernel, lstm/recurrent_kernel, lstm/bias, lstm/while/EmptyTensorList, lstm/while/EmptyTensorList_1, lstm/while/EmptyTensorList_2, lstm/while/EmptyTensorList_3, lstm/while/EmptyTensorList_4, lstm/while/EmptyTensorList_5, lstm/while/EmptyTensorList_6, lstm/while/EmptyTensorList_7, lstm/while/EmptyTensorList_8, lstm/while/EmptyTensorList_9, lstm/while/EmptyTensorList_10, lstm/while/EmptyTensorList_11, lstm/while/EmptyTensorList_12, lstm/while/EmptyTensorList_13, lstm/while/EmptyTensorList_14, lstm/while/EmptyTensorList_15, lstm/while/EmptyTensorList_16, lstm/while/EmptyTensorList_17, lstm/while/EmptyTensorList_18, lstm/while/EmptyTensorList_19, lstm/while/EmptyTensorList_20, lstm/while/EmptyTensorList_21, lstm/while/EmptyTensorList_22, lstm/while/EmptyTensorList_23, lstm/while/EmptyTensorList_24, lstm/while/EmptyTensorList_25, lstm/while/EmptyTensorList_26, lstm/while/EmptyTensorList_27, lstm/while/EmptyTensorList_28, lstm/while/EmptyTensorList_29, lstm/while/EmptyTensorList_30, lstm/while/EmptyTensorList_31, lstm/while/EmptyTensorList_32, lstm/while/EmptyTensorList_33, lstm/while/EmptyTensorList_34, lstm/while/EmptyTensorList_35, lstm/while/EmptyTensorList_36, lstm/while/EmptyTensorList_37, lstm/while/EmptyTensorList_38, lstm/while/EmptyTensorList_39, lstm/while/EmptyTensorList_40, lstm/while/EmptyTensorList_41, lstm/while/EmptyTensorList_42, lstm/while/EmptyTensorList_43, lstm/while/EmptyTensorList_44, lstm/while/EmptyTensorList_45)}}' was changed by setting attribute after it was run by a session. This mutation will have no effect, and will trigger an error in the future. Either don't modify nodes after running them or create a new session.
+&lt;/denchmark-code&gt;
+
+Custom script and data
+As for my custom model and data, I ran my un-shared testing script, and now get only 1 seconds of overhead on the first training epoch with Eager enabled - otherwise, all epochs run in 9 seconds, whether Eager is disabled or not. If I use mock data instead of my custom one, the epochs run faster but the slight 2 seconds overhead is similar, which confirms Dataset handling issue have also been fixed in rc0.
+Conclusion
+Given these latest test results, I am happy to say that the issue has been solved in 2.0rc0. Again, thank you to everyone involved in developing it, and special thanks to &lt;denchmark-link:https://github.com/robieta&gt;@robieta&lt;/denchmark-link&gt;
+ for your feedback on this issue, and work in general.
+I leave it to you to deem whether the couple of warnings I brought up in this post are worth investigating (more probably, you would already know about those), but as far as the core point of performance dropout is concerned, I am happy to close this issue!
+		</comment>
+		<comment id='14' author='pandrey-fr' date='2019-08-26T07:28:24Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=30561&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=30561&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='15' author='pandrey-fr' date='2019-10-22T14:58:44Z'>
+		I had the same problem, and seem to have found a good solution:
+when manually defining the training loop using the gradient type stuff like inidcated in the TensorFlow migration tutorial, training gets even sligthly faster than with disabled eager mode.
+Just adapting this code. to your situation:
+@tf.function
+def train_step(inputs, labels):
+with tf.GradientTape() as tape:
+predictions = model(inputs, training=True)
+if len(model.losses) &gt; 0:
+regularization_loss = tf.math.add_n(model.losses)
+else:
+regularization_loss = 0
+pred_loss = loss_fn(labels, predictions)
+total_loss = pred_loss + regularization_loss
+gradients = tape.gradient(total_loss, model.trainable_variables)
+optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+for epoch in range(NUM_EPOCHS):
+for inputs, labels in train_data:
+train_step(inputs, labels)
+print("Finished epoch", epoch)
+		</comment>
+	</comments>
+</bug>

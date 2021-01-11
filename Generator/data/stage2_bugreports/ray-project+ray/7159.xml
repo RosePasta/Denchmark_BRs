@@ -1,0 +1,162 @@
+<bug id='7159' author='justinglibert' open_date='2020-02-13T22:22:55Z' closed_time='2020-02-17T18:26:59Z'>
+	<summary>RLLib: PyTorch Recurrent Model: Hidden_state is not a Tensor, it's a Numpy Array</summary>
+	<description>
+&lt;denchmark-h:h3&gt;What is the problem?&lt;/denchmark-h&gt;
+
+Latest ray installed from this wheel: &lt;denchmark-link:https://s3-us-west-2.amazonaws.com/ray-wheels/latest/ray-0.9.0.dev0-cp36-cp36m-manylinux1_x86_64.whl&gt;https://s3-us-west-2.amazonaws.com/ray-wheels/latest/ray-0.9.0.dev0-cp36-cp36m-manylinux1_x86_64.whl&lt;/denchmark-link&gt;
+
+&lt;denchmark-h:h3&gt;Reproduction (REQUIRED)&lt;/denchmark-h&gt;
+
+PyTorch models get back a hidden state that has been casted to a Numpy array.
+That breaks torch.nn and will break backprop too.
+I took this file as an example of a RNN in PyTorch:
+&lt;denchmark-link:https://github.com/ray-project/ray/blob/master/rllib/agents/qmix/model.py&gt;https://github.com/ray-project/ray/blob/master/rllib/agents/qmix/model.py&lt;/denchmark-link&gt;
+
+import ray
+from ray import tune
+from ray.rllib.agents import ppo
+from ray.rllib.models import ModelCatalog
+from ray.rllib.models.torch.torch_modelv2 import TorchModelV2
+from ray.rllib.utils.annotations import override
+from ray.tune.registry import register_env
+import gym
+from gym.spaces import Discrete, Box
+import numpy as np
+
+import torch
+from torch import nn
+
+
+class SimpleCorridor(gym.Env):
+    """Example of a custom env in which you have to walk down a corridor.
+    You can configure the length of the corridor via the env config."""
+
+    def __init__(self, config):
+        self.end_pos = config["corridor_length"]
+        self.cur_pos = 0
+        self.action_space = Discrete(2)
+        self.observation_space = Box(
+            0.0, self.end_pos, shape=(1, ), dtype=np.float32)
+
+    def reset(self):
+        self.cur_pos = 0
+        return [self.cur_pos]
+
+    def step(self, action):
+        assert action in [0, 1], action
+        if action == 0 and self.cur_pos &gt; 0:
+            self.cur_pos -= 1
+        elif action == 1:
+            self.cur_pos += 1
+        done = self.cur_pos &gt;= self.end_pos
+        return [self.cur_pos], 1 if done else 0, done, {}
+
+
+
+class TestNet(TorchModelV2, nn.Module):
+    def init_hidden(self, hidden_size):
+        h0 = self.policy_fc.weight.new(1, hidden_size).zero_()
+        c0 = self.policy_fc.weight.new(1, hidden_size).zero_()
+        return (h0, c0)
+
+    def __init__(self, obs_space, action_space, num_outputs, config, name):
+        TorchModelV2.__init__(
+            self, obs_space, action_space, num_outputs, config, name
+        )
+        nn.Module.__init__(self)
+        # Value function
+        self._value_branch = nn.Sequential(
+            nn.Linear(1, 4),
+            nn.LeakyReLU(),
+            nn.Linear(4, 1)
+        )
+        # Policy
+        self.policy_fc = nn.Linear(64, 2)
+        self.lstm = nn.LSTM(1, 64, batch_first=True)        
+        self._cur_value = None
+
+    @override(TorchModelV2)
+    def get_initial_state(self):
+        # make hidden states on same device as model
+        lstm_h, lstm_c = self.init_hidden(64)
+    
+        initial_state = [
+            lstm_h,
+            lstm_c,
+        ]
+        return initial_state
+
+    @override(TorchModelV2)
+    def value_function(self):
+        assert self._cur_value is not None, "must call forward() first"
+        return self._cur_value
+
+    def forward(self, input_dict, hidden_state, seq_lens):
+        obs = input_dict['obs_flat']
+        batch_size, features = obs.size()
+
+        # Unpack the hidden_state
+        lstm_h = hidden_state[0]
+        # THIS IS NOT A TENSOR
+        print(type(lstm_h))
+        lstm_c = hidden_state[1]
+
+        # Build the tuples
+        lstm_hidden = (lstm_h.reshape(-1, 1, 64), lstm_c.reshape(-1, 1, 64))
+
+        out, lstm_hidden = self.lstm(
+            obs.view(-1, 1, 1), lstm_hidden
+        )
+        new_hidden_state = [
+            lstm_hidden[0],
+            lstm_hidden[1],
+        ]
+        print(new_hidden_state)
+        # Value function
+        self._cur_value = self._value_branch(obs)
+        self.logits = self.policy_fc(out)
+        return logits, new_hidden_state
+
+
+
+
+ModelCatalog.register_custom_model("test", TestNet)
+register_env("test", lambda config: SimpleCorridor(config))
+
+ray.init()
+tune.run(
+    ppo.PPOTrainer,
+    config={
+        "env": "test",
+        "use_pytorch": True,
+        "env_config": {
+            "corridor_length": 10
+        },
+        "model": {
+            "custom_model": "test",
+            "custom_options": {},
+        },
+    },
+)
+
+ I have verified my script runs in a clean environment and reproduces the issue.
+ I have verified the issue also occurs with the latest wheels.
+
+	</description>
+	<comments>
+		<comment id='1' author='justinglibert' date='2020-02-13T23:57:55Z'>
+		Hm so I think it's expected it will be numpy during inference (since we never backprop during that). However during learning, it should be a Tensor.
+		</comment>
+		<comment id='2' author='justinglibert' date='2020-02-14T00:06:59Z'>
+		Try out &lt;denchmark-link:https://github.com/ray-project/ray/pull/7162&gt;#7162&lt;/denchmark-link&gt;
+ ? I couldn't get your example to run completely but it seems to have gotten further (had to also add ).
+		</comment>
+		<comment id='3' author='justinglibert' date='2020-02-14T00:49:58Z'>
+		Thanks for the fast reply!
+"I think it's expected it will be numpy during inference (since we never backprop during that). However during learning, it should be a Tensor."
+Do you mean that it is incorrectly doing some eval? Or is the default behaviour of the trainer to first eval before doing any training?
+I'll try the PR tomorrow!
+Also: If the hidden state is a numpy array during eval, what's the recommended way of making sure it's always a Tensor? Should I check the type of the variable and cast it to a Tensor when it's not (during eval I guess)?
+		</comment>
+	</comments>
+</bug>

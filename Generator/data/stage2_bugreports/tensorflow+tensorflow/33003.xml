@@ -1,0 +1,171 @@
+<bug id='33003' author='nikogamulin' open_date='2019-10-02T23:07:59Z' closed_time='2020-02-22T21:35:48Z'>
+	<summary>Loss of the model ran with TF2.0 is much higher compared to 1.x</summary>
+	<description>
+Please make sure that this is a bug. As per our GitHub Policy, we only address code/doc bugs, performance issues, feature requests and build/installation issues on GitHub. tag:bug_template
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow):
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Ubuntu 18.04
+Mobile device (e.g. iPhone 8, Pixel 2, Samsung Galaxy) if the issue happens on mobile device:
+TensorFlow installed from (source or binary): binary
+TensorFlow version (use command below): 2.0 GPU
+Python version: 3.6
+Bazel version (if compiling from source):
+GCC/Compiler version (if compiling from source):
+CUDA/cuDNN version: 10.1
+GPU model and memory: GeForce RTX 2080 Ti
+
+You can collect some of this information using our environment capture
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/tree/master/tools/tf_env_collect.sh&gt;script&lt;/denchmark-link&gt;
+
+You can also obtain the TensorFlow version with: 1. TF 1.0:  2. TF 2.0: 
+Describe the current behavior
+After migrating to TF 2.0 I tried to run the exact same model and got much worse results
+Describe the expected behavior
+The results should be the same as in TF1.x
+Code to reproduce the issue
+Provide a reproducible test case that is the bare minimum necessary to generate the problem.
+Below is the model definition:
+&lt;denchmark-code&gt;import os
+os.environ['TF_KERAS'] = '1'
+
+from tensorflow.keras.layers import *
+from tensorflow.keras.callbacks import TensorBoard, ModelCheckpoint
+from heatmaps import *
+import numpy as np
+from keras_radam import RAdam
+
+image_size = 200
+## output shape is the same as input
+n = 32 * 5
+nClasses = 6
+nfmp_block1 = 64
+nfmp_block2 = 128
+batch_size = 64
+
+IMAGE_ORDERING = "channels_last"
+img_input = tf.keras.Input(shape=(image_size, image_size, 3))
+
+# Encoder Block 1
+x = Conv2D(nfmp_block1, (3, 3), activation='relu', padding='same', name='block1_conv1', data_format=IMAGE_ORDERING)(
+    img_input)
+x = Conv2D(nfmp_block1, (3, 3), activation='relu', padding='same', name='block1_conv2', data_format=IMAGE_ORDERING)(x)
+block1 = MaxPooling2D((2, 2), strides=(2, 2), name='block1_pool', data_format=IMAGE_ORDERING)(x)
+
+# Encoder Block 2
+x = Conv2D(nfmp_block2, (3, 3), activation='relu', padding='same', name='block2_conv1', data_format=IMAGE_ORDERING)(
+    block1)
+x = Conv2D(nfmp_block2, (3, 3), activation='relu', padding='same', name='block2_conv2', data_format=IMAGE_ORDERING)(x)
+x = MaxPooling2D((2, 2), strides=(2, 2), name='block2_pool', data_format=IMAGE_ORDERING)(x)
+
+## bottleneck
+o = (Conv2D(n, (int(image_size / 4), int(image_size / 4)),
+            activation='relu', padding='same', name="bottleneck_1", data_format=IMAGE_ORDERING))(x)
+o = (Conv2D(n, (1, 1), activation='relu', padding='same', name="bottleneck_2", data_format=IMAGE_ORDERING))(o)
+
+## Decoder Block
+## upsampling to bring the feature map size to be the same as the input image i.e., heatmap size
+output = Conv2DTranspose(nClasses, kernel_size=(4, 4), strides=(4, 4), use_bias=False, name='upsample_2',
+                         data_format=IMAGE_ORDERING)(o)
+
+## Reshaping is necessary to use sample_weight_mode="temporal" which assumes 3 dimensional output shape
+## See below for the discussion of weights
+output = Reshape((image_size * image_size * nClasses, 1))(output)
+model = tf.keras.Model(img_input, output)
+model.summary()
+
+radam = RAdam(total_steps=10000, warmup_proportion=0.1, min_lr=1e-5)
+model.compile(optimizer=radam, loss='mse', sample_weight_mode="temporal")
+
+data_folder = 'data'
+id2filename, filename2id, annotated_images = dataloader.get_image_annotations(data_folder)
+df = dataloader.get_annotation_dataframe(id2filename, annotated_images)
+msk = np.random.rand(len(df)) &lt; 0.8
+train = df[msk]
+test = df[~msk]
+encoding = MultiPointHeatmapEncoding(image_size, df, batch_size=64)
+
+model_name = 'stacked_hourglass_tf2'
+log_dir = "logs/{}".format(model_name)
+model_filename = "saved-models/{}.h5".format(model_name)
+
+train_gen = encoding.generator(train, batch_size)
+test_gen = encoding.generator(test, batch_size, get_weights=True)
+
+steps_per_epoch = len(train) // batch_size
+validation_steps = len(test) // batch_size
+if validation_steps == 0:
+    validation_steps = 1
+if steps_per_epoch == 0:
+    steps_per_epoch = 1
+
+cb_tensorboard = TensorBoard(log_dir=log_dir)
+callback_save_images = CallbackHeatmapOutput(model, get_generator(test_gen), log_dir, encoding)
+checkpoint = ModelCheckpoint(model_filename, monitor='val_loss', verbose=1, save_best_only=True, mode='min')
+
+history = model.fit_generator(
+            get_generator(train_gen),
+            validation_data=get_generator(test_gen),
+            steps_per_epoch=steps_per_epoch,
+            epochs=5000,
+            validation_steps=validation_steps,
+            verbose=2,
+            use_multiprocessing=True,
+            callbacks=[checkpoint, callback_save_images, cb_tensorboard]
+        )
+
+&lt;/denchmark-code&gt;
+
+Other info / logs
+Include any logs or source code that would be helpful to diagnose the problem. If including tracebacks, please include the full traceback. Large logs and files should be attached.
+output log while running the epochs:
+
+2019-10-03 00:16:43.397431: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamic library libcudnn.so.7
+2019-10-03 00:16:45.096352: W tensorflow/stream_executor/cuda/redzone_allocator.cc:312] Not found: ./bin/ptxas not found
+Relying on driver to perform ptx compilation. This message will be only logged once.
+2019-10-03 00:17:16.303969: I tensorflow/core/profiler/lib/profiler_session.cc:184] Profiler session started.
+2019-10-03 00:17:16.304314: W tensorflow/stream_executor/platform/default/dso_loader.cc:55] Could not load dynamic library 'libcupti.so.10.0'; dlerror: libcupti.so.10.0: cannot open shared object file: No such file or directory; LD_LIBRARY_PATH: /usr/local/cuda-10.0/lib64::/usr/local/cuda/lib64:/usr/local/cuda/extras/CUPTI/lib64
+2019-10-03 00:17:16.304328: W tensorflow/core/profiler/lib/profiler_session.cc:192] Encountered error while starting profiler: Unavailable: CUPTI error: CUPTI could not be loaded or symbol could not be found.
+2019-10-03 00:17:17.242794: I tensorflow/core/platform/default/device_tracer.cc:588] Collecting 0 kernel records, 0 memcpy records.
+2019-10-03 00:17:17.276983: E tensorflow/core/platform/default/device_tracer.cc:70] CUPTI error: CUPTI could not be loaded or symbol could not be found.
+
+	</description>
+	<comments>
+		<comment id='1' author='nikogamulin' date='2019-10-03T10:56:22Z'>
+		&lt;denchmark-link:https://github.com/nikogamulin&gt;@nikogamulin&lt;/denchmark-link&gt;
+
+I tried to execute the code in colab with TF 2.0.0-rc2 , i am getting the below error message  , also  .Please, help me in reproducing the issue in our environment.Thanks!
+		</comment>
+		<comment id='2' author='nikogamulin' date='2019-10-03T11:54:28Z'>
+		&lt;denchmark-link:https://github.com/ravikyram&gt;@ravikyram&lt;/denchmark-link&gt;
+ , thanks for help. The project is fairly complex, but the archtecture is actually the same is &lt;denchmark-link:https://fairyonice.github.io/Achieving-top-5-in-Kaggles-facial-keypoints-detection-using-FCN.html&gt;this one&lt;/denchmark-link&gt;
+. Also, it would be helpful to benchmark the model using the same dataset (facial keypoints expression from kaggle) as I can't share the data.
+		</comment>
+		<comment id='3' author='nikogamulin' date='2019-10-12T18:08:17Z'>
+		I have a similar problem. My project is training a model to predict Q value in Reinforcement Learning. The error is TD error, which has similar fashion as MSE. I'm using compact.v1.AdamOptimizer
+In Tensorflow 1.14 and before, the learning curve in training starts from 8 and drop to 7.
+However, from Tensorflow 1.15 and afterwards, the learning curve rises up to 17 fairly quickly.
+Is there some modification to optimizers or underlying operations after Tensorflow 1.14?
+		</comment>
+		<comment id='4' author='nikogamulin' date='2019-10-15T00:49:36Z'>
+		May I ask whether you try to run it in 1.15? For my project, the loss gets larger starting from Tensorflow 1.15.
+		</comment>
+		<comment id='5' author='nikogamulin' date='2020-01-10T23:17:45Z'>
+		Apologies for the delay in response.
+As mentioned in the stack trace Could not load dynamic library 'libcupti.so.10.0'; dlerror: libcupti.so.10.0: cannot open shared object file: No such file or directory; 
+It is looking for cuda 10.0 whereas you have installed cuda 10.
+You may want to upgrade your TF to 2.1 which supports cuda10.1.
+Thanks!
+		</comment>
+		<comment id='6' author='nikogamulin' date='2020-02-21T18:50:44Z'>
+		It has been 41 days with no activity and the awaiting response label was assigned. Is this still an issue?
+		</comment>
+		<comment id='7' author='nikogamulin' date='2020-02-22T21:35:50Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/33003&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/33003&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

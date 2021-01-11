@@ -1,0 +1,255 @@
+<bug id='6702' author='hannes-brt' open_date='2017-01-06T22:29:13Z' closed_time='2017-06-16T17:23:23Z'>
+	<summary>Deadlock when decoding TFRecords</summary>
+	<description>
+I am storing my training examples as variable-length TFRecords using the following function for encoding:
+&lt;denchmark-code&gt;def convert_to_tf_example(const_exonic_seq, const_intronic_seq,
+                          alt_exonic_seq, alt_intronic_seq,
+                          psi_distribution, psi_std,
+                          alt_ss_position, alt_ss_type,
+                          const_site_id, const_site_position,
+                          n_alt_ss, event_type):
+    """Encode a COSSMO example as a TFRecord"""
+
+    assert len(alt_exonic_seq) == n_alt_ss
+    assert len(alt_intronic_seq) == n_alt_ss
+    # assert len(psi_distribution) == n_alt_ss
+    # assert len(psi_std) == n_alt_ss
+    assert event_type in ['acceptor', 'donor']
+    assert len(alt_ss_type) == n_alt_ss
+    assert all([t in ('annotated', 'gtex', 'maxent', 'hard_negative')
+                for t in alt_ss_type])
+
+    example = tf.train.SequenceExample(
+        context=tf.train.Features(feature={
+            'n_alt_ss': tf.train.Feature(
+                int64_list=tf.train.Int64List(value=[n_alt_ss])
+            ),
+            'event_type': tf.train.Feature(
+                bytes_list=tf.train.BytesList(value=[event_type])
+            ),
+            'const_seq': tf.train.Feature(
+                bytes_list=tf.train.BytesList(
+                    value=[const_exonic_seq, const_intronic_seq])
+            ),
+            'const_site_id': tf.train.Feature(
+                bytes_list=tf.train.BytesList(
+                    value=[const_site_id])
+            ),
+            'const_site_position': tf.train.Feature(
+                int64_list=tf.train.Int64List(
+                    value=[const_site_position])
+            )
+        }),
+        feature_lists=tf.train.FeatureLists(feature_list={
+            'alt_seq': tf.train.FeatureList(
+                feature=[tf.train.Feature(
+                    bytes_list=tf.train.BytesList(value=[aes, ais])
+                ) for aes, ais in
+                         zip(alt_exonic_seq, alt_intronic_seq)]
+            ),
+            'psi': tf.train.FeatureList(
+                feature=[tf.train.Feature(
+                    float_list=tf.train.FloatList(value=psi))
+                         for psi in psi_distribution]),
+            'psi_std': tf.train.FeatureList(
+                feature=[tf.train.Feature(
+                    float_list=tf.train.FloatList(value=psi_sd))
+                         for psi_sd in psi_std]),
+            'alt_ss_position': tf.train.FeatureList(
+                feature=[tf.train.Feature(
+                    int64_list=tf.train.Int64List(value=[pos]))
+                         for pos in alt_ss_position]),
+            'alt_ss_type': tf.train.FeatureList(
+                feature=[tf.train.Feature(
+                    bytes_list=tf.train.BytesList(value=[t]))
+                        for t in alt_ss_type])
+        })
+    )
+    return example
+&lt;/denchmark-code&gt;
+
+The data stored here is genomic, but the details shouldn't matter.
+When I'm training, I use the following function to decode the TFRecords:
+&lt;denchmark-code&gt;def read_single_cossmo_example(serialized_example, n_tissues):
+    """Decode a single COSSMO example"""
+
+    decoded_features = tf.parse_single_sequence_example(
+        serialized_example,
+        context_features={
+            'n_alt_ss': tf.FixedLenFeature([], tf.int64),
+            'event_type': tf.FixedLenFeature([], tf.string),
+            'const_seq': tf.FixedLenFeature([2], tf.string),
+            'const_site_id': tf.FixedLenFeature([], tf.string),
+            'const_site_position': tf.FixedLenFeature([], tf.int64)
+        },
+        sequence_features={
+            'alt_seq': tf.FixedLenSequenceFeature([2], tf.string),
+            'psi': tf.FixedLenSequenceFeature([n_tissues], tf.float32),
+            'psi_std': tf.FixedLenSequenceFeature([n_tissues], tf.float32),
+            'alt_ss_position': tf.FixedLenSequenceFeature([], tf.int64),
+            'alt_ss_type': tf.FixedLenSequenceFeature([], tf.string)
+        }
+    )
+    return decoded_features
+&lt;/denchmark-code&gt;
+
+During training, I've been getting deadlocks with triple-digit CPU loads during training (running on a six-core i7) and I've isolated the problem to the above decoding function. A simple Tensorflow program like the following will reproduce the deadlock:
+&lt;denchmark-code&gt; with tf.device('/cpu:0'):
+    filename_queue = tf.train.string_input_producer(
+        train_files, num_epochs=num_epochs, shuffle=shuffle)
+    file_reader = tf.TFRecordReader()
+    tf_record_key, serialized_example = file_reader.read(filename_queue)
+    decoded_example = read_single_cossmo_example(serialized_example,
+                                                  n_tissues)
+
+with tf.Session() as sess:
+    sess.run(
+        tf.variables_initializer(
+            tf.global_variables() + tf.local_variables()
+        )
+    )
+
+    # Start queue runners
+    coord = tf.train.Coordinator()
+    threads = tf.train.start_queue_runners(sess=sess, coord=coord)
+
+    try:
+        while not coord.should_stop():
+            fetch_vals = sess.run(decoded_example)
+    except tf.errors.OutOfRangeError:
+        pass
+    except KeyboardInterrupt:
+        print "Training stopped by Ctrl+C."
+    finally:
+        coord.request_stop()
+    coord.join(threads)
+&lt;/denchmark-code&gt;
+
+Now, setting intra_op_threads = 1 and inter_op_threads = 1 will prevent the small script from deadlocking. However, even when restricting the thread pool I have run into deadlocks when using these TFRecords in long running training sessions, so I suspect there is a deeper issue.
+&lt;denchmark-h:h3&gt;Environment info&lt;/denchmark-h&gt;
+
+Operating System: Ubuntu 14.04
+Installed version of CUDA and cuDNN:
+CUDA: 8.0
+cuDNN: 5.1.5
+If installed from binary pip package, provide:
+&lt;denchmark-link:https://storage.googleapis.com/tensorflow/linux/gpu/tensorflow_gpu-0.12.1-cp27-none-linux_x86_64.whl&gt;https://storage.googleapis.com/tensorflow/linux/gpu/tensorflow_gpu-0.12.1-cp27-none-linux_x86_64.whl&lt;/denchmark-link&gt;
+
+&lt;denchmark-h:h3&gt;If possible, provide a minimal reproducible example (We usually don't have time to read hundreds of lines of your code)&lt;/denchmark-h&gt;
+
+&lt;denchmark-h:h3&gt;What other attempted solutions have you tried?&lt;/denchmark-h&gt;
+
+&lt;denchmark-h:h3&gt;Logs or other output that would be helpful&lt;/denchmark-h&gt;
+
+(If logs are large, please upload as attachment or provide link).
+	</description>
+	<comments>
+		<comment id='1' author='hannes-brt' date='2017-01-07T01:52:53Z'>
+		Can you give a more complete reproducible example? I tried running your code on some synthetic data, and couldn't reproduce.
+In particular, the function read_single_cossmo_example executes to completion. Do you mean that the problem happens on session.run on tensors created in that function?
+Also, deadlock scenarios are typically low CPU usage -- you end up with every thread waiting on a mutex, and those don't take any CPU.
+Some possibilities:
+
+
+Parse example is inefficient and if you wait long enough, it'll produce the answer. One way to tease out inefficiencies is to use google profiling tools to get CPU profile, like is done in #6116
+
+
+There's some bug in parse example which causes things to go into an infinite loop. In this case it would be useful to get the example which causes this condition. Also, perhaps you can gdb attach -p &lt;pid&gt; to the hanging process and do bt to see which function it is hanging in. If you compile with -c dbg, it'll give you line numbers as well, although it can make everything 10x slower and harder to reproduce
+
+
+		</comment>
+		<comment id='2' author='hannes-brt' date='2017-01-09T18:38:52Z'>
+		Thanks &lt;denchmark-link:https://github.com/yaroslavvb&gt;@yaroslavvb&lt;/denchmark-link&gt;
+,
+the behaviour I'm seeing is kind of subtle, so hopefully I can describe it a little better.
+The graph creation works fine, the "deadlock" happens in session.run, when running the graph. By deadlock I mean that CPU load gets extremely high, such that the machine becomes unresponsive.
+This is quite certainly an issue with multi-threading. If I don't supply a ConfigProto to session.run, i.e. using the default parallelism settings, then I run into the deadlock after very iterations of the loop.
+If I set
+&lt;denchmark-code&gt;tf.Session(config=tf.ConfigProto(
+        intra_op_parallelism_threads=1,
+        inter_op_parallelism_threads=1,
+        log_device_placement=True))
+&lt;/denchmark-code&gt;
+
+the script above should run forever without a problem.
+However, my problem is that even when I restricted parallelism, executing a long-running training script would still encounter the CPU load explosion situation which would crash my machine. I'm not sure how I could create a standalone reproducible example of this issue, so I'm trying to reduce the issue to the root cause and it seems to me that the fact that decoding the TFRecords fails with default parallelism settings is the original problem here.
+I'm aware that tf.parse_single_sequence_example is inefficient, but there is no equivalent to tf.parse_example for sequence examples.
+I will use the Google profiling tools to generate profiles in both the multi-threaded and single-threaded case. Hopefully, this will give some additional clues.
+		</comment>
+		<comment id='3' author='hannes-brt' date='2017-01-09T18:58:24Z'>
+		Could it be that there's a bad tfrecords example which causes infinite loop? If you use 1 thread, it takes longer to get to that example, so that explains the extra delay. You can fix seeds to help with determinism and print out example keys to see which example could be the problem
+		</comment>
+		<comment id='4' author='hannes-brt' date='2017-01-09T20:29:27Z'>
+		I set a seed and printed every tf record key, but the it always hangs at a different example.
+I did manage to run the CPU profiler though and created two profiles for the singled threaded configuration and the hanging multi threaded configuration.
+Single-threaded: &lt;denchmark-link:https://drive.google.com/open?id=0B_AiZCOgaorxSXRaaUl3SGJCYUk&gt;https://drive.google.com/open?id=0B_AiZCOgaorxSXRaaUl3SGJCYUk&lt;/denchmark-link&gt;
+
+Multi-threaded (hanging): &lt;denchmark-link:https://drive.google.com/open?id=0B_AiZCOgaorxWlVxaUFnS1YzWWs&gt;https://drive.google.com/open?id=0B_AiZCOgaorxWlVxaUFnS1YzWWs&lt;/denchmark-link&gt;
+
+You can see that the hanging program spends all its time in __sched_yield in the Eigen thread pool.
+		</comment>
+		<comment id='5' author='hannes-brt' date='2017-01-10T16:05:55Z'>
+		Hm, from the profile it seems to get stuck in NonBlockingThreadPoolTempl::WorkerLoop -&gt; sched_yield .... not really familiar with that part of the code but this vaguely seems like a bug in parse_single_sequence_example
+blame &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blame/a4b9b3ad4d602621f2a81fe86d11a531aaa4701d/tensorflow/core/ops/parsing_ops.cc&gt;says&lt;/denchmark-link&gt;
+ vrv put that code in, but it maybe misattribution
+		</comment>
+		<comment id='6' author='hannes-brt' date='2017-01-11T00:54:59Z'>
+		Per last comment, I'm assigning to &lt;denchmark-link:https://github.com/vrv&gt;@vrv&lt;/denchmark-link&gt;
+ to take this out of triage queue.
+		</comment>
+		<comment id='7' author='hannes-brt' date='2017-01-11T00:57:56Z'>
+		I don't really know what parse_single_sequence_example is, I think the original author was &lt;denchmark-link:https://github.com/ebrevdo&gt;@ebrevdo&lt;/denchmark-link&gt;
+, so assigning to him.
+		</comment>
+		<comment id='8' author='hannes-brt' date='2017-01-11T17:25:34Z'>
+		That op does not use multiple threads.  Could you try running with
+--config=asan to see if there are any associated memory issues?
+
+If you want me to try to debug, you'll have to send me enough input data,
+so i can reproduce, by email.  You can send it to my username@, the domain
+is either gmail.com or google.com.
+&lt;denchmark-link:#&gt;…&lt;/denchmark-link&gt;
+
+
+On Tue, Jan 10, 2017 at 4:58 PM, Vijay Vasudevan ***@***.***&gt; wrote:
+ I don't really know what parse_single_sequence_example is, I think the
+ original author was @ebrevdo &lt;https://github.com/ebrevdo&gt;, so assigning
+ to him.
+
+ —
+ You are receiving this because you were mentioned.
+ Reply to this email directly, view it on GitHub
+ &lt;#6702 (comment)&gt;,
+ or mute the thread
+ &lt;https://github.com/notifications/unsubscribe-auth/ABtimweFQ3p65c426AabmTtJ0Dg8oRGGks5rRCkrgaJpZM4LdLzp&gt;
+ .
+
+
+
+		</comment>
+		<comment id='9' author='hannes-brt' date='2017-01-13T20:17:22Z'>
+		&lt;denchmark-link:https://github.com/ebrevdo&gt;@ebrevdo&lt;/denchmark-link&gt;
+ Emailed you with some scripts that should hopefully reproduce the problem
+		</comment>
+		<comment id='10' author='hannes-brt' date='2017-01-24T16:19:47Z'>
+		&lt;denchmark-link:https://github.com/ebrevdo&gt;@ebrevdo&lt;/denchmark-link&gt;
+ Have you been able to gain any insights?
+		</comment>
+		<comment id='11' author='hannes-brt' date='2017-02-09T01:17:06Z'>
+		&lt;denchmark-link:https://github.com/ebrevdo&gt;@ebrevdo&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/yaroslavvb&gt;@yaroslavvb&lt;/denchmark-link&gt;
+ After additional investigation I believe that this problem is OS-specific. I had a suspicion that the way the kernel queues tasks was related to the problem after I observed that the machine load would get extremely high (e.g. &gt;1000 on a six core machine), but CPU, memory, and disk I/O would all remain low.
+So I tried both my test script as well as my regular training task on Ubuntu 16.04 (from 14.04 before) and I haven't encountered the issue since.
+		</comment>
+		<comment id='12' author='hannes-brt' date='2017-02-09T02:21:41Z'>
+		nice investigation! Can you share more details for posterity? IE, what commands did you to use to query machine load (how is that different from CPU?)
+		</comment>
+		<comment id='13' author='hannes-brt' date='2017-02-09T02:55:00Z'>
+		I mean load average as reported by e.g.  or  and many other tools. For example, here is an article that explains load and how it is different from CPU utilization: &lt;denchmark-link:http://www.linuxjournal.com/article/9001&gt;http://www.linuxjournal.com/article/9001&lt;/denchmark-link&gt;
+. You can find people reporting similar problems by googling "high load average low cpu".
+		</comment>
+		<comment id='14' author='hannes-brt' date='2017-06-16T17:23:23Z'>
+		Closing since this seems fixed by upgrading the OS.
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,108 @@
+<bug id='7226' author='AlexDBlack' open_date='2019-02-26T03:14:45Z' closed_time='2019-04-02T06:37:11Z'>
+	<summary>Libnd4j: matmul op incorrect for rank 4 case</summary>
+	<description>
+&lt;denchmark-link:https://github.com/deeplearning4j/deeplearning4j/blob/master/libnd4j/include/ops/declarable/generic/blas/matmul.cpp&gt;https://github.com/deeplearning4j/deeplearning4j/blob/master/libnd4j/include/ops/declarable/generic/blas/matmul.cpp&lt;/denchmark-link&gt;
+
+Below is a very simple test case: [32,12,128,64] x [32, 12, 128, 64]^T = [32, 12, 128, 128]
+For this rank 4 case, we are doing 32x12 separate mmuls - [128,64]x[128,64]^T
+When all input values are 1.0, the output must be 64.0 for every entry.
+&lt;denchmark-link:https://gist.github.com/AlexDBlack/2b2fe6b2c49ff6169d3dfe97ee4bbda2&gt;https://gist.github.com/AlexDBlack/2b2fe6b2c49ff6169d3dfe97ee4bbda2&lt;/denchmark-link&gt;
+
+&lt;denchmark-code&gt;    @Test
+    public void test(){
+
+        INDArray arr1 = Nd4j.ones(DataType.FLOAT, 32, 12, 128, 64);
+        INDArray arr2 = Nd4j.ones(DataType.FLOAT, 32, 12, 128, 64);
+
+        DynamicCustomOp op = DynamicCustomOp.builder("matmul")
+                .addInputs(arr1, arr2)
+                .addIntegerArguments(0, 1)      //Transpose arr2 only
+                .build();
+
+        List&lt;LongShapeDescriptor&gt; shapes = op.calculateOutputShape();
+        assertEquals(1, shapes.size());
+        long[] shape = new long[]{32,12,128,128};
+        assertArrayEquals(shape, shapes.get(0).getShape());
+
+        INDArray out = Nd4j.create(DataType.FLOAT, shape);
+
+        op.setOutputArgument(0, out);
+        Nd4j.exec(op);
+        System.out.println(out);
+
+        INDArray exp = Nd4j.valueArrayOf(shape, 64.0, DataType.FLOAT);      //Each entry in output is sum of 64 (1.0 x 1.0) multiplications
+        assertEquals(exp, out);
+    }
+&lt;/denchmark-code&gt;
+
+Edit: new test case:
+&lt;denchmark-code&gt;    @Test
+    public void testFull() throws Exception {
+        Nd4j.getRandom().setSeed(12345);
+
+        INDArray arr1 = Nd4j.rand(DataType.FLOAT, 32, 12, 128, 64);
+        INDArray arr2 = Nd4j.rand(DataType.FLOAT, 32, 12, 128, 64);
+
+        DynamicCustomOp op = DynamicCustomOp.builder("matmul")
+                .addInputs(arr1, arr2)
+                .addIntegerArguments(0, 1)      //Transpose arr2 only
+                .build();
+
+        List&lt;LongShapeDescriptor&gt; shapes = op.calculateOutputShape();
+        assertEquals(1, shapes.size());
+        long[] shape = new long[]{32,12,128,128};
+        assertArrayEquals(shape, shapes.get(0).getShape());
+
+        INDArray out = Nd4j.create(DataType.FLOAT, shape);
+
+        INDArray outExp = out.like();
+        for( int i=0; i&lt;32; i++ ){
+            for( int j=0; j&lt;12; j++ ){
+                INDArray sub1 = arr1.get(NDArrayIndex.point(i), NDArrayIndex.point(j), NDArrayIndex.all(), NDArrayIndex.all());
+                INDArray sub2 = arr2.get(NDArrayIndex.point(i), NDArrayIndex.point(j), NDArrayIndex.all(), NDArrayIndex.all());
+                INDArray mmul = sub1.mmul(sub2.transpose());
+                outExp.get(NDArrayIndex.point(i), NDArrayIndex.point(j), NDArrayIndex.all(), NDArrayIndex.all()).assign(mmul);
+            }
+        }
+
+        op.setOutputArgument(0, out);
+        Nd4j.exec(op);
+
+        assertEquals(outExp, out);
+    }
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='AlexDBlack' date='2019-02-26T03:43:06Z'>
+		Looks like this is the cause: &lt;denchmark-link:https://github.com/deeplearning4j/deeplearning4j/blob/master/libnd4j/include/helpers/impl/MmulHelper.cpp#L751-L757&gt;https://github.com/deeplearning4j/deeplearning4j/blob/master/libnd4j/include/helpers/impl/MmulHelper.cpp#L751-L757&lt;/denchmark-link&gt;
+
+I can see 2 things wrong here... first, getting the subset looks wrong.
+Second, the transpose args are ignored.
+Edit: maybe not. It's basically doing ind2subc to work out the point indices, and then doing get(point(x), point(y), all, all) (or [x,x+1,y,y+1,0,0,0,0] in NDArray(vector&lt;Nd4jLong&gt;) notation). That's basically TAD implemented using get.
+As for permuting: this is implemented also... xT, yT, zT are post permute, so it should be ok here.
+Edit 2: I had also hypothesized some issue with strides and BLAS... seems like this is not the case.
+Notably, always duping the input and result arrays in MmulHelper::mmulMxM is not sufficient to make this test pass... &lt;denchmark-link:https://github.com/deeplearning4j/deeplearning4j/blob/master/libnd4j/include/helpers/impl/MmulHelper.cpp#L473&gt;https://github.com/deeplearning4j/deeplearning4j/blob/master/libnd4j/include/helpers/impl/MmulHelper.cpp#L473&lt;/denchmark-link&gt;
+
+Edit 3: The indexing calculated by  (as used within &lt;denchmark-link:https://github.com/deeplearning4j/deeplearning4j/blob/master/libnd4j/include/helpers/impl/MmulHelper.cpp#L751-L757&gt;https://github.com/deeplearning4j/deeplearning4j/blob/master/libnd4j/include/helpers/impl/MmulHelper.cpp#L751-L757&lt;/denchmark-link&gt;
+ ) seems correct.
+		</comment>
+		<comment id='2' author='AlexDBlack' date='2019-02-26T05:42:00Z'>
+		Cause is this pragma - &lt;denchmark-link:https://github.com/deeplearning4j/deeplearning4j/blob/master/libnd4j/include/helpers/impl/MmulHelper.cpp#L751&gt;https://github.com/deeplearning4j/deeplearning4j/blob/master/libnd4j/include/helpers/impl/MmulHelper.cpp#L751&lt;/denchmark-link&gt;
+
+Already fixed on CUDA branch, apparently will be backported to master soon by &lt;denchmark-link:https://github.com/shyrma&gt;@shyrma&lt;/denchmark-link&gt;
+
+I'll work around this by commenting it out for now.
+		</comment>
+		<comment id='3' author='AlexDBlack' date='2019-04-02T04:45:07Z'>
+		&lt;denchmark-link:https://github.com/shyrma&gt;@shyrma&lt;/denchmark-link&gt;
+ wasn't this fixed?
+		</comment>
+		<comment id='4' author='AlexDBlack' date='2019-04-02T06:37:11Z'>
+		Confirmed passing on current master, thanks
+		</comment>
+		<comment id='5' author='AlexDBlack' date='2019-05-02T06:57:42Z'>
+		This thread has been automatically locked since there has not been any recent activity after it was closed. Please open a new issue for related bugs.
+		</comment>
+	</comments>
+</bug>

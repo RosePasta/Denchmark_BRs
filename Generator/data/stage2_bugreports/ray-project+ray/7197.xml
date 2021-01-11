@@ -1,0 +1,140 @@
+<bug id='7197' author='jsuarez5341' open_date='2020-02-17T18:49:57Z' closed_time='2020-02-27T19:43:32Z'>
+	<summary>Cannot call ray.get inside async actor (not a request for async get)</summary>
+	<description>
+Problem: ray.get not allowed inside async actors
+Have been discussing this issue with &lt;denchmark-link:https://github.com/edoakes&gt;@edoakes&lt;/denchmark-link&gt;
+ on Slack. Apparently the decision was made to hard stop ray.get inside async actors to prevent people from accidentally running blocking code inside otherwise fully async tasks. The problem is that blocking code is actually needed inside  async tasks.
+Key Example: Ray.signal is quite buggy and sadly hasn't seen much love lately (and I have heard it may be deprecated). One possible replacement is to use the Async api to add queues to synchronous actors that function as async inboxes. In this case, you would want to have a light async workload, such as adding items to a queue (represented by asyncWork in the snippet below). You wouldn't want most of your run() method preempted, but instead would designate a small segment where control can be yielded using asyncio.sleep() (where I have time.sleep() now).
+Impact: Point-to-point communication is a key feature in many distributed applications. Without ray.get inside async actors, it's not really possible to replicate the functionality of ray.signal with the async api (at least I couldn't find a solution). Adding an allow_blocking flag or similar to ray.init would solve this issue for now. I'd like to emphasize that this really isn't a good long term solution. Ray.signal is a much, much better API for what it's intended to do. Async code introduces much more complexity than signaling, so having async replace signal is far from ideal unless we can come up with a really easy plug-and-play async queue for use with otherwise synchronous actors.
+Ray version and other system information (Python version, TensorFlow version, OS): Latest Ray wheel on Ubuntu (though this should hold on all systems -- seems more of a design choice that has outlived its usefulness than anything)
+Reproduction:
+&lt;denchmark-code&gt;import ray                                                                    
+import time                                                                   
+import asyncio                                                                
+                                                                              
+@ray.remote                                                                   
+def bar():                                                                    
+   return                                                                     
+                                                                              
+@ray.remote                                                                   
+class Foo:                                                                    
+   def run(self):                                                             
+      while True:                                                             
+         time.sleep(1)                                                        
+         ray.get(bar.remote())                                                
+                                                                              
+   async def asyncWork(self):                                                 
+      pass                                                                    
+    
+if __name__ == '__main__':                                                    
+   ray.init()                                                                 
+   foo = Foo.remote()                                                         
+   foo.run.remote()                                                           
+   while True:                                                                
+      time.sleep(1)                                                           
+      foo.asyncWork.remote()
+&lt;/denchmark-code&gt;
+
+
+[ y] I have verified my script runs in a clean environment and reproduces the issue.
+[ y] I have verified the issue also occurs with the latest wheels.
+
+	</description>
+	<comments>
+		<comment id='1' author='jsuarez5341' date='2020-02-17T18:50:45Z'>
+		Edit: fixed code format
+		</comment>
+		<comment id='2' author='jsuarez5341' date='2020-02-17T19:40:58Z'>
+		It seems the alternative async version of the run method is
+ async def run(self):                                                             
+    while True:                                                             
+       time.sleep(1)  # simulate work, this won't be preempted
+       await bar.remote()
+the blocking code itself won't be pre-emptied. asyncio will only context switch when you are waiting for bar.remote() to execute. When the context switch happens, other coroutines will be allowed to run.
+		</comment>
+		<comment id='3' author='jsuarez5341' date='2020-02-17T21:58:46Z'>
+		That works if you happen to be calling ray.get from an async method, but what if you want to call it from a synchronous method?
+		</comment>
+		<comment id='4' author='jsuarez5341' date='2020-02-17T22:18:12Z'>
+		can you elaborate on why do you need to call it from synchronous method? Wrapping your synchronous method inside an async method have no performance penalty and there won't be any preemption. You have to explicitly yield control with await.
+		</comment>
+		<comment id='5' author='jsuarez5341' date='2020-02-17T22:45:56Z'>
+		Isn't the bigger issue that run will block the entire event loop unless it's an async def? Even if we allowed get, the example above still wouldn't work. You would need:
+&lt;denchmark-code&gt;import ray
+import time
+import asyncio
+
+@ray.remote
+def bar():
+   return
+
+@ray.remote
+class Foo:
+   async def run(self):
+      while True:
+         await asyncio.sleep(1)
+         await bar.remote()
+         print("running")
+
+   async def asyncWork(self):
+      print("do async poll")
+
+if __name__ == '__main__':
+   ray.init()
+   foo = Foo.remote()
+   foo.run.remote()
+   while True:
+      time.sleep(1)
+      ray.get(foo.asyncWork.remote())
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-link:https://github.com/simon-mo&gt;@simon-mo&lt;/denchmark-link&gt;
+ can we raise a warning if a non-async method is called?
+		</comment>
+		<comment id='6' author='jsuarez5341' date='2020-02-17T23:52:36Z'>
+		&lt;denchmark-link:https://github.com/ericl&gt;@ericl&lt;/denchmark-link&gt;
+ Yes I missed an async def in my example, thank you.
+&lt;denchmark-link:https://github.com/simon-mo&gt;@simon-mo&lt;/denchmark-link&gt;
+ The larger issue is that having to await ray.get forces you to redefine a potentially large number of functions as asynchronous (see below).
+&lt;denchmark-code&gt;import ray                                                                    
+import time                                                                   
+import asyncio                                                                
+
+@ray.remote                                                                   
+def bar():                                                                    
+   return                                                                     
+                                                                              
+@ray.remote                                                                   
+class Foo:                                                                    
+   async def run(self):                                                       
+      while True:                                                             
+         time.sleep(1)                                                        
+         self.f1()                                                            
+                                                                              
+   def f1(self):                                                              
+      return self.f2()                                                        
+                                                                              
+   def f2(self):                                                              
+      return self.f3()                                                        
+                                                                              
+   def f3(self):                                                              
+      return ray.get(bar.remote())                                            
+                                                                              
+if __name__ == '__main__':                                                    
+   ray.init()                                                                 
+   foo = Foo.remote()                                                         
+   foo.run.remote()                                                           
+   while True:                                                                
+      time.sleep(1)
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='7' author='jsuarez5341' date='2020-02-21T19:50:14Z'>
+		&lt;denchmark-link:https://github.com/ray-project/ray/pull/7262&gt;#7262&lt;/denchmark-link&gt;
+ change the error to warning
+		</comment>
+		<comment id='8' author='jsuarez5341' date='2020-02-27T19:43:32Z'>
+		Much better, thank you
+		</comment>
+	</comments>
+</bug>

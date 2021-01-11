@@ -1,0 +1,180 @@
+<bug id='27392' author='apls777' open_date='2019-04-01T22:37:10Z' closed_time='2020-04-06T05:50:08Z'>
+	<summary>Runtime error when using ExponentialMovingAverage with MirroredStrategy (TF 1.13.1)</summary>
+	<description>
+I'm trying to use ExponentialMovingAverage with MirroredStrategy training the model on several GPUs, but getting an error:
+&lt;denchmark-code&gt;RuntimeError: Tried to create variable dense/kernel/replica_1/ExponentialMovingAverage/ with mismatching name on device 1
+&lt;/denchmark-code&gt;
+
+This error can also be reproduced on a CPU machine by specifying the number of GPUs in the "tf.contrib.distribute.MirroredStrategy" more or equal to 2.
+The model works fine if I'm training it on a single GPU (by specifying the number of GPUs to 1).
+I'm using TF v1.13.1. Here is a simplified code:
+import tensorflow as tf
+
+
+def input_fn():
+    features = tf.data.Dataset.from_tensors([1., 2., 3.])
+    labels = tf.data.Dataset.from_tensors(1.)
+    dataset = tf.data.Dataset.zip((features, labels)).repeat(10).batch(1)
+    return dataset
+
+
+def model_fn(features, labels, mode, params):
+    logits = tf.layers.dense(features, 1, activation=tf.nn.relu)
+    logits = tf.reshape(logits, (-1,))
+    loss = tf.losses.mean_squared_error(logits, labels)
+
+    ema = tf.train.ExponentialMovingAverage(0.999)
+
+    if mode == tf.estimator.ModeKeys.TRAIN:
+        optimizer = tf.train.GradientDescentOptimizer(learning_rate=0.0001)
+        train_op = optimizer.minimize(loss=loss, global_step=tf.train.get_global_step())
+
+        # apply moving averages
+        with tf.variable_scope(tf.get_variable_scope(), reuse=tf.AUTO_REUSE):
+            ema_update_op = ema.apply(tf.trainable_variables())
+
+        with tf.control_dependencies([train_op]):
+            train_op = tf.group(ema_update_op)
+
+        return tf.estimator.EstimatorSpec(mode=mode, loss=loss, train_op=train_op)
+
+    raise NotImplementedError
+
+
+def train(model_dir):
+    distribution = tf.contrib.distribute.MirroredStrategy(num_gpus=2)
+
+    estimator = tf.estimator.Estimator(
+        model_fn=model_fn,
+        config=tf.estimator.RunConfig(
+            train_distribute=distribution,
+            model_dir=model_dir,
+            log_step_count_steps=1,
+        ),
+    )
+
+    estimator.train(input_fn=input_fn)
+
+
+if __name__ == '__main__':
+    tf.logging.set_verbosity(tf.logging.INFO)
+    train('training/test1')
+	</description>
+	<comments>
+		<comment id='1' author='apls777' date='2019-04-12T22:29:19Z'>
+		I have a similar problem.
+RuntimeError: Tried to create variable mnasnet-a1/mnas_net_model/mnasnet/mnas_blocks_4/se/conv2d_11/kernel/replica_1/ExponentialMovingAverage/ with mismatching name on device 1
+I don't understand why replica_1 appears in the middle of the variable name.
+		</comment>
+		<comment id='2' author='apls777' date='2019-04-13T02:00:07Z'>
+		This seems to be a problem caused by using both tf.contrib.distribute.MirroredStrategy and tf.train.ExponentialMovingAverage.When ema.apply(tf.trainable_variables()) is executed, the replica variable has been generated.Finally generated a variable name like kernel/replica_1/ExponentialMovingAverage.
+Maybe this is not a bug, but it needs a way to solve this problem.Can someone help solve this problem?
+		</comment>
+		<comment id='3' author='apls777' date='2019-04-13T09:42:44Z'>
+		&lt;denchmark-link:https://github.com/rootkitchao&gt;@rootkitchao&lt;/denchmark-link&gt;
+ For now, I solved this problem by using a deprecated functionality: &lt;denchmark-link:https://www.tensorflow.org/api_docs/python/tf/contrib/estimator/replicate_model_fn&gt;tf.contrib.estimator.replicate_model_fn&lt;/denchmark-link&gt;
+ with &lt;denchmark-link:https://www.tensorflow.org/api_docs/python/tf/contrib/estimator/TowerOptimizer&gt;tf.contrib.estimator.TowerOptimizer&lt;/denchmark-link&gt;
+. Check out &lt;denchmark-link:https://joe-antognini.github.io/machine-learning/multi-gpu-tf&gt;this article&lt;/denchmark-link&gt;
+ to see how to use them together.
+		</comment>
+		<comment id='4' author='apls777' date='2019-04-13T21:27:00Z'>
+		
+@rootkitchao For now, I solved this problem by using a deprecated functionality: tf.contrib.estimator.replicate_model_fn with tf.contrib.estimator.TowerOptimizer. Check out this article to see how to use them together.
+
+Thanks for your reply.I solved this problem temporarily by modifying shared_variable_creator:
+  def reuse_variable(next_creator, *args, **kwargs):
+    """Re-use existing variable from store with same name (in order)."""
+    del next_creator, args
+    name = kwargs.get("name")
+    canonical_name = _canonicalize_variable_name(name)
+    replica_index = canonical_name.find('replica/')
+    if replica_index != -1:
+      canonical_name = canonical_name[0:replica_index] + canonical_name[replica_index+8:]
+    try:
+      variable_index = variable_scope_access_index.get(canonical_name, 0)
+      v = shared_variable_store[canonical_name][variable_index]
+      # TODO(priyag): Make this variable re-use more robust by adding checks
+      # that the requested shape and dtype match the existing variable.
+      variable_scope_access_index[canonical_name] = variable_index + 1
+      return v
+    except (KeyError, IndexError):
+      raise RuntimeError(
+          "Tried to create variable {} with mismatching name on device {}".
+          format(name, device_id))
+
+  if device_id == 0:
+    return create_new_variable
+  else:
+    return reuse_variable
+I found that MirroredStrategy always generates some wrong variable names on GPU1.Removing 'replica/' from the variable name can temporarily solve this problem.But I think there is a conflict when MirroredStrategy and ExponentialMovingAverage are used together.Ema.apply(tf.trainable_variables()) adds variables from each GPU to the list.Need a way to just manipulate variables on the current GPU.
+		</comment>
+		<comment id='5' author='apls777' date='2019-04-24T10:51:41Z'>
+		&lt;denchmark-link:https://github.com/guptapriya&gt;@guptapriya&lt;/denchmark-link&gt;
+ Will this issue be fixed? Thank you.
+		</comment>
+		<comment id='6' author='apls777' date='2019-04-26T08:43:52Z'>
+		&lt;denchmark-link:https://github.com/rootkitchao&gt;@rootkitchao&lt;/denchmark-link&gt;
+ we will definitely look into the bug, but I don't have an ETA yet unfortunately. Thanks.
+		</comment>
+		<comment id='7' author='apls777' date='2019-05-07T09:47:38Z'>
+		&lt;denchmark-link:https://github.com/guptapriya&gt;@guptapriya&lt;/denchmark-link&gt;
+ hi, any updates on this issue?
+		</comment>
+		<comment id='8' author='apls777' date='2019-05-24T00:14:15Z'>
+		any updates?
+		</comment>
+		<comment id='9' author='apls777' date='2019-05-24T06:56:25Z'>
+		Hi, sorry we don't have any updates yet. I will open this up for contributions as well.
+		</comment>
+		<comment id='10' author='apls777' date='2019-06-06T13:09:39Z'>
+		I have found an ugly workaround. Just define your ExponentialMovingAverage outside of the training function and set the num_updates inside the training function. Here is an working example:
+def input_fn():
+  features = tf.data.Dataset.from_tensors([[1.]]).repeat(100)
+  labels = tf.data.Dataset.from_tensors(1.).repeat(100)
+  return tf.data.Dataset.zip((features, labels))
+
+ema = tf.train.ExponentialMovingAverage(decay=0.9999)
+
+def model_fn(features, labels, mode):
+  regularizer = tf.contrib.layers.l2_regularizer(0.001)
+  layer = tf.compat.v1.layers.Dense(1, kernel_regularizer=regularizer)
+  logits = layer(features)
+
+  loss = tf.compat.v1.losses.mean_squared_error(labels, tf.reshape(logits, []))
+
+  global_step = tf.compat.v1.train.get_or_create_global_step()
+
+  # NOTE Here we set the global step for the ema
+  ema._num_updates = global_step
+
+  train_op = tf.compat.v1.train.GradientDescentOptimizer(0.2).minimize(loss, global_step=global_step)
+
+  ema_vars = tf.compat.v1.trainable_variables()
+
+  with tf.control_dependencies([train_op]):
+    train_op = ema.apply(ema_vars)
+
+  return tf.estimator.EstimatorSpec(mode, loss=loss, train_op=train_op)
+
+distribution = tf.contrib.distribute.MirroredStrategy(num_gpus=2)
+config = tf.estimator.RunConfig(log_step_count_steps=10, train_distribute=distribution)
+classifier = tf.estimator.Estimator(model_fn=model_fn, config=config)
+classifier.train(input_fn=input_fn)
+This workaround will only work for mirrored strategies  for replicated. The issue is in the &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/r1.13/tensorflow/python/training/moving_averages.py#L422&gt;ExponentialMovingAverage::apply&lt;/denchmark-link&gt;
+ method. This method will be called for every mirror and will create a new average-variable for every trainable variable. Because variables in the  will be shared as  this will fail for the second mirror, because this  a  was already created in the context of the first mirror.
+Creating a global  instance will overcome this problem, because he store the averages for already visited variables in a local dict &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/r1.13/tensorflow/python/training/moving_averages.py#L430&gt;_averages&lt;/denchmark-link&gt;
+.
+		</comment>
+		<comment id='11' author='apls777' date='2020-04-06T05:50:08Z'>
+		This was fixed in &lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/3a22ef3c8a466123d60c1a5d10d62e4d2d0f92d2#diff-4617aef7d483dc28665b640fbe23c18d&gt;3a22ef3#diff-4617aef7d483dc28665b640fbe23c18d&lt;/denchmark-link&gt;
+.
+		</comment>
+		<comment id='12' author='apls777' date='2020-04-06T05:50:10Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/27392&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/27392&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

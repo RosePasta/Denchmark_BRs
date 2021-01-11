@@ -1,0 +1,230 @@
+<bug id='40154' author='ShiyongL' open_date='2020-06-04T15:52:46Z' closed_time='2020-07-09T21:14:23Z'>
+	<summary>GPU delegate gives different result from CPU</summary>
+	<description>
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): Yes
+OS Platform and Distribution:Linux Ubuntu 18.04
+Mobile device if the issue happens on mobile device: Pixel 3 XL
+TensorFlow installed from (source or binary): source
+TensorFlow version (use command below): r2.2.0 and master
+Python version: 3.6
+Bazel version (if compiling from source): 3.0.0
+GCC/Compiler version (if compiling from source): default
+CUDA/cuDNN version: 10.0
+GPU model and memory:
+
+Describe the current behavior
+GPU delegate gives very different result from CPU.
+I was able to hard-code the source (in tensorflow/lite/delegates/gpu/common/model_builder.cc) to allow some operations to be delegated to GPU. Out of 270+ operations:
+
+Delegating just one Conv_2d will produce very similar result as the one by CPU only.
+Delegating a few more operations seem to produce bigger difference.
+Delegating just the first MUL operation will produce very different result.
+
+Describe the expected behavior
+result should be close
+Standalone code to reproduce the issue
+I personally hijacked tflite tools/benchmark code and give an sample image as deterministic input, instead of random input.
+I would love to provide my code change if it helps.
+Other info / logs Include any logs or source code that would be helpful to
+diagnose the problem. If including tracebacks, please include the full
+traceback. Large logs and files should be attached.
+The tflite model was converted from InsightFace/ArcFace MXNet model
+&lt;denchmark-link:https://github.com/deepinsight/insightface/wiki/Model-Zoo&gt;https://github.com/deepinsight/insightface/wiki/Model-Zoo&lt;/denchmark-link&gt;
+ (3.2 model)
+link to download the tflite
+&lt;denchmark-link:https://drive.google.com/file/d/1pJX2I8btskVy-QHiF-mcUF7HF6ZFaQuf/view?usp=sharing&gt;https://drive.google.com/file/d/1pJX2I8btskVy-QHiF-mcUF7HF6ZFaQuf/view?usp=sharing&lt;/denchmark-link&gt;
+
+Also attached the graph of above model:
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/files/4731201/visualized_official_arcface_no_sub.zip&gt;visualized_official_arcface_no_sub.zip&lt;/denchmark-link&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='ShiyongL' date='2020-06-10T16:23:40Z'>
+		Can confirm that I see output diff errors for GPU vs CPU.
+&lt;denchmark-link:https://github.com/ShiyongL&gt;@ShiyongL&lt;/denchmark-link&gt;
+ , for future ease, feel free to check out our &lt;denchmark-link:https://github.com/tensorflow/tensorflow/tree/master/tensorflow/lite/tools/evaluation/tasks/inference_diff&gt;inference_diff tool&lt;/denchmark-link&gt;
+ to compare raw delegate outputs with CPU, and modify the &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/master/tensorflow/lite/delegates/utils.cc#L125&gt;delegate node partitioner&lt;/denchmark-link&gt;
+ to select particular nodes by their index in their execution plan (which can be visualized with &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/master/tensorflow/lite/tools/visualize.py&gt;this tool&lt;/denchmark-link&gt;
+) :-).
+Looking into this...
+		</comment>
+		<comment id='2' author='ShiyongL' date='2020-06-10T18:29:39Z'>
+		The culprit (atleast partially) seems to be the GPU delegate's &lt;denchmark-link:setQuantizedModelsAllowed&gt;low-precision mode&lt;/denchmark-link&gt;
+, which is enabled by default in our benchmark tooling.
+AFAIK, the delegate uses fp16 (instead of fp32) precision in that case, and that seems to be the cause of your output diffs. I could not pinpoint a single node/nodes that cause the output errors; they seem to be increasing with number of delegate nodes as you suggested.
+See the outputs with &lt;denchmark-link:https://github.com/tensorflow/tensorflow/tree/master/tensorflow/lite/tools/evaluation/tasks/inference_diff&gt;inference_diff&lt;/denchmark-link&gt;
+ with the mode enabled/disabled:
+&lt;denchmark-code&gt;$ adb shell /data/local/tmp/run_eval   --model_file=/data/local/tmp/gpu_debug_model.tflite --delegate=gpu --num_runs=5 --gpu_precision_loss_allowed=true
+...
+OutputDiff[0]: avg_error=nan, std_dev=nan
+OutputDiff[1]: avg_error=0, std_dev=0
+&lt;/denchmark-code&gt;
+
+vs
+&lt;denchmark-code&gt;$ adb shell /data/local/tmp/run_eval   --model_file=/data/local/tmp/gpu_debug_model.tflite --delegate=gpu --num_runs=5 --gpu_precision_loss_allowed=false
+...
+OutputDiff[0]: avg_error=0.0824622, std_dev=0.000453001
+OutputDiff[1]: avg_error=0, std_dev=0
+&lt;/denchmark-code&gt;
+
+There are still some errors in the latter case, but they are lesser than the earlier one. (Note that the latency goes to ~80ms from ~50ms on a Pixel 3, when the mode is disabled).
+In our Java API, the mode can be disabled by doing the following instead of &lt;denchmark-link:&gt;the usual&lt;/denchmark-link&gt;
+:
+&lt;denchmark-code&gt;GpuDelegate delegate = new GpuDelegate(new GpuDelegate.Options().setPrecisionLossAllowed(false));
+&lt;/denchmark-code&gt;
+
+CC'ing Juhyun who might know if such output diffs are expected - I guess Convolutions &amp; Fully-Connecteds can amplify previous error.
+		</comment>
+		<comment id='3' author='ShiyongL' date='2020-06-10T18:59:23Z'>
+		Usually, it's either the model's fault of numerical instability (e.g. using squared diff on an error that is below a very small threshold such as 1e-6, often visible in instance norms of X - MEAN followed by SQUARE_DIFF, and then doing math based on those values) or a bug in our shaders' accumulators, i.e. some accumulators needs to be in FP32 regardless of the precision mode such as SOFTMAX.  Unfortunately, I don't think I will have time to look into this, it would be nice if you could pinpoint what the issue is.
+		</comment>
+		<comment id='4' author='ShiyongL' date='2020-06-11T14:20:32Z'>
+		&lt;denchmark-link:https://github.com/srjoglekar246&gt;@srjoglekar246&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/impjdi&gt;@impjdi&lt;/denchmark-link&gt;
+ Thanks a lot for looking into this! The inference_diff tool is super for debugging the issue. Here are what I found so far:
+
+
+Following @srjoglekar246's lead, I tried the inference_diff and got slightly different errors on my Pixel 3XL. And I used tensorflow master branch and r2.2 branch and both produced different results. So my first question is: which branch I should use for Android deployment? I notice most users are using org.tensorflow:tensorflow-lite-gpu:0.0.0-nightly arr, but there is also org.tensorflow:tensorflow-lite-gpu:2.2.0 arr. I tried both in my app, the results are very different on GPU delegation but same on CPU.
+
+
+I also tried to allow GPU delegation to each single operation. Surprisingly, the first MUL operation already produced some error. I trimmed out all the operations but the first MUL operation and convert this tiny model to TFLite. Running on inference_diff and I got same error already, using  gpu_precision_loss_allowed=true or false.
+
+
+output_errors { output_errors { max_value: 0.0021719106 min_value: 0.00214503519 avg_value: 0.0021564289927482605 std_deviation: 1.0854229e-05 }
+
+Furthermore, I noticed that the inference_diff tool uses random inputs of [-1, 1] while my original input is [-127, 127]. If I hardcoded the inputs to all -127, I got even much bigger error with GPU delegation. Here is one line of code change in  [https://github.com/tensorflow/tensorflow/blob/2b96f3662bd776e277f86997659e61046b56c315/tensorflow/lite/tools/evaluation/stages/inference_profiler_stage.cc#L51]
+
+    data-&gt;push_back(static_cast&lt;T&gt;(-127.0f)); //data-&gt;push_back(static_cast&lt;T&gt;(rand_float));
+Here is the error I got:
+output_errors { max_value: 0.661458313 min_value: 0.661458313 avg_value: 0.6614583015441895 std_deviation: 0 }
+The tiny model of a single MUL operation is attached
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/files/4765345/MUL_only.zip&gt;MUL_only.zip&lt;/denchmark-link&gt;
+
+And my number was produced on branch r2.2.
+It would be greatly appreciated if you could take another look.
+		</comment>
+		<comment id='5' author='ShiyongL' date='2020-06-11T14:21:08Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/40154&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/40154&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='6' author='ShiyongL' date='2020-06-11T15:51:22Z'>
+		Sorry I was accidently closed this issue but reopened it again.
+		</comment>
+		<comment id='7' author='ShiyongL' date='2020-06-11T17:22:34Z'>
+		&lt;denchmark-link:https://github.com/ShiyongL&gt;@ShiyongL&lt;/denchmark-link&gt;
+ for the AAR, it depends on whether you would prefer to use the TF nightly branch or the stabler TF 2.2 master branch for your environment. TF2.2 will probably be safer, but not contain any recent patches you might need. If the results are very different, can you explain how? Are the results with the 2.2 branch more correct? Then the issue might have been introduced recently.
+About the 1-op model diff: In most delegates, there will be some diff v/s CPU, mainly because of the accumulators/optimizations used. For example, even with MobileNet v1 (where the GPU gives comparable top-k accuracy), there is a diff of ~2e-5 for the output tensor.
+Do you have a way to check the task-oriented 'accuracy' of the model? (for example, how well your app recognises objects for an object detection model). That might help us see how bad the actual performance is (maybe with/without the gpu_precision_loss param)
+		</comment>
+		<comment id='8' author='ShiyongL' date='2020-06-11T19:12:22Z'>
+		
+@ShiyongL for the AAR, it depends on whether you would prefer to use the TF nightly branch or the stabler TF 2.2 master branch for your environment. TF2.2 will probably be safer, but not contain any recent patches you might need. If the results are very different, can you explain how? Are the results with the 2.2 branch more correct? Then the issue might have been introduced recently.
+About the 1-op model diff: In most delegates, there will be some diff v/s CPU, mainly because of the accumulators/optimizations used. For example, even with MobileNet v1 (where the GPU gives comparable top-k accuracy), there is a diff of ~2e-5 for the output tensor.
+Do you have a way to check the task-oriented 'accuracy' of the model? (for example, how well your app recognises objects for an object detection model). That might help us see how bad the actual performance is (maybe with/without the gpu_precision_loss param)
+
+&lt;denchmark-link:https://github.com/srjoglekar246&gt;@srjoglekar246&lt;/denchmark-link&gt;
+ for the 1-op model, TF2.2 and TF nightly branch(I assume it is the Master branch) produced slightly results:
+TF nightly:
+
+
+TF 2.2 (exactly same results for gpu_precision_loss = true or false ):
+
+
+The diff is 2e-3, which much larger than ~2e-5 by MobileNet v1.
+When the input is 100x larger (change input from -1, 1 to -127, 127), the error is 100x larger. If you could reproduce the error using the single op model, it should help @impjdi for further debugging.
+
+To answer your second question, I am using the official ArcFace model from InsigntFace &lt;denchmark-link:url&gt;https://github.com/deepinsight/insightface&lt;/denchmark-link&gt;
+ to recognize faces. The input is (112x112x3) image, output is a 512 tensor.
+
+With original model (has the first MUL operation), I was getting all NAN at my output.
+After removing the first MUL operation (which I do the MUL first then passing the result to CNN model), I was getting more reasonable results but still quite different (for a sample image):
+Outputs from CPU: [0.7939907, 0.5848467, -0.94000, -0.9900000, ..., 0.3934663, 0.93600059]
+Outputs from GPU: [0.7978515, 0.3818359, -0.96875, -0.9086914, ..., 0.1318359, 0.77441406] (with gpu_precision_loss_allowed=false)  TF2.2 and TF nightly produced exactly same results here (CPU or GPU.)
+
+I would be very happy if the error is ~e-2.
+Thank again for your support!
+		</comment>
+		<comment id='9' author='ShiyongL' date='2020-06-11T23:24:56Z'>
+		The output differences between TF2.2 &amp; nightly seem too tiny to show any change in behavior between the two (~1e-7). So we can assume that nothing has been broken since TF2.2
+About the MUL op:
+
+
+The MUL op provided by @ShiyongL has an input tensor being multiplied by a scalar value 0.007812. The avg diff w/ CPU does rise as the input sampling range is increased from {-1, 1} to {-100, 100} or {-1000, 1000} (proportionately). However, the std deviation of the diff values  remains ~5-e6, which indicates that the problem might just be accumulation errors that increase as the input values grow. I audited the OpenCL kernel on the GPU delegate, and it seems a straight-forward multiplication.
+
+
+Even when I run inference_diff on the arcface model by rejecting all MUL ops (leading to delegation of only 5 ops somewhere in the middle of the graph), I still see an avg error of ~0.02. So MUL might not be the only issue.
+
+
+A couple of clarifying questions from my side:
+
+
+Is -127, 127 the expected input range for the model?
+
+
+I am not sure what the 512-element output tensor represents, so looking at raw diffs might be misleading. Have you tried plugging in the model into an application that post-processes the output as needed? And does the precision with GPU fall a lot even after post-processing? A simple example I know is the SSD MobileNet, which has &gt;1 raw diffs (CPU vs the DSP delegate) when we use inference_diff directly, but the COCO metrics remain good enough.
+
+
+		</comment>
+		<comment id='10' author='ShiyongL' date='2020-06-12T01:29:53Z'>
+		I agree with &lt;denchmark-link:https://github.com/srjoglekar246&gt;@srjoglekar246&lt;/denchmark-link&gt;
+ that MUL is not the only issue. Since it is the first operation, it is easier to trim out the rest and focusing on this particular operation. Like &lt;denchmark-link:https://github.com/srjoglekar246&gt;@srjoglekar246&lt;/denchmark-link&gt;
+ said, multiplication should be a straightforward operation, the difference should not be that big between CPU and GPU. It is super interesting to see the reason.
+Re 1: -127, 127 was the expected input. Multiply by 0.007812 will normalize the input to -1, 1, which might be a better input for numerical stability reason. As I have shown the a previous comment, the difference between CPU and GPU is still quite large.
+Re2: the 512 output tensor is a 512 vector. ArcFace would inference two images and get 2 512 vectors. Then sure the distance between the two vectors. If the two vectors are similar, the two images are considered to be matched. I am not sure what you meant by &gt;1 raw diffs for SSD MobileNet, which has multiple outputs like class, score and bboxes. I agree we should not compare just the raw values but the error ratio should be relatively low, like less than 1% due to floating point precision.
+I reported this issue when I got NAN as the output. Now we figured out the MUL is causing a big issue. After removing the MUL operation, I could get some more reasonable results, though the error is still not small and I am not totally convinced that this is caused by numerical stability. I will take the results anyhow and run the evaluation tomorrow. Will report back.
+Thanks a lot!
+		</comment>
+		<comment id='11' author='ShiyongL' date='2020-06-15T15:50:23Z'>
+		&lt;denchmark-link:https://github.com/srjoglekar246&gt;@srjoglekar246&lt;/denchmark-link&gt;
+ The errors between CPU and GPU are so large that it deteriorates the evaluation performance, when the inference results are used to determine whether one face image is similar to another.
+It would be greatly appreciated if you or other engineers could look into it!
+		</comment>
+		<comment id='12' author='ShiyongL' date='2020-06-16T20:00:54Z'>
+		&lt;denchmark-link:https://github.com/ShiyongL&gt;@ShiyongL&lt;/denchmark-link&gt;
+ , I have asked the GPU folks internally to take a look at this model/issue. Will keep you posted on the details :-).
+On that note, did you try any other delegates for this? (for example, XNNPack?)
+		</comment>
+		<comment id='13' author='ShiyongL' date='2020-06-17T14:52:54Z'>
+		
+@ShiyongL , I have asked the GPU folks internally to take a look at this model/issue. Will keep you posted on the details :-).
+On that note, did you try any other delegates for this? (for example, XNNPack?)
+
+Thanks a lot &lt;denchmark-link:https://github.com/srjoglekar246&gt;@srjoglekar246&lt;/denchmark-link&gt;
+ !
+I haven't tried XNNPack. Will check it out.
+		</comment>
+		<comment id='14' author='ShiyongL' date='2020-06-17T16:47:47Z'>
+		&lt;denchmark-link:https://github.com/ShiyongL&gt;@ShiyongL&lt;/denchmark-link&gt;
+ we just fixed this on our end (will probably take a day or so to reflect in nightly). There were a couple of small issues with some GPU graph optimizations &amp; model parsing which are now fixed.
+The error for input in [-127, 127] is now ~0.02 with precision loss, and ~1e-6 with precision loss disabled (the precision loss issues are likely due to numerical instability w/ FP16). Could you do check the inference results again and close the issue if things work now?
+		</comment>
+		<comment id='15' author='ShiyongL' date='2020-06-17T18:18:42Z'>
+		Perfect!
+I are using org.tensorflow:tensorflow-lite-gpu:0.0.0-nightly ARR. Do you know how long does it take for the fix to be available to the ARR, for example at &lt;denchmark-link:https://bintray.com/google/tensorflow/tensorflow-lite&gt;JCenter&lt;/denchmark-link&gt;
+?
+On the other hand, do you mind sharing a link to a PR so that I could make sure to have the fixed code?
+Thank you very much!
+		</comment>
+		<comment id='16' author='ShiyongL' date='2020-06-17T18:27:06Z'>
+		&lt;denchmark-link:https://github.com/ShiyongL&gt;@ShiyongL&lt;/denchmark-link&gt;
+ it should reflect within 24 hours or so. (&lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/225bdf60f3c4f51ab5568a53d31b0799369a1b89&gt;This&lt;/denchmark-link&gt;
+ is the commit after which the model should work fine).
+Note: You should have cleared the gradle cache and/or use the change=true flag
+		</comment>
+		<comment id='17' author='ShiyongL' date='2020-07-09T21:14:23Z'>
+		Managed to validate the fix. Thank you very much!
+		</comment>
+		<comment id='18' author='ShiyongL' date='2020-07-09T21:14:25Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/40154&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/40154&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,169 @@
+<bug id='38655' author='lgeiger' open_date='2020-04-17T21:18:34Z' closed_time='2020-04-23T16:17:21Z'>
+	<summary>[2.2rc3] Keras validation data doesn't respect cache in MirroredStrategy</summary>
+	<description>
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): Yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Ubuntu 18.04
+TensorFlow installed from (source or binary): binary
+TensorFlow version (use command below): 2.2.0rc3
+Python version: 3.7
+CUDA/cuDNN version: 10.1 / 7.6.5.32
+GPU model and memory: 4 x NVIDIA V100 on GCP
+
+Describe the current behavior
+When running the code below with cached training and validations datasets in a multi-GPU environment (I am using a GCP VM with 312GB of memory and 4 NVIDIA V100s) with tf.distribute.MirroredStrategy() the validation dataset isn't correctly cached and examples are still read from GCS during validation.
+The memory usage suggests that the validation dataset is cached, but during the Keras validation loop it looks like that data is still read from GCS instead of from the cache which can be observed by the very high network usage during validation. I would expect no network usage after the first epoch.
+In the example below I intentionally use an very large validation set to make this issue very obvious and easy to detect through monitoring network usage. This behaviour can also be observed with other datasets, but the unexpected network access will be less noticible on smaller datsets.
+In which cases can this issue not be observed?
+To narrow down the possible causes for this I found two cases where this issue doesn't exist:
+
+
+When running on a single GPU without MirroredStrategy the validation data is correctly read from the cache and after the start of the second epoch no additional network traffic reading from GCS can be observed.
+
+
+When not using a validation dataset at all the network usage is zero after the first epoch so caching of the training set works as expected.
+
+
+This seems to be a complicated interaction between tf.data, tf.keras and tf.distribute, do you have an idea what could cause this behaviour? Please let me know what additional information I could provide.
+Describe the expected behavior
+Network usage should be zero after the start of the second epoch since both datasets are cached  in memory and no additional reads from GCS should be required.
+Standalone code to reproduce the issue
+import tensorflow as tf
+import tensorflow_datasets as tfds
+
+
+batch_size = 1024
+decoders = {"image": tfds.decode.SkipDecoding()}
+
+dataset = tfds.load(
+    "imagenet2012:5.0.0",
+    decoders=decoders,
+    split="validation",
+    data_dir="gs://my-data-bucket",
+)
+
+val_dataset = tfds.load(
+    "imagenet2012:5.0.0",
+    decoders=decoders,
+    split="train",
+    data_dir="gs://my-data-bucket",
+)
+
+
+def _decode_and_center_crop(image_bytes):
+    """Crops to center of image with padding then scales image_size."""
+    shape = tf.image.extract_jpeg_shape(image_bytes)
+    image_height = shape[0]
+    image_width = shape[1]
+    image_size = 224
+
+    padded_center_crop_size = tf.cast(
+        (
+            (image_size / (image_size + 32))
+            * tf.cast(tf.minimum(image_height, image_width), tf.float32)
+        ),
+        tf.int32,
+    )
+
+    offset_height = ((image_height - padded_center_crop_size) + 1) // 2
+    offset_width = ((image_width - padded_center_crop_size) + 1) // 2
+    crop_window = tf.stack(
+        [offset_height, offset_width, padded_center_crop_size, padded_center_crop_size]
+    )
+    image = tf.image.decode_and_crop_jpeg(image_bytes, crop_window, channels=3)
+    return tf.image.resize(image, [image_size, image_size], method="bicubic")
+
+
+def preprocessing(data):
+    return tf.cast(_decode_and_center_crop(data["image"]), tf.float32), data["label"]
+
+
+def apply_preprocessing(dataset):
+    return (
+        dataset.cache()
+        .map(preprocessing, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+        .batch(batch_size)
+        .prefetch(1)
+    )
+
+
+dataset = apply_preprocessing(dataset)
+val_dataset = apply_preprocessing(val_dataset)
+
+with tf.distribute.MirroredStrategy().scope():
+    model = tf.keras.models.Sequential(
+        [
+            tf.keras.layers.GlobalMaxPool2D(input_shape=(224, 224, 3)),
+            tf.keras.layers.Dense(1000, activation="softmax",),
+        ]
+    )
+
+    model.compile(
+        optimizer="adam",
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy", "sparse_top_k_categorical_accuracy"],
+    )
+
+model.fit(
+    dataset, epochs=5, validation_data=val_dataset,
+)
+Other info / logs
+To monitor the network usage over time tools like &lt;denchmark-link:https://github.com/cjbassi/ytop/&gt;ytop&lt;/denchmark-link&gt;
+ can be used.
+	</description>
+	<comments>
+		<comment id='1' author='lgeiger' date='2020-04-18T03:20:57Z'>
+		Thank you for filing, it seems like this is known issue and the team is looking into it.  I can suggest a workaround with tf-nightly if this is blocking you.
+		</comment>
+		<comment id='2' author='lgeiger' date='2020-04-20T13:41:44Z'>
+		&lt;denchmark-link:https://github.com/lgeiger&gt;@lgeiger&lt;/denchmark-link&gt;
+
+please update as per above comment
+		</comment>
+		<comment id='3' author='lgeiger' date='2020-04-20T14:18:23Z'>
+		
+Thank you for filing, it seems like this is known issue and the team is looking into it. I can suggest a workaround with tf-nightly if this is blocking you.
+
+It'd be great to have a workaround, in case the fix cannot make into v2.2.
+		</comment>
+		<comment id='4' author='lgeiger' date='2020-04-21T17:28:41Z'>
+		Actually &lt;denchmark-link:https://github.com/jsimsa&gt;@jsimsa&lt;/denchmark-link&gt;
+ just submitted a fix for this yesterday (&lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/7ebbab819e736319ec35b48e31f4d62fbad6626b&gt;7ebbab8&lt;/denchmark-link&gt;
+). Assuming that has made it to the nightly - could &lt;denchmark-link:https://github.com/lgeiger&gt;@lgeiger&lt;/denchmark-link&gt;
+ could you try the nightly and see if this has been fixed for your use case?
+We will try to have this fix in 2.2 as well.
+		</comment>
+		<comment id='5' author='lgeiger' date='2020-04-21T21:34:28Z'>
+		&lt;denchmark-link:https://github.com/guptapriya&gt;@guptapriya&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/jsimsa&gt;@jsimsa&lt;/denchmark-link&gt;
+ Thank you for the fast fix 
+I can confirm that this issue doesn't exist on the latest nightly.
+Should I open a PR to cherry-pick &lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/7ebbab819e736319ec35b48e31f4d62fbad6626b&gt;7ebbab8&lt;/denchmark-link&gt;
+ onto the release branch?
+		</comment>
+		<comment id='6' author='lgeiger' date='2020-04-23T16:10:35Z'>
+		Has been cherrypicked as &lt;denchmark-link:https://github.com/tensorflow/tensorflow/pull/38807&gt;#38807&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='7' author='lgeiger' date='2020-04-23T16:17:21Z'>
+		Thanks for the fast fix 👍
+		</comment>
+		<comment id='8' author='lgeiger' date='2020-04-23T16:17:23Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/38655&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/38655&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='9' author='lgeiger' date='2020-04-28T14:21:02Z'>
+		Hi, I was training my model using Multi Workers Mirrored Strategy and still get this issue.
+Time by time, the memory usage is still increasing until I got OOM.
+		</comment>
+		<comment id='10' author='lgeiger' date='2020-04-28T14:25:44Z'>
+		&lt;denchmark-link:https://github.com/alimhanif&gt;@alimhanif&lt;/denchmark-link&gt;
+ Could you check if your issue is related to &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/38617&gt;#38617&lt;/denchmark-link&gt;
+?
+		</comment>
+	</comments>
+</bug>

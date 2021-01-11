@@ -1,0 +1,201 @@
+<bug_data>
+<bug id='2983' author='erikbrntsn' open_date='2020-02-06T13:47:49Z' closed_time='2020-03-24T01:36:13Z'>
+ 	<summary>Error using output of one model as input for another</summary>
+ 	<description>
+ I have two nested/sequential models i.e. I want to call model2.Run(model1.Run(data))
+ With the call to model2.Run I get "Arithmetic operation resulted in an overflow". I dont believe it is really related to &lt;denchmark-link:https://github.com/microsoft/onnxruntime/issues/713&gt;#713&lt;/denchmark-link&gt;
+  as the output of model1 is a 1x64x56x64 float tensor which should not give any memory problems.
+ The overflow happens here
+ &lt;denchmark-code&gt;return new MemoryHandle((void*)((int)_dataBufferPointer + elementIndex * _elementWidth)); //could not use Unsafe.Add
+ &lt;/denchmark-code&gt;
+ 
+ with _dataBufferPointer=0x000002c542065060, elementIndex=0
+ The output dimensions of model1 are the same as the input dimensions for model2.
+ I am using onnxruntime in a c# application through the nuget package (version 1.1.1).
+ I am missing something?
+ If this is intentionally not supported, would it be possible to output a more user friendly error message?
+ 	</description>
+ 	<comments>
+ 		<comment id='1' author='erikbrntsn' date='2020-02-06T19:19:53Z'>
+ 		Can you share the model please ?
+ 		</comment>
+ 		<comment id='2' author='erikbrntsn' date='2020-02-06T19:24:36Z'>
+ 		Also, are you able to run both the models individually ?
+ 		</comment>
+ 		<comment id='3' author='erikbrntsn' date='2020-02-07T08:07:55Z'>
+ 		I just tried a few things and doing the following works:
+ &lt;denchmark-code&gt;model2.Run(Fix(model1.Run(data), model2))
+ 
+ private static List&lt;NamedOnnxValue&gt; Fix(IDisposableReadOnlyCollection&lt;DisposableNamedOnnxValue&gt; t, InferenceSession model)
+ {
+     var q = t.First().AsTensor&lt;float&gt;();
+     var dims = q.Dimensions;
+     var data = q.ToArray();
+     var tensor = new DenseTensor&lt;float&gt;(data, dims);
+     var name = model.InputMetadata.Keys.First();
+     return new List&lt;NamedOnnxValue&gt; { NamedOnnxValue.CreateFromTensor(name, tensor) };
+ }
+ &lt;/denchmark-code&gt;
+ 
+ So yes, both models work individually.
+ 		</comment>
+ 		<comment id='4' author='erikbrntsn' date='2020-02-11T10:54:38Z'>
+ 		I have created a minimal model that reproduces the problem:
+ &lt;denchmark-link:https://github.com/microsoft/onnxruntime/files/4185375/models.zip&gt;models.zip&lt;/denchmark-link&gt;
+ 
+ Run the following in a c# application after having loaded the models:
+ &lt;denchmark-code&gt;head.Run(base.Run(data))
+ &lt;/denchmark-code&gt;
+ 
+ The two models are implemented in PyTorch like this:
+ &lt;denchmark-code&gt;class BaseModel(nn.Module):
+     def __init__(self):
+         super(BaseModel, self).__init__()
+         self.conv = torch.nn.Conv2d(1, 64, kernel_size=3, stride=1, padding=1)
+ 
+     def forward(self, x):
+         return self.conv(x)
+ 
+ 
+ class Head(nn.Module):
+     def __init__(self):
+         super(Head, self).__init__()
+         self.conv = torch.nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1)
+ 
+     def forward(self, x):
+         return self.conv(x)
+ &lt;/denchmark-code&gt;
+ 
+ 		</comment>
+ 		<comment id='5' author='erikbrntsn' date='2020-03-11T06:03:34Z'>
+ 		Hi,
+ I finally got around to investigating this. I used your sample models (thanks) and there are several takeaways:
+ 
+ 
+ The output (tensor) of Run() is of type DisposableNamedOnnxValue and the input tensor of Run() is of type NamedOnnxValue. DisposableNamedOnnxValue is a derived class of NamedOnnxValue and hence Run() accepts the output of another Run(). Unfortunately, there is logic in the Run() to pin managed memory buffer in the NamedOnnxValue which doesn't play well with DisposableNamedOnnxValue since DisposableNamedOnnxValue just maintains a wrapper over the native memory containing the output of Run().
+ 
+ 
+ We could support an input to Run() containing DisposableNamedOnnxValue  by adding some guard logic to prevent pinning in that case and directly re-using the native memory but chances of that being useful are very low because both NamedOnnxValue and DisposableNamedOnnxValue are bound to "feed names" and hence validation of the input will eventually fail unless we run into the very rare chance that the output name of one model exactly matches the input name of the next model. Even in your toy example, even though the shapes match the names are different.
+ 
+ 
+ As it stands, you can get it to work with something like this -
+ 
+ 
+ &lt;denchmark-code&gt;                var container1 = new List&lt;NamedOnnxValue&gt;();
+                 var tensorIn = new DenseTensor&lt;float&gt;(....);
+                 var nov1 = NamedOnnxValue.CreateFromTensor("input", tensorIn);
+                 container1.Add(nov1);
+                 var res1 = session1.Run(container1); // This is not disposed
+ 
+                 var container2 = new List&lt;NamedOnnxValue&gt;();
+                 var nov2 = NamedOnnxValue.CreateFromTensor("input", res1.First().AsTensor&lt;float&gt;().ToDenseTensor()); // .ToDenseTensor() copies contents over
+                 container2.Add(nov2 );
+                 var res2 = session.Run(container2);
+ &lt;/denchmark-code&gt;
+ 
+ 
+ 
+ The above will work but is not optimal -
+ i) It will create another managed buffer and copy over the contents of the results of the first run
+ ii) It will create another OrtValue instance (for the new input) before calling into native code. Ideally we should be able to re-use the OrtValue instance created from the output of the first Run()
+ 
+ 
+ There is a PR by @fs-eire (#3171) that will eventually solve it. It introduces a new class PinnedOnnxValue that can help re-use the underlying OrtValue value instances and there are several Run() overloads that will take in PinnedOnnxValues. You can use PinnedOnnxValue for the output of the first Run() and use the same for the input of the next Run() and that will solve the problem.
+ 
+ 
+ CC: &lt;denchmark-link:https://github.com/jignparm&gt;@jignparm&lt;/denchmark-link&gt;
+ 
+ 		</comment>
+ 		<comment id='6' author='erikbrntsn' date='2020-03-12T19:04:06Z'>
+ 		Synced offline with &lt;denchmark-link:https://github.com/fs-eire&gt;@fs-eire&lt;/denchmark-link&gt;
+ . After discussing, we felt DisposableNamedOnnxValue inputs in Run() should be accommodated as DisposableNamedOnnxValue is NamedOnnxValue (it is a derived class). Adjusted the PR contents accordingly.
+ 		</comment>
+ 		<comment id='7' author='erikbrntsn' date='2020-03-24T08:01:39Z'>
+ 		Thank you guys!
+ 		</comment>
+ 	</comments>
+ </bug>
+<commit id='ef7b98f9886639dd8ed750532c132a5d96b2aadd' author='Hariharan Seshadri' date='2020-03-23 18:36:12-07:00'>
+ 	<dmm_unit complexity='0.9213483146067416' interfacing='0.9325842696629213' size='0.16853932584269662'></dmm_unit>
+ 	<modification change_type='MODIFY' old_name='csharp\src\Microsoft.ML.OnnxRuntime\DisposableNamedOnnxValue.cs' new_name='csharp\src\Microsoft.ML.OnnxRuntime\DisposableNamedOnnxValue.cs'>
+ 		<file_info nloc='258' complexity='45' token_count='1519'></file_info>
+ 		<method name='Microsoft.ML.OnnxRuntime::DisposableNamedOnnxValue::DisposableNamedOnnxValue' parameters='name,value,nativeMemoryManager'>
+ 				<method_info nloc='5' complexity='1' token_count='24' nesting_level='2' start_line='64' end_line='68'></method_info>
+ 			<added_lines>64,65</added_lines>
+ 			<deleted_lines>64</deleted_lines>
+ 		</method>
+ 		<method name='Microsoft.ML.OnnxRuntime::DisposableNamedOnnxValue::DisposableNamedOnnxValue' parameters='name,value,nativeMemoryManager'>
+ 				<method_info nloc='5' complexity='1' token_count='24' nesting_level='2' start_line='65' end_line='69'></method_info>
+ 			<added_lines>65</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<method name='Microsoft.ML.OnnxRuntime::DisposableNamedOnnxValue::ToNativeOnnxValue' parameters='onnxValue,pinnedMemoryHandle'>
+ 				<method_info nloc='15' complexity='3' token_count='55' nesting_level='2' start_line='81' end_line='104'></method_info>
+ 			<added_lines>81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100,101,102,103,104</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines>5,71,72,73,74,75,76,77,78,79,80,105</added_lines>
+ 			<deleted_lines>63</deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='csharp\src\Microsoft.ML.OnnxRuntime\InferenceSession.cs' new_name='csharp\src\Microsoft.ML.OnnxRuntime\InferenceSession.cs'>
+ 		<file_info nloc='424' complexity='46' token_count='2044'></file_info>
+ 		<method name='Microsoft.ML.OnnxRuntime::InferenceSession::Run' parameters='inputs,outputNames,options'>
+ 				<method_info nloc='60' complexity='6' token_count='329' nesting_level='2' start_line='134' end_line='207'></method_info>
+ 			<added_lines>146,147,191,192,194,195,196,197,198,199,200,201,202,203</added_lines>
+ 			<deleted_lines>146,190,191,193,194,195</deleted_lines>
+ 		</method>
+ 		<method name='Microsoft.ML.OnnxRuntime::InferenceSession::GetMetadataFromTypeInfo' parameters='typeInfo'>
+ 				<method_info nloc='42' complexity='6' token_count='336' nesting_level='2' start_line='431' end_line='480'></method_info>
+ 			<added_lines>440,478</added_lines>
+ 			<deleted_lines>432,470</deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines></added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='csharp\src\Microsoft.ML.OnnxRuntime\NamedOnnxValue.cs' new_name='csharp\src\Microsoft.ML.OnnxRuntime\NamedOnnxValue.cs'>
+ 		<file_info nloc='435' complexity='56' token_count='2079'></file_info>
+ 		<method name='Microsoft.ML.OnnxRuntime::NamedOnnxValue::ToNativeOnnxValue' parameters='onnxValue,pinnedMemoryHandle'>
+ 				<method_info nloc='199' complexity='22' token_count='853' nesting_level='2' start_line='75' end_line='293'></method_info>
+ 			<added_lines>75,76</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines>31,74</added_lines>
+ 			<deleted_lines>31,74</deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='csharp\src\Microsoft.ML.OnnxRuntime\NativeOnnxTensorMemory.cs' new_name='csharp\src\Microsoft.ML.OnnxRuntime\NativeOnnxTensorMemory.cs'>
+ 		<file_info nloc='219' complexity='28' token_count='1103'></file_info>
+ 		<modified_lines>
+ 			<added_lines>15,16,17,18,19,20,21,22,23,133,134</added_lines>
+ 			<deleted_lines>15</deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='csharp\test\Microsoft.ML.OnnxRuntime.Tests\InferenceTest.cs' new_name='csharp\test\Microsoft.ML.OnnxRuntime.Tests\InferenceTest.cs'>
+ 		<file_info nloc='1313' complexity='146' token_count='10201'></file_info>
+ 		<method name='Microsoft.ML.OnnxRuntime.Tests::InferenceTest::TestReusingRunOutputNonStringType' parameters=''>
+ 				<method_info nloc='21' complexity='2' token_count='178' nesting_level='2' start_line='735' end_line='760'></method_info>
+ 			<added_lines>735,736,737,738,739,740,741,742,743,744,745,746,747,748,749,750,751,752,753,754,755,756,757,758,759,760</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<method name='Microsoft.ML.OnnxRuntime.Tests::InferenceTest::TestReusingDisposedRunOutput' parameters=''>
+ 				<method_info nloc='25' complexity='2' token_count='172' nesting_level='2' start_line='791' end_line='826'></method_info>
+ 			<added_lines>791,792,793,794,795,796,797,798,799,800,801,802,803,804,805,806,807,808,809,810,811,812,813,814,815,816,817,818,819,820,821,822,823,824,825,826</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<method name='Microsoft.ML.OnnxRuntime.Tests::InferenceTest::TestReusingRunOutputStringType' parameters=''>
+ 				<method_info nloc='21' complexity='2' token_count='178' nesting_level='2' start_line='763' end_line='788'></method_info>
+ 			<added_lines>763,764,765,766,767,768,769,770,771,772,773,774,775,776,777,778,779,780,781,782,783,784,785,786,787,788</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines>734,761,762,789,790,827</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ </commit>
+</bug_data>

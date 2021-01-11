@@ -1,0 +1,213 @@
+<bug id='34182' author='OverLordGoldDragon' open_date='2019-11-12T02:50:40Z' closed_time='2020-04-04T17:21:14Z'>
+	<summary>Can't load optimizer weights after adding layer without parameters</summary>
+	<description>
+MODEL A:
+ipt = Input(batch_shape=(32, 240, 4))
+x1  = Conv1D(16, 20,  strides=200, padding='same')(ipt)
+x1  = BatchNormalization()(x1)
+x2  = Conv1D(16, 200, strides=120, padding='same')(ipt)
+x2  = BatchNormalization()(x2) # ...
+MODEL B:
+ipt = Input(batch_shape=(32, 250, 4))
+x1  = Conv1D(16, 20,  strides=200)(ipt)
+x1  = BatchNormalization()(x1)
+x2  = Conv1D(16, 200, strides=120)(ipt)
+x2  = BatchNormalization()(x2) # ...
+&lt;denchmark-h:hr&gt;&lt;/denchmark-h&gt;
+
+
+The two have identical weight shapes - however, A's optimizer `weights` _cannot_ be loaded onto B, as B has a different build order (images &amp; code below). 
+
+This is a tiny snippet of a much larger model which needs its timesteps parameter changed every X epochs, and ZeroPadding1D appears to change layer build order whenever it's used; this doesn't affect model weights, as they're mapped via a dictionary - whereas optimizer weights are mapped sequentially, list-to-list.
+Reproducible in both TF1 &amp; TF2, and w/  &amp;  imports. What's the problem, and how to fix? &lt;denchmark-link:https://stackoverflow.com/questions/58811292/why-does-zeropadding-change-optimizer-weights-order&gt;Relevant SO&lt;/denchmark-link&gt;
+
+&lt;denchmark-h:hr&gt;&lt;/denchmark-h&gt;
+
+Environment: Win-10 OS, CUDA 10.0.130, cuDNN 7.6.0, Python 3.7.4, GTX 1070
+Observations:
+
+Swaps any other layer, not just BatchNormalization - and any number of layers before concatenate; optimizer weights end up being simply swapped in .get_weights()
+Can change strides instead of batch_shape[1]
+Can use MaxPooling1D w/ strides &gt; 1
+padding='valid' leads to ZeroPadding1D, but it doesn't change build order (don't know why)
+
+&lt;denchmark-h:hr&gt;&lt;/denchmark-h&gt;
+
+model_A.summary():
+Layer (type)                    Output Shape         Param #     Connected to     
+==================================================================================
+input_1 (InputLayer)            [(32, 240, 4)]       0                            
+__________________________________________________________________________________
+conv1d (Conv1D)                 (32, 2, 16)          1296        input_1[0][0]    
+__________________________________________________________________________________
+conv1d_1 (Conv1D)               (32, 2, 16)          12816       input_1[0][0]    
+__________________________________________________________________________________
+bn_1 (BatchNormalization)       (32, 2, 16)          64          conv1d[0][0]     
+__________________________________________________________________________________
+bn_2 (BatchNormalization)       (32, 2, 16)          64          conv1d_1[0][0]   
+__________________________________________________________________________________
+concatenate (Concatenate)       (32, 2, 32)          0           bn_1[0][0]       
+                                                                 bn_2[0][0]       
+__________________________________________________________________________________
+gap_0 (GlobalAveragePooling1D)  (32, 32)             0           concatenate[0][0]
+__________________________________________________________________________________
+dense (Dense)                   (32, 1)              33          gap_0[0][0]      
+model_B.summary() (note the swapped layers)
+input_2 (InputLayer)            [(32, 250, 4)]       0                               
+_____________________________________________________________________________________
+conv1d_2 (Conv1D)               (32, 2, 16)          1296        input_2[0][0]       
+_____________________________________________________________________________________
+bn_1 (BatchNormalization)       (32, 2, 16)          64          conv1d_2[0][0]      
+_____________________________________________________________________________________
+conv1d_3 (Conv1D)               (32, 3, 16)          12816       input_2[0][0]       
+_____________________________________________________________________________________
+zero_padding1d (ZeroPadding1D)  (32, 3, 16)          0           bn_1[0][0]          
+_____________________________________________________________________________________
+bn_2 (BatchNormalization)       (32, 3, 16)          64          conv1d_3[0][0]      
+_____________________________________________________________________________________
+concatenate_1 (Concatenate)     (32, 3, 32)          0           zero_padding1d[0][0]
+                                                                 bn_2[0][0]          
+_____________________________________________________________________________________
+gap_0 (GlobalAveragePooling1D)  (32, 32)             0           concatenate_1[0][0] 
+_____________________________________________________________________________________
+dense_1 (Dense)                 (32, 1)              33          gap_0[0][0]  
+&lt;denchmark-h:hr&gt;&lt;/denchmark-h&gt;
+
+Minimally reproducible code:
+# also works with `from keras`
+from tensorflow.keras.layers import Input, Conv1D, ZeroPadding1D, concatenate
+from tensorflow.keras.layers import BatchNormalization, Dense, GlobalAveragePooling1D
+from tensorflow.keras.models import Model
+import numpy as np
+
+def make_model(batch_shape):
+    ipt = Input(batch_shape=batch_shape)
+
+    x1  = Conv1D(16, 20,  strides=200, padding='same')(ipt)
+    x1  = BatchNormalization()(x1)
+    x2  = Conv1D(16, 200, strides=120, padding='same')(ipt)
+    x2  = BatchNormalization()(x2)
+
+    x1, x2 = zero_pad(x1, x2)
+    preout = concatenate([x1, x2])
+    preout = GlobalAveragePooling1D()(preout)
+    out    = Dense(1)(preout)
+
+    model  = Model(ipt, out)
+    model.compile('adam', 'mse')
+    return model 
+
+def zero_pad(x1, x2):
+    diff = int(x2.shape[1]) - int(x1.shape[1])
+    if   diff &gt; 0:
+        x1 = ZeroPadding1D((diff, 0))(x1)
+    elif diff &lt; 0:
+        x2 = ZeroPadding1D((abs(diff), 0))(x2)
+    return x1, x2
+    
+def make_data(batch_shape):
+    return (np.random.randn(*batch_shape), 
+            np.random.randint(0, 2, (batch_shape[0], 1)))
+
+batch_shape_A = (32, 240, 4)
+batch_shape_B = (32, 250, 4)
+batch_shape_C = (32, 240, 4)
+model_A  = make_model(batch_shape_A)
+model_B  = make_model(batch_shape_B)
+model_C  = make_model(batch_shape_C) # 'control group'
+x_A, y_A = make_data(batch_shape_A)
+x_B, y_B = make_data(batch_shape_B)
+x_C, y_C = make_data(batch_shape_C)
+
+model_A.train_on_batch(x_A, y_A)
+model_B.train_on_batch(x_B, y_B)
+model_C.train_on_batch(x_C, y_C)
+
+optimizer_weights_A = model_A.optimizer.get_weights()
+
+model_C.optimizer.set_weights(optimizer_weights_A)
+print("model_C optimizer weights set successfully")
+
+model_B.optimizer.set_weights(optimizer_weights_A)
+print("model_B optimizer weights set successfully") # will not print
+Output:
+model_C optimizer weights set successfully
+
+ValueError: Optimizer weight shape (16,) not compatible with provided 
+weight shape (200, 4, 16)
+	</description>
+	<comments>
+		<comment id='1' author='OverLordGoldDragon' date='2019-11-12T21:56:13Z'>
+		Found a workaround, and a form of explanation; it isn't about ZeroPadding1D, but about there being an additional layer in one 'branch' and not the other - as revealed by plot_model(); see below.
+Keras appears to build layers via vertical traversal - note that the numbered layer graphs match exactly w/ .summary() ordering. Order change could still have occurred toward the end of the 'branch' - I suppose the reasoning is, the two branches' layer nodes should be at the same depth before merging to a common layer. However, this isn't the full story - see disclaimer at bottom.
+Workaround: insert a 'pseudolayer' to equalize # of layers in each branch; I'll stick with the z-padding:
+def zero_pad(x1, x2):
+    diff = int(x2.shape[1]) - int(x1.shape[1])
+    if   diff &gt; 0:
+        x1 = ZeroPadding1D((diff, 0))(x1)
+        x2 = ZeroPadding1D((0, 0))(x2)
+    elif diff &lt; 0:
+        x2 = ZeroPadding1D((abs(diff), 0))(x2)
+        x1 = ZeroPadding1D((0, 0))(x1)
+    return x1, x2
+Running the code in the question:
+model_C optimizer weights set successfully
+model_B optimizer weights set successfully  # SUCCESS
+&lt;denchmark-h:hr&gt;&lt;/denchmark-h&gt;
+
+Model graphs: via from tensorflow.keras.utils import plot_model; plot_model(model_A) ...
+&lt;denchmark-link:https://i.stack.imgur.com/DU2tZ.png&gt;&lt;/denchmark-link&gt;
+
+&lt;denchmark-h:hr&gt;&lt;/denchmark-h&gt;
+
+Explanation disclaimer: I haven't confirmed it in  exact lines of source code, and .summary() doesn't always agree w/ plot_model(); for example, using padding='valid', we get model_B graph above for both model_A and model_B, yet summary shows model_A's build order. Also, padding='valid' works without the fix because both models end up using ZeroPadding1D, so the layer structure is (seemingly) identical.
+		</comment>
+		<comment id='2' author='OverLordGoldDragon' date='2020-04-04T01:56:49Z'>
+		The functional API builds the layers from a DFS algorithm, and treats output as depth=0 and walks backward. When a certain upstream layer is connected to two downstream layer, its depth is determined by the max depth of them, + 1, i.e., if layer_C's outputs are connected to both layer_A and layer_B, then depth(layer_C) = max(depth(layer_A), depth(layer_B)) + 1.
+So in this particular case, if we do a layers_by_depth dict, you can see for model_A:
+defaultdict(list,
+            {0: [&lt;tensorflow.python.keras.layers.core.Dense&gt;],
+             1: [&lt;tensorflow.python.keras.layers.pooling.GlobalAveragePooling1D&gt;],
+             2: [&lt;tensorflow.python.keras.layers.merge.Concatenate&gt;],
+             3: [&lt;tensorflow.python.keras.layers.normalization_v2.BatchNormalization&gt;,
+              &lt;tensorflow.python.keras.layers.normalization_v2.BatchNormalization&gt;],
+             4: [&lt;tensorflow.python.keras.layers.convolutional.Conv1D&gt;,
+              &lt;tensorflow.python.keras.layers.convolutional.Conv1D&gt;],
+             5: [&lt;tensorflow.python.keras.engine.input_layer.InputLayer&gt;]})
+and for model_B:
+defaultdict(list,
+            {0: [&lt;tensorflow.python.keras.layers.core.Dense&gt;],
+             1: [&lt;tensorflow.python.keras.layers.pooling.GlobalAveragePooling1D&gt;],
+             2: [&lt;tensorflow.python.keras.layers.merge.Concatenate&gt;],
+             3: [&lt;tensorflow.python.keras.layers.convolutional.ZeroPadding1D&gt;,
+              &lt;tensorflow.python.keras.layers.normalization_v2.BatchNormalization&gt;],
+             4: [&lt;tensorflow.python.keras.layers.normalization_v2.BatchNormalization&gt;,
+              &lt;tensorflow.python.keras.layers.convolutional.Conv1D&gt;],
+             5: [&lt;tensorflow.python.keras.layers.convolutional.Conv1D&gt;],
+             6: [&lt;tensorflow.python.keras.engine.input_layer.InputLayer&gt;]})
+In summary, the models' structure don't match, which is pretty much the same as what you described. I don't think we can support this use case easily.
+So yep the workaround you have is pretty neat. Does that answer your question?
+		</comment>
+		<comment id='3' author='OverLordGoldDragon' date='2020-04-04T17:16:09Z'>
+		&lt;denchmark-link:https://github.com/tanzhenyu&gt;@tanzhenyu&lt;/denchmark-link&gt;
+ Is there a method to generate these dicts, or you built them manually?
+		</comment>
+		<comment id='4' author='OverLordGoldDragon' date='2020-04-04T17:19:04Z'>
+		
+@tanzhenyu Is there a method to generate these dicts, or you built them manually?
+
+There is a _map_graph_network private method under keras/engine/network.py which you can use to verify it
+		</comment>
+		<comment id='5' author='OverLordGoldDragon' date='2020-04-04T17:21:14Z'>
+		&lt;denchmark-link:https://github.com/tanzhenyu&gt;@tanzhenyu&lt;/denchmark-link&gt;
+ Alright - makes sense, thanks for the explanation.
+		</comment>
+		<comment id='6' author='OverLordGoldDragon' date='2020-04-04T17:21:16Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/34182&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/34182&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

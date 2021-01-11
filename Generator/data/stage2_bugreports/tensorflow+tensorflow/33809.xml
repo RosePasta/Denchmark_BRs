@@ -1,0 +1,534 @@
+<bug id='33809' author='olk' open_date='2019-10-29T06:58:47Z' closed_time='2019-12-13T19:31:54Z'>
+	<summary>MirroredStrategy compared to OneDeviceStrategy slower and much weaker learning</summary>
+	<description>
+System informationSystem information
+
+OS Platform and Distribution: Arch Linux, 5.3.7-arch1-1-ARCH
+TensorFlow installed from: binary
+TensorFlow version: 2.0.0
+Keras version: 2.2.4-tf
+Python version: 3.7.4
+CUDA/cuDNN version: CUDA 10.1.243 / cuDNN 7.6.2.24
+GPU model and memory: 2x GTX 1080 Ti 11GB"`
+
+Describe the current behavior
+If the model is trained with OneDeviceStrategy on one GPU an accuracy of 0.9988 is reached after 150 epochs in 5h 24min.
+If the model is trained with MirroredStrategy on two GPUs an accuracy of 0 is reached after 150 epochs in 5h. The loss does not significantly drop.
+
+With MirroredStrategy the same accuracy is reached as training on one GPU  in shorter time (ideally in half the time).
+Might be related to issue &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/33767&gt;#33767&lt;/denchmark-link&gt;
+.
+Code to reproduce the issue
+The complete code with data is available in a git repo if required.
+
+Model:
+
+&lt;denchmark-code&gt;class FeatureExtraction(Layer):
+    def __init__(self, conv_filters, pool_size, name='feature-extraction', **kwargs):
+        super(FeatureExtraction, self).__init__(name=name, **kwargs)
+        self.conv1 = Conv2D(filters=conv_filters, kernel_size=(3, 3), padding='same', activation='relu', kernel_initializer='he_normal', name='conv1')
+        self.conv2 = Conv2D(filters=conv_filters, kernel_size=(3, 3), padding='same', activation='relu', kernel_initializer='he_normal', name='conv2')
+        self.max1 = MaxPooling2D(pool_size=(pool_size, pool_size), name='max1')
+        self.max2 = MaxPooling2D(pool_size=(pool_size, pool_size), name='max2')
+
+    def call(self, inputs):
+        x = self.conv1(inputs)
+        x = self.max1(x)
+        x = self.conv2(x)
+        return self.max2(x)
+
+    def get_config(self):
+        return super(FeatureExtraction, self).get_config()
+
+
+class FeatureReduction(Layer):
+    def __init__(self, img_w, img_h, pool_size, conv_filters, name='feature-reduction', **kwargs):
+        super(FeatureReduction, self).__init__(name=name, **kwargs)
+        target_shape = (img_w // (pool_size ** 2), (img_h // (pool_size ** 2)) * conv_filters)
+        self.reshape = Reshape(target_shape=target_shape, name='reshape')
+        self.dense = Dense(32, activation='relu', name='dense')
+
+    def call(self, inputs):
+        x = self.reshape(inputs)
+        return self.dense(x)
+
+    def get_config(self):
+        return super(FeatureReduction, self).get_config()
+
+
+class SequentialLearner(Layer):
+    def __init__(self, name='sequential-learner', **kwargs):
+        super(SequentialLearner, self).__init__(name=name, **kwargs)
+        self.gru_1a = GRU(512, return_sequences=True, kernel_initializer='he_normal', name='gru_1a')
+        self.gru_1b = GRU(512, return_sequences=True, go_backwards=True, kernel_initializer='he_normal', name='gru_1b')
+        self.gru_2a = GRU(512, return_sequences=True, kernel_initializer='he_normal', name='gru_2a')
+        self.gru_2b = GRU(512, return_sequences=True, go_backwards=True, kernel_initializer='he_normal', name='gru_2b')
+
+    def call(self, inputs):
+        x_1a = self.gru_1a(inputs)
+        x_1b = self.gru_1b(inputs)
+        x = add([x_1a, x_1b])
+        x_2a = self.gru_2a(x)
+        x_2b = self.gru_2b(x)
+        return concatenate([x_2a, x_2b])
+
+    def get_config(self):
+        return super(SequentialLearner, self).get_config()
+
+
+class Output(Layer):
+    def __init__(self, output_size, name='output', **kwargs):
+        super(Output, self).__init__(name=name, **kwargs)
+        self.dense = Dense(output_size, kernel_initializer='he_normal', name='dense')
+        self.softmax = Activation('softmax', name='softmax')
+
+    def call(self, inputs):
+        x = self.dense(inputs)
+        return self.softmax(x)
+
+    def get_config(self):
+        return super(Output, self).get_config()
+
+
+class OCRNet(Model):
+    def __init__(self, output_size, img_w, img_h, max_text_len, name='OCRNet', **kwargs):
+        # parameters
+        conv_filters = 16
+        pool_size = 2
+        # define layers
+        feature_extraction = FeatureExtraction(conv_filters=conv_filters, pool_size=pool_size)
+        sequential_learner = SequentialLearner()
+        feature_reduction = FeatureReduction(img_w=img_w, img_h=img_h, pool_size=pool_size, conv_filters=conv_filters)
+        output = Output(output_size)
+        # NHWC == channels_last NCHW == channels_first
+        # initialize input shape
+        if 'channels_first' == K.image_data_format():
+            input_shape = (1, img_w, img_h)
+        else:
+            input_shape = (img_w, img_h, 1)
+        # input
+        inputs = Input(name='the_input', shape=input_shape, dtype='float32')
+        labels = Input(name='the_labels', shape=[max_text_len], dtype='float32')
+        input_length = Input(name='input_length', shape=[1], dtype='int64')
+        label_length = Input(name='label_length', shape=[1], dtype='int64')
+        # call layers
+        x = feature_extraction(inputs)
+        x = feature_reduction(x)
+        x = sequential_learner(x)
+        predictions = output(x)
+        # Keras doesn't currently support loss funcs with extra parameters
+        # so CTC loss is implemented in a lambda layer
+        loss_out = Lambda(self._ctc_lambda_func, output_shape=(1,), name='ctc')([predictions, labels, input_length, label_length])
+        super(OCRNet, self).__init__(
+                inputs=[inputs, labels, input_length, label_length], outputs=loss_out,
+                name=name, **kwargs)
+
+        # ctc decoder
+        flattened_input_length = K.reshape(input_length, (-1,))
+        top_k_decoded, _ = K.ctc_decode(predictions, flattened_input_length)
+        self.decoder = K.function([inputs, flattened_input_length], [top_k_decoded[0]])
+
+    # loss and train functions, network architecture
+    def _ctc_lambda_func(self, args):
+        predictions, labels, input_length, label_length = args
+        # the 2 is critical here since the first couple outputs of the RNN
+        # tend to be garbage
+        predictions = predictions[:, 2:, :]
+        return K.ctc_batch_cost(labels, predictions, input_length, label_length)
+&lt;/denchmark-code&gt;
+
+
+training (stripped):
+
+&lt;denchmark-code&gt;    ...
+    strategy = tf.distribute.MirroredStrategy() if 1 &lt; ngpus else tf.distribute.OneDeviceStrategy(device="/gpu:1")
+    batch_size = batch_size * strategy.num_replicas_in_sync
+   ...
+    with strategy.scope():
+        model = OCRNet(train_gen.output_size, img_w, img_h, max_text_len)
+        model.summary()
+        adam = Adam(lr=lr, beta_1=0.9, beta_2=0.999, epsilon=1e-08)
+        model.compile(loss={'ctc': lambda y_true, y_pred: y_pred}, optimizer=adam, metrics=['accuracy'])
+    callbacks = []
+    start = time.perf_counter()
+    model.fit(
+            train_gen,
+            validation_data=val_gen,
+            epochs=epochs,
+            shuffle=False,
+            use_multiprocessing=True,
+            workers=6,
+            callbacks=callbacks)
+    elapsed = time.perf_counter() - start
+    logger.info('elapsed: {:0.3f}'.format(elapsed))
+&lt;/denchmark-code&gt;
+
+Other info / logs
+
+Output using OneDeviceStrategy:
+
+
+Train for 700 steps, validate for 150 steps
+Epoch 1/150
+WARNING:tensorflow:Entity &lt;function Function._initialize_uninitialized_variables..initialize_variables at 0x7fb63f70d170&gt; could not be transformed and will be executed as-is. Please report this to the AutoGraph team. When filing the bug, set the verbosity to 10 (on Linux, export AUTOGRAPH_VERBOSITY=10) and attach the full output. Cause: module 'gast' has no attribute 'Num'
+2019-10-29 06:07:28,887 - WARNING - Entity &lt;function Function._initialize_uninitialized_variables..initialize_variables at 0x7fb63f70d170&gt; could not be transformed and will be executed as-is. Please report this to the AutoGraph team. When filing the bug, set the verbosity to 10 (on Linux, export AUTOGRAPH_VERBOSITY=10) and attach the full output. Cause: module 'gast' has no attribute 'Num'
+2019-10-29 06:07:31.225908: E tensorflow/core/grappler/optimizers/meta_optimizer.cc:502] function_optimizer failed: Invalid argument: Node 'OCRNet/sequential-learner/gru_1a/StatefulPartitionedCall_StatefulPartitionedCall_2_26': Connecting to invalid output 31 of source node OCRNet/sequential-learner/gru_1a/StatefulPartitionedCall which has 31 outputs.
+2019-10-29 06:07:31.774256: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamic library libcublas.so.10
+2019-10-29 06:07:31.965277: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamic library libcudnn.so.7
+699/700 [============================&gt;.] - ETA: 0s - loss: 41.7196 - accuracy: 0.0000e+002019-10-29 06:09:19.892252: W tensorflow/core/grappler/optimizers/implementation_selector.cc:310] Skipping optimization due to error while loading function libraries: Invalid argument: Functions '__inference_cudnn_gru_with_fallback_16142_specialized_for_OCRNet_sequential-learner_gru_2b_StatefulPartitionedCall_at___inference_distributed_function_16574' and '__inference_cudnn_gru_with_fallback_16142' both implement 'gru_939794c2-9fc6-48f9-8d2a-e319e349d493' but their signatures do not match.
+700/700 [==============================] - 134s 191ms/step - loss: 41.6829 - accuracy: 0.0000e+00 - val_loss: 15.7647 - val_accuracy: 0.0000e+00
+Epoch 2/150
+700/700 [==============================] - 129s 185ms/step - loss: 15.9857 - accuracy: 0.0000e+00 - val_loss: 15.0192 - val_accuracy: 0.0000e+00
+Epoch 3/150
+700/700 [==============================] - 129s 184ms/step - loss: 14.3529 - accuracy: 0.0000e+00 - val_loss: 13.8274 - val_accuracy: 0.0000e+00
+Epoch 4/150
+700/700 [==============================] - 129s 185ms/step - loss: 13.4774 - accuracy: 0.0000e+00 - val_loss: 13.1987 - val_accuracy: 0.0000e+00
+Epoch 5/150
+700/700 [==============================] - 129s 185ms/step - loss: 12.9877 - accuracy: 0.0000e+00 - val_loss: 12.8102 - val_accuracy: 0.0000e+00
+...
+Epoch 145/150
+700/700 [==============================] - 130s 185ms/step - loss: 0.0059 - accuracy: 0.9985 - val_loss: 0.0119 - val_accuracy: 0.9952
+Epoch 146/150
+700/700 [==============================] - 130s 185ms/step - loss: 0.0058 - accuracy: 0.9985 - val_loss: 0.0118 - val_accuracy: 0.9953
+Epoch 147/150
+700/700 [==============================] - 130s 185ms/step - loss: 0.0056 - accuracy: 0.9987 - val_loss: 0.0116 - val_accuracy: 0.9953
+Epoch 148/150
+700/700 [==============================] - 129s 185ms/step - loss: 0.0055 - accuracy: 0.9988 - val_loss: 0.0114 - val_accuracy: 0.9953
+Epoch 149/150
+700/700 [==============================] - 129s 185ms/step - loss: 0.0053 - accuracy: 0.9988 - val_loss: 0.0113 - val_accuracy: 0.9954
+Epoch 150/150
+700/700 [==============================] - 129s 185ms/step - loss: 0.0052 - accuracy: 0.9988 - val_loss: 0.0111 - val_accuracy: 0.9954
+2019-10-28 04:33:15,026 - INFO - elapsed: 19429.327
+
+
+Output using MirroredStrategy:
+
+
+Train for 350 steps, validate for 75 steps
+Epoch 1/150
+INFO:tensorflow:batch_all_reduce: 20 all-reduces with algorithm = nccl, num_packs = 1, agg_small_grads_max_bytes = 0 and agg_small_grads_max_group = 10
+2019-10-28 21:41:23,061 - INFO - batch_all_reduce: 20 all-reduces with algorithm = nccl, num_packs = 1, agg_small_grads_max_bytes = 0 and agg_small_grads_max_group = 10
+INFO:tensorflow:Reduce to /job:localhost/replica:0/task:0/device:CPU:0 then broadcast to ('/job:localhost/replica:0/task:0/device:CPU:0',).
+2019-10-28 21:41:23,323 - INFO - Reduce to /job:localhost/replica:0/task:0/device:CPU:0 then broadcast to ('/job:localhost/replica:0/task:0/device:CPU:0',).
+INFO:tensorflow:Reduce to /job:localhost/replica:0/task:0/device:CPU:0 then broadcast to ('/job:localhost/replica:0/task:0/device:CPU:0',).
+2019-10-28 21:41:23,328 - INFO - Reduce to /job:localhost/replica:0/task:0/device:CPU:0 then broadcast to ('/job:localhost/replica:0/task:0/device:CPU:0',).
+INFO:tensorflow:Reduce to /job:localhost/replica:0/task:0/device:CPU:0 then broadcast to ('/job:localhost/replica:0/task:0/device:CPU:0',).
+2019-10-28 21:41:24,338 - INFO - Reduce to /job:localhost/replica:0/task:0/device:CPU:0 then broadcast to ('/job:localhost/replica:0/task:0/device:CPU:0',).
+INFO:tensorflow:Reduce to /job:localhost/replica:0/task:0/device:CPU:0 then broadcast to ('/job:localhost/replica:0/task:0/device:CPU:0',).
+2019-10-28 21:41:24,341 - INFO - Reduce to /job:localhost/replica:0/task:0/device:CPU:0 then broadcast to ('/job:localhost/replica:0/task:0/device:CPU:0',).
+WARNING:tensorflow:Entity &lt;function Function._initialize_uninitialized_variables..initialize_variables at 0x7f787c47b170&gt; could not be transformed and will be executed as-is. Please report this to the AutoGraph team. When filing the bug, set the verbosity to 10 (on Linux, export AUTOGRAPH_VERBOSITY=10) and attach the full output. Cause: module 'gast' has no attribute 'Num'
+2019-10-28 21:41:24,385 - WARNING - Entity &lt;function Function._initialize_uninitialized_variables..initialize_variables at 0x7f787c47b170&gt; could not be transformed and will be executed as-is. Please report this to the AutoGraph team. When filing the bug, set the verbosity to 10 (on Linux, export AUTOGRAPH_VERBOSITY=10) and attach the full output. Cause: module 'gast' has no attribute 'Num'
+INFO:tensorflow:batch_all_reduce: 20 all-reduces with algorithm = nccl, num_packs = 1, agg_small_grads_max_bytes = 0 and agg_small_grads_max_group = 10
+2019-10-28 21:41:28,827 - INFO - batch_all_reduce: 20 all-reduces with algorithm = nccl, num_packs = 1, agg_small_grads_max_bytes = 0 and agg_small_grads_max_group = 10
+INFO:tensorflow:Reduce to /job:localhost/replica:0/task:0/device:CPU:0 then broadcast to ('/job:localhost/replica:0/task:0/device:CPU:0',).
+2019-10-28 21:41:29,117 - INFO - Reduce to /job:localhost/replica:0/task:0/device:CPU:0 then broadcast to ('/job:localhost/replica:0/task:0/device:CPU:0',).
+INFO:tensorflow:Reduce to /job:localhost/replica:0/task:0/device:CPU:0 then broadcast to ('/job:localhost/replica:0/task:0/device:CPU:0',).
+2019-10-28 21:41:29,120 - INFO - Reduce to /job:localhost/replica:0/task:0/device:CPU:0 then broadcast to ('/job:localhost/replica:0/task:0/device:CPU:0',).
+INFO:tensorflow:Reduce to /job:localhost/replica:0/task:0/device:CPU:0 then broadcast to ('/job:localhost/replica:0/task:0/device:CPU:0',).
+2019-10-28 21:41:29,128 - INFO - Reduce to /job:localhost/replica:0/task:0/device:CPU:0 then broadcast to ('/job:localhost/replica:0/task:0/device:CPU:0',).
+INFO:tensorflow:Reduce to /job:localhost/replica:0/task:0/device:CPU:0 then broadcast to ('/job:localhost/replica:0/task:0/device:CPU:0',).
+2019-10-28 21:41:29,130 - INFO - Reduce to /job:localhost/replica:0/task:0/device:CPU:0 then broadcast to ('/job:localhost/replica:0/task:0/device:CPU:0',).
+2019-10-28 21:41:29.440363: E tensorflow/core/grappler/optimizers/meta_optimizer.cc:502] function_optimizer failed: Invalid argument: Node 'replica_1/OCRNet/sequential-learner/gru_1a/StatefulPartitionedCall_replica_1/StatefulPartitionedCall_2_26': Connecting to invalid output 31 of source node replica_1/OCRNet/sequential-learner/gru_1a/StatefulPartitionedCall which has 31 outputs.
+2019-10-28 21:41:30.730864: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamic library libcublas.so.10
+2019-10-28 21:41:31.078427: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamic library libcudnn.so.7
+349/350 [============================&gt;.] - ETA: 0s - loss: 89.5114 - accuracy: 0.0000e+002019-10-28 21:43:16.332927: W tensorflow/core/grappler/optimizers/implementation_selector.cc:310] Skipping optimization due to error while loading function libraries: Invalid argument: Functions '__inference_standard_gru_26258' and '__inference_cudnn_gru_with_fallback_26349_specialized_for_OCRNet_sequential-learner_gru_2b_StatefulPartitionedCall_at___inference_distributed_function_28787' both implement 'gru_d38ba96e-e1cb-43bd-a1af-2f107f6aab80' but their signatures do not match.
+350/350 [==============================] - 138s 395ms/step - loss: 89.5000 - accuracy: 0.0000e+00 - val_loss: 86.4455 - val_accuracy: 0.0000e+00
+Epoch 2/150
+350/350 [==============================] - 120s 342ms/step - loss: 83.2679 - accuracy: 0.0000e+00 - val_loss: 80.2358 - val_accuracy: 0.0000e+00
+Epoch 3/150
+350/350 [==============================] - 120s 342ms/step - loss: 76.8871 - accuracy: 0.0000e+00 - val_loss: 73.5664 - val_accuracy: 0.0000e+00
+Epoch 4/150
+350/350 [==============================] - 120s 342ms/step - loss: 69.5524 - accuracy: 0.0000e+00 - val_loss: 65.3586 - val_accuracy: 0.0000e+00
+Epoch 5/150
+350/350 [==============================] - 120s 342ms/step - loss: 61.0491 - accuracy: 0.0000e+00 - val_loss: 57.3255 - val_accuracy: 0.0000e+00
+...
+Epoch 145/150
+350/350 [==============================] - 120s 343ms/step - loss: 9.9171 - accuracy: 0.0000e+00 - val_loss: 9.8855 - val_accuracy: 0.0000e+00
+Epoch 146/150
+350/350 [==============================] - 120s 343ms/step - loss: 9.8615 - accuracy: 0.0000e+00 - val_loss: 9.8293 - val_accuracy: 0.0000e+00
+Epoch 147/150
+350/350 [==============================] - 120s 342ms/step - loss: 9.8055 - accuracy: 0.0000e+00 - val_loss: 9.7728 - val_accuracy: 0.0000e+00
+Epoch 148/150
+350/350 [==============================] - 120s 343ms/step - loss: 9.7491 - accuracy: 0.0000e+00 - val_loss: 9.7160 - val_accuracy: 0.0000e+00
+Epoch 149/150
+350/350 [==============================] - 120s 343ms/step - loss: 9.6923 - accuracy: 0.0000e+00 - val_loss: 9.6588 - val_accuracy: 0.0000e+00
+Epoch 150/150
+350/350 [==============================] - 120s 342ms/step - loss: 9.6351 - accuracy: 0.0000e+00 - val_loss: 9.6010 - val_accuracy: 0.0000e+00
+2019-10-29 02:41:31,149 - INFO - elapsed: 18013.239
+
+	</description>
+	<comments>
+		<comment id='1' author='olk' date='2019-11-03T17:01:00Z'>
+		What’s the difference between MirroredStrategy and OneDeviceStrategy, when there is only one GPU available? (TF2.0 stable)
+		</comment>
+		<comment id='2' author='olk' date='2019-11-11T04:25:45Z'>
+		&lt;denchmark-link:https://github.com/olk&gt;@olk&lt;/denchmark-link&gt;
+ - can you provide the entire training code? Is it possible to repro this in colab - that will make it easier for us to debug.
+Also, can you try a few things:
+
+have you tried using a standard loss? I am wondering if we are not handling loss dictionary properly with mirrored strategy
+can you also try mirrored strategy with 1 GPU? I want to see if it's a number of replicas issue, or strategy issue.
+is your training supposed to scale as you double the batch size? training characteristics can change as you increase the global batch size. do you think you may need to tune the hyper params? Alternatively, for now, just test with the same global batch size (ie. half the batch size per replica with 2 replicas).
+
+&lt;denchmark-link:https://github.com/ASLPZHAO&gt;@ASLPZHAO&lt;/denchmark-link&gt;
+ - there should not be any user visible difference, but the strategies' implementations are quite different so a bug could lead to some observable difference.
+		</comment>
+		<comment id='3' author='olk' date='2019-11-11T04:32:13Z'>
+		Also, &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/33767&gt;#33767&lt;/denchmark-link&gt;
+ was marked fixed, so in case that had anything to do with this issue, worth trying with the latest nightly.
+		</comment>
+		<comment id='4' author='olk' date='2019-11-13T17:57:16Z'>
+		the problem still remains:
+
+using MirroredStrategy with one GPU strategy = tf.distribute.MirroredStrategy(["/gpu:1"])  results in an error:
+
+
+2019-11-13 18:49:44.542233: E tensorflow/core/grappler/optimizers/meta_optimizer.cc:502] function_optimizer failed: Invalid argument: Node 'OCRNet/sequential-learner/gru_1a/StatefulPartitionedCall_StatefulPartitionedCall_2_26': Connecting to invalid output 31 of source node OCRNet/sequential-learner/gru_1a/StatefulPartitionedCall which has 31 outputs.
+2019-11-13 18:49:45.117933: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamic library libcublas.so.10
+2019-11-13 18:49:45.313954: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamic library libcudnn.so.7
+2019-11-13 18:49:46.495134: W tensorflow/core/common_runtime/base_collective_executor.cc:216] BaseCollectiveExecutor::StartAbort Invalid argument: var and grad do not have the same shape[2,1536] [512,1536]
+[[{{node Adam/Adam/update_14/update_0/ResourceApplyAdam}}]]
+[[GroupCrossDeviceControlEdges_0/Identity_3/_185]]
+2019-11-13 18:49:46.495246: W tensorflow/core/common_runtime/base_collective_executor.cc:216] BaseCollectiveExecutor::StartAbort Invalid argument: var and grad do not have the same shape[2,1536] [512,1536]
+[[{{node Adam/Adam/update_14/update_0/ResourceApplyAdam}}]]
+[[Identity_4/_190]]
+2019-11-13 18:49:46.495287: W tensorflow/core/common_runtime/base_collective_executor.cc:216] BaseCollectiveExecutor::StartAbort Invalid argument: var and grad do not have the same shape[2,1536] [512,1536]
+[[{{node Adam/Adam/update_14/update_0/ResourceApplyAdam}}]]
+1/1000 [..............................] - ETA: 2:16:08WARNING:tensorflow:Early stopping conditioned on metric val_loss which is not available. Available metrics are:
+2019-11-13 18:49:46,569 - WARNING - Early stopping conditioned on metric val_loss which is not available. Available metrics are:
+1/1000 [..............................] - ETA: 2:18:55Traceback (most recent call last):
+File "src/models/train.py", line 104, in 
+main()
+File "src/models/train.py", line 98, in main
+callbacks=callbacks)
+File "/usr/lib/python3.7/site-packages/tensorflow_core/python/keras/engine/training.py", line 728, in fit
+use_multiprocessing=use_multiprocessing)
+File "/usr/lib/python3.7/site-packages/tensorflow_core/python/keras/engine/training_v2.py", line 324, in fit
+total_epochs=epochs)
+File "/usr/lib/python3.7/site-packages/tensorflow_core/python/keras/engine/training_v2.py", line 123, in run_one_epoch
+batch_outs = execution_function(iterator)
+File "/usr/lib/python3.7/site-packages/tensorflow_core/python/keras/engine/training_v2_utils.py", line 86, in execution_function
+distributed_function(input_fn))
+File "/usr/lib/python3.7/site-packages/tensorflow_core/python/eager/def_function.py", line 457, in call
+result = self._call(*args, **kwds)
+File "/usr/lib/python3.7/site-packages/tensorflow_core/python/eager/def_function.py", line 520, in _call
+return self._stateless_fn(*args, **kwds)
+File "/usr/lib/python3.7/site-packages/tensorflow_core/python/eager/function.py", line 1823, in call
+return graph_function._filtered_call(args, kwargs)  # pylint: disable=protected-access
+File "/usr/lib/python3.7/site-packages/tensorflow_core/python/eager/function.py", line 1141, in _filtered_call
+self.captured_inputs)
+File "/usr/lib/python3.7/site-packages/tensorflow_core/python/eager/function.py", line 1224, in _call_flat
+ctx, args, cancellation_manager=cancellation_manager)
+File "/usr/lib/python3.7/site-packages/tensorflow_core/python/eager/function.py", line 511, in call
+ctx=ctx)
+File "/usr/lib/python3.7/site-packages/tensorflow_core/python/eager/execute.py", line 67, in quick_execute
+six.raise_from(core._status_to_exception(e.code, message), None)
+File "", line 3, in raise_from
+tensorflow.python.framework.errors_impl.InvalidArgumentError: 2 root error(s) found.
+(0) Invalid argument:  var and grad do not have the same shape[2,1536] [512,1536]
+[[node Adam/Adam/update_14/update_0/ResourceApplyAdam (defined at /usr/lib/python3.7/site-packages/tensorflow_core/python/framework/ops.py:1751) ]]
+[[GroupCrossDeviceControlEdges_0/Identity_3/_185]]
+(1) Invalid argument:  var and grad do not have the same shape[2,1536] [512,1536]
+[[node Adam/Adam/update_14/update_0/ResourceApplyAdam (defined at /usr/lib/python3.7/site-packages/tensorflow_core/python/framework/ops.py:1751) ]]
+0 successful operations.
+1 derived errors ignored. [Op:__inference_distributed_function_12688]
+Function call stack:
+distributed_function -&gt; distributed_function
+2019-11-13 18:49:46.942138: W tensorflow/core/kernels/data/generator_dataset_op.cc:102] Error occurred when finalizing GeneratorDataset iterator: Failed precondition: Python interpreter state is not initialized. The process may be terminated.
+[[{{node PyFunc}}]]
+make: *** [Makefile:56: train] Fehler 1
+
+
+the code already doubles the batch_size if MirroredStrategy is used (two GPUsare available)
+gast was downgraded to 0.2.2 before testing
+I think standard loss is not applicable because CTC is required
+
+		</comment>
+		<comment id='5' author='olk' date='2019-11-13T18:01:45Z'>
+		
+the entire training code is available at ki-ocr-spreadsheet
+I don't think that it will run in colab
+
+		</comment>
+		<comment id='6' author='olk' date='2019-11-13T18:05:41Z'>
+		&lt;denchmark-link:https://github.com/olk&gt;@olk&lt;/denchmark-link&gt;
+ thank you for trying out the other things.
+Regarding batch size - I meant can you try with 2 GPUs but without doubling the batch size. This would potentially give worse scaling, but should more faithfully match training on 1 GPU in terms of convergence.
+		</comment>
+		<comment id='7' author='olk' date='2019-11-13T20:32:09Z'>
+		&lt;denchmark-link:https://github.com/guptapriya&gt;@guptapriya&lt;/denchmark-link&gt;
+:
+Using the same batch-size for MirroredStrategy as for OneDeviceStrategy doesn't change the behaviour.
+Why does  MirroredStrategy crash if only one GPU has been configured?
+Maybe you already noticed that the loss starts at much higher values for MirroredStrategy as it does for OneDeviceStrategy?!
+
+999/1000 [============================&gt;.] - ETA: 0s - loss: 83.1715 - accuracy: 0.0000e+002019-11-13 21:28:58.423118: W tensorflow/core/grappler/optimizers/implementation_selector.cc:310] Skipping optimization due to error while loading function libraries: Invalid argument: Functions '__inference_standard_gru_29792' and '__inference_cudnn_gru_with_fallback_29881_specialized_for_replica_1_OCRNet_sequential-learner_gru_2a_StatefulPartitionedCall_at___inference_distributed_function_30737' both implement 'gru_f0a269b3-1fd4-4b86-a90b-9414b82bd560' but their signatures do not match.
+1000/1000 [==============================] - 133s 133ms/step - loss: 83.1631 - accuracy: 0.0000e+00 - val_loss: 75.9862 - val_accuracy: 0.0000e+00
+Epoch 2/150
+1000/1000 [==============================] - 115s 115ms/step - loss: 66.3670 - accuracy: 0.0000e+00 - val_loss: 50.6435 - val_accuracy: 0.0000e+00
+
+		</comment>
+		<comment id='8' author='olk' date='2019-11-17T17:21:23Z'>
+		Yeah I noticed the loss starts at higher value for mirrored strategy.
+&lt;denchmark-link:https://github.com/pavithrasv&gt;@pavithrasv&lt;/denchmark-link&gt;
+ - do you think there could be some issue with using this custom loss and loss dictionary?
+&lt;denchmark-link:https://github.com/olk&gt;@olk&lt;/denchmark-link&gt;
+ - would it possible for you to isolate this into a simple test that can be runnable in colab? you can use some fake/synthetic data, and fix the random seed - with that, the model will not converge but we can still check that the loss etc should be same at each step in both cases.
+I don't have the bandwidth to take the code from github and try to reproduce it, so if you can provide a runnable sample in colab that reproduces the issue, we can debug much faster.
+		</comment>
+		<comment id='9' author='olk' date='2019-11-19T14:35:23Z'>
+		@guptapriya, I don't believe that the code can be reduced to run in colab. Could you point me to an example that uses MirroredStrategy and runs in colab? I'd like to test it on my system (2 NUMA nodes, but both GPU are connected tot the same NUMA node + numactl for memory allocation == data do not cross the QPI).
+		</comment>
+		<comment id='10' author='olk' date='2019-11-26T07:01:37Z'>
+		&lt;denchmark-link:https://github.com/guptapriya&gt;@guptapriya&lt;/denchmark-link&gt;
+, I'll test this issue with a modified version (using MirroredStrategy and OneDeviceStrategy) of &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/34588&gt;#34588&lt;/denchmark-link&gt;
+ , if the issue of &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/34588&gt;#34588&lt;/denchmark-link&gt;
+ has been solved.
+		</comment>
+		<comment id='11' author='olk' date='2019-11-26T07:34:37Z'>
+		&lt;denchmark-link:https://github.com/olk&gt;@olk&lt;/denchmark-link&gt;
+ Here are a couple of resources to help with creating a repro with colab which has 1 GPU:
+&lt;denchmark-link:https://www.tensorflow.org/guide/gpu#using_multiple_gpus&gt;https://www.tensorflow.org/guide/gpu#using_multiple_gpus&lt;/denchmark-link&gt;
+ - you can use virtual device config to create 2 virtual GPUs
+&lt;denchmark-link:https://www.tensorflow.org/tutorials/distribute/keras&gt;https://www.tensorflow.org/tutorials/distribute/keras&lt;/denchmark-link&gt;
+ - Colab example with MirorredStrategy - this example doesn't specify any devices but if you setup 2 virtual GPUs as above, it should run with those 2 virtual devices.
+I think if it's a quality / correctness issue, we should be able to repro with virtual GPUs and not necessarily need 2 physical GPUs.
+		</comment>
+		<comment id='12' author='olk' date='2019-12-01T09:27:14Z'>
+		I've used a slightly modified version of MNIST  &lt;denchmark-link:https://colab.research.google.com/drive/1TXu1dD46r19jhyoD_HOIihxenNaytwQ3#scrollTo=Pasya9wZzJIc&gt;example available in colab&lt;/denchmark-link&gt;
+.
+
+Measurements at colab using two logical GPUs
+
+OneDeviceStrategy: elapsed time: 880s, accuracy of val-data: 98.75%
+MirredStrategy:  elapsed time: 1776s, accuracy of val-data: 98.71%
+
+Measurements at my NUMA system using two physical GPUs
+
+
+both GPUs are connected to NUMA node 1
+invoked at command line: numactl --cpunodebind=1 --membind=1 python mnist.py
+
+OneDeviceStrategy: elapsed time: 332, accuracy of val-data: 98.79%
+MirredStrategy:  elapsed time: 647s, accuracy of val-data: 98.72%
+The code block regarding to logic GPU setup has to be commented out because an exception was thrown:
+
+Traceback (most recent call last):
+File "mnist.py", line 25, in 
+strategy = tf.distribute.MirroredStrategy()
+File "/usr/lib/python3.7/site-packages/tensorflow_core/python/distribute/mirrored_strategy.py", line 356, in init
+self, devices=devices, cross_device_ops=cross_device_ops)
+File "/usr/lib/python3.7/site-packages/tensorflow_core/python/distribute/mirrored_strategy.py", line 396, in init
+self._initialize_strategy(devices)
+File "/usr/lib/python3.7/site-packages/tensorflow_core/python/distribute/mirrored_strategy.py", line 410, in _initialize_strategy
+self._initialize_local(devices)
+File "/usr/lib/python3.7/site-packages/tensorflow_core/python/distribute/mirrored_strategy.py", line 420, in _initialize_local
+cross_device_ops_lib.choose_the_best(devices))
+File "/usr/lib/python3.7/site-packages/tensorflow_core/python/distribute/cross_device_ops.py", line 1196, in choose_the_best
+machine_devices = device_lib.list_local_devices(session_config=session_config)
+File "/usr/lib/python3.7/site-packages/tensorflow_core/python/client/device_lib.py", line 41, in list_local_devices
+for s in pywrap_tensorflow.list_devices(session_config=session_config)
+File "/usr/lib/python3.7/site-packages/tensorflow_core/python/pywrap_tensorflow_internal.py", line 2249, in list_devices
+return ListDevices()
+tensorflow.python.framework.errors_impl.AlreadyExistsError: TensorFlow device (GPU:1) is being mapped to multiple CUDA devices (1 now, and 0 previously), which is not supported. This may be the result of providing different GPU configurations (ConfigProto.gpu_options, for example different visible_device_list) when creating multiple Sessions in the same process. This is not  currently supported, see #19083
+
+
+Observations
+
+
+surprisingly MirroredStrategy is two times slower than OneDeviceStrategy
+logical GPU configuration can not be used with two physical GPUs and MirroredStrategy (exception thrown)
+
+
+Expectation
+
+
+my target is a NUMA system with two physical GPUs, Tensorflow code should take benefit of it
+with MirroredStrategy the runtime should be almost the half of using OneDeviceStrategy (not two times longer)
+
+		</comment>
+		<comment id='13' author='olk' date='2019-12-02T05:40:21Z'>
+		&lt;denchmark-link:https://github.com/olk&gt;@olk&lt;/denchmark-link&gt;
+ - let's focus on the issue of why the learning is different between the 2 for your use case. We should look at the performance/slowness issue separately. Are you able to change the colab to be more similar to your use case so we can try to repro the convergence issue?
+		</comment>
+		<comment id='14' author='olk' date='2019-12-02T07:05:31Z'>
+		&lt;denchmark-link:https://github.com/guptapriya&gt;@guptapriya&lt;/denchmark-link&gt;
+, I strongly disagree - I'd like to focus at the missing speedup. Please note that I've bought a second GPU in order to speedup the learning. I hope you understand the disappointment that the MirroredStrategy with two GPUs is much slower than using OneDeviceStrategy with one GPU.
+My example can not be ported to colab because of the complex data generation.
+Let us stick with MNIST example that is part of tensorflow.
+		</comment>
+		<comment id='15' author='olk' date='2019-12-02T08:00:50Z'>
+		&lt;denchmark-link:https://github.com/olk&gt;@olk&lt;/denchmark-link&gt;
+ There are two kinds of scaling when working with more processors: strong-scaling and weak scaling.
+Strong-scaling means that for a fixed TOTAL problem size, and in your case it means that half the original batch size for each of your two GPUs, and then measure your speedup. Strong-scaling does not concern the convergence rate regarding to the number of steps, because no matter how many GPUs you are using, your original problem, i.e. the model hyper parameters such as batch size, learning rate, etc. are not changed. If you are familiar with MapReduce or any other "embarrassingly parallel" kind of problems, they are all strong scaling problems.
+Unfortunately, strong-scaling does not give the best performance speed-up for deep learning models, where we usually employ "weak-scaling", or a fixed problem size for EACH processor. That, in your case, means doubling the global batch size for 2 GPUs. And since you are not dealing with the exact same problems with more GPUs, your model hyper-parameters need to be updated accordingly to compensate for the convergence rate. If the hyper-parameters are tuned well (in the case of SGD it usually means double the learning rate), you could get close to the ideal speed-up with more GPUs.
+As &lt;denchmark-link:https://github.com/guptapriya&gt;@guptapriya&lt;/denchmark-link&gt;
+ said, I will suggest you to take one step at a time, and help us to investigate from the system side first, i.e. why the performance is slow in the strong-scaling case. It cannot give you the best end-to-end performance, but it isolates the root cause so we could focus on the system side and temporarily shift away from investigating how to adjust your model hyper-parameters for weak-scaling. Once we are done in the strong-scaling regime, we can surely move on and try to reach the ideal performance speed-up.
+		</comment>
+		<comment id='16' author='olk' date='2019-12-02T08:23:12Z'>
+		Are the hyper params found optimal for OneDeviceStrategy optimal for MirroredStrategy too?
+If not, do you have to tune hyper params for each hardware/accelerator configuration (== 2 GPUs vs. 3 GPUs etc.) using MirroredStrategy?
+		</comment>
+		<comment id='17' author='olk' date='2019-12-03T14:51:23Z'>
+		Using keras-tune and CTC loss (used by my orignal example) doesn't work:
+&lt;denchmark-code&gt;W tensorflow/core/common_runtime/base_collective_executor.cc:216] BaseCollectiveExecutor::StartAbort Invalid argument: sequence_length(0) &lt;= 12
+	 [[{{node OCRNet/ctc/CTCLoss}}]]
+   1/1000 [..............................] - ETA: 2:14:41WARNING:tensorflow:Early stopping conditioned on metric `val_accuracy` which is not available. Available metrics are: 
+WARNING:tensorflow:Can save best model only with val_accuracy available, skipping.
+...
+tensorflow.python.framework.errors_impl.InvalidArgumentError:  sequence_length(0) &lt;= 12
+	 [[node OCRNet/ctc/CTCLoss (defined at usr/lib/python3.7/site-packages/tensorflow_core/python/framework/ops.py:1751) ]] [Op:__inference_distributed_function_15256]
+&lt;/denchmark-code&gt;
+
+So I've to fallback to MNIST example.
+		</comment>
+		<comment id='18' author='olk' date='2019-12-04T06:35:55Z'>
+		I've tuned the hyper parameters for Tensorflow's MNIST example with Keras Tuner.
+The network was trained with the tuned hyper parameters.
+&lt;denchmark-link:https://colab.research.google.com/drive/19y3BmBymeRKXV6w1BfB3B2_YwPBBnWAs#scrollTo=26yDrlokmr8n&gt;Code&lt;/denchmark-link&gt;
+ is available in colab.
+MirroredStrategy (2 GPUs):
+
+12000/12000 [==============================] - 135s 11ms/step - loss: 0.0247 - accuracy: 0.9990 - val_loss: 1.6112 - val_accuracy: 0.9859
+elapsed: 664.446s
+
+OneDeviceStrategy (1 GPU) :
+
+12000/12000 [==============================] - 68s 6ms/step - loss: 0.0341 - accuracy: 0.9971 - val_loss: 0.7370 - val_accuracy: 0.9819
+elapsed: 334.543s
+
+Even with tuned hyper parameters MirroredStrategy is still 2 times slower than OneDeviceStrategy
+		</comment>
+		<comment id='19' author='olk' date='2019-12-13T19:31:54Z'>
+		closed - use MNIST example instead
+		</comment>
+		<comment id='20' author='olk' date='2019-12-13T19:31:56Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/33809&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/33809&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='21' author='olk' date='2020-01-11T02:28:00Z'>
+		I have the same issue! MirroredStrategy is not giving any improvement neither in speed nor accuracy. &lt;denchmark-link:https://github.com/olk&gt;@olk&lt;/denchmark-link&gt;
+ what was your final conclusion about this?
+		</comment>
+		<comment id='22' author='olk' date='2020-01-11T10:41:12Z'>
+		&lt;denchmark-link:https://github.com/alisaaalehi&gt;@alisaaalehi&lt;/denchmark-link&gt;
+ I switched to MXNet - it utilizes the GPUs much better (Keras can be used too)
+		</comment>
+		<comment id='23' author='olk' date='2020-01-12T08:27:33Z'>
+		&lt;denchmark-link:https://github.com/alisaaalehi&gt;@alisaaalehi&lt;/denchmark-link&gt;
+ is MirroredStrategy leading to worse accuracy? Or same accuracy but with no improvement in speed? Please open an issue with your code to repro. Speed issues can be debugged with profiling tools.
+		</comment>
+		<comment id='24' author='olk' date='2020-01-13T16:24:00Z'>
+		&lt;denchmark-link:https://github.com/olk&gt;@olk&lt;/denchmark-link&gt;
+ I've spent too much time on TF, not happy, but cannot switch either!
+		</comment>
+		<comment id='25' author='olk' date='2020-01-13T16:45:17Z'>
+		&lt;denchmark-link:https://github.com/guptapriya&gt;@guptapriya&lt;/denchmark-link&gt;
+ with the promise of higher speed I have switched to TF2, but it is slower than my TF1 code.
+Compared to TF1, with small input images, my TF2 code is two times slower (when using MirroredStrategy with two GPUs). When bigger images are used as input and maximum possible batch size is used, TF2 takes about  while TF1 is  per epoch.
+		</comment>
+	</comments>
+</bug>

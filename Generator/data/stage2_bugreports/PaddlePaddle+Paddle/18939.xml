@@ -1,0 +1,131 @@
+<bug id='18939' author='jiangjiajun' open_date='2019-07-31T11:49:58Z' closed_time='2019-10-18T14:57:43Z'>
+	<summary>depthwise conv2d在实现时，GPU上和CPU上的存在较大diff</summary>
+	<description>
+&lt;denchmark-code&gt;import paddle.fluid as fluid
+input = fluid.layers.data(dtype='float32', shape=[None, 384, 28, 28], name='data')
+pad_input = fluid.layers.pad2d(input, paddings=[2, 2, 2, 2], pad_value=0.0)
+result = fluid.layers.conv2d(pad_input, bias_attr=False, param_attr="depthwise_kernel",
+                    num_filters=384, filter_size=[5, 5], stride=[1, 1], groups=384)
+
+exe = fluid.Executor(fluid.CPUPlace())
+exe.run(fluid.default_startup_program())
+
+#fluid.io.save_params(executor=exe, dirname='test_model', main_program=None)
+fluid.io.load_params(executor=exe, dirname='test_model', main_program=fluid.default_main_program())
+
+import numpy
+numpy.random.seed(13)
+data = numpy.random.rand(5, 384, 28, 28).astype('float32')
+res, = exe.run(feed={'data':data}, fetch_list=[result])
+
+numpy.save('res_cpu.npy', res)
+&lt;/denchmark-code&gt;
+
+上面是我的测试代码，当把CPUPlace换成CUDAPlace后，两者同样的模型结果存在1e-03级的diff，目前测得CPU上跟TensorFlow对齐，但GPU没有对齐（TensorFlow测得CPU与GPU结果一致）
+	</description>
+	<comments>
+		<comment id='1' author='jiangjiajun' date='2019-08-05T07:24:22Z'>
+		貌似 5*5下的depthwise 一直有问题。貌似之前有同学在修复，需要进一步了解。
+		</comment>
+		<comment id='2' author='jiangjiajun' date='2019-09-24T02:15:30Z'>
+		use_cudnn=True的情况下gpu的计算结果和cpu计算结果有diff的原因是 gpu cudnn7的情况下卷积调用的winograd算法对卷积计算进行加速导致的。
+		</comment>
+		<comment id='3' author='jiangjiajun' date='2019-10-14T07:14:03Z'>
+		I didn't see any difference between CPUPlace and CUDAPlace. Besides,  because group size is equal to input channel size, cuDNN will invoke conv2d_grouped_direct_kernel kernel so it should be nothing to do with winograd algorithm (You can use nsight-system to observe GPU behavior) .
+Please try following code:
+# demo.py:
+import paddle.fluid as fluid
+
+first_run = True
+
+def test(place, data):
+    input = fluid.layers.data(dtype='float32', shape=[None, 384, 28, 28], name='data')
+    pad_input = fluid.layers.pad2d(input, paddings=[2, 2, 2, 2], pad_value=0.0)
+    result = fluid.layers.conv2d(pad_input, bias_attr=False, param_attr="depthwise_kernel",
+        num_filters=384, filter_size=[5, 5], stride=[1, 1], groups=384)
+
+    exe = fluid.Executor(place)
+    exe.run(fluid.default_startup_program())
+
+    global first_run
+    if (first_run):
+        fluid.io.save_params(executor=exe, dirname='test_model', main_program=None)
+        first_run = False
+
+    fluid.io.load_params(executor=exe, dirname='test_model', main_program=fluid.default_main_program())
+
+    res, = exe.run(feed={'data':data}, fetch_list=[result])
+    return res
+
+import numpy
+numpy.random.seed(13)
+data = numpy.random.rand(5, 384, 28, 28).astype('float32')
+res_gpu = test(fluid.CUDAPlace(0), data)
+res_cpu = test(fluid.CPUPlace(), data)
+
+diff = numpy.abs(res_gpu - res_cpu)
+print(diff) # report [0, 0, 0, 0...0]
+run:
+python ./demo.py
+test environment:
+
+hub.baidubce.com/paddlepaddle/paddle:1.5.2-gpu-cuda10.0-cudnn7
+
+		</comment>
+		<comment id='4' author='jiangjiajun' date='2019-10-14T07:40:06Z'>
+		
+I didn't see any difference between CPUPlace and CUDAPlace. Besides, because group size is equal to input channel size, cuDNN will invoke conv2d_grouped_direct_kernel kernel so it should be nothing to do with winograd algorithm (You can use nsight-system to observe GPU behavior) .
+Please try following code:
+import paddle.fluid as fluid
+
+first_run = True
+
+def test(place, data):
+    input = fluid.layers.data(dtype='float32', shape=[None, 384, 28, 28], name='data')
+    pad_input = fluid.layers.pad2d(input, paddings=[2, 2, 2, 2], pad_value=0.0)
+    result = fluid.layers.conv2d(pad_input, bias_attr=False, param_attr="depthwise_kernel",
+        num_filters=384, filter_size=[5, 5], stride=[1, 1], groups=384)
+
+    exe = fluid.Executor(place)
+    exe.run(fluid.default_startup_program())
+
+    global first_run
+    if (first_run):
+        fluid.io.save_params(executor=exe, dirname='test_model', main_program=None)
+        first_run = False
+
+    fluid.io.load_params(executor=exe, dirname='test_model', main_program=fluid.default_main_program())
+
+    res, = exe.run(feed={'data':data}, fetch_list=[result])
+    return res
+
+import numpy
+numpy.random.seed(13)
+data = numpy.random.rand(5, 384, 28, 28).astype('float32')
+res_gpu = test(fluid.CUDAPlace(0), data)
+res_cpu = test(fluid.CPUPlace(), data)
+
+diff = numpy.abs(res_gpu - res_cpu)
+print(diff) # report [0, 0, 0, 0...0]
+test environment:
+hub.baidubce.com/paddlepaddle/paddle:1.5.2-gpu-cuda10.0-cudnn7
+
+hi,  I test the code in two different machine, and get different result: in Tesla P40, the max diff is 0.0005939016 , but in Tesla V100, the max diff is 7.4505806e-08. Is there anything wrong in P40?
+test environment:
+paddlepaddle:1.5.2 cuda 9, cudnn7.5
+		</comment>
+		<comment id='5' author='jiangjiajun' date='2019-10-15T09:41:06Z'>
+		I can reproduce the problem now. The behavior difference is that on P4 or P40, Paddle did invoke winogradForward series kernels 384 times. Instead, on V100 or T4, it only invoked conv2d_grouped_direct_kernel kernel  one times. Need more time to make a simple test based on CUDA C to verify cuDNN functionality.
+		</comment>
+		<comment id='6' author='jiangjiajun' date='2019-10-15T12:30:54Z'>
+		&lt;denchmark-link:https://github.com/ceci3&gt;@ceci3&lt;/denchmark-link&gt;
+ ,
+To solve this issue, you need to assign  to  series API for depthwise convolution, then cuDNN will invoke . Now only  algorithm is fully tuned for depthwise convolution.
+A kindly reminder that using nsight-system to observe GPU behavior is very helpful to solve such issue.
+		</comment>
+		<comment id='7' author='jiangjiajun' date='2019-10-15T13:00:45Z'>
+		&lt;denchmark-link:https://github.com/jeng1220&gt;@jeng1220&lt;/denchmark-link&gt;
+  OK，I will try. Thank you.  ^_^
+		</comment>
+	</comments>
+</bug>

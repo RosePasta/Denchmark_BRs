@@ -1,0 +1,115 @@
+<bug id='8869' author='lukaszbachman' open_date='2020-04-23T05:46:06Z' closed_time='2020-04-23T12:51:03Z'>
+	<summary>Windows - MMAP Memory Workspace not releasing the resource to the underlying file</summary>
+	<description>
+Hello,
+First of all - sorry for reporting so many MMAP related issues lately. I hit few roadblockers with my initial implementation of PCA using MMAPs and I'm working under a bit of pressure. Not something which concerns you but just wanted to say - sorry ;-)
+&lt;denchmark-h:h4&gt;Issue Description&lt;/denchmark-h&gt;
+
+It looks like on Windows the MMAP resources used within the TRY-WITH-RESOURCE block are not released on a timely manner, which causes attempts of removing the oldmap file to fail. Best illustrated with this sample:
+&lt;denchmark-code&gt;@Test
+	public void testDeletion()
+			  throws IOException
+	{
+		final Path mmapFile = Paths.get("D://test.mmap");
+		WorkspaceConfiguration mmap = WorkspaceConfiguration.builder()
+				  .initialSize(100 * 1024L * 1024L) // 100 mb
+				  .policyLocation(LocationPolicy.MMAP)
+				  .tempFilePath(mmapFile.toAbsolutePath().toString())
+				  .build();
+		try (MemoryWorkspace ws = Nd4j.getWorkspaceManager().getAndActivateWorkspace(mmap, "M2")) {
+			Nd4j.ones(100);
+		}
+		Files.delete(mmapFile);
+	}
+&lt;/denchmark-code&gt;
+
+This fails immediately with
+&lt;denchmark-code&gt;java.nio.file.FileSystemException: D:\test.mmap: The process cannot access the file because it is being used by another process.
+&lt;/denchmark-code&gt;
+
+I had a look at your tests and found the DL4JFileUtils and that you are using deleteOnExit() to cleanup the resources in your tests, but so happens that this piece of code also runs in a bigger test of ours which deletes the entire folder @After each test. This obviously is causing that one to fail, because it cannot do that due to blocked resource.
+Deletion works fine on Linux.
+&lt;denchmark-h:h4&gt;Version Information&lt;/denchmark-h&gt;
+
+
+ND4J 1.0.0-beta6, CPU backend
+Windows (not working), tested on Linux (working)
+
+	</description>
+	<comments>
+		<comment id='1' author='lukaszbachman' date='2020-04-23T05:48:53Z'>
+		Sure it can't be deleted. Workspace is alive and active, so the file is still memory-mapped. You'd  need to destroy workspace first.
+re: mmap issues. Man, keep them going in please :)
+		</comment>
+		<comment id='2' author='lukaszbachman' date='2020-04-23T06:07:11Z'>
+		Hm. Yes, right now, the only way to un-mmap file is to make a call to destroyWorkspace(). Which is wrong. I'll fix this.
+		</comment>
+		<comment id='3' author='lukaszbachman' date='2020-04-23T06:26:59Z'>
+		Hhmmm I was actually trying this before, calling various variants of destroy*() methods, but that didn't help to rectify the issue. Let me try few more times.
+		</comment>
+		<comment id='4' author='lukaszbachman' date='2020-04-23T06:30:13Z'>
+		Yeah, so none of these commented lines helped:
+&lt;denchmark-code&gt;		try (MemoryWorkspace ws = Nd4j.getWorkspaceManager().getAndActivateWorkspace(mmap, "M2")) {
+			Nd4j.ones(100);
+//			ws.destroyWorkspace();
+//			ws.destroyWorkspace(true);
+		}
+//		Nd4j.getWorkspaceManager().destroyAllWorkspacesForCurrentThread();
+&lt;/denchmark-code&gt;
+
+BTW, in another ticket I read that there is a memory limit on how large the MMAP can be. Is there really one?
+		</comment>
+		<comment id='5' author='lukaszbachman' date='2020-04-23T06:54:04Z'>
+		No, you're doing it wrong.  ws.destroyWorkspace(true); helps, but you can't do it within try block.
+Anyway, i'll provide a fix for regular gc method
+		</comment>
+		<comment id='6' author='lukaszbachman' date='2020-04-23T08:30:31Z'>
+		Ok, so another update:
+I was able to properly cleanup all resources when I called ws.close() followed by ws.destroy(true) in the finally block. But I also found that doing this was not enough to get all my tests green. As it turns out, I was not specifying learning policy at all, but that is causing Memory Worspace reinitialization inside the ws.close() method. So the second cleanup was always failing because it tried to create new MMAP (this was failing with: Error code: 123 java.lang.RuntimeException: MMAP failed).
+After setting LearningPolicy.NONE it started working fine. Final code:
+&lt;denchmark-code&gt;WorkspaceConfiguration mmap = WorkspaceConfiguration.builder()
+				  .initialSize(100 * 1024L * 1024L) // 100 mb
+				  .policyLocation(LocationPolicy.MMAP)
+				  .policyLearning(LearningPolicy.NONE) // Needed because otherwise MMAP will be reinitialized
+				  .tempFilePath(ramFile.toAbsolutePath().toString())
+				  .build();
+
+		MemoryWorkspace ws = null;
+		try {
+			ws = Nd4j.getWorkspaceManager().getAndActivateWorkspace(mmap, "M2");
+			// Do anything you want withing the workspace
+		}
+		finally {
+			if (ws != null) {
+				ws.close();
+				ws.destroyWorkspace(true);
+			}
+		}
+
+		try {
+			Files.delete(ramFile);
+		}
+		catch (IOException e) {
+			logger.warn("Unable to cleanup MMAP file. You can delete it manually: " + ramFile.toAbsolutePath());
+		}
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='7' author='lukaszbachman' date='2020-04-23T08:54:26Z'>
+		Good catch, thank you! Adding validation fix for this as well.
+		</comment>
+		<comment id='8' author='lukaszbachman' date='2020-04-23T08:57:34Z'>
+		Ok, great. My tests are starting to look good now! Only one more issue to solve.
+		</comment>
+		<comment id='9' author='lukaszbachman' date='2020-04-23T08:59:03Z'>
+		&lt;denchmark-link:https://github.com/KonduitAI/deeplearning4j/pull/409&gt;KonduitAI#409&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='10' author='lukaszbachman' date='2020-04-23T12:49:03Z'>
+		Awesome! Thank you! Due to some internal conflicts with other javacpp, javacv, opencv versions it may take some time before I get to use ND4J snapshots, but I will definitely give it a go once I can. Thanks!
+		</comment>
+		<comment id='11' author='lukaszbachman' date='2020-04-23T12:51:03Z'>
+		Both issues were addressed. Thanks for highlighting them :)
+		</comment>
+	</comments>
+</bug>

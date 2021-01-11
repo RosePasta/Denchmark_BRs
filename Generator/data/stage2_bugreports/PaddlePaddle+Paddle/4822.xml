@@ -1,0 +1,138 @@
+<bug id='4822' author='prm10' open_date='2017-10-16T03:34:16Z' closed_time='2018-08-15T10:47:16Z'>
+	<summary>infer输出的layer output顺序不符合预期</summary>
+	<description>
+做检索排序任务，需要衡量两个doc与query的相关性，并计算pairwise loss，模型相关部分如下：
+    sim_1 = paddle.layer.cos_sim(a=query_vector, b=title_1_vector, name='cosine_1')
+    sim_2 = paddle.layer.cos_sim(a=query_vector, b=title_2_vector, name='cosine_2')
+    cost = paddle.layer.rank_cost(
+        left=sim_1,
+        right=sim_2,
+        label=label_data,
+    )
+模型能够完成训练，并在每轮训练中输出event结果。
+保存模型后，在第2阶段载入模型，进行infer，相关代码如下：
+        infer = paddle.inference.Inference(output_layer=[cost, sim_1, sim_2], parameters=parameters)
+        for item in train_reader():
+            item = list(item)
+            infer_data = [item[0:4]]
+            # infer_data=[[[2, 3], [1, 2, 3], [1, 2, 3], 0]]
+            output = infer.infer(
+                input=infer_data, feeding=feeding, field=["value"],
+                # flatten_result=False,
+            )
+            cost = output[0][0]
+            s1 = output[1][0]
+            s2 = output[2][0]
+            label = item[3]
+            result = ((s1 - s2) &gt; 0) == label
+            print '%.4f\t%.4f\t%.4f\t%d\t%d' % (cost, s1, s2, label, result)
+输出的部分预测结果如下：
+-0.4013	-0.0975	0.5527	0	1
+-0.0975	-0.1557	0.6645	1	0
+-0.1552	-0.4013	0.5777	1	0
+-0.1557	-0.1552	0.6929	0	1
+-0.4013	-0.2339	0.6129	0	1
+-0.1557	-0.2339	0.7330	0	1
+-0.2383	-0.4128	0.6097	1	0
+rank_cost函数的定义在document中定义如下（经典的cross entropy pairwise loss）：
+C_{i,j} &amp; = -\\tilde{P_{ij}} * o_{i,j} + log(1 + e^{o_{i,j}})
+得到的rank_cost输出结果不符合预期：
+
+预测错误时（result=0），loss不应该为负数；
+在其他case中，预测正确了（result=1），loss为正数时，也与上述公式的计算结果不同。
+
+	</description>
+	<comments>
+		<comment id='1' author='prm10' date='2017-10-16T06:11:53Z'>
+		后来发现，是输出的output layer的顺序与要求的不同：
+在inference中给定的顺序是[cost, sim_1, sim_2]
+而实际上返回的顺序是[sim_1, sim_2, cost]
+当用如下代码print时，cost结果符合预期：
+        model_path = 'params_pass_00001.tar.gz'
+        parameters = paddle.parameters.Parameters.from_tar(gzip.open(model_path, 'r'))
+        train_reader = reader_pairwise_data(
+            data_filename='pairwise_data.txt',
+            dict_filename='word_list.txt',
+            dict_size=dict_size,
+            is_hie=title_model_switch &gt; 1,
+        )
+        infer = paddle.inference.Inference(output_layer=[cost, sim_1, sim_2], parameters=parameters)
+        for item in train_reader():
+            item = list(item)
+            infer_data = [item[0:4]]
+            # infer_data=[[[2, 3], [1, 2, 3], [1, 2, 3], 0]]
+            output = infer.infer(
+                input=infer_data, feeding=feeding, field=["value"],
+                # flatten_result=False,
+            )
+            cost = output[2][0]
+            s1 = output[0][0]
+            s2 = output[1][0]
+            label = item[3]
+            result = ((s1 - s2) &gt; 0) == label
+            print '%.4f\t%.4f\t%.4f\t%d\t%d' % (cost, s1, s2, label, result)
+            print 'theoretical: %.4f' % pairwise_loss(s1, s2, label)
+为此，进一步做了下面的实验：
+# -*- coding: utf-8 -*-
+# Created by pangrenming@baidu.com on 2017/10/16
+import paddle.v2 as paddle
+import math
+
+
+def pairwise_loss(o_i, o_j, label):
+    o_ij = o_i - o_j
+    pairwise_loss = -label * o_ij + math.log(1 + math.exp(o_ij))
+    return pairwise_loss
+
+
+paddle.init(use_gpu=False, trainer_count=1)
+is_train = True
+dict_size = 100
+word_vector_dim = 64
+
+###########################
+# 测试rank_cost layer
+###########################
+sim_1 = paddle.layer.data(
+    name='sim_1',
+    type=paddle.data_type.dense_vector(1),
+)
+sim_2 = paddle.layer.data(
+    name='sim_2',
+    type=paddle.data_type.dense_vector(1),
+)
+label_data = paddle.layer.data(
+    name='label_data',
+    type=paddle.data_type.integer_value(1),
+)
+cost = paddle.layer.rank_cost(
+    left=sim_1,
+    right=sim_2,
+    label=label_data,
+)
+test_data = [[[0.6], [0.5], 0]]
+feeding = {'sim_1': 0, 'sim_2': 1, 'label_data': 2}
+
+parameters = paddle.parameters.create(cost)
+infer = paddle.inference.Inference(output_layer=[cost, sim_1, sim_2], parameters=parameters)
+output = infer.infer(input=test_data, feeding=feeding, field=["value"])  # ,flatten_result=False
+cost = output[0][0]
+s1 = output[1][0]
+s2 = output[2][0]
+label = test_data[0][2]
+result = ((s1 - s2) &gt; 0) == label
+print output
+print '%.4f\t%.4f\t%.4f\t%d\t%d' % (cost, s1, s2, label, result)
+print 'theoretical: %.4f' % pairwise_loss(s1, s2, label)
+此时返回的output layer的顺序却又与给定的顺序相同了。
+总结下目前的问题：在用训练好的模型进行预测时，调用infer函数，返回的layer output 顺序与给定的不一样；而当用上面的测试程序直接进行infer时，返回的layer output顺序与给定的顺序相同。
+目前想到的上述两者的主要区别在于：
+1、前者通过from_tar导入的模型，后者直接infer；
+2、前者的模型更为复杂，后者模型简单，只是用来测试了cosine层。
+		</comment>
+		<comment id='2' author='prm10' date='2017-10-16T07:10:16Z'>
+		&lt;denchmark-link:https://github.com/prm10&gt;@prm10&lt;/denchmark-link&gt;
+  感谢你的问题和实验，这个问题会跟踪解决下~
+		</comment>
+	</comments>
+</bug>

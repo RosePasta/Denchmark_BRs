@@ -1,0 +1,317 @@
+<bug id='951' author='ThyrixYang' open_date='2017-03-20T12:52:12Z' closed_time='2017-04-25T19:18:41Z'>
+	<summary>mlpack_decision_tree memory exploded on dataset "reuters"</summary>
+	<description>
+I have just finished benchmark script of mlpack_decision_tree, and I noticed that on reuters dataset the memory increases very fast and I have to drop this dataset to run benchmark on my machine. Maybe there is something wrong? (this dataset is extreme because it has so many features)
+	</description>
+	<comments>
+		<comment id='1' author='ThyrixYang' date='2017-03-20T13:04:01Z'>
+		sklearn worked well on this dataset, used about 4Gb memory. And I think mlpack need more than 10Gb(my RAM is 12Gb)
+		</comment>
+		<comment id='2' author='ThyrixYang' date='2017-03-20T13:41:11Z'>
+		This dataset has 5114 rows and 17388 columns, I think it's not appropriate to apply decision tree directly on it though, but it's in sklearn's benchmark dataset.
+		</comment>
+		<comment id='3' author='ThyrixYang' date='2017-03-20T14:29:49Z'>
+		Definitely with 5k features, mlpack will loop over every possible split and test them all.  So I would expect it to take a long time.  But when I wrote the Train() function that does this looping over all dimensions, I wrote it so that it would minimize RAM usage... or so I thought.  Gains aren't cached for every dimension---we only cache the highest gain and the best split dimension.  I wonder if valgrind would reveal some memory leak somewhere?
+Alternately I suppose it could be possible that the splits are making a huge, imbalanced tree... for instance, if at every level we take only one point for the left child and the rest for the right child, then we end up with a tree that's 17k levels deep.  That could cause a memory explosion.
+		</comment>
+		<comment id='4' author='ThyrixYang' date='2017-03-30T14:39:21Z'>
+		I ran some simple tests.  First I used massif to check the memory usage.  I only have access to a terminal on the system I ran it on right now, so the CLI output from ms_print will have to do:
+&lt;denchmark-code&gt;--------------------------------------------------------------------------------
+Command:            bin/mlpack_decision_tree -t /home/ryan/datasets/reuters_train.csv -T /home/ryan/datasets/reuters_test.csv -L /home/ryan/datasets/reuters_labels.csv -e -v
+Massif arguments:   (none)
+ms_print arguments: massif.out.22295
+--------------------------------------------------------------------------------
+
+    GB
+28.79^                                                                 ##
+     |                                                                @#
+     |                                                            @@@@@#
+     |                                                          ::@ @ @#
+     |                                                       @@@: @ @ @#
+     |                                                     ::@@ : @ @ @#
+     |                                                 ::::::@@ : @ @ @#
+     |                                              @@@: : ::@@ : @ @ @#
+     |                                            ::@@ : : ::@@ : @ @ @#
+     |                                          ::::@@ : : ::@@ : @ @ @#
+     |                                      @:::: ::@@ : : ::@@ : @ @ @#
+     |                                    @:@:: : ::@@ : : ::@@ : @ @ @#
+     |                               @@:::@:@:: : ::@@ : : ::@@ : @ @ @#
+     |                              :@ :: @:@:: : ::@@ : : ::@@ : @ @ @#
+     |                          @::::@ :: @:@:: : ::@@ : : ::@@ : @ @ @#
+     |                        ::@:: :@ :: @:@:: : ::@@ : : ::@@ : @ @ @#
+     |                     :::: @:: :@ :: @:@:: : ::@@ : : ::@@ : @ @ @#
+     |                  :::: :: @:: :@ :: @:@:: : ::@@ : : ::@@ : @ @ @#
+     |               @:::: : :: @:: :@ :: @:@:: : ::@@ : : ::@@ : @ @ @#
+     |            :::@ ::: : :: @:: :@ :: @:@:: : ::@@ : : ::@@ : @ @ @#
+   0 +-----------------------------------------------------------------------&gt;Gi
+     0                                                                   864.7
+&lt;/denchmark-code&gt;
+
+I then serialized the tree using boost::serialization, to get an idea of the size of the tree:
+&lt;denchmark-code&gt;$ bin/mlpack_decision_tree -t ~/datasets/reuters_train.csv -M tree.bin
+$ ls -lh tree.bin
+-rw-rw-r-- 1 ryan ryan 17K Mar 30 10:36 tree.bin
+&lt;/denchmark-code&gt;
+
+So clearly if the tree can be saved as only 17k, then there must be some unnecessary copying or something going on.  I also checked with valgrind and found no memory leaks.  So there must exist a bug somewhere that is causing a massive number of unnecessary copies.
+		</comment>
+		<comment id='5' author='ThyrixYang' date='2017-03-31T08:52:07Z'>
+		Hi &lt;denchmark-link:https://github.com/rcurtin&gt;@rcurtin&lt;/denchmark-link&gt;
+ ,
+I found that a copy of data is made for every child,
+//line 397 in decision_tree_impl.hpp
+// Now that we have the size of the matrix we need to extract, extract it.
+    for (size_t i = 0; i &lt; numChildren; ++i)
+    {
+      // Now that we have the size of the matrix we need to extract, extract it.
+      MatType childPoints(data.n_rows, childCounts[i]);
+      arma::Row&lt;size_t&gt; childLabels(childCounts[i]);
+These memory are only used in this for(), but can't be freed during recursion.
+If there are a large number of features, these copies will increase memory usage significantly.
+So I think we can just pass the ID of sample in recursion, and we need only one copy of data.
+		</comment>
+		<comment id='6' author='ThyrixYang' date='2017-04-04T21:34:38Z'>
+		I see, I had forgotten about that bit.  The reuters dataset is ~170MB so I guess this means that the tree has depth ~200 (let me check that and post another comment).
+I think we shouldn't pass indices though because of the extra runtime cost: if we pass an index then we have to do what is effectively random access of the dataset.  Since we have to pass through every dimension when we calculate the gain, we do d passes of n elements in a random order with an additional lookup for each element access.  It is probably going to be more efficient to copy the matrix (a contiguous d x n read/write operation) and then do d contiguous passes over the n elements.
+When I thought about this I realized that at the time we make this copy for children, the original data matrix is no longer necessary.  Therefore we could reuse its memory and move points like in the construction of BinarySpaceTree (see src/mlpack/core/tree/perform_split.hpp).  We would probably have to add an additional constructor that takes an rvalue reference to a dataset for this to work.
+I will try to go ahead and implement this shortly, unless you would rather do it.
+		</comment>
+		<comment id='7' author='ThyrixYang' date='2017-04-05T13:34:56Z'>
+		You are right, that's much better.
+I've looked at perform_split, it swaps all the data in left tree to left and right to right.
+But if we are using a rvalue reference, then we should new a Mat for each child, and delete the original data, then use a rvalue constructor to move them to subtrees?
+Move columns or renew and move rvalue, which one is better?
+&lt;denchmark-link:https://github.com/rcurtin&gt;@rcurtin&lt;/denchmark-link&gt;
+  I'm glad to do this work if you can guide me. :)
+		</comment>
+		<comment id='8' author='ThyrixYang' date='2017-04-05T14:17:46Z'>
+		Sure, you can go ahead and do it, and I can look over a PR and make sure it's what I was thinking.  Basically we should have two constructors.  One can take a const MatType&amp; and will copy that matrix to a temporary MatType object that is used for construction.  The other can take a MatType&amp;&amp;, and then simply moves that object to the temporary MatType.
+Then, since we are working with a temporary MatType that we can modify, we can move the columns.  When we have moved the columns of the temporary MatType, we can pass either a submatrix view (i.e. new DecisionTree(temporaryMat.cols(0, leftPoints - 1), ...)) or the indices of the columns to use like BinarySpaceTree (i.e. new DecisionTree(temporaryMat, 0, leftPoints - 1, ...)).
+You can refer pretty heavily to the BinarySpaceTree code for this, but one caveat is that for the decision tree, we don't actually have to hold the dataset after construction---so the dataset you are using to build can be temporary.
+Let me know if I can clarify anything; I'm happy to help out and explain further.
+		</comment>
+		<comment id='9' author='ThyrixYang' date='2017-04-05T17:06:47Z'>
+		If we use swap and indices of the columns then we use the same mat through recursion, I think I can do this as in perform_split.
+If we use a subview, I think the constructor may like this:
+template&lt;typename MatType&gt;
+  DecisionTree(arma::subview&lt;ElemType&gt; data,
+               const data::DatasetInfo&amp; datasetInfo,
+               arma::subview_col&lt;size_t&gt; labels,
+               const size_t numClasses,
+               const size_t minimumLeafSize = 10);
+I think pass the subview is more consistent with original constructor.
+The subview is just like passing index and we can't use "const &amp;", otherwise the swap_cols can't be used.
+Maybe there is a more elegant way to do this?
+Thank you.
+		</comment>
+		<comment id='10' author='ThyrixYang' date='2017-04-05T21:50:24Z'>
+		The only problem with a subview is that arma::subview is the type for dense subviews, but arma::sp_subview is the type for sparse subviews, so you can't catch both like that.  It might be easier to just pass the indices in that case; otherwise the strategy would have to be to templatize further to catch any type of Armadillo expression.
+		</comment>
+		<comment id='11' author='ThyrixYang' date='2017-04-07T07:53:41Z'>
+		I see, I think I can write four functions and invoke them from original one.
+template&lt;typename MatType&gt;
+  DecisionTree(const MatType&amp; data,
+               const size_t begin,
+               const size_t count,
+               const data::DatasetInfo&amp; datasetInfo,
+               const arma::Row&lt;size_t&gt;&amp; labels,
+               const size_t numClasses,
+               const size_t minimumLeafSize = 10);
+
+  template&lt;typename MatType&gt;
+  DecisionTree(const MatType&amp; data,
+               const size_t begin,
+               const size_t count,
+               const arma::Row&lt;size_t&gt;&amp; labels,
+               const size_t numClasses,
+               const size_t minimumLeafSize = 10);
+
+  template&lt;typename MatType&gt;
+  void Train(const MatType&amp; data,
+             const size_t begin,
+             const size_t count,
+             const data::DatasetInfo&amp; datasetInfo,
+             const arma::Row&lt;size_t&gt;&amp; labels,
+             const size_t numClasses,
+             const size_t minimumLeafSize = 10);
+
+  template&lt;typename MatType&gt;
+  void Train(const MatType&amp; data,
+             const size_t begin,
+             const size_t count,
+             const arma::Row&lt;size_t&gt;&amp; labels,
+             const size_t numClasses,
+             const size_t minimumLeafSize = 10);
+But it's a bit tedious and there will be many copies.
+Should I replace original functions with these? Or any suggestions?
+Thank you.
+		</comment>
+		<comment id='12' author='ThyrixYang' date='2017-04-07T18:05:29Z'>
+		The constructors with begin and count will only ever be used by children during building, so we can be a little more specific with those and mark them private:
+&lt;denchmark-code&gt; private:
+  template&lt;typename MatType&gt;
+  DecisionTree(MatType&amp; data /* must be non-const since we will modify it */,
+               const size_t begin,
+               const size_t count,
+               const arma::Row&lt;size_t&gt;&amp; labels,
+               const size_t numClasses,
+               const size_t minimumLeafSize = 10);
+
+  template&lt;typename MatType&gt;
+  DecisionTree(MatType&amp; data,
+               const size_t begin,
+               const size_t count,
+               const data::DatasetInfo&amp; datasetInfo,
+               const arma::Row&lt;size_t&gt;&amp; labels,
+               const size_t numClasses,
+               const size_t minimumLeafSize = 10);
+&lt;/denchmark-code&gt;
+
+It would probably be useful to add two similar private overloads of Train() too, and then have the public overloads of Train() call those private overloads.  But there is also one more bit.  If the user uses the constructor DecisionTree(const arma::mat&amp; data, ...) to build the tree, then we have to copy the matrix data since it's const.  We should also offer the user a way to allow the tree-building procedure to modify the data:
+&lt;denchmark-code&gt; public:
+  template&lt;typename MatType&gt;
+  DecisionTree(MatType&amp;&amp; data, /* rvalue reference allows us to move the matrix into a temporary */
+               const arma::Row&lt;size_t&gt;&amp; labels,
+               const size_t numClasses,
+               const size_t minimumLeafSize = 10)
+  {
+    // example implementation
+    MatType tmp = std::move(data);
+    Train(tmp /* non-const overload */, 0, tmp.n_cols, numClasses, minimumLeafSize);
+  }
+&lt;/denchmark-code&gt;
+
+and then probably one more overload of that for when DatasetInfo is passed too.
+I know it is a lot of overloads but I think it is necessary to provide the flexibility the user might need.  Fortunately we are only adding two methods to the public methods, everything else will be private.
+Let me know what you think.  Maybe there is a better way I didn't think of.
+		</comment>
+		<comment id='13' author='ThyrixYang' date='2017-04-08T13:29:39Z'>
+		I see, I'll make a pr soon according to this.
+I think it's a good solution to this issue.
+		</comment>
+		<comment id='14' author='ThyrixYang' date='2017-04-09T09:14:32Z'>
+		Do we deal with the labels same as data or simply copy labels through recursion? I think it's better to swap labels the same as data, so the labels should also be non-const.
+And I think the original Train method can simply copy data and call the non-const method like this:
+Train(const MatType&amp; data,
+                                      const arma::Row&lt;size_t&gt;&amp; labels,
+                                      const size_t numClasses,
+                                      const size_t minimumLeafSize)
+{
+  MatType tmpData = data;
+  arma::Row&lt;size_t&gt; tmpLabels = labels;
+  Train(tmpData, 0, tmp.n_cols, tmpLabels, numClasses, minimumLeafSize)
+}
+So we do not copy data in constructors, and the Train method will work when users call it by a no-trained model. And do we need two overload for rvalue Train method?
+		</comment>
+		<comment id='15' author='ThyrixYang' date='2017-04-10T15:21:01Z'>
+		Ah, yeah, I agree, we can deal with the labels in the same way.  But I think we only need one overload for rvalue-based Train().
+		</comment>
+		<comment id='16' author='ThyrixYang' date='2017-04-10T15:37:57Z'>
+		I think there will be one Train overload with datasetInfo and one without it?
+		</comment>
+		<comment id='17' author='ThyrixYang' date='2017-04-10T15:40:19Z'>
+		Ah, right!  Yes, there will be two then.  Sorry for the mistake. :)
+		</comment>
+		<comment id='18' author='ThyrixYang' date='2017-04-11T15:45:24Z'>
+		I encountered a problem
+&lt;denchmark-code&gt;In file included from /home/thyrix/Projects/mlpack/src/mlpack/../mlpack/methods/decision_tree/decision_tree.hpp:442:0,
+                 from /home/thyrix/Projects/mlpack/src/mlpack/tests/decision_tree_test.cpp:13:
+/home/thyrix/Projects/mlpack/src/mlpack/../mlpack/methods/decision_tree/decision_tree_impl.hpp: In instantiation of ‘mlpack::tree::DecisionTree&lt;FitnessFunction, NumericSplitType, CategoricalSplitType, ElemType, NoRecursion&gt;::DecisionTree(MatType&amp;&amp;, arma::Row&lt;long unsigned int&gt;&amp;&amp;, size_t, size_t) [with MatType = arma::Mat&lt;double&gt;&amp;; FitnessFunction = mlpack::tree::GiniGain; NumericSplitType = mlpack::tree::BestBinaryNumericSplit; CategoricalSplitType = mlpack::tree::AllCategoricalSplit; ElemType = double; bool NoRecursion = false; size_t = long unsigned int]’:
+/home/thyrix/Projects/mlpack/src/mlpack/tests/decision_tree_test.cpp:432:44:   required from here
+/home/thyrix/Projects/mlpack/src/mlpack/../mlpack/methods/decision_tree/decision_tree_impl.hpp:100:35: error: invalid initialization of non-const reference of type ‘arma::Mat&lt;double&gt;&amp;’ from an rvalue of type ‘std::remove_reference&lt;arma::Mat&lt;double&gt;&amp;&gt;::type {aka arma::Mat&lt;double&gt;}’
+   MatType tmpData = std::move(data);
+                                   ^
+&lt;/denchmark-code&gt;
+
+Maybe it's a stupid question..Why "with MatType = arma::Mat&amp;"?
+my code
+template&lt;typename FitnessFunction,
+         template&lt;typename&gt; class NumericSplitType,
+         template&lt;typename&gt; class CategoricalSplitType,
+         typename ElemType,
+         bool NoRecursion&gt;
+template&lt;typename MatType&gt;
+DecisionTree&lt;FitnessFunction,
+             NumericSplitType,
+             CategoricalSplitType,
+             ElemType,
+             NoRecursion&gt;::DecisionTree(MatType&amp;&amp; data,
+                                        arma::Row&lt;size_t&gt;&amp;&amp; labels,
+                                        const size_t numClasses,
+                                        const size_t minimumLeafSize)
+{
+  // move the data to avoid copy
+  MatType tmpData = std::move(data);
+  arma::Row&lt;size_t&gt; tmpLabels = std::move(labels);
+  // Pass off work to the Train() method.
+  Train(tmpData, 0, tmpData.n_cols, tmpLabels, numClasses, minimumLeafSize);
+}
+If I change MatType to arma::Mat, there will be no error.
+Thank you!
+		</comment>
+		<comment id='19' author='ThyrixYang' date='2017-04-11T17:30:19Z'>
+		It looks like it's inferring MatType = arma::mat&amp; not arma::mat.  What is the code you are using to instantiate this method?
+		</comment>
+		<comment id='20' author='ThyrixYang' date='2017-04-11T23:35:36Z'>
+		According to build information, it's decision_tree_test.cpp:432:44.
+Which is
+arma::mat inputData;
+  if (!data::Load("vc2.csv", inputData))
+    BOOST_FAIL("Cannot load test dataset vc2.csv!");
+
+  arma::Mat&lt;size_t&gt; labels;
+  if (!data::Load("vc2_labels.txt", labels))
+    BOOST_FAIL("Cannot load labels for vc2_labels.txt");
+
+  // Build decision tree.
+  line 432: DecisionTree&lt;&gt; d(inputData, labels, 3, 10); // Leaf size of 10.
+		</comment>
+		<comment id='21' author='ThyrixYang' date='2017-04-12T11:05:47Z'>
+		I've found what is wrong:
+arma::Mat&lt;size_t&gt; labels;  // should be arma::Row&lt;size_t&gt; labels;
+  if (!data::Load("vc2_labels.txt", labels))
+    BOOST_FAIL("Cannot load labels for vc2_labels.txt");
+Seems when I have added rvalue constructor and reference constructor, the compiler can't match functions correctly, so the match must be exactly.
+I've corrected this.
+		</comment>
+		<comment id='22' author='ThyrixYang' date='2017-04-12T14:41:12Z'>
+		I've just made a pr.
+Here is my test result on reuters:
+&lt;denchmark-code&gt;--------------------------------------------------------------------------------
+Command:            /home/thyrix/Projects/mlpack/build/bin/mlpack_decision_tree -t /home/thyrix/Downloads/forkedSrc/benchmarks/datasets/reuters_train.csv -T /home/thyrix/Downloads/forkedSrc/benchmarks/datasets/reuters_test.csv -L /home/thyrix/Downloads/forkedSrc/benchmarks/datasets/reuters_labels.csv
+Massif arguments:   --stacks=yes --detailed-freq=5 --max-snapshots=400
+ms_print arguments: massif.out.31069
+--------------------------------------------------------------------------------
+
+
+    GB
+1.329^                                                                  :     
+     |         #:@@::@:@@:@::@@@@@::@@:@@@@:@@:@@:@@:@::@@:::@@:::@:@@@@@:    
+     |         #:@@::@:@@:@::@@@@@::@@:@@@@:@@:@@:@@:@::@@:::@@:::@:@@@@@:    
+     |         #:@@::@:@@:@::@@@@@::@@:@@@@:@@:@@:@@:@::@@:::@@:::@:@@@@@:    
+     |         #:@@::@:@@:@::@@@@@::@@:@@@@:@@:@@:@@:@::@@:::@@:::@:@@@@@:    
+     |         #:@@::@:@@:@::@@@@@::@@:@@@@:@@:@@:@@:@::@@:::@@:::@:@@@@@:    
+     |         #:@@::@:@@:@::@@@@@::@@:@@@@:@@:@@:@@:@::@@:::@@:::@:@@@@@:    
+     |         #:@@::@:@@:@::@@@@@::@@:@@@@:@@:@@:@@:@::@@:::@@:::@:@@@@@:    
+     |         #:@@::@:@@:@::@@@@@::@@:@@@@:@@:@@:@@:@::@@:::@@:::@:@@@@@:    
+     |         #:@@::@:@@:@::@@@@@::@@:@@@@:@@:@@:@@:@::@@:::@@:::@:@@@@@:    
+     |         #:@@::@:@@:@::@@@@@::@@:@@@@:@@:@@:@@:@::@@:::@@:::@:@@@@@:    
+     | @@::::@:#:@@::@:@@:@::@@@@@::@@:@@@@:@@:@@:@@:@::@@:::@@:::@:@@@@@:    
+     | @@::::@:#:@@::@:@@:@::@@@@@::@@:@@@@:@@:@@:@@:@::@@:::@@:::@:@@@@@:    
+     | @@::::@:#:@@::@:@@:@::@@@@@::@@:@@@@:@@:@@:@@:@::@@:::@@:::@:@@@@@:    
+     | @@::::@:#:@@::@:@@:@::@@@@@::@@:@@@@:@@:@@:@@:@::@@:::@@:::@:@@@@@:    
+     | @@::::@:#:@@::@:@@:@::@@@@@::@@:@@@@:@@:@@:@@:@::@@:::@@:::@:@@@@@:    
+     | @@::::@:#:@@::@:@@:@::@@@@@::@@:@@@@:@@:@@:@@:@::@@:::@@:::@:@@@@@:@@@@
+     | @@::::@:#:@@::@:@@:@::@@@@@::@@:@@@@:@@:@@:@@:@::@@:::@@:::@:@@@@@:@@@@
+     | @@::::@:#:@@::@:@@:@::@@@@@::@@:@@@@:@@:@@:@@:@::@@:::@@:::@:@@@@@:@@@@
+     | @@::::@:#:@@::@:@@:@::@@@@@::@@:@@@@:@@:@@:@@:@::@@:::@@:::@:@@@@@@@@@@
+   0 +-----------------------------------------------------------------------&gt;Gi
+     0                                                                   886.3
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='23' author='ThyrixYang' date='2017-04-14T15:47:15Z'>
+		These results look excellent, I am excited to merge this in.  Thanks for taking the time to work this out!
+		</comment>
+	</comments>
+</bug>

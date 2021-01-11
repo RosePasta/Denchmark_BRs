@@ -1,0 +1,270 @@
+<bug id='8523' author='janblumenkamp' open_date='2020-05-20T14:54:16Z' closed_time='2020-05-21T10:32:39Z'>
+	<summary>[rllib] Make QMix support complex observation spaces</summary>
+	<description>
+&lt;denchmark-h:h3&gt;Describe your feature request&lt;/denchmark-h&gt;
+
+The QMix example and the default model only uses a simple MultiDiscrete observation space. It would be nice if more abstract observation spaces and custom models would be supported. The following example using a nested dict observation space (&lt;denchmark-link:https://github.com/ray-project/ray/blob/master/rllib/examples/env/two_step_game.py&gt;based on the two step game&lt;/denchmark-link&gt;
+) fails &lt;denchmark-link:https://github.com/ray-project/ray/blob/master/rllib/agents/qmix/qmix_policy.py#L482&gt;here&lt;/denchmark-link&gt;
+ (I am aware that the model would have to be adapted as well, but that does not seem to be the cause of this error):
+&lt;denchmark-code&gt;import argparse
+from gym.spaces import Tuple, MultiDiscrete, Dict, Discrete
+
+import ray
+from ray import tune
+from ray.tune import register_env, grid_search
+from ray.rllib.env.multi_agent_env import ENV_STATE
+from ray.rllib.examples.env.two_step_game import TwoStepGame
+from ray.rllib.utils.test_utils import check_learning_achieved
+
+from gym.spaces import MultiDiscrete, Dict, Discrete
+import numpy as np
+
+from ray.rllib.env.multi_agent_env import MultiAgentEnv, ENV_STATE
+
+
+class TwoStepGame(MultiAgentEnv):
+    action_space = Discrete(2)
+
+    def __init__(self, env_config):
+        self.state = None
+        self.agent_1 = 0
+        self.agent_2 = 1
+        # MADDPG emits action logits instead of actual discrete actions
+        self.actions_are_logits = env_config.get("actions_are_logits", False)
+        self.one_hot_state_encoding = env_config.get("one_hot_state_encoding",
+                                                     False)
+        self.with_state = env_config.get("separate_state_space", False)
+
+        if not self.one_hot_state_encoding:
+            self.observation_space = Discrete(6)
+            self.with_state = False
+        else:
+            # Each agent gets the full state (one-hot encoding of which of the
+            # three states are active) as input with the receiving agent's
+            # ID (1 or 2) concatenated onto the end.
+            if self.with_state:
+                self.observation_space = Dict({
+                    "obs": MultiDiscrete([2, 2, 2, 3]),
+                    ENV_STATE: MultiDiscrete([2, 2, 2])
+                })
+            else:
+                self.observation_space = MultiDiscrete([2, 2, 2, 3])
+
+    def reset(self):
+        self.state = np.array([1, 0, 0])
+        return self._obs()
+
+    def step(self, action_dict):
+        if self.actions_are_logits:
+            action_dict = {
+                k: np.random.choice([0, 1], p=v)
+                for k, v in action_dict.items()
+            }
+
+        state_index = np.flatnonzero(self.state)
+        if state_index == 0:
+            action = action_dict[self.agent_1]
+            assert action in [0, 1], action
+            if action == 0:
+                self.state = np.array([0, 1, 0])
+            else:
+                self.state = np.array([0, 0, 1])
+            global_rew = 0
+            done = False
+        elif state_index == 1:
+            global_rew = 7
+            done = True
+        else:
+            if action_dict[self.agent_1] == 0 and action_dict[self.
+                                                              agent_2] == 0:
+                global_rew = 0
+            elif action_dict[self.agent_1] == 1 and action_dict[self.
+                                                                agent_2] == 1:
+                global_rew = 8
+            else:
+                global_rew = 1
+            done = True
+
+        rewards = {
+            self.agent_1: global_rew / 2.0,
+            self.agent_2: global_rew / 2.0
+        }
+        obs = self._obs()
+        dones = {"__all__": done}
+        infos = {}
+        return obs, rewards, dones, infos
+
+    def _obs(self):
+        if self.with_state:
+            return {
+                self.agent_1: {
+                    "obs": {
+                        "data": self.agent_1_obs(),
+                        "test": 1
+                    },
+                    ENV_STATE: self.state
+                },
+                self.agent_2: {
+                    "obs": {
+                        "data": self.agent_2_obs(),
+                        "test": 2
+                    },
+                    ENV_STATE: self.state
+                }
+            }
+        else:
+            return {
+                self.agent_1: self.agent_1_obs(),
+                self.agent_2: self.agent_2_obs()
+            }
+
+    def agent_1_obs(self):
+        if self.one_hot_state_encoding:
+            return np.concatenate([self.state, [1]])
+        else:
+            return np.flatnonzero(self.state)[0]
+
+    def agent_2_obs(self):
+        if self.one_hot_state_encoding:
+            return np.concatenate([self.state, [2]])
+        else:
+            return np.flatnonzero(self.state)[0] + 3
+
+if __name__ == "__main__":
+    grouping = {
+        "group_1": [0, 1],
+    }
+    obs_space = Tuple([
+        Dict({
+            "obs": Dict({
+                'data': MultiDiscrete([2, 2, 2, 3]),
+                'test': Discrete(5)
+            }),
+            ENV_STATE: MultiDiscrete([2, 2, 2])
+        }),
+        Dict({
+            "obs": Dict({
+                'data': MultiDiscrete([2, 2, 2, 3]),
+                'test': Discrete(5)
+            }),
+            ENV_STATE: MultiDiscrete([2, 2, 2])
+        }),
+    ])
+    act_space = Tuple([
+        TwoStepGame.action_space,
+        TwoStepGame.action_space,
+    ])
+    register_env(
+        "grouped_twostep",
+        lambda config: TwoStepGame(config).with_agent_groups(
+            grouping, obs_space=obs_space, act_space=act_space))
+
+    ray.init()
+
+    results = tune.run("QMIX", config={
+        "rollout_fragment_length": 4,
+        "train_batch_size": 32,
+        "exploration_fraction": .4,
+        "exploration_final_eps": 0.0,
+        "num_workers": 0,
+        "mixer": "qmix",
+        "env_config": {
+            "separate_state_space": True,
+            "one_hot_state_encoding": True
+        },
+        "use_pytorch": True,
+        "env": "grouped_twostep"
+    })
+
+    ray.shutdown()
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-code&gt;2020-05-20 15:40:03,477 ERROR trial_runner.py:519 -- Trial QMIX_grouped_twostep_c960c_00002: Error processing event.             
+Traceback (most recent call last):
+  File "[...]/ray/tune/trial_runner.py", line 467, in _process_trial        
+    result = self.trial_executor.fetch_result(trial)
+  File "[...]/ray/tune/ray_trial_executor.py", line 430, in fetch_result         
+    result = ray.get(trial_future[0], DEFAULT_GET_TIMEOUT)         
+  File "[...]/ray/worker.py", line 1516, in get                                      
+    raise value.as_instanceof_cause()                              
+ray.exceptions.RayTaskError(ValueError): ray::QMIX.train() (pid=54834, ip=128.232.69.20)
+  File "python/ray/_raylet.pyx", line 460, in ray._raylet.execute_task
+  File "python/ray/_raylet.pyx", line 414, in ray._raylet.execute_task.function_executor
+  File "[...]/ray/rllib/agents/trainer.py", line 504, in train
+    raise e                     
+  File "[...]/ray/rllib/agents/trainer.py", line 490, in train
+    result = Trainable.train(self)          
+  File "[...]/ray/tune/trainable.py", line 260, in train
+    result = self._train()                                       
+  File "[...]/ray/rllib/agents/trainer_template.py", line 138, in _train
+    return self._train_exec_impl()                               
+  File "[...]/ray/rllib/agents/trainer_template.py", line 173, in _train_exec_impl
+    res = next(self.train_exec_impl)                             
+  File "[...]/ray/util/iter.py", line 689, in __next__
+    return next(self.built_iterator)                             
+  File "[...]/ray/util/iter.py", line 702, in apply_foreach
+    for item in it:                                                                                                                                        
+  File "[...]/ray/util/iter.py", line 772, in apply_filter                                        
+    for item in it:                                                                                                                                        
+  File "[...]/ray/util/iter.py", line 772, in apply_filter                                        
+    for item in it:                                                                                                                                        
+  File "[...]/ray/util/iter.py", line 702, in apply_foreach                                       
+    for item in it:                                                                                                                                        
+  File "[...]/ray/util/iter.py", line 772, in apply_filter
+    for item in it:               
+  File "[...]/ray/util/iter.py", line 977, in build_union
+    item = next(it)         
+  File "[...]/ray/util/iter.py", line 689, in __next__
+    return next(self.built_iterator)                             
+  File "[...]/ray/util/iter.py", line 702, in apply_foreach                                         
+    for item in it:                                                       
+  File "[...]/ray/util/iter.py", line 702, in apply_foreach
+    for item in it:                                                                            
+  File "[...]/ray/util/iter.py", line 702, in apply_foreach
+    for item in it:
+  File "[...]/ray/rllib/execution/rollout_ops.py", line 70, in sampler
+    yield workers.local_worker().sample()
+  File "[...]/ray/rllib/evaluation/rollout_worker.py", line 515, in sample
+    batches = [self.input_reader.next()]
+  File "[...]/ray/rllib/evaluation/sampler.py", line 56, in next
+    batches = [self.get_data()]
+  File "[...]/ray/rllib/evaluation/sampler.py", line 101, in get_data
+    item = next(self.rollout_provider)
+  File "[...]/ray/rllib/evaluation/sampler.py", line 367, in _env_runner
+    active_episodes)
+  File "[...]/ray/rllib/evaluation/sampler.py", line 637, in _do_policy_eval
+    timestep=policy.global_timestep)
+  File "[...]/ray/rllib/agents/qmix/qmix_policy.py", line 260, in compute_actions
+    obs_batch, action_mask, _ = self._unpack_observation(obs_batch)
+  File "[...]/ray/rllib/agents/qmix/qmix_policy.py", line 486, in _unpack_observation
+    axis=1).reshape([len(obs_batch), self.n_agents, self.obs_size])
+  File "&lt;__array_function__ internals&gt;", line 6, in concatenate
+ValueError: zero-dimensional arrays cannot be concatenated
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='janblumenkamp' date='2020-05-21T10:27:23Z'>
+		&lt;denchmark-link:https://github.com/janblumenkamp&gt;@janblumenkamp&lt;/denchmark-link&gt;
+ Got it. Could you test against this PR and see whether it works now?
+&lt;denchmark-link:https://github.com/ray-project/ray/pull/8533&gt;#8533&lt;/denchmark-link&gt;
+
+Your example script runs fine with these changes now.
+The problem was that the _unpack_observations was expecting a flat value inside key "obs" in a Dict obs-space. Using dm-tree, this restriction is now relaxed.
+I have added a more complex example to the existing check_avail_actions_qmix tests.
+		</comment>
+		<comment id='2' author='janblumenkamp' date='2020-05-21T10:32:39Z'>
+		Closing this issue. Feel free to re-open if it still occurs on our end.
+		</comment>
+		<comment id='3' author='janblumenkamp' date='2020-05-21T21:11:56Z'>
+		Thanks for the quick PR, Sven! Now the observation is also flattened in the model though. I would like to have the complex observation passed to the model batched so that I can implement my own model that can handle this complex observation space. Unflattening it manually in the model doesn't seem right - is there a good reason why it would not be possible to handle such observation spaces similar to how it is handled in other algorithms in RLLib?
+		</comment>
+		<comment id='4' author='janblumenkamp' date='2020-06-25T12:17:18Z'>
+		Ah, I see. I'm guessing it's not distinguishing between obs and obs_flat?
+Let me take another look.
+		</comment>
+		<comment id='5' author='janblumenkamp' date='2020-06-25T12:25:57Z'>
+		Hmm, it's quite QMIX specific, this problem. You could override _unpack_observation in qmix_policy.py and return the "obs" field (from the incoming obs_batch) as a dict of batches.
+		</comment>
+	</comments>
+</bug>

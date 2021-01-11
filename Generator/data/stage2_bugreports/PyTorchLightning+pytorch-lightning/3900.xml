@@ -1,0 +1,339 @@
+<bug id='3900' author='WangHexie' open_date='2020-10-06T13:00:32Z' closed_time='2020-10-06T13:36:14Z'>
+	<summary>Multi-GPU training. learning rate is all zero in tensorboard .</summary>
+	<description>
+&lt;denchmark-h:h2&gt;🐛 Bug&lt;/denchmark-h&gt;
+
+I used LearningrateLogger to log learning rate. But in tensorboard learning rate is all zero.
+&lt;denchmark-link:https://user-images.githubusercontent.com/31768052/95203272-1aafdb00-0815-11eb-912d-fb04a8f392e7.png&gt;&lt;/denchmark-link&gt;
+
+&lt;denchmark-h:h3&gt;To Reproduce&lt;/denchmark-h&gt;
+
+Steps to reproduce the behavior:
+
+install 0.10.0rc1
+set gpus in Trainer bigger than 1
+use lr_logger = LearningRateLogger(logging_interval='step') to log learning rate
+
+&lt;denchmark-h:h4&gt;Code sample&lt;/denchmark-h&gt;
+
+pseudocode
+class BartFineTuner(pl.LightningModule):
+    def __init__(self, hparams, learning_rate=None):
+        super(BartFineTuner, self).__init__()
+        self.hparams = hparams
+        self.learning_rate = learning_rate
+
+        model_name = hparams.model_name_or_path
+        self.model, self.tokenizer = load_model_and_tokenizer(model_name, config_dict)
+
+        self.loss = nn.CrossEntropyLoss(ignore_index=self.tokenizer.pad_token_id)
+
+    def is_logger(self):
+        return self.trainer.global_rank &lt;= 0
+
+    def forward(
+            self, input_ids, attention_mask=None, decoder_input_ids=None, decoder_attention_mask=None, lm_labels=None,
+            use_cache=False
+
+    ):
+        return self.model(
+            input_ids,
+            attention_mask=attention_mask,
+            decoder_input_ids=decoder_input_ids,
+            decoder_attention_mask=decoder_attention_mask,
+            use_cache=use_cache
+        )
+
+    def _step(self, batch):
+        tgt_ids = batch["target_ids"]
+        decoder_input_ids = shift_tokens_right(tgt_ids, self.tokenizer.pad_token_id)
+
+        outputs = self(
+            input_ids=batch["source_ids"],
+            attention_mask=batch["source_mask"],
+            decoder_input_ids=decoder_input_ids,
+            decoder_attention_mask=None,  
+            use_cache=False
+        )
+        target = batch["target_ids"]
+        if self.hparams.epsilon &gt; 0:
+            output_softmax = F.log_softmax(outputs[0], dim=-1)
+            loss, _ = label_smoothed_nll_loss(output_softmax, target, self.hparams.epsilon,
+                                              ignore_index=self.tokenizer.pad_token_id)
+        else:
+            ce_loss_fct = torch.nn.CrossEntropyLoss(ignore_index=self.tokenizer.pad_token_id)
+            loss = ce_loss_fct(outputs[0].view(-1, outputs[0].shape[-1]), target.view(-1))
+        return loss
+
+    def training_step(self, batch, batch_idx):
+        loss = self._step(batch)
+        self.log('train_loss', loss)
+        return {"loss": loss}
+
+    def training_epoch_end(self, outputs):
+        avg_train_loss = torch.stack([x["loss"] for x in outputs]).mean()
+        self.log("avg_train_loss", avg_train_loss)
+
+    def validation_step(self, batch, batch_idx):
+        loss = self._step(batch)
+        return {"val_loss": loss}
+
+    def validation_epoch_end(self, outputs):
+        avg_loss = torch.stack([x["val_loss"] for x in outputs]).mean()
+        self.log("val_loss", avg_loss)
+        return {"avg_val_loss": avg_loss}
+
+    def total_steps(self) -&gt; int:
+        """The number of total training steps that will be run. Used for lr scheduler purposes."""
+        num_devices = max(1, self.hparams.n_gpu)  
+        effective_batch_size = self.hparams.train_batch_size * self.hparams.gradient_accumulation_steps * num_devices
+
+        dataset_size = len(self.train_loader.dataset)
+        return (dataset_size / effective_batch_size) * self.hparams.num_train_epochs
+
+    def setup(self, mode):
+        if mode == "fit":
+            self.train_loader = self.get_dataloader()
+
+    def configure_optimizers(self):
+
+        model = self.model
+        no_decay = ["bias", "LayerNorm.weight"]
+        optimizer_grouped_parameters = [
+            {
+                "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+                "weight_decay": self.hparams.weight_decay,
+            },
+            {
+                "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+                "weight_decay": 0.0,
+            },
+        ]
+
+        lr = self.hparams.learning_rate
+
+        optimizer = AdamW(optimizer_grouped_parameters, lr=lr, eps=self.hparams.adam_epsilon)
+        self.opt = optimizer
+        scheduler = get_polynomial_decay_schedule_with_warmup(
+            self.opt, num_warmup_steps=self.hparams.warmup_steps, num_training_steps=self.total_steps()
+        )
+        return [optimizer], [scheduler]
+
+
+    def get_dataloader(self):
+        train_dataset = get_dataset(tokenizer=self.tokenizer, args=self.hparams, type_path="train",
+                                    train_type=self.hparams.train_type)
+        dataloader = DataLoader(train_dataset, batch_size=self.hparams.train_batch_size, drop_last=True, shuffle=True,
+                                num_workers=1)
+        return dataloader
+tb_logger = pl_loggers.TensorBoardLogger(os.path.join("logs", self.args["name"], args.train_type))
+lr_logger = LearningRateLogger(logging_interval='step')
+train_params = dict(
+            gpus=2,
+            early_stop_callback=False,
+            precision=16 if args.fp_16 else 32,
+            amp_level='O1',
+            checkpoint_callback=False,
+            callbacks=[lr_logger],
+            logger=tb_logger,
+        )
+model = BartFineTuner(args)
+trainer = pl.Trainer(**train_params)
+trainer.fit(model)
+&lt;denchmark-h:h3&gt;Expected behavior&lt;/denchmark-h&gt;
+
+Log real learning rate
+&lt;denchmark-h:h3&gt;Environment&lt;/denchmark-h&gt;
+
+
+CUDA:
+- GPU:
+- Tesla P4
+- Tesla P4
+- available:         True
+- version:           10.2
+Packages:
+- numpy:             1.18.5
+- pyTorch_debug:     False
+- pyTorch_version:   1.6.0
+- pytorch-lightning: 0.10.0rc1
+- tqdm:              4.50.0
+System:
+- OS:                Linux
+- architecture:
+- 64bit
+-
+- processor:         x86_64
+- python:            3.7.9
+- version:           #32~16.04.2-Ubuntu SMP Thu Jul 20 10:19:48 UTC 2017
+
+&lt;denchmark-h:h3&gt;Additional context&lt;/denchmark-h&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='WangHexie' date='2020-10-06T13:01:23Z'>
+		Hi! thanks for your contribution!, great first issue!
+		</comment>
+		<comment id='2' author='WangHexie' date='2020-10-06T13:08:32Z'>
+		got it, thanks for sharing!
+Mind replicating the bug using this model?
+&lt;denchmark-link:https://github.com/PyTorchLightning/pytorch-lightning/blob/master/pl_examples/bug_report_model.py&gt;https://github.com/PyTorchLightning/pytorch-lightning/blob/master/pl_examples/bug_report_model.py&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='3' author='WangHexie' date='2020-10-06T13:09:33Z'>
+		cc &lt;denchmark-link:https://github.com/ananyahjha93&gt;@ananyahjha93&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='4' author='WangHexie' date='2020-10-06T13:16:58Z'>
+		
+Mind replicating the bug using this model?
+https://github.com/PyTorchLightning/pytorch-lightning/blob/master/pl_examples/bug_report_model.py
+
+This is the minimum code to replicate the bug. But it seems to be bug of adamw?Change to Adamw in pytorch still have the bug. It works fine with SGD
+import torch
+from pytorch_lightning import LightningModule
+from torch.utils.data import Dataset
+from pytorch_lightning import Trainer, LightningModule
+from pytorch_lightning.callbacks import LearningRateLogger
+from unittest import mock
+from pytorch_lightning import loggers as pl_loggers
+from transformers import AdamW, get_polynomial_decay_schedule_with_warmup
+
+
+class RandomDataset(Dataset):
+    def __init__(self, size, length):
+        self.len = length
+        self.data = torch.randn(length, size)
+    def __getitem__(self, index):
+        return self.data[index]
+    def __len__(self):
+        return self.len
+class BoringModel(LightningModule):
+    def __init__(self):
+        """
+        Testing PL Module
+        Use as follows:
+        - subclass
+        - modify the behavior for what you want
+        class TestModel(BaseTestModel):
+            def training_step(...):
+                # do your own thing
+        or:
+        model = BaseTestModel()
+        model.training_epoch_end = None
+        """
+        super().__init__()
+        self.layer = torch.nn.Linear(32, 2)
+    def forward(self, x):
+        return self.layer(x)
+    def loss(self, batch, prediction):
+        # An arbitrary loss to have a loss that updates the model weights during `Trainer.fit` calls
+        return torch.nn.functional.mse_loss(prediction, torch.ones_like(prediction))
+    def step(self, x):
+        x = self.layer(x)
+        out = torch.nn.functional.mse_loss(x, torch.ones_like(x))
+        return out
+    def training_step(self, batch, batch_idx):
+        output = self.layer(batch)
+        loss = self.loss(batch, output)
+        return {"loss": loss}
+    def training_step_end(self, training_step_outputs):
+        return training_step_outputs
+    def training_epoch_end(self, outputs) -&gt; None:
+        torch.stack([x["loss"] for x in outputs]).mean()
+    def validation_step(self, batch, batch_idx):
+        output = self.layer(batch)
+        loss = self.loss(batch, output)
+        return {"x": loss}
+    def validation_epoch_end(self, outputs) -&gt; None:
+        torch.stack([x['x'] for x in outputs]).mean()
+    def test_step(self, batch, batch_idx):
+        output = self.layer(batch)
+        loss = self.loss(batch, output)
+        return {"y": loss}
+    def test_epoch_end(self, outputs) -&gt; None:
+        torch.stack([x["y"] for x in outputs]).mean()
+
+    def configure_optimizers(self):
+        "Prepare optimizer and schedule (linear warmup and decay)"
+
+        optimizer = AdamW(self.layer.parameters(), lr=0.001, eps=1e-9)
+        self.opt = optimizer
+        scheduler = get_polynomial_decay_schedule_with_warmup(
+            self.opt, num_warmup_steps=100, num_training_steps=1000
+        )
+
+        # self.lr_scheduler = scheduler
+        return [optimizer], [scheduler]
+
+    def train_dataloader(self):
+        return torch.utils.data.DataLoader(RandomDataset(32, 64))
+    def val_dataloader(self):
+        return torch.utils.data.DataLoader(RandomDataset(32, 64))
+    def test_dataloader(self):
+        return torch.utils.data.DataLoader(RandomDataset(32, 64))
+if __name__ == '__main__':
+    import os
+    lr_logger = LearningRateLogger(logging_interval='step')
+    model = BoringModel()
+    model.training_epoch_end = None
+
+    tb_logger = pl_loggers.TensorBoardLogger(os.path.join("logs", "lr_test"))
+    lr_logger = LearningRateLogger(logging_interval='step')
+    train_params = dict(
+        accumulate_grad_batches=2,
+        gpus=2,
+        max_epochs=1,
+        early_stop_callback=False,
+        precision= 32,
+        gradient_clip_val=1,
+        checkpoint_callback=False,
+        callbacks=[lr_logger],
+        logger=tb_logger,
+
+    )
+    trainer = Trainer(
+        **train_params
+    )
+    trainer.fit(model)
+		</comment>
+		<comment id='5' author='WangHexie' date='2020-10-06T13:17:40Z'>
+		transformers package is needed to run the code sample.
+		</comment>
+		<comment id='6' author='WangHexie' date='2020-10-06T13:31:18Z'>
+		The cause of this seems to be this call
+&lt;denchmark-code&gt;scheduler = get_polynomial_decay_schedule_with_warmup(
+            self.opt, num_warmup_steps=100, num_training_steps=1000
+        )
+&lt;/denchmark-code&gt;
+
+Looking at the optimizer right after this will show that the learning rate has be altered to 0.0.
+		</comment>
+		<comment id='7' author='WangHexie' date='2020-10-06T13:36:14Z'>
+		Thanks a lot.
+Though it's quite weird that with learning rate of 0, model can still be fitted.
+issue closed
+		</comment>
+		<comment id='8' author='WangHexie' date='2020-10-06T13:43:09Z'>
+		I am really not sure why this happens, after all get_polynomial_decay_scheduler_with_warmup just returns a instance of LambdaLR scheduler which should work.
+		</comment>
+		<comment id='9' author='WangHexie' date='2020-10-06T13:45:22Z'>
+		should I reopen this issue?
+		</comment>
+		<comment id='10' author='WangHexie' date='2020-10-06T14:03:34Z'>
+		So I found the error &lt;denchmark-link:https://github.com/WangHexie&gt;@WangHexie&lt;/denchmark-link&gt;
+ .
+The problem is that you want to log on  () but your scheduler steps on . Since this specific scheduler () starts out with a learning rate of 0 (can be seen from its code) you will not see the learning rate change in your plot before a hole epoch has passed.
+You want to add this when you return optimizer and scheduler in :
+&lt;denchmark-code&gt;def configure_optimizers(self):
+    ...
+    return [optimizer], [{'scheduler': scheduler, 'interval': 'step'}]
+&lt;/denchmark-code&gt;
+
+This indicated that the scheduler should step after each batch.
+		</comment>
+		<comment id='11' author='WangHexie' date='2020-10-06T14:12:00Z'>
+		Thank you so much for  correcting my mistakes.
+		</comment>
+	</comments>
+</bug>

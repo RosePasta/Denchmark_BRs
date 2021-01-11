@@ -1,0 +1,1569 @@
+<bug id='35093' author='CNOCycle' open_date='2019-12-13T16:35:52Z' closed_time='2020-08-11T19:46:20Z'>
+	<summary>Custom loss may not work when running keras model with tf.distribute.MirroredStrategy()</summary>
+	<description>
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): Yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Linux Ubuntu 16.04 in Docker
+TensorFlow installed from (source or binary): pip install
+TensorFlow version (use command below): v2.0.0-rc2-26-g64c3d38
+Python version: 3.5
+CUDA/cuDNN version: 10.0 / 7
+GPU model and memory: GTX 1080Ti / 11175MiB
+
+Describe the current behavior
+Hi authors and developers,
+I am developing our project in tf=2.0.0 and eager_mode is disable.
+The main reason is tf=1.x will not be maintained but third party libraries have not been ready for tf=2.0 yet.
+I got bug when I was running custom loss keras model with tf.distribute.MirroredStrategy()
+This bug can be reproduced by the following minimal testcase:
+#%%
+from distutils.version import LooseVersion
+import numpy as np
+import tensorflow as tf
+
+# disable eager model for tf=2.x
+tf.compat.v1.disable_eager_execution()
+
+batch_size = 100
+img_h = 32
+img_w = 32
+img_min = 0
+img_max = 1
+channels = 3
+num_classes = 10
+
+strategy = tf.distribute.MirroredStrategy()
+#%%
+def download_data():
+
+    # get raw data
+    (trainX, trainY), (testX, testY) = tf.keras.datasets.cifar10.load_data()
+    trainX = trainX.astype(np.float32)
+    testX  = testX.astype(np.float32)
+
+    # ont-hot
+    trainY = tf.keras.utils.to_categorical(trainY, 10)
+    testY  = tf.keras.utils.to_categorical(testY , 10)
+
+    # get validation sets
+    training_size = 45000
+    validX = trainX[training_size:,:]
+    validY = trainY[training_size:,:]
+
+    trainX = trainX[:training_size,:]
+    trainY = trainY[:training_size,:]
+
+    return trainX, trainY, validX, validY, testX, testY
+
+#%%
+class DataGenerator:
+
+    def __init__(self, sess, dataX, dataY, total_len, batch_size):
+
+        super().__init__()
+
+        self.total_len  = total_len
+        self.batch_size = batch_size
+        self.cleanX = dataX
+        self.totalY = dataY
+        self.sess = sess
+        self.on_epoch_end()
+
+    def __build_pipeline(self, dataX, dataY):
+
+        # create dataset API
+        def preprocess_fn(dataX, dataY):
+            
+            dataX = tf.image.random_flip_left_right(dataX)
+
+            # workaround solution
+            if LooseVersion(tf.__version__) &lt; LooseVersion('1.14.0'):
+                outputX = dataX
+            else:
+                outputX = (dataX, dataY)
+            return outputX, dataY
+
+        dataset = tf.data.Dataset.from_tensor_slices( (dataX, dataY) )
+        dataset = dataset.shuffle(batch_size * 8)
+        dataset = dataset.repeat()
+        dataset = dataset.batch(batch_size)
+        dataset = dataset.map(preprocess_fn, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+        dataset = dataset.prefetch(tf.data.experimental.AUTOTUNE)
+
+        self.dataset   = dataset
+
+    def  __len__(self):
+
+        return self.total_len // self.batch_size
+
+    def on_epoch_end(self):
+
+        # run permutation
+        rand_idx = np.random.permutation(self.total_len)
+        cleanX = self.cleanX[rand_idx]
+        totalY = self.totalY[rand_idx]
+
+        self.__build_pipeline(cleanX, totalY)
+
+#%%
+# ref: https://keras.io/examples/cifar10_resnet/
+def build_clf():
+    #with strategy.scope():
+    with tf.compat.v1.variable_scope('optimizer'):
+        def resnet_layer(inputs,
+                        num_filters=16,
+                        kernel_size=3,
+                        strides=1,
+                        activation='relu',
+                        batch_normalization=True,
+                        conv_first=True):
+            """2D Convolution-Batch Normalization-Activation stack builder
+
+            # Arguments
+                inputs (tensor): input tensor from input image or previous layer
+                num_filters (int): Conv2D number of filters
+                kernel_size (int): Conv2D square kernel dimensions
+                strides (int): Conv2D square stride dimensions
+                activation (string): activation name
+                batch_normalization (bool): whether to include batch normalization
+                conv_first (bool): conv-bn-activation (True) or
+                    bn-activation-conv (False)
+
+            # Returns
+                x (tensor): tensor as input to the next layer
+            """
+            conv = tf.keras.layers.Conv2D(num_filters,
+                        kernel_size=kernel_size,
+                        strides=strides,
+                        padding='same',
+                        kernel_initializer='he_normal',
+                        kernel_regularizer=tf.keras.regularizers.l2(1e-4))
+
+            x = inputs
+            if conv_first:
+                x = conv(x)
+                if batch_normalization:
+                    x = tf.keras.layers.BatchNormalization()(x)
+                if activation is not None:
+                    x = tf.keras.layers.Activation(activation)(x)
+            else:
+                if batch_normalization:
+                    x = tf.keras.layers.BatchNormalization()(x)
+                if activation is not None:
+                    x = tf.keras.layers.Activation(activation)(x)
+                x = conv(x)
+            return x
+
+        def cw_loss(y_true, y_pred):
+            label_mask  = label_ref
+            pre_softmax = x
+            if LooseVersion(tf.__version__) &lt; LooseVersion('1.14.0'):
+                correct_logit = tf.reduce_sum(label_mask * pre_softmax, axis=1, keep_dims=True)
+            else:
+                correct_logit = tf.reduce_sum(label_mask * pre_softmax, axis=1, keepdims=True)
+            distance = tf.nn.relu( pre_softmax - correct_logit + (1-label_mask) * 10)
+            inactivate = tf.cast( tf.less_equal(distance, 1e-9), dtype=tf.float32)
+            weight = tf.keras.layers.Activation('softmax')(-1e9*inactivate + distance)
+            loss = tf.reduce_sum((1-label_mask) * distance * weight, axis=1)
+            loss = tf.math.reduce_mean(loss)
+            return loss
+
+        # set model's parameters (depth = n * 6 + 2)
+        n = 8
+        num_filters = 16
+
+        clf_input = tf.keras.layers.Input(shape=(img_h, img_w, channels), name="model/input")
+        label_ref = tf.keras.layers.Input(shape=(num_classes,), name='label_ref')
+        input_list = [clf_input, label_ref]
+
+        x = resnet_layer(inputs=clf_input)
+        for stack in range(3):
+            for res_block in range(n):
+                strides = 1
+                if stack &gt; 0 and res_block == 0:  # first layer but not first stack
+                    strides = 2  # downsample
+                y = resnet_layer(inputs=x,
+                                num_filters=num_filters,
+                                strides=strides)
+                y = resnet_layer(inputs=y,
+                                num_filters=num_filters,
+                                activation=None)
+                if stack &gt; 0 and res_block == 0:  # first layer but not first stack
+                    # linear projection residual shortcut connection to match
+                    # changed dims
+                    x = resnet_layer(inputs=x,
+                                    num_filters=num_filters,
+                                    kernel_size=1,
+                                    strides=strides,
+                                    activation=None,
+                                    batch_normalization=False)
+                x = tf.keras.layers.Add()([x, y])
+                x = tf.keras.layers.Activation('relu')(x)
+            num_filters *= 2
+
+        x = tf.keras.layers.AveragePooling2D(pool_size=8)(x)
+        x = tf.keras.layers.Flatten()(x)
+        x = tf.keras.layers.Dense(num_classes , kernel_initializer='he_normal', activation=None)(x)
+        y = tf.keras.layers.Activation('softmax')(x)
+
+        optimizer = tf.keras.optimizers.Adam(lr=0.001)
+        clf_model = tf.keras.models.Model(inputs=input_list, outputs=y, name='clf_model')
+        clf_model.compile(loss='categorical_crossentropy', optimizer=optimizer, metrics=['accuracy', cw_loss])
+    clf_model.summary()
+
+    return clf_model
+
+#%%
+if __name__ == '__main__':
+
+    # set GPU
+    import os
+    if os.environ.get("CUDA_VISIBLE_DEVICES") is None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+    # reset tf session
+    tf.compat.v1.keras.backend.clear_session()
+    gpu_options = tf.compat.v1.GPUOptions(allow_growth=True)
+    sess = tf.compat.v1.Session(config=tf.compat.v1.ConfigProto(gpu_options=gpu_options))
+    tf.compat.v1.keras.backend.set_session(sess)
+
+    # Hyperparameters
+    batch_size = 100
+    epochs = 1
+
+    # prepare data
+    trainX, trainY, validX, validY, testX, testY = download_data()
+    train_gen = DataGenerator(sess, trainX, trainY, trainY.shape[0], batch_size)
+    valid_gen = DataGenerator(sess, validX, validY, validY.shape[0], batch_size)
+    test_gen  = DataGenerator(sess, testX, testY, testY.shape[0], batch_size)
+
+    # build model
+    model = build_clf()
+
+    # train model
+    model.fit(train_gen.dataset,
+                    epochs=epochs,
+                    steps_per_epoch = train_gen.__len__(),
+                    validation_data=valid_gen.dataset,
+                    validation_steps= valid_gen.__len__(),
+                    verbose=1)
+
+    # print result
+    meta_string = '[Testing]'
+    prefix_string = ''
+    output = model.evaluate(test_gen.dataset, steps = test_gen.__len__())
+    for ii in range( len( model.metrics_names) ):
+        meta_string = meta_string + '- {:s}{:s}: {:.3f} '.format(prefix_string, model.metrics_names[ii], output[ii])
+
+    print(meta_string)
+First, this testing case looks good without enabling tf.distribute.MirroredStrategy()
+There is the output for normal case:
+&lt;denchmark-code&gt;Train on 450 steps, validate on 50 steps
+2019-12-13 16:20:30.625379: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamic library libcublas.so.10.0
+2019-12-13 16:20:31.217430: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamic library libcudnn.so.7
+2019-12-13 16:20:33.007150: W tensorflow/stream_executor/cuda/redzone_allocator.cc:312] Not found: ./bin/ptxas not found
+Relying on driver to perform ptx compilation. This message will be only logged once.
+450/450 [==============================] - 40s 88ms/step - loss: 1.8299 - accuracy: 0.4744 - cw_loss: 9.5022 - val_loss: 1.9870 - val_accuracy: 0.4528 - val_cw_loss: 9.6570
+100/100 [==============================] - 3s 26ms/step - loss: 2.0089 - accuracy: 0.4511 - cw_loss: 9.6708
+[Testing]- loss: 2.009 - accuracy: 0.451 - cw_loss: 9.671
+
+&lt;/denchmark-code&gt;
+
+Next, we tried to enable tf.distribute.MirroredStrategy() so we modified the testcase by the following patch:
+def build_clf():
+-    #with strategy.scope():
+-    with tf.compat.v1.variable_scope('optimizer'):
+def build_clf():
++    with strategy.scope():
++    #with tf.compat.v1.variable_scope('optimizer'):
+And we got the error message:
+&lt;denchmark-code&gt;Traceback (most recent call last):
+  File "bug.py", line 233, in &lt;module&gt;
+    verbose=1)
+  File "/usr/local/lib/python3.5/dist-packages/tensorflow_core/python/keras/engine/training.py", line 717, in fit
+    use_multiprocessing=use_multiprocessing)
+  File "/usr/local/lib/python3.5/dist-packages/tensorflow_core/python/keras/engine/training_distributed.py", line 685, in fit
+    steps_name='steps_per_epoch')
+  File "/usr/local/lib/python3.5/dist-packages/tensorflow_core/python/keras/engine/training_arrays.py", line 299, in model_iteration
+    batch_outs = f(actual_inputs)
+  File "/usr/local/lib/python3.5/dist-packages/tensorflow_core/python/keras/backend.py", line 3580, in __call__
+    run_metadata=self.run_metadata)
+  File "/usr/local/lib/python3.5/dist-packages/tensorflow_core/python/client/session.py", line 1472, in __call__
+    run_metadata_ptr)
+tensorflow.python.framework.errors_impl.InvalidArgumentError: 2 root error(s) found.
+  (0) Invalid argument: You must feed a value for placeholder tensor 'model/input' with dtype float and shape [?,32,32,3]
+         [[{{node model/input}}]]
+         [[batch_normalization_9/cond/else/_325/FusedBatchNormV3/ReadVariableOp/_2529]]
+  (1) Invalid argument: You must feed a value for placeholder tensor 'model/input' with dtype float and shape [?,32,32,3]
+         [[{{node model/input}}]]
+0 successful operations.
+0 derived errors ignored.
+&lt;/denchmark-code&gt;
+
+This error is very similar to the previous issue &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/34866&gt;#34866&lt;/denchmark-link&gt;
+.
+I guess that those two issues may have some strong connection.
+Describe the expected behavior
+It should work properly.
+Code to reproduce the issue
+Please see the section of Describe the current behavior
+Other info / logs
+The following message is the result generated by tf_env_collect.sh
+&lt;denchmark-code&gt;== check python ===================================================
+python version: 3.5.2
+python branch:
+python build version: ('default', 'Oct  8 2019 13:06:37')
+python compiler version: GCC 5.4.0 20160609
+python implementation: CPython
+
+
+== check os platform ===============================================
+os: Linux
+os kernel version: #40~18.04.1-Ubuntu SMP Thu Nov 14 12:06:39 UTC 2019
+os release version: 5.0.0-37-generic
+os platform: Linux-5.0.0-37-generic-x86_64-with-Ubuntu-16.04-xenial
+linux distribution: ('Ubuntu', '16.04', 'xenial')
+linux os distribution: ('Ubuntu', '16.04', 'xenial')
+mac version: ('', ('', '', ''), '')
+uname: uname_result(system='Linux', node='f7f509f1dacf', release='5.0.0-37-generic', version='#40~18.04.1-Ubuntu SMP Thu Nov 14 12:06:39 UTC 2019', machine='x86_64', processor='x86_64')
+architecture: ('64bit', 'ELF')
+machine: x86_64
+
+
+== are we in docker =============================================
+Yes
+
+== compiler =====================================================
+c++ (Ubuntu 5.4.0-6ubuntu1~16.04.12) 5.4.0 20160609
+Copyright (C) 2015 Free Software Foundation, Inc.
+This is free software; see the source for copying conditions.  There is NO
+warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+
+
+== check pips ===================================================
+numpy                  1.17.4
+protobuf               3.11.1
+tensorflow-estimator   2.0.1
+tensorflow-gpu         2.0.0
+tensorflow-probability 0.8.0
+
+== check for virtualenv =========================================
+False
+
+== tensorflow import ============================================
+tf.version.VERSION = 2.0.0
+tf.version.GIT_VERSION = v2.0.0-rc2-26-g64c3d38
+tf.version.COMPILER_VERSION = 7.3.1 20180303
+Sanity check: array([1], dtype=int32)
+       443:     find library=libpthread.so.0 [0]; searching
+       443:      search path=/usr/local/nvidia/lib/tls/x86_64:/usr/local/nvidia/lib/tls:/usr/local/nvidia/lib/x86_64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64/tls/x86_64:/usr/local/nvidia/lib64/tls:/usr/local/nvidia/lib64/x86_64:/usr/local/nvidia/lib64          (LD_LIBRARY_PATH)
+       443:       trying file=/usr/local/nvidia/lib/tls/x86_64/libpthread.so.0
+       443:       trying file=/usr/local/nvidia/lib/tls/libpthread.so.0
+       443:       trying file=/usr/local/nvidia/lib/x86_64/libpthread.so.0
+       443:       trying file=/usr/local/nvidia/lib/libpthread.so.0
+       443:       trying file=/usr/local/nvidia/lib64/tls/x86_64/libpthread.so.0
+       443:       trying file=/usr/local/nvidia/lib64/tls/libpthread.so.0
+       443:       trying file=/usr/local/nvidia/lib64/x86_64/libpthread.so.0
+       443:       trying file=/usr/local/nvidia/lib64/libpthread.so.0
+       443:      search cache=/etc/ld.so.cache
+       443:       trying file=/lib/x86_64-linux-gnu/libpthread.so.0
+       443:
+       443:     find library=libc.so.6 [0]; searching
+       443:      search path=           (LD_LIBRARY_PATH)
+       443:      search cache=/etc/ld.so.cache
+       443:       trying file=/lib/x86_64-linux-gnu/libc.so.6
+       443:
+       443:     find library=libdl.so.2 [0]; searching
+       443:      search path=           (LD_LIBRARY_PATH)
+       443:      search cache=/etc/ld.so.cache
+       443:       trying file=/lib/x86_64-linux-gnu/libdl.so.2
+       443:
+       443:     find library=libutil.so.1 [0]; searching
+       443:      search path=           (LD_LIBRARY_PATH)
+       443:      search cache=/etc/ld.so.cache
+       443:       trying file=/lib/x86_64-linux-gnu/libutil.so.1
+       443:
+       443:     find library=libexpat.so.1 [0]; searching
+       443:      search path=           (LD_LIBRARY_PATH)
+       443:      search cache=/etc/ld.so.cache
+       443:       trying file=/lib/x86_64-linux-gnu/libexpat.so.1
+       443:
+       443:     find library=libz.so.1 [0]; searching
+       443:      search path=           (LD_LIBRARY_PATH)
+       443:      search cache=/etc/ld.so.cache
+       443:       trying file=/lib/x86_64-linux-gnu/libz.so.1
+       443:
+       443:     find library=libm.so.6 [0]; searching
+       443:      search path=           (LD_LIBRARY_PATH)
+       443:      search cache=/etc/ld.so.cache
+       443:       trying file=/lib/x86_64-linux-gnu/libm.so.6
+       443:
+       443:
+       443:     calling init: /lib/x86_64-linux-gnu/libpthread.so.0
+       443:
+       443:
+       443:     calling init: /lib/x86_64-linux-gnu/libc.so.6
+       443:
+       443:
+       443:     calling init: /lib/x86_64-linux-gnu/libm.so.6
+       443:
+       443:
+       443:     calling init: /lib/x86_64-linux-gnu/libz.so.1
+       443:
+       443:
+       443:     calling init: /lib/x86_64-linux-gnu/libexpat.so.1
+       443:
+       443:
+       443:     calling init: /lib/x86_64-linux-gnu/libutil.so.1
+       443:
+       443:
+       443:     calling init: /lib/x86_64-linux-gnu/libdl.so.2
+       443:
+       443:
+       443:     initialize program: /usr/local/bin/python
+       443:
+       443:
+       443:     transferring control: /usr/local/bin/python
+       443:
+       443:
+       443:     calling init: /usr/lib/python3.5/lib-dynload/_opcode.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/lib/python3.5/lib-dynload/_ctypes.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:     find library=libopenblasp-r0-34a18dc3.3.7.so [0]; searching
+       443:      search path=/usr/local/lib/python3.5/dist-packages/numpy/core/../.libs/tls/x86_64:/usr/local/lib/python3.5/dist-packages/numpy/core/../.libs/tls:/usr/local/lib/python3.5/dist-packages/numpy/core/../.libs/x86_64:/usr/local/lib/python3.5/dist-packages/numpy/core/../.libs            (RPATH from file /usr/local/lib/python3.5/dist-packages/numpy/core/_multiarray_umath.cpython-35m-x86_64-linux-gnu.so)
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/numpy/core/../.libs/tls/x86_64/libopenblasp-r0-34a18dc3.3.7.so
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/numpy/core/../.libs/tls/libopenblasp-r0-34a18dc3.3.7.so
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/numpy/core/../.libs/x86_64/libopenblasp-r0-34a18dc3.3.7.so
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/numpy/core/../.libs/libopenblasp-r0-34a18dc3.3.7.so
+       443:
+       443:     find library=libgfortran-ed201abd.so.3.0.0 [0]; searching
+       443:      search path=/usr/local/lib/python3.5/dist-packages/numpy/core/../.libs         (RPATH from file /usr/local/lib/python3.5/dist-packages/numpy/core/_multiarray_umath.cpython-35m-x86_64-linux-gnu.so)
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/numpy/core/../.libs/libgfortran-ed201abd.so.3.0.0
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/numpy/core/../.libs/libgfortran-ed201abd.so.3.0.0
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/numpy/core/../.libs/libopenblasp-r0-34a18dc3.3.7.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/numpy/core/_multiarray_umath.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/numpy/core/_multiarray_tests.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/numpy/linalg/lapack_lite.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/numpy/linalg/_umath_linalg.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:     find library=libbz2.so.1.0 [0]; searching
+       443:      search path=           (LD_LIBRARY_PATH)
+       443:      search cache=/etc/ld.so.cache
+       443:       trying file=/lib/x86_64-linux-gnu/libbz2.so.1.0
+       443:
+       443:
+       443:     calling init: /lib/x86_64-linux-gnu/libbz2.so.1.0
+       443:
+       443:
+       443:     calling init: /usr/lib/python3.5/lib-dynload/_bz2.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:     find library=liblzma.so.5 [0]; searching
+       443:      search path=           (LD_LIBRARY_PATH)
+       443:      search cache=/etc/ld.so.cache
+       443:       trying file=/lib/x86_64-linux-gnu/liblzma.so.5
+       443:
+       443:
+       443:     calling init: /lib/x86_64-linux-gnu/liblzma.so.5
+       443:
+       443:
+       443:     calling init: /usr/lib/python3.5/lib-dynload/_lzma.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:     find library=libmpdec.so.2 [0]; searching
+       443:      search path=           (LD_LIBRARY_PATH)
+       443:      search cache=/etc/ld.so.cache
+       443:       trying file=/usr/lib/x86_64-linux-gnu/libmpdec.so.2
+       443:
+       443:
+       443:     calling init: /usr/lib/x86_64-linux-gnu/libmpdec.so.2
+       443:
+       443:
+       443:     calling init: /usr/lib/python3.5/lib-dynload/_decimal.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/numpy/fft/_pocketfft_internal.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/numpy/random/mtrand.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/numpy/random/common.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/numpy/random/bounded_integers.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/numpy/random/mt19937.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/numpy/random/bit_generator.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:     find library=libcrypto.so.1.0.0 [0]; searching
+       443:      search path=           (LD_LIBRARY_PATH)
+       443:      search cache=/etc/ld.so.cache
+       443:       trying file=/lib/x86_64-linux-gnu/libcrypto.so.1.0.0
+       443:
+       443:
+       443:     calling init: /lib/x86_64-linux-gnu/libcrypto.so.1.0.0
+       443:
+       443:
+       443:     calling init: /usr/lib/python3.5/lib-dynload/_hashlib.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/numpy/random/philox.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/numpy/random/pcg64.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/numpy/random/sfc64.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/numpy/random/generator.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:     find library=libtensorflow_framework.so.2 [0]; searching
+       443:      search path=/usr/local/lib/python3.5/dist-packages/tensorflow_core/python/../../_solib_local/_U_S_Stensorflow_Spython_C_Upywrap_Utensorflow_Uinternal.so___Utensorflow/tls/x86_64:/usr/local/lib/python3.5/dist-packages/tensorflow_core/python/../../_solib_local/_U_S_Stensorflow_Spython_C_Upywrap_Utensorflow_Uinternal.so___Utensorflow/tls:/usr/local/lib/python3.5/dist-packages/tensorflow_core/python/../../_solib_local/_U_S_Stensorflow_Spython_C_Upywrap_Utensorflow_Uinternal.so___Utensorflow/x86_64:/usr/local/lib/python3.5/dist-packages/tensorflow_core/python/../../_solib_local/_U_S_Stensorflow_Spython_C_Upywrap_Utensorflow_Uinternal.so___Utensorflow:/usr/local/lib/python3.5/dist-packages/tensorflow_core/python/tls/x86_64:/usr/local/lib/python3.5/dist-packages/tensorflow_core/python/tls:/usr/local/lib/python3.5/dist-packages/tensorflow_core/python/x86_64:/usr/local/lib/python3.5/dist-packages/tensorflow_core/python:/usr/local/lib/python3.5/dist-packages/tensorflow_core/python/../tls/x86_64:/usr/local/lib/python3.5/dist-packages/tensorflow_core/python/../tls:/usr/local/lib/python3.5/dist-packages/tensorflow_core/python/../x86_64:/usr/local/lib/python3.5/dist-packages/tensorflow_core/python/..            (RPATH from file /usr/local/lib/python3.5/dist-packages/tensorflow_core/python/_pywrap_tensorflow_internal.so)
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/tensorflow_core/python/../../_solib_local/_U_S_Stensorflow_Spython_C_Upywrap_Utensorflow_Uinternal.so___Utensorflow/tls/x86_64/libtensorflow_framework.so.2
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/tensorflow_core/python/../../_solib_local/_U_S_Stensorflow_Spython_C_Upywrap_Utensorflow_Uinternal.so___Utensorflow/tls/libtensorflow_framework.so.2
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/tensorflow_core/python/../../_solib_local/_U_S_Stensorflow_Spython_C_Upywrap_Utensorflow_Uinternal.so___Utensorflow/x86_64/libtensorflow_framework.so.2
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/tensorflow_core/python/../../_solib_local/_U_S_Stensorflow_Spython_C_Upywrap_Utensorflow_Uinternal.so___Utensorflow/libtensorflow_framework.so.2
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/tensorflow_core/python/tls/x86_64/libtensorflow_framework.so.2
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/tensorflow_core/python/tls/libtensorflow_framework.so.2
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/tensorflow_core/python/x86_64/libtensorflow_framework.so.2
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/tensorflow_core/python/libtensorflow_framework.so.2
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/tensorflow_core/python/../tls/x86_64/libtensorflow_framework.so.2
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/tensorflow_core/python/../tls/libtensorflow_framework.so.2
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/tensorflow_core/python/../x86_64/libtensorflow_framework.so.2
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/tensorflow_core/python/../libtensorflow_framework.so.2
+       443:
+       443:     find library=librt.so.1 [0]; searching
+       443:      search path=/usr/local/lib/python3.5/dist-packages/tensorflow_core/python:/usr/local/lib/python3.5/dist-packages/tensorflow_core/python/..             (RPATH from file /usr/local/lib/python3.5/dist-packages/tensorflow_core/python/_pywrap_tensorflow_internal.so)
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/tensorflow_core/python/librt.so.1
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/tensorflow_core/python/../librt.so.1
+       443:      search path=           (LD_LIBRARY_PATH)
+       443:      search cache=/etc/ld.so.cache
+       443:       trying file=/lib/x86_64-linux-gnu/librt.so.1
+       443:
+       443:     find library=libstdc++.so.6 [0]; searching
+       443:      search path=/usr/local/lib/python3.5/dist-packages/tensorflow_core/python:/usr/local/lib/python3.5/dist-packages/tensorflow_core/python/..             (RPATH from file /usr/local/lib/python3.5/dist-packages/tensorflow_core/python/_pywrap_tensorflow_internal.so)
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/tensorflow_core/python/libstdc++.so.6
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/tensorflow_core/python/../libstdc++.so.6
+       443:      search path=           (LD_LIBRARY_PATH)
+       443:      search cache=/etc/ld.so.cache
+       443:       trying file=/usr/lib/x86_64-linux-gnu/libstdc++.so.6
+       443:
+       443:     find library=libgcc_s.so.1 [0]; searching
+       443:      search path=/usr/local/lib/python3.5/dist-packages/tensorflow_core/python:/usr/local/lib/python3.5/dist-packages/tensorflow_core/python/..             (RPATH from file /usr/local/lib/python3.5/dist-packages/tensorflow_core/python/_pywrap_tensorflow_internal.so)
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/tensorflow_core/python/libgcc_s.so.1
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/tensorflow_core/python/../libgcc_s.so.1
+       443:      search path=           (LD_LIBRARY_PATH)
+       443:      search cache=/etc/ld.so.cache
+       443:       trying file=/lib/x86_64-linux-gnu/libgcc_s.so.1
+       443:
+       443:
+       443:     calling init: /lib/x86_64-linux-gnu/libgcc_s.so.1
+       443:
+       443:
+       443:     calling init: /usr/lib/x86_64-linux-gnu/libstdc++.so.6
+       443:
+       443:
+       443:     calling init: /lib/x86_64-linux-gnu/librt.so.1
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/tensorflow_core/python/../libtensorflow_framework.so.2
+       443:
+       443:     find library=libhdfs.so [0]; searching
+       443:      search path=/usr/local/lib/python3.5/dist-packages/tensorflow_core/python/..           (RPATH from file /usr/local/lib/python3.5/dist-packages/tensorflow_core/python/_pywrap_tensorflow_internal.so)
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/tensorflow_core/python/../libhdfs.so
+       443:      search path=/usr/local/lib/python3.5/dist-packages/tensorflow_core/python:/usr/local/lib/python3.5/dist-packages/tensorflow_core/python/..             (RPATH from file /usr/local/lib/python3.5/dist-packages/tensorflow_core/python/_pywrap_tensorflow_internal.so)
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/tensorflow_core/python/libhdfs.so
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/tensorflow_core/python/../libhdfs.so
+       443:      search path=           (LD_LIBRARY_PATH)
+       443:      search cache=/etc/ld.so.cache
+       443:      search path=/lib/x86_64-linux-gnu/tls/x86_64:/lib/x86_64-linux-gnu/tls:/lib/x86_64-linux-gnu/x86_64:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu/tls/x86_64:/usr/lib/x86_64-linux-gnu/tls:/usr/lib/x86_64-linux-gnu/x86_64:/usr/lib/x86_64-linux-gnu:/lib/tls/x86_64:/lib/tls:/lib/x86_64:/lib:/usr/lib/tls/x86_64:/usr/lib/tls:/usr/lib/x86_64:/usr/lib              (system search path)
+       443:       trying file=/lib/x86_64-linux-gnu/tls/x86_64/libhdfs.so
+       443:       trying file=/lib/x86_64-linux-gnu/tls/libhdfs.so
+       443:       trying file=/lib/x86_64-linux-gnu/x86_64/libhdfs.so
+       443:       trying file=/lib/x86_64-linux-gnu/libhdfs.so
+       443:       trying file=/usr/lib/x86_64-linux-gnu/tls/x86_64/libhdfs.so
+       443:       trying file=/usr/lib/x86_64-linux-gnu/tls/libhdfs.so
+       443:       trying file=/usr/lib/x86_64-linux-gnu/x86_64/libhdfs.so
+       443:       trying file=/usr/lib/x86_64-linux-gnu/libhdfs.so
+       443:       trying file=/lib/tls/x86_64/libhdfs.so
+       443:       trying file=/lib/tls/libhdfs.so
+       443:       trying file=/lib/x86_64/libhdfs.so
+       443:       trying file=/lib/libhdfs.so
+       443:       trying file=/usr/lib/tls/x86_64/libhdfs.so
+       443:       trying file=/usr/lib/tls/libhdfs.so
+       443:       trying file=/usr/lib/x86_64/libhdfs.so
+       443:       trying file=/usr/lib/libhdfs.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/tensorflow_core/python/_pywrap_tensorflow_internal.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/google/protobuf/internal/_api_implementation.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/google/protobuf/pyext/_message.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/lib/python3.5/lib-dynload/_csv.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/lib/python3.5/lib-dynload/termios.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/tensorflow_core/python/framework/fast_tensor_util.so
+       443:
+       443:     find library=libuuid.so.1 [0]; searching
+       443:      search path=           (LD_LIBRARY_PATH)
+       443:      search cache=/etc/ld.so.cache
+       443:       trying file=/lib/x86_64-linux-gnu/libuuid.so.1
+       443:
+       443:
+       443:     calling init: /lib/x86_64-linux-gnu/libuuid.so.1
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/wrapt/_wrappers.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/lib/python3.5/lib-dynload/_json.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:     find library=libssl.so.1.0.0 [0]; searching
+       443:      search path=           (LD_LIBRARY_PATH)
+       443:      search cache=/etc/ld.so.cache
+       443:       trying file=/lib/x86_64-linux-gnu/libssl.so.1.0.0
+       443:
+       443:
+       443:     calling init: /lib/x86_64-linux-gnu/libssl.so.1.0.0
+       443:
+       443:
+       443:     calling init: /usr/lib/python3.5/lib-dynload/_ssl.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:     find library=libhdf5-49599f4e.so.103.0.0 [0]; searching
+       443:      search path=/usr/local/lib/python3.5/dist-packages/h5py/.libs/tls/x86_64:/usr/local/lib/python3.5/dist-packages/h5py/.libs/tls:/usr/local/lib/python3.5/dist-packages/h5py/.libs/x86_64:/usr/local/lib/python3.5/dist-packages/h5py/.libs                (RPATH from file /usr/local/lib/python3.5/dist-packages/h5py/_errors.cpython-35m-x86_64-linux-gnu.so)
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/h5py/.libs/tls/x86_64/libhdf5-49599f4e.so.103.0.0
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/h5py/.libs/tls/libhdf5-49599f4e.so.103.0.0
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/h5py/.libs/x86_64/libhdf5-49599f4e.so.103.0.0
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/h5py/.libs/libhdf5-49599f4e.so.103.0.0
+       443:
+       443:     find library=libhdf5_hl-db841637.so.100.1.1 [0]; searching
+       443:      search path=/usr/local/lib/python3.5/dist-packages/h5py/.libs          (RPATH from file /usr/local/lib/python3.5/dist-packages/h5py/_errors.cpython-35m-x86_64-linux-gnu.so)
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/h5py/.libs/libhdf5_hl-db841637.so.100.1.1
+       443:
+       443:     find library=libsz-1c7dd0cf.so.2.0.1 [0]; searching
+       443:      search path=/usr/local/lib/python3.5/dist-packages/h5py/.libs/./tls/x86_64:/usr/local/lib/python3.5/dist-packages/h5py/.libs/./tls:/usr/local/lib/python3.5/dist-packages/h5py/.libs/./x86_64:/usr/local/lib/python3.5/dist-packages/h5py/.libs/.                (RPATH from file /usr/local/lib/python3.5/dist-packages/h5py/.libs/libhdf5-49599f4e.so.103.0.0)
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/h5py/.libs/./tls/x86_64/libsz-1c7dd0cf.so.2.0.1
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/h5py/.libs/./tls/libsz-1c7dd0cf.so.2.0.1
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/h5py/.libs/./x86_64/libsz-1c7dd0cf.so.2.0.1
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/h5py/.libs/./libsz-1c7dd0cf.so.2.0.1
+       443:
+       443:     find library=libaec-2147abcd.so.0.0.4 [0]; searching
+       443:      search path=/usr/local/lib/python3.5/dist-packages/h5py/.libs/.                (RPATH from file /usr/local/lib/python3.5/dist-packages/h5py/.libs/libhdf5-49599f4e.so.103.0.0)
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/h5py/.libs/./libaec-2147abcd.so.0.0.4
+       443:
+       443:     find library=libz-a147dcb0.so.1.2.3 [0]; searching
+       443:      search path=/usr/local/lib/python3.5/dist-packages/h5py/.libs/.                (RPATH from file /usr/local/lib/python3.5/dist-packages/h5py/.libs/libhdf5-49599f4e.so.103.0.0)
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/h5py/.libs/./libz-a147dcb0.so.1.2.3
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/h5py/.libs/./libz-a147dcb0.so.1.2.3
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/h5py/.libs/./libaec-2147abcd.so.0.0.4
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/h5py/.libs/./libsz-1c7dd0cf.so.2.0.1
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/h5py/.libs/libhdf5-49599f4e.so.103.0.0
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/h5py/.libs/libhdf5_hl-db841637.so.100.1.1
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/h5py/_errors.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/h5py/h5.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/h5py/defs.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/h5py/_objects.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/h5py/_conv.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/h5py/h5r.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/h5py/h5t.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/h5py/utils.cpython-35m-x86_64-linux-gnu.so
+       443:
+       452:     find library=libc.so.6 [0]; searching
+       452:      search path=/usr/local/nvidia/lib/tls/x86_64:/usr/local/nvidia/lib/tls:/usr/local/nvidia/lib/x86_64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64/tls/x86_64:/usr/local/nvidia/lib64/tls:/usr/local/nvidia/lib64/x86_64:/usr/local/nvidia/lib64          (LD_LIBRARY_PATH)
+       452:       trying file=/usr/local/nvidia/lib/tls/x86_64/libc.so.6
+       452:       trying file=/usr/local/nvidia/lib/tls/libc.so.6
+       452:       trying file=/usr/local/nvidia/lib/x86_64/libc.so.6
+       452:       trying file=/usr/local/nvidia/lib/libc.so.6
+       452:       trying file=/usr/local/nvidia/lib64/tls/x86_64/libc.so.6
+       452:       trying file=/usr/local/nvidia/lib64/tls/libc.so.6
+       452:       trying file=/usr/local/nvidia/lib64/x86_64/libc.so.6
+       452:       trying file=/usr/local/nvidia/lib64/libc.so.6
+       452:      search cache=/etc/ld.so.cache
+       452:       trying file=/lib/x86_64-linux-gnu/libc.so.6
+       452:
+       452:
+       452:     calling init: /lib/x86_64-linux-gnu/libc.so.6
+       452:
+       452:
+       452:     initialize program: /bin/sh
+       452:
+       452:
+       452:     transferring control: /bin/sh
+       452:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/h5py/h5z.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/h5py/h5a.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/h5py/h5s.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/h5py/h5p.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/h5py/h5ac.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/h5py/_proxy.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/h5py/h5d.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/h5py/h5ds.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/h5py/h5f.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/h5py/h5g.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/h5py/h5i.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/h5py/h5fd.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/h5py/h5pl.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/h5py/h5o.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/h5py/h5l.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/scipy/_lib/_ccallback_c.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/scipy/sparse/_sparsetools.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/scipy/sparse/_csparsetools.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/scipy/sparse/csgraph/_shortest_path.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/scipy/sparse/csgraph/_tools.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/scipy/sparse/csgraph/_traversal.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/scipy/sparse/csgraph/_min_spanning_tree.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/scipy/sparse/csgraph/_reordering.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:     find library=libjpeg-3b10b538.so.9.3.0 [0]; searching
+       443:      search path=/usr/local/lib/python3.5/dist-packages/PIL/.libs/tls/x86_64:/usr/local/lib/python3.5/dist-packages/PIL/.libs/tls:/usr/local/lib/python3.5/dist-packages/PIL/.libs/x86_64:/usr/local/lib/python3.5/dist-packages/PIL/.libs            (RPATH from file /usr/local/lib/python3.5/dist-packages/PIL/_imaging.cpython-35m-x86_64-linux-gnu.so)
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/PIL/.libs/tls/x86_64/libjpeg-3b10b538.so.9.3.0
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/PIL/.libs/tls/libjpeg-3b10b538.so.9.3.0
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/PIL/.libs/x86_64/libjpeg-3b10b538.so.9.3.0
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/PIL/.libs/libjpeg-3b10b538.so.9.3.0
+       443:
+       443:     find library=libopenjp2-b3d7668a.so.2.3.1 [0]; searching
+       443:      search path=/usr/local/lib/python3.5/dist-packages/PIL/.libs           (RPATH from file /usr/local/lib/python3.5/dist-packages/PIL/_imaging.cpython-35m-x86_64-linux-gnu.so)
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/PIL/.libs/libopenjp2-b3d7668a.so.2.3.1
+       443:
+       443:     find library=libtiff-8267adfe.so.5.4.0 [0]; searching
+       443:      search path=/usr/local/lib/python3.5/dist-packages/PIL/.libs           (RPATH from file /usr/local/lib/python3.5/dist-packages/PIL/_imaging.cpython-35m-x86_64-linux-gnu.so)
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/PIL/.libs/libtiff-8267adfe.so.5.4.0
+       443:
+       443:     find library=liblzma-6cd627ed.so.5.2.4 [0]; searching
+       443:      search path=/usr/local/lib/python3.5/dist-packages/PIL/.libs/./tls/x86_64:/usr/local/lib/python3.5/dist-packages/PIL/.libs/./tls:/usr/local/lib/python3.5/dist-packages/PIL/.libs/./x86_64:/usr/local/lib/python3.5/dist-packages/PIL/.libs/.            (RPATH from file /usr/local/lib/python3.5/dist-packages/PIL/.libs/libtiff-8267adfe.so.5.4.0)
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/PIL/.libs/./tls/x86_64/liblzma-6cd627ed.so.5.2.4
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/PIL/.libs/./tls/liblzma-6cd627ed.so.5.2.4
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/PIL/.libs/./x86_64/liblzma-6cd627ed.so.5.2.4
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/PIL/.libs/./liblzma-6cd627ed.so.5.2.4
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/PIL/.libs/./liblzma-6cd627ed.so.5.2.4
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/PIL/.libs/libjpeg-3b10b538.so.9.3.0
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/PIL/.libs/libtiff-8267adfe.so.5.4.0
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/PIL/.libs/libopenjp2-b3d7668a.so.2.3.1
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/PIL/_imaging.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/scipy/ndimage/_nd_image.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/scipy/ndimage/_ni_label.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:     find library=libopenblasp-r0-2ecf47d5.3.7.dev.so [0]; searching
+       443:      search path=/usr/local/lib/python3.5/dist-packages/scipy/linalg/../.libs/tls/x86_64:/usr/local/lib/python3.5/dist-packages/scipy/linalg/../.libs/tls:/usr/local/lib/python3.5/dist-packages/scipy/linalg/../.libs/x86_64:/usr/local/lib/python3.5/dist-packages/scipy/linalg/../.libs            (RPATH from file /usr/local/lib/python3.5/dist-packages/scipy/linalg/_fblas.cpython-35m-x86_64-linux-gnu.so)
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/scipy/linalg/../.libs/tls/x86_64/libopenblasp-r0-2ecf47d5.3.7.dev.so
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/scipy/linalg/../.libs/tls/libopenblasp-r0-2ecf47d5.3.7.dev.so
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/scipy/linalg/../.libs/x86_64/libopenblasp-r0-2ecf47d5.3.7.dev.so
+       443:       trying file=/usr/local/lib/python3.5/dist-packages/scipy/linalg/../.libs/libopenblasp-r0-2ecf47d5.3.7.dev.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/scipy/linalg/../.libs/libopenblasp-r0-2ecf47d5.3.7.dev.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/scipy/linalg/_fblas.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/scipy/linalg/_flapack.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/scipy/linalg/_flinalg.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/scipy/linalg/_solve_toeplitz.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/scipy/linalg/_decomp_update.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/scipy/linalg/cython_blas.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/scipy/linalg/cython_lapack.cpython-35m-x86_64-linux-gnu.so
+       443:
+       443:
+       443:     calling init: /usr/local/lib/python3.5/dist-packages/tensorflow_core/lite/experimental/microfrontend/python/ops/_audio_microfrontend_op.so
+       443:
+       443:
+       443:     calling fini: /usr/local/bin/python [0]
+       443:
+       443:
+       443:     calling fini: /lib/x86_64-linux-gnu/libutil.so.1 [0]
+       443:
+       443:
+       443:     calling fini: /lib/x86_64-linux-gnu/libexpat.so.1 [0]
+       443:
+       443:
+       443:     calling fini: /lib/x86_64-linux-gnu/libz.so.1 [0]
+       443:
+       443:
+       443:     calling fini: /usr/lib/python3.5/lib-dynload/_opcode.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/lib/python3.5/lib-dynload/_ctypes.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/numpy/core/_multiarray_umath.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/numpy/core/_multiarray_tests.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/numpy/linalg/lapack_lite.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/numpy/linalg/_umath_linalg.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/numpy/core/../.libs/libopenblasp-r0-34a18dc3.3.7.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/lib/python3.5/lib-dynload/_bz2.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /lib/x86_64-linux-gnu/libbz2.so.1.0 [0]
+       443:
+       443:
+       443:     calling fini: /usr/lib/python3.5/lib-dynload/_lzma.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /lib/x86_64-linux-gnu/liblzma.so.5 [0]
+       443:
+       443:
+       443:     calling fini: /usr/lib/python3.5/lib-dynload/_decimal.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/lib/x86_64-linux-gnu/libmpdec.so.2 [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/numpy/fft/_pocketfft_internal.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/numpy/random/mtrand.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/numpy/random/common.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/numpy/random/bounded_integers.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/numpy/random/mt19937.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/numpy/random/bit_generator.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/lib/python3.5/lib-dynload/_hashlib.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/numpy/random/philox.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/numpy/random/pcg64.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/numpy/random/sfc64.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/numpy/random/generator.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/tensorflow_core/python/_pywrap_tensorflow_internal.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/google/protobuf/internal/_api_implementation.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/google/protobuf/pyext/_message.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/lib/python3.5/lib-dynload/_csv.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/lib/python3.5/lib-dynload/termios.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/tensorflow_core/python/framework/fast_tensor_util.so [0]
+       443:
+       443:
+       443:     calling fini: /lib/x86_64-linux-gnu/libuuid.so.1 [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/wrapt/_wrappers.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/lib/python3.5/lib-dynload/_json.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/lib/python3.5/lib-dynload/_ssl.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /lib/x86_64-linux-gnu/libssl.so.1.0.0 [0]
+       443:
+       443:
+       443:     calling fini: /lib/x86_64-linux-gnu/libcrypto.so.1.0.0 [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/h5py/_errors.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/h5py/h5.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/h5py/defs.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/h5py/_objects.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/h5py/_conv.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/h5py/h5r.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/h5py/h5t.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/h5py/utils.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/h5py/h5z.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/h5py/h5a.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/h5py/h5s.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/h5py/h5p.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/h5py/h5ac.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/h5py/_proxy.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/h5py/h5d.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/h5py/h5ds.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/h5py/h5f.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/h5py/h5g.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/h5py/h5i.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/h5py/h5fd.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/h5py/h5pl.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/h5py/h5o.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/h5py/h5l.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/h5py/.libs/libhdf5_hl-db841637.so.100.1.1 [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/h5py/.libs/libhdf5-49599f4e.so.103.0.0 [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/h5py/.libs/./libsz-1c7dd0cf.so.2.0.1 [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/h5py/.libs/./libaec-2147abcd.so.0.0.4 [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/scipy/_lib/_ccallback_c.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/scipy/sparse/_sparsetools.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/scipy/sparse/_csparsetools.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/scipy/sparse/csgraph/_shortest_path.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/scipy/sparse/csgraph/_tools.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/scipy/sparse/csgraph/_traversal.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/scipy/sparse/csgraph/_min_spanning_tree.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/scipy/sparse/csgraph/_reordering.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/PIL/_imaging.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/PIL/.libs/libopenjp2-b3d7668a.so.2.3.1 [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/PIL/.libs/libtiff-8267adfe.so.5.4.0 [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/PIL/.libs/libjpeg-3b10b538.so.9.3.0 [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/h5py/.libs/./libz-a147dcb0.so.1.2.3 [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/PIL/.libs/./liblzma-6cd627ed.so.5.2.4 [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/scipy/ndimage/_nd_image.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/scipy/ndimage/_ni_label.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/scipy/linalg/_fblas.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/scipy/linalg/_flapack.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/scipy/linalg/_flinalg.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/scipy/linalg/_solve_toeplitz.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/scipy/linalg/_decomp_update.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/scipy/linalg/cython_blas.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/scipy/linalg/cython_lapack.cpython-35m-x86_64-linux-gnu.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/scipy/linalg/../.libs/libopenblasp-r0-2ecf47d5.3.7.dev.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/numpy/core/../.libs/libgfortran-ed201abd.so.3.0.0 [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/tensorflow_core/lite/experimental/microfrontend/python/ops/_audio_microfrontend_op.so [0]
+       443:
+       443:
+       443:     calling fini: /usr/local/lib/python3.5/dist-packages/tensorflow_core/python/../libtensorflow_framework.so.2 [0]
+       443:
+       443:
+       443:     calling fini: /usr/lib/x86_64-linux-gnu/libstdc++.so.6 [0]
+       443:
+       443:
+       443:     calling fini: /lib/x86_64-linux-gnu/libgcc_s.so.1 [0]
+       443:
+       443:
+       443:     calling fini: /lib/x86_64-linux-gnu/librt.so.1 [0]
+       443:
+       443:
+       443:     calling fini: /lib/x86_64-linux-gnu/libm.so.6 [0]
+       443:
+       443:
+       443:     calling fini: /lib/x86_64-linux-gnu/libdl.so.2 [0]
+       443:
+       443:
+       443:     calling fini: /lib/x86_64-linux-gnu/libpthread.so.0 [0]
+       443:
+
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='CNOCycle' date='2019-12-16T11:28:41Z'>
+		I have tried on colab with TF version 2.0  and was able to reproduce the issue.Please, find the gist &lt;denchmark-link:https://colab.sandbox.google.com/gist/ravikyram/8a6018f81c690559cafa31428706bd61/untitled484.ipynb&gt;here&lt;/denchmark-link&gt;
+. Thanks!
+		</comment>
+		<comment id='2' author='CNOCycle' date='2019-12-16T16:39:49Z'>
+		We don't support custom losses in legacy graph mode (which is what you have if you disable eager mode). Does this fail if you use proper TF 2.0 (without disabling eager mode)?
+		</comment>
+		<comment id='3' author='CNOCycle' date='2019-12-17T01:15:39Z'>
+		&lt;denchmark-link:https://github.com/guptapriya&gt;@guptapriya&lt;/denchmark-link&gt;
+
+How do I know which functions or features will not be supported or maintained in future?
+Yes, I still got an error when I disable eager_mode.
+First, I removed Session and tf.compat.v1.disable_eager_execution() in my testcase and ran testcase without tf.distribute.MirroredStrategy() in tf=2.0.0.
+The testcase can be seen in the following:
+#%%
+from distutils.version import LooseVersion
+import numpy as np
+import tensorflow as tf
+
+#tf.compat.v1.disable_eager_execution()
+
+batch_size = 100
+img_h = 32
+img_w = 32
+img_min = 0
+img_max = 1
+channels = 3
+num_classes = 10
+
+strategy = tf.distribute.MirroredStrategy()
+#%%
+def download_data():
+
+    # get raw data
+    (trainX, trainY), (testX, testY) = tf.keras.datasets.cifar10.load_data()
+    trainX = trainX.astype(np.float32)
+    testX  = testX.astype(np.float32)
+
+    # ont-hot
+    trainY = tf.keras.utils.to_categorical(trainY, 10)
+    testY  = tf.keras.utils.to_categorical(testY , 10)
+
+    # get validation sets
+    training_size = 45000
+    validX = trainX[training_size:,:]
+    validY = trainY[training_size:,:]
+
+    trainX = trainX[:training_size,:]
+    trainY = trainY[:training_size,:]
+
+    return trainX, trainY, validX, validY, testX, testY
+
+#%%
+class DataGenerator:
+
+    def __init__(self, dataX, dataY, total_len, batch_size):
+
+        super().__init__()
+
+        self.total_len  = total_len
+        self.batch_size = batch_size
+        self.cleanX = dataX
+        self.totalY = dataY
+        self.on_epoch_end()
+
+    def __build_pipeline(self, dataX, dataY):
+
+        # create dataset API
+        def preprocess_fn(dataX, dataY):
+            
+            dataX = tf.image.random_flip_left_right(dataX)
+
+            # workaround solution
+            if LooseVersion(tf.__version__) &lt; LooseVersion('1.14.0'):
+                outputX = dataX
+            else:
+                outputX = (dataX, dataY)
+            return outputX, dataY
+
+        dataset = tf.data.Dataset.from_tensor_slices( (dataX, dataY) )
+        dataset = dataset.shuffle(batch_size * 8)
+        dataset = dataset.repeat()
+        dataset = dataset.batch(batch_size)
+        dataset = dataset.map(preprocess_fn, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+        dataset = dataset.prefetch(tf.data.experimental.AUTOTUNE)
+
+        self.dataset   = dataset
+
+    def  __len__(self):
+
+        return self.total_len // self.batch_size
+
+    def on_epoch_end(self):
+
+        # run permutation
+        rand_idx = np.random.permutation(self.total_len)
+        cleanX = self.cleanX[rand_idx]
+        totalY = self.totalY[rand_idx]
+
+        self.__build_pipeline(cleanX, totalY)
+
+#%%
+# ref: https://keras.io/examples/cifar10_resnet/
+def build_clf():
+    #with strategy.scope():
+    if True:
+        def resnet_layer(inputs,
+                        num_filters=16,
+                        kernel_size=3,
+                        strides=1,
+                        activation='relu',
+                        batch_normalization=True,
+                        conv_first=True):
+            """2D Convolution-Batch Normalization-Activation stack builder
+
+            # Arguments
+                inputs (tensor): input tensor from input image or previous layer
+                num_filters (int): Conv2D number of filters
+                kernel_size (int): Conv2D square kernel dimensions
+                strides (int): Conv2D square stride dimensions
+                activation (string): activation name
+                batch_normalization (bool): whether to include batch normalization
+                conv_first (bool): conv-bn-activation (True) or
+                    bn-activation-conv (False)
+
+            # Returns
+                x (tensor): tensor as input to the next layer
+            """
+            conv = tf.keras.layers.Conv2D(num_filters,
+                        kernel_size=kernel_size,
+                        strides=strides,
+                        padding='same',
+                        kernel_initializer='he_normal',
+                        kernel_regularizer=tf.keras.regularizers.l2(1e-4))
+
+            x = inputs
+            if conv_first:
+                x = conv(x)
+                if batch_normalization:
+                    x = tf.keras.layers.BatchNormalization()(x)
+                if activation is not None:
+                    x = tf.keras.layers.Activation(activation)(x)
+            else:
+                if batch_normalization:
+                    x = tf.keras.layers.BatchNormalization()(x)
+                if activation is not None:
+                    x = tf.keras.layers.Activation(activation)(x)
+                x = conv(x)
+            return x
+
+        def cw_loss(y_true, y_pred):
+            label_mask  = label_ref
+            pre_softmax = x
+            if LooseVersion(tf.__version__) &lt; LooseVersion('1.14.0'):
+                correct_logit = tf.reduce_sum(label_mask * pre_softmax, axis=1, keep_dims=True)
+            else:
+                correct_logit = tf.reduce_sum(label_mask * pre_softmax, axis=1, keepdims=True)
+            distance = tf.nn.relu( pre_softmax - correct_logit + (1-label_mask) * 10)
+            inactivate = tf.cast( tf.less_equal(distance, 1e-9), dtype=tf.float32)
+            weight = tf.keras.layers.Activation('softmax')(-1e9*inactivate + distance)
+            loss = tf.reduce_sum((1-label_mask) * distance * weight, axis=1)
+            loss = tf.math.reduce_mean(loss)
+            return loss
+
+        # set model's parameters (depth = n * 6 + 2)
+        n = 8
+        num_filters = 16
+
+        clf_input = tf.keras.layers.Input(shape=(img_h, img_w, channels), name="model/input")
+        label_ref = tf.keras.layers.Input(shape=(num_classes,), name='label_ref')
+        input_list = [clf_input, label_ref]
+
+        x = resnet_layer(inputs=clf_input)
+        for stack in range(3):
+            for res_block in range(n):
+                strides = 1
+                if stack &gt; 0 and res_block == 0:  # first layer but not first stack
+                    strides = 2  # downsample
+                y = resnet_layer(inputs=x,
+                                num_filters=num_filters,
+                                strides=strides)
+                y = resnet_layer(inputs=y,
+                                num_filters=num_filters,
+                                activation=None)
+                if stack &gt; 0 and res_block == 0:  # first layer but not first stack
+                    # linear projection residual shortcut connection to match
+                    # changed dims
+                    x = resnet_layer(inputs=x,
+                                    num_filters=num_filters,
+                                    kernel_size=1,
+                                    strides=strides,
+                                    activation=None,
+                                    batch_normalization=False)
+                x = tf.keras.layers.Add()([x, y])
+                x = tf.keras.layers.Activation('relu')(x)
+            num_filters *= 2
+
+        x = tf.keras.layers.AveragePooling2D(pool_size=8)(x)
+        x = tf.keras.layers.Flatten()(x)
+        x = tf.keras.layers.Dense(num_classes , kernel_initializer='he_normal', activation=None)(x)
+        y = tf.keras.layers.Activation('softmax')(x)
+
+        optimizer = tf.keras.optimizers.Adam(lr=0.001)
+        clf_model = tf.keras.models.Model(inputs=input_list, outputs=y, name='clf_model')
+        clf_model.compile(loss='categorical_crossentropy', optimizer=optimizer, metrics=['accuracy', cw_loss])
+    clf_model.summary()
+
+    return clf_model
+
+#%%
+if __name__ == '__main__':
+
+    # set GPU
+    import os
+    if os.environ.get("CUDA_VISIBLE_DEVICES") is None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+    # Hyperparameters
+    batch_size = 100
+    epochs = 1
+
+    # prepare data
+    trainX, trainY, validX, validY, testX, testY = download_data()
+    train_gen = DataGenerator(trainX, trainY, trainY.shape[0], batch_size)
+    valid_gen = DataGenerator(validX, validY, validY.shape[0], batch_size)
+    test_gen  = DataGenerator(testX, testY, testY.shape[0], batch_size)
+
+    # build model
+    model = build_clf()
+
+    # train model
+    model.fit(train_gen.dataset,
+                    epochs=epochs,
+                    steps_per_epoch = train_gen.__len__(),
+                    validation_data=valid_gen.dataset,
+                    validation_steps= valid_gen.__len__(),
+                    verbose=1)
+
+    # print result
+    meta_string = '[Testing]'
+    prefix_string = ''
+    output = model.evaluate(test_gen.dataset, steps = test_gen.__len__())
+    for ii in range( len( model.metrics_names) ):
+        meta_string = meta_string + '- {:s}{:s}: {:.3f} '.format(prefix_string, model.metrics_names[ii], output[ii])
+
+    print(meta_string)
+I got the following error message:
+&lt;denchmark-code&gt;__________________________________________________________________________________________________
+Train for 450 steps, validate for 50 steps
+  1/450 [..............................] - ETA: 35:06Traceback (most recent call last):
+  File "/home/ecchen/opt/miniconda/envs/tf/lib/python3.6/site-packages/tensorflow_core/python/eager/execute.py", line 61, in quick_execute
+    num_outputs)
+TypeError: An op outside of the function building code is being passed
+a "Graph" tensor. It is possible to have Graph tensors
+leak out of the function building context by including a
+tf.init_scope in your function building code.
+For example, the following function will fail:
+  @tf.function
+  def has_init_scope():
+    my_constant = tf.constant(1.)
+    with tf.init_scope():
+      added = my_constant * 2
+The graph tensor has name: label_ref:0
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "bug.py", line 223, in &lt;module&gt;
+    verbose=1)
+  File "/home/ecchen/opt/miniconda/envs/tf/lib/python3.6/site-packages/tensorflow_core/python/keras/engine/training.py", line 728, in fit
+    use_multiprocessing=use_multiprocessing)
+  File "/home/ecchen/opt/miniconda/envs/tf/lib/python3.6/site-packages/tensorflow_core/python/keras/engine/training_v2.py", line 324, in fit
+    total_epochs=epochs)
+  File "/home/ecchen/opt/miniconda/envs/tf/lib/python3.6/site-packages/tensorflow_core/python/keras/engine/training_v2.py", line 123, in run_one_epoch
+    batch_outs = execution_function(iterator)
+  File "/home/ecchen/opt/miniconda/envs/tf/lib/python3.6/site-packages/tensorflow_core/python/keras/engine/training_v2_utils.py", line 86, in execution_function
+    distributed_function(input_fn))
+  File "/home/ecchen/opt/miniconda/envs/tf/lib/python3.6/site-packages/tensorflow_core/python/eager/def_function.py", line 457, in __call__
+    result = self._call(*args, **kwds)
+  File "/home/ecchen/opt/miniconda/envs/tf/lib/python3.6/site-packages/tensorflow_core/python/eager/def_function.py", line 520, in _call
+    return self._stateless_fn(*args, **kwds)
+  File "/home/ecchen/opt/miniconda/envs/tf/lib/python3.6/site-packages/tensorflow_core/python/eager/function.py", line 1823, in __call__
+    return graph_function._filtered_call(args, kwargs)  # pylint: disable=protected-access
+  File "/home/ecchen/opt/miniconda/envs/tf/lib/python3.6/site-packages/tensorflow_core/python/eager/function.py", line 1141, in _filtered_call
+    self.captured_inputs)
+  File "/home/ecchen/opt/miniconda/envs/tf/lib/python3.6/site-packages/tensorflow_core/python/eager/function.py", line 1224, in _call_flat
+    ctx, args, cancellation_manager=cancellation_manager)
+  File "/home/ecchen/opt/miniconda/envs/tf/lib/python3.6/site-packages/tensorflow_core/python/eager/function.py", line 511, in call
+    ctx=ctx)
+  File "/home/ecchen/opt/miniconda/envs/tf/lib/python3.6/site-packages/tensorflow_core/python/eager/execute.py", line 75, in quick_execute
+    "tensors, but found {}".format(keras_symbolic_tensors))
+tensorflow.python.eager.core._SymbolicException: Inputs to eager execution function cannot be Keras symbolic tensors, but found [&lt;tf.Tensor 'label_ref:0' shape=(None, 10) dtype=float32&gt;, &lt;tf.Tensor 'dense/Identity:0' shape=(None, 10) dtype=float32&gt;]
+&lt;/denchmark-code&gt;
+
+Next, I tried to custom model with tf.distribute.MirroredStrategy()
+-    #with strategy.scope():
+-    if True:
++    with strategy.scope():
++    #if True:
+I still got same error.
+In conclusion, tf.distribute.MirroredStrategy() dose not support custom loss.
+		</comment>
+		<comment id='4' author='CNOCycle' date='2019-12-17T01:32:50Z'>
+		The error reported in &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/35093#issuecomment-566334859&gt;#35093 (comment)&lt;/denchmark-link&gt;
+ - is that happening both with and without MirroredStrategy?
+Also you're using "cw_loss" as a metric? I don't see from the code how that is being used as a custom loss.
+There are a few tests in &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/master/tensorflow/python/keras/distribute/distribute_strategy_test.py&gt;https://github.com/tensorflow/tensorflow/blob/master/tensorflow/python/keras/distribute/distribute_strategy_test.py&lt;/denchmark-link&gt;
+ which test MirroredStrategy works with custom losses.
+		</comment>
+		<comment id='5' author='CNOCycle' date='2019-12-17T01:45:14Z'>
+		Yes, error is that happening both with and without MirroredStrategy
+And Yes, I use cw_loss as a metric in this testcase.
+Because I will switch loss form categorical_crossentropy to cw_loss during our custom training phase.
+But I want to know that which epoch is the best epoch to do the conversion.
+So I have to record my custom loss as metric in the beginning.
+		</comment>
+		<comment id='6' author='CNOCycle' date='2019-12-17T01:49:41Z'>
+		&lt;denchmark-link:https://github.com/guptapriya&gt;@guptapriya&lt;/denchmark-link&gt;
+
+If you want to test cw_loss as loss, Please apply the following patch.
+-        clf_model.compile(loss='categorical_crossentropy', optimizer=optimizer, metrics=['accuracy', 
++        clf_model.compile(loss=cw_loss, optimizer=optimizer, metrics=['accuracy', 'categorical_crossentropy'])
+
+tf still throws error.
+		</comment>
+		<comment id='7' author='CNOCycle' date='2020-08-04T17:51:47Z'>
+		Hi &lt;denchmark-link:https://github.com/CNOCycle&gt;@CNOCycle&lt;/denchmark-link&gt;
+, I've run the code you provided in &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/35093#issuecomment-566334859&gt;this comment&lt;/denchmark-link&gt;
+ with tf-nightly, and see a type error
+
+I then replaced
+clf_model.compile(loss='categorical_crossentropy', optimizer=optimizer, metrics=['accuracy', cw_loss]
+with
+clf_model.compile(loss=cw_loss, optimizer=optimizer, metrics=['accuracy', 'categorical_crossentropy'])
+And get
+ TypeError: Cannot convert a symbolic Keras input/output to a numpy array. This error may indicate that you're trying to pass a symbolic value to a NumPy call, which is not supported. Or, you may be trying to pass Keras symbolic inputs/outputs to a TF API that does not register dispatching, preventing Keras from automatically converting the API call to a lambda layer in the Functional Model.
+So there seem to be two different issues that are not related to MirroredStrategy, as both errors occur when training without MirroredStrategy. You'll want to test you code without distribution and make sure it works first, before wrapping it in MirroredStrategy.
+If you are still facing difficulties with your model and want to open up a new issue for either of these errors feel free to do so. As &lt;denchmark-link:https://github.com/guptapriya&gt;@guptapriya&lt;/denchmark-link&gt;
+ mentioned, MirroredStrategy does work with custom losses and it seems to me you are facing a different problem other than MirroredStrategy and custom losses.
+		</comment>
+		<comment id='8' author='CNOCycle' date='2020-08-05T10:16:48Z'>
+		I guess that tensorflow has huge upgrades from 2.0 to 2.3 or above. I can't successfully run my code either in tf-nightly.
+I will try to redesign a new custom loss for tf-nightly.
+From my opinion, custom loss with MirroredStrategy is still a important feature.
+Some of models with custom loss are complex and it should be trained with GPUs.
+It has been worked in TF1 as least.
+		</comment>
+		<comment id='9' author='CNOCycle' date='2020-08-05T16:00:52Z'>
+		Agreed that it's an important feature, and as mentioned earlier custom losses do work with MirroredStrategy. I'd be happy to share an example with you if that's helpful. Also, if you look through the dist-strat component issues on Github you'll see some different examples of custom losses with MirroredStrategy.
+		</comment>
+		<comment id='10' author='CNOCycle' date='2020-08-11T19:46:20Z'>
+		Closing this issue now since custom loss functions are supported with MirroredStrategy. Please open a new issue if you find an example where this is not the case.
+		</comment>
+		<comment id='11' author='CNOCycle' date='2020-08-11T19:46:22Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/35093&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/35093&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='12' author='CNOCycle' date='2020-09-07T08:36:48Z'>
+		&lt;denchmark-link:https://github.com/nikitamaia&gt;@nikitamaia&lt;/denchmark-link&gt;
+ I am facing the same issue, it would be useful if you could share the links here for future references.
+		</comment>
+		<comment id='13' author='CNOCycle' date='2020-09-08T22:18:48Z'>
+		Hi &lt;denchmark-link:https://github.com/uzi0espil&gt;@uzi0espil&lt;/denchmark-link&gt;
+, can you open a new issue with information on the problem you're facing and reproducible code? I can help you to debug.
+		</comment>
+		<comment id='14' author='CNOCycle' date='2020-09-16T15:57:40Z'>
+		Hi, &lt;denchmark-link:https://github.com/nikitamaia&gt;@nikitamaia&lt;/denchmark-link&gt;
+, could you let me know which version supports the custom loss with MirroredStrategy?
+		</comment>
+	</comments>
+</bug>

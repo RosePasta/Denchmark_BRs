@@ -1,0 +1,162 @@
+<bug id='38506' author='rakshanda22' open_date='2020-04-13T20:08:55Z' closed_time='2020-05-07T17:57:50Z'>
+	<summary>Keras Assertion Error for TPU Strategy</summary>
+	<description>
+I get the following assertion error at .fit() when trying to use TPU distributed strategy.
+&lt;denchmark-code&gt;Model: "my_model_final"
+_________________________________________________________________
+Layer (type)                 Output Shape              Param #   
+=================================================================
+my_model (MyModel)           multiple                  2098016   
+_________________________________________________________________
+dense_2 (Dense)              multiple                  3120      
+_________________________________________________________________
+layer_normalization_9 (Layer multiple                  96        
+_________________________________________________________________
+dense_3 (Dense)              multiple                  4160      
+_________________________________________________________________
+output_2 (Dense)             multiple                  65        
+_________________________________________________________________
+output_1 (EmbeddingSimilarit multiple                  32000     
+=================================================================
+Total params: 2,137,457
+Trainable params: 2,137,457
+Non-trainable params: 0
+_________________________________________________________________
+None
+Traceback (most recent call last):
+  File "copy_train_lm.py", line 91, in &lt;module&gt;
+    model.fit(x=gen(all_files,128), epochs=100, steps_per_epoch=100)#,
+  File "/usr/local/lib/python3.7/dist-packages/tensorflow_core/python/keras/engine/training.py", line 819, in fit
+    use_multiprocessing=use_multiprocessing)
+  File "/usr/local/lib/python3.7/dist-packages/tensorflow_core/python/keras/engine/training_distributed.py", line 619, in fit
+    epochs=epochs)
+  File "/usr/local/lib/python3.7/dist-packages/tensorflow_core/python/keras/engine/training.py", line 2242, in _distribution_standardize_user_data
+    assert isinstance(x, dataset_ops.DatasetV2)
+AssertionError
+&lt;/denchmark-code&gt;
+
+This is my code to reproduce the results:
+&lt;denchmark-code&gt;import numpy as np 
+import tensorflow as tf 
+from keras_model import MyModelFinal
+from tensorflow import keras
+tf.compat.v1.disable_eager_execution()
+resolver = tf.distribute.cluster_resolver.TPUClusterResolver(tpu='rakshanda-agarwal')
+tf.config.experimental_connect_to_host(resolver.master())tf.tpu.experimental.initialize_tpu_system(resolver)
+strategy = tf.distribute.experimental.TPUStrategy(resolver)
+
+def gen(all_files, batch_size):
+    while True:
+        for file in all_files:
+            with np.load(file) as data:
+                for i in range(0,len(data["input_ids"]),batch_size):
+
+                    input_ids = data["input_ids"][i:(i+batch_size)] 
+                    input_mask = data['input_mask'][i:(i+batch_size)]
+                    segment_ids = data["segment_ids"][i:(i+batch_size)]
+                    masked_lm_positions = data["masked_lm_positions"][i:(i+batch_size)]
+                    masked_lm_ids = data["masked_lm_ids"][i:(i+batch_size)]
+                    masked_lm_weights = data["masked_lm_weights"][i:(i+batch_size)]
+                    next_sentence_labels = data["next_sentence_labels"][i:(i+batch_size)]
+
+                    # masked_lm_weights=tf.reshape(masked_lm_weights,[128*20])
+                    # masked_lm_ids=tf.reshape(masked_lm_ids, [128,20,1])
+                    yield ([input_ids, segment_ids, input_mask, masked_lm_positions],
+                        [[masked_lm_ids,masked_lm_weights], next_sentence_labels])
+                        # {'output_1':masked_lm_ids, 'output_2':next_sentence_labels}, 
+                        # {'output_1':masked_lm_weights, 'output_2':np.ones(batch_size)})
+                        # [masked_lm_ids, next_sentence_labels],[masked_lm_weights,1])
+
+                        # [masked_lm_ids, next_sentence_labels],[masked_lm_weights,np.ones(batch_size)])
+
+
+all_files=["data1/train/1.npz"]
+# val_files=["LM1/train/1.npz"]
+
+batch_size = 128
+out_filters = 64
+num_layers = 4
+
+def loss1(logits, y, vocab_size=32000):
+    print(y)
+    masked_lm_ids = y[0]
+    masked_lm_weights = y[1]
+    logits = tf.reshape(logits, [2560,32000])
+    log_probs = tf.nn.log_softmax(logits, axis=-1)
+    masked_lm_ids = tf.reshape(masked_lm_ids, [-1])
+    masked_lm_weights = tf.reshape(masked_lm_weights, [-1])
+    one_hot_labels = tf.one_hot(masked_lm_ids, depth=vocab_size, dtype=tf.float32)
+    per_example_loss = -tf.reduce_sum(log_probs * one_hot_labels, axis=[-1])
+    numerator = tf.reduce_sum(masked_lm_weights * per_example_loss)
+    denominator = tf.reduce_sum(masked_lm_weights) + 1e-5
+    loss=numerator / denominator
+    return loss
+
+with strategy.scope():
+    model=MyModelFinal(out_filters=64, is_training=True, emb_size=48, 
+        vocab_size=32000, max_seq_length=128, num_layers=4) 
+
+    
+    with np.load(all_files[0]) as data:
+        for i in range(0,len(data["input_ids"]),batch_size):
+
+            input_ids = data["input_ids"][i:(i+batch_size)] 
+            input_mask = data['input_mask'][i:(i+batch_size)]
+            segment_ids = data["segment_ids"][i:(i+batch_size)]
+            masked_lm_positions = data["masked_lm_positions"][i:(i+batch_size)]
+            # masked_lm_ids = data["masked_lm_ids"][i:(i+batch_size)]
+            # masked_lm_weights = data["masked_lm_weights"][i:(i+batch_size)]
+            # next_sentence_labels = data["next_sentence_labels"][i:(i+batch_size)]
+
+            model([input_ids, segment_ids, input_mask, masked_lm_positions])
+            break
+
+
+    print(model.summary())
+
+    optimizer = keras.optimizers.Adam(lr=0.0002)
+    losses={'output_1':loss1,
+        'output_2':'binary_crossentropy'}
+
+    # lossWeights = {"output_1": 1.0, "output_2": 1.0}
+
+    model.compile(optimizer=optimizer, loss=losses)
+    # ,
+    #     sample_weight_mode={'output_1' : 'temporal', 'output_2':None})
+
+model.fit(x=gen(all_files,128), epochs=100, steps_per_epoch=100)#,
+    # validation_data=gen(val_files,128),
+    # 
+    # validation_steps=100, validation_freq=1)
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='rakshanda22' date='2020-04-14T07:29:19Z'>
+		&lt;denchmark-link:https://github.com/rakshanda22&gt;@rakshanda22&lt;/denchmark-link&gt;
+, Please provide the Tensorflow version that you are using. Thanks
+		</comment>
+		<comment id='2' author='rakshanda22' date='2020-04-14T15:48:43Z'>
+		&lt;denchmark-link:https://github.com/gadagashwini&gt;@gadagashwini&lt;/denchmark-link&gt;
+ I am using tensorflow 2.1.0
+		</comment>
+		<comment id='3' author='rakshanda22' date='2020-04-15T16:09:28Z'>
+		&lt;denchmark-link:https://github.com/rakshanda22&gt;@rakshanda22&lt;/denchmark-link&gt;
+ Can you please share a standalone code to reproduce the error? I tried to make a &lt;denchmark-link:https://colab.research.google.com/gist/jvishnuvardhan/d7a982e1fc59ca597b9c74ce8a0e5378/untitled88.ipynb&gt;gist&lt;/denchmark-link&gt;
+, but it is throwing errors. Thanks!
+		</comment>
+		<comment id='4' author='rakshanda22' date='2020-04-15T16:34:27Z'>
+		Could you try tf 2.2rc or tf nightly? There's a refactor model.fit() so it's somewhat hard to debug a 2.1 issue
+		</comment>
+		<comment id='5' author='rakshanda22' date='2020-05-07T17:57:50Z'>
+		Keras and TPU Strategy will work best with eager execution enabled, as that will ensure the TF v2 datasets are used. Please enable eager execution, and file a new issue if the problem persists.
+		</comment>
+		<comment id='6' author='rakshanda22' date='2020-05-07T17:57:52Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/38506&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/38506&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

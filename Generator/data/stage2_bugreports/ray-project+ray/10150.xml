@@ -1,0 +1,285 @@
+<bug id='10150' author='mattearllongshot' open_date='2020-08-17T09:07:43Z' closed_time='2020-08-27T16:48:24Z'>
+	<summary>Poor spillback scheduling behavior in large clusters</summary>
+	<description>
+&lt;denchmark-h:h1&gt;What is the problem?&lt;/denchmark-h&gt;
+
+Ray version: 0.8.5
+Python version: 3.8.1
+OS: Ubuntu 18.04.4 LTS
+When launching 3000 tasks on an autoscaling EC2 cluster, start times are staggered by more than a minute.  Here is an image illustrating this:
+&lt;denchmark-link:https://user-images.githubusercontent.com/37295291/90377427-e408e000-e06f-11ea-8974-864d7f5a8598.png&gt;&lt;/denchmark-link&gt;
+
+Each horizontal line here represents a task, and they are grouped into blocks according to node that the task is run on, and then ordered by start time.  The x-axis scale is seconds.  As you can see, on some nodes some tasks can start over a minute after others, even if the task is doing a simple sleep, which can extend the run time of the task / incur unnecessary EC2 charges.
+&lt;denchmark-h:h3&gt;Reproduction (REQUIRED)&lt;/denchmark-h&gt;
+
+Boot an EC2 cluster using worker types c4.8xlarge, and then run the following script.  You'll need matplotlib / pandas / numpy installed to reproduce the plot, but otherwise it'll run with just ray.
+&lt;denchmark-code&gt;import datetime
+import socket
+import time
+
+import ray
+from ray.autoscaler.autoscaler import request_resources
+
+ray.init('127.0.0.1:6379')
+
+@ray.remote(num_cpus=1)
+def func():
+    start = datetime.datetime.utcnow()
+    time.sleep(120)
+    end = datetime.datetime.utcnow()
+    return start, end, socket.gethostname()
+
+request_resources(3000)
+results = ray.get([func.remote() for _ in range(3000)])   # errors/warnings produced here
+
+#  Produce the plot
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+df = pd.DataFrame(data=results, columns=['start_time', 'end_time', 'host_name'])
+df = df.sort_values(['host_name', 'start_time'])
+min_time = df.start_time.min()
+
+y = 0
+last_host_name = None
+plt.figure(figsize=(20, 100))
+for _, row in df.iterrows():
+    if last_host_name != None and row.host_name != last_host_name:
+        y += 10
+    x1 = (row.start_time - min_time).total_seconds()
+    x2 = (row.end_time - min_time).total_seconds()
+    plt.plot([x1, x2], [y, y])
+    y += 1
+    last_host_name = row.host_name
+&lt;/denchmark-code&gt;
+
+At the point of running   a few errors are output, which I've attached here:
+&lt;denchmark-link:https://github.com/ray-project/ray/files/5083237/errors.txt&gt;errors.txt&lt;/denchmark-link&gt;
+
+I tried it with a smaller set of tasks (1000) but couldn't reproduce the issue.
+
+ I have verified my script runs in a clean environment and reproduces the issue.
+ I have verified the issue also occurs with the latest wheels.
+
+	</description>
+	<comments>
+		<comment id='1' author='mattearllongshot' date='2020-08-17T18:36:13Z'>
+		cc &lt;denchmark-link:https://github.com/wuisawesome&gt;@wuisawesome&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/ijrsvt&gt;@ijrsvt&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='2' author='mattearllongshot' date='2020-08-17T22:01:56Z'>
+		Interesting. &lt;denchmark-link:https://github.com/mattearllongshot&gt;@mattearllongshot&lt;/denchmark-link&gt;
+ to clarify, does this happen also on a fixed-sized (non-autoscaling cluster)?
+I can't think of any reason why this would happen, beyond some scheduling bug (cc &lt;denchmark-link:https://github.com/stephanie-wang&gt;@stephanie-wang&lt;/denchmark-link&gt;
+ for ideas)
+		</comment>
+		<comment id='3' author='mattearllongshot' date='2020-08-17T22:39:12Z'>
+		It seems likely due to bad behavior in the spillback policy used to load-balance tasks in a cluster. Could also just be that the spillback policy is too slow to push tasks onto other nodes. &lt;denchmark-link:https://github.com/wuisawesome&gt;@wuisawesome&lt;/denchmark-link&gt;
+ probably has a better idea than me.
+		</comment>
+		<comment id='4' author='mattearllongshot' date='2020-08-17T22:51:27Z'>
+		Ah, this might just be fixed in the new scheduler (or at least, it makes sense to investigate after we've enabled the new scheduler).
+		</comment>
+		<comment id='5' author='mattearllongshot' date='2020-08-17T22:59:30Z'>
+		&lt;denchmark-link:https://github.com/mattearllongshot&gt;@mattearllongshot&lt;/denchmark-link&gt;
+ you mentioned errors/warnings. are these just warning about the number of workers started? or are there other warnings?
+My initial instinct was that this could be a side effect of rate limiting the number of in flight lease requests?
+If Stephanie's theory is correct, this should go away/change with the new scheduler. I agree that we should investigate after/when enabling the new scheduler.
+		</comment>
+		<comment id='6' author='mattearllongshot' date='2020-08-18T09:53:11Z'>
+		Hi &lt;denchmark-link:https://github.com/wuisawesome&gt;@wuisawesome&lt;/denchmark-link&gt;
+, I've pasted the errors here &lt;denchmark-link:https://github.com/ray-project/ray/files/5083237/errors.txt&gt;https://github.com/ray-project/ray/files/5083237/errors.txt&lt;/denchmark-link&gt;
+ . They look like raylet crashes.  Both of the IPs shown in the log are for worker nodes.
+Is the new scheduler in the nightlies?  I've just reproduced the issue with the latest ray nightly build (latest as of Monday, at least).  Here is the output from that run:
+&lt;denchmark-link:https://github.com/ray-project/ray/files/5089621/errors-2020-08-18.txt&gt;errors-2020-08-18.txt&lt;/denchmark-link&gt;
+.
+		</comment>
+		<comment id='7' author='mattearllongshot' date='2020-08-18T10:13:15Z'>
+		I've just managed to reproduce something similar locally (with yesterday's nightly).
+&lt;denchmark-code&gt;import datetime, time, ray
+
+ray.init(num_cpus=50)
+
+@ray.remote(num_cpus=1)
+def func():
+    start = datetime.datetime.utcnow()
+    time.sleep(15)
+    return start
+
+results = ray.get([func.remote() for _ in range(30)])
+min_time = min(results)
+print([(r - min_time).total_seconds() for r in results])
+&lt;/denchmark-code&gt;
+
+output:
+[0.002964, 0.002317, 0.021966, 0.0, 0.001448, 0.034085, 0.003278, 0.004434, 0.004678, 0.00506, 0.005454, 0.006248, 0.344598, 0.682394, 1.028834, 1.362036, 1.698101, 2.02707, 2.370679, 2.71421, 3.103086, 3.429623, 3.792918, 4.165995, 4.483482, 4.817203, 5.157538, 5.475349, 5.825019, 6.172419]
+so start times are staggered by up to 6 seconds, when launching 30 sleep tasks.  Could this be related to the main issue above?  No raylet crashes this time though.
+		</comment>
+		<comment id='8' author='mattearllongshot' date='2020-08-18T16:36:30Z'>
+		That's probably just worker start delay, it takes time to launch 50
+workers. Subsequent runs will be faster.
+&lt;denchmark-link:#&gt;…&lt;/denchmark-link&gt;
+
+
+On Tue, Aug 18, 2020, 3:13 AM mattearllongshot ***@***.***&gt; wrote:
+ I've just managed to reproduce something similar locally (with yesterday's
+ nightly).
+
+ import datetime, time, ray
+
+ ray.init(num_cpus=50)
+
+ @ray.remote(num_cpus=1)
+ def func():
+     start = datetime.datetime.utcnow()
+     time.sleep(15)
+     return start
+
+ results = ray.get([func.remote() for _ in range(30)])
+ min_time = min(results)
+ print([(r - min_time).total_seconds() for r in results])
+
+ output:
+ [0.002964, 0.002317, 0.021966, 0.0, 0.001448, 0.034085, 0.003278,
+ 0.004434, 0.004678, 0.00506, 0.005454, 0.006248, 0.344598, 0.682394,
+ 1.028834, 1.362036, 1.698101, 2.02707, 2.370679, 2.71421, 3.103086,
+ 3.429623, 3.792918, 4.165995, 4.483482, 4.817203, 5.157538, 5.475349,
+ 5.825019, 6.172419]
+
+ so start times are staggered by up to 6 seconds, when launching 30 sleep
+ tasks. Could this be related to the main issue above?
+
+ —
+ You are receiving this because you commented.
+ Reply to this email directly, view it on GitHub
+ &lt;#10150 (comment)&gt;,
+ or unsubscribe
+ &lt;https://github.com/notifications/unsubscribe-auth/AAADUSRJP2YHH4YEMR6KGL3SBJH4VANCNFSM4QBNQ3PQ&gt;
+ .
+
+
+
+		</comment>
+		<comment id='9' author='mattearllongshot' date='2020-08-18T18:53:52Z'>
+		Hmm yeah 300ms is long, but we never really optimize for start up time so it's definitely believable. I will label this an enhancement because we could probably do a better job of tuning some of our constants (in this case, maybe maximum_startup_concurrency)
+		</comment>
+		<comment id='10' author='mattearllongshot' date='2020-08-18T20:09:14Z'>
+		Hmm &lt;denchmark-link:https://github.com/wuisawesome&gt;@wuisawesome&lt;/denchmark-link&gt;
+, is that relevant to the original issue, though? It doesn't seem like worker startup time alone explains the staggered tasks in the cluster version. Anyway, it'd be good to confirm if that's the case.
+		</comment>
+		<comment id='11' author='mattearllongshot' date='2020-08-18T21:28:53Z'>
+		So the 2 "non-bug" factors here are autoscaling latency and overhead of spinning up new workers. We should probably confirm both of those, and see what portion of the staggering this accounts for (it sounds like your intuition is saying it won't account for all of this?)
+		</comment>
+		<comment id='12' author='mattearllongshot' date='2020-08-18T21:35:43Z'>
+		I don't think autoscaling latency is relevant here since the diagram shows that all machines start at around the same time.
+The reason I don't think the worker startup time is the only issue is because the diagram shows that times are staggered by up to ~60s. c4.8xlarge as 36 vCPUs, so that would mean nearly 2s to start each worker process, which seems very high.
+		</comment>
+		<comment id='13' author='mattearllongshot' date='2020-08-18T21:51:56Z'>
+		Btw, I heard issues in the past that the worker startup took more than a couple seconds when it is running inside containers. Don't remember the details though. (&lt;denchmark-link:https://github.com/ray-project/ray/pull/9221&gt;#9221&lt;/denchmark-link&gt;
+)
+		</comment>
+		<comment id='14' author='mattearllongshot' date='2020-08-19T08:43:17Z'>
+		Ok, it sounds like the local issue is indeed separate then. I don't think it's &lt;denchmark-link:https://github.com/ray-project/ray/pull/9221&gt;#9221&lt;/denchmark-link&gt;
+ since we're not using docker or containers.  Is there any more info I can grab to help diagnose the cluster issue?
+		</comment>
+		<comment id='15' author='mattearllongshot' date='2020-08-19T08:50:31Z'>
+		One other feature in the diagram is that some nodes start just fine (all workers start instantaneously) which makes me doubt that it's just a performance barrier on worker startup time, otherwise why would some nodes be immune to it?
+		</comment>
+		<comment id='16' author='mattearllongshot' date='2020-08-19T11:42:43Z'>
+		Here's the output of ray.timeline(), in case it's useful.  It seems not to be showing some of the workers though.
+&lt;denchmark-link:https://github.com/ray-project/ray/files/5096131/timeline.tracing.log&gt;timeline.tracing.log&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='17' author='mattearllongshot' date='2020-08-19T16:24:29Z'>
+		One thing that might help is if you could collect the raylet logs from all of the nodes with debug logging on. This is a bit of a headache to do, so only if you're stuck on this :)
+
+Set RAY_BACKEND_LOG_LEVEL=debug on all nodes, including the head node. You can do that by prepending the ray start commands in the autoscaler config.
+Collect /tmp/ray/session_latest/logs/raylet.out, one per node.
+
+		</comment>
+		<comment id='18' author='mattearllongshot' date='2020-08-20T10:18:17Z'>
+		Here's the output for one of worker node's raylets:
+&lt;denchmark-link:https://github.com/ray-project/ray/files/5102266/raylet_10.2.252.220.out.zip&gt;raylet_10.2.252.220.out.zip&lt;/denchmark-link&gt;
+
+I have the others so if you need any more, let me know (in total they are 150MB compressed).
+		</comment>
+		<comment id='19' author='mattearllongshot' date='2020-08-20T10:23:03Z'>
+		Note that the performance this time was slightly worse than before (the spread of the start times of each task was even longer), possibly due to the extra work that was having to be done by the logging?
+		</comment>
+		<comment id='20' author='mattearllongshot' date='2020-08-20T17:19:40Z'>
+		Ack yeah, so this seems to be very clearly an issue with the current spillback scheduling policy (the policy used to distribute tasks across multiple nodes). In this file alone, there are 2000+ events where the raylet spills back to another node! :(
+Sorry this is so bad right now, but hopefully the new scheduler will make these issues go away. &lt;denchmark-link:https://github.com/wuisawesome&gt;@wuisawesome&lt;/denchmark-link&gt;
+ could potentially work on a quick fix for the current scheduler that would at least solve this issue.
+&lt;denchmark-link:https://github.com/mattearllongshot&gt;@mattearllongshot&lt;/denchmark-link&gt;
+, are you blocked on this right now?
+		</comment>
+		<comment id='21' author='mattearllongshot' date='2020-08-20T17:30:10Z'>
+		Hi &lt;denchmark-link:https://github.com/stephanie-wang&gt;@stephanie-wang&lt;/denchmark-link&gt;
+ we're not really blocked, but it'd be nice to get it fixed since it's adding a couple of minutes onto our testing times, plus the associated EC2 charges.  You mention it should be fixed in the new scheduler, is the new scheduler in the latest nightlies?  The above testing was done with the nightly build as of Monday.
+		</comment>
+		<comment id='22' author='mattearllongshot' date='2020-08-20T17:33:18Z'>
+		&lt;denchmark-link:https://github.com/stephanie-wang&gt;@stephanie-wang&lt;/denchmark-link&gt;
+ I think we've discovered this in the stress test before (when there are lots of stress, there are lots of spillback). The root cause was inbetween each heartbeat update, the node has wrong information, and it spillbacks to the wrong nodes. I think if we materialize heartbeat data (meaning we temporarily update the heartbeat data in-memory), this can be alleviated.
+		</comment>
+		<comment id='23' author='mattearllongshot' date='2020-08-20T17:53:40Z'>
+		
+@stephanie-wang I think we've discovered this in the stress test before (when there are lots of stress, there are lots of spillback). The root cause was inbetween each heartbeat update, the node has wrong information, and it spillbacks to the wrong nodes. I think if we materialize heartbeat data (meaning we temporarily update the heartbeat data in-memory), this can be alleviated.
+
+Thanks, &lt;denchmark-link:https://github.com/rkooo567&gt;@rkooo567&lt;/denchmark-link&gt;
+! But unfortunately I don't think that's the problem here. There are as many cores as tasks so any of the nodes are feasible and there shouldn't really be a stale heartbeat problem, except maybe when a node is close to becoming full.
+
+You mention it should be fixed in the new scheduler, is the new scheduler in the latest nightlies? The above testing was done with the nightly build as of Monday.
+
+&lt;denchmark-link:https://github.com/wuisawesome&gt;@wuisawesome&lt;/denchmark-link&gt;
+ can comment on this.
+		</comment>
+		<comment id='24' author='mattearllongshot' date='2020-08-20T17:57:22Z'>
+		&lt;denchmark-link:https://github.com/mattearllongshot&gt;@mattearllongshot&lt;/denchmark-link&gt;
+ the new scheduler isn't really ready to be used yet. It will likely be usable (but not stable or on by default) in ~1 month. Essentially long enough to not be useful for you, but close enough that there probably won't be any major overhauls to the current scheduler.
+Definitely open to a quick heuristic to help with spillback on the current scheduler though.
+		</comment>
+		<comment id='25' author='mattearllongshot' date='2020-08-24T13:18:08Z'>
+		Thanks for the updates everyone.  Looking forward to trying out the new scheduler when it's ready.  In the meantime are there any settings we can tweak with the current scheduler to minimize this effect, or are there any possible workarounds?
+		</comment>
+		<comment id='26' author='mattearllongshot' date='2020-08-24T14:51:22Z'>
+		Hmm I don't think we fully understand the scope of this bug yet which makes it hard to suggest a mitigation. If you could use actors instead of tasks, that might help (assuming you an get some reuse out of the actors, otherwise the overhead will just be high).
+I think we should have a patch in master (for the old scheduler) in the next 2 weeks though.
+		</comment>
+		<comment id='27' author='mattearllongshot' date='2020-08-25T22:03:28Z'>
+		Hey &lt;denchmark-link:https://github.com/mattearllongshot&gt;@mattearllongshot&lt;/denchmark-link&gt;
+, we just merged a temporary fix for this. When you get a chance, can you retry your workload on the nightly wheels for this commit? &lt;denchmark-link:https://github.com/ray-project/ray/commit/d4537ac1ced4923ebbc2fd838b325a324072ab4c&gt;d4537ac&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='28' author='mattearllongshot' date='2020-08-26T17:01:28Z'>
+		Sounds great.  I haven't been able to test this today due to EC2 instance availability, but I'll give it another go tomorrow.
+		</comment>
+		<comment id='29' author='mattearllongshot' date='2020-08-27T08:24:32Z'>
+		Hi &lt;denchmark-link:https://github.com/stephanie-wang&gt;@stephanie-wang&lt;/denchmark-link&gt;
+ , here are the results from yesterday's nightly wheel:
+&lt;denchmark-link:https://user-images.githubusercontent.com/37295291/91416316-21772580-e847-11ea-9705-a94b455d6757.png&gt;&lt;/denchmark-link&gt;
+
+I've added dashed horizontal lines to make it separate IPs more clearly.  It seems to be more even on startup times, but a few tasks are being delayed until after the others have finished
+		</comment>
+		<comment id='30' author='mattearllongshot' date='2020-08-27T08:30:26Z'>
+		I also get these errors printed to stderr when running ray.get: &lt;denchmark-link:https://github.com/ray-project/ray/files/5135094/errors.txt&gt;errors.txt&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='31' author='mattearllongshot' date='2020-08-27T09:29:16Z'>
+		The above appears to have some instances delayed in their bringup, which perhaps could be causing the problem?  I've run it again and this time the behaviour is more sensible.  Here's the image:
+&lt;denchmark-link:https://user-images.githubusercontent.com/37295291/91422818-96e6f400-e84f-11ea-83d2-4b654d79e442.png&gt;&lt;/denchmark-link&gt;
+
+Note that one node ends up executing more than the others (57 tasks vs 35) but this is because some instances did not come up (presumably just EC2 issues)  until after the over subscribed node had started its second round of tasks.  No errors on stderr this time.
+		</comment>
+		<comment id='32' author='mattearllongshot' date='2020-08-27T16:48:24Z'>
+		Thanks, &lt;denchmark-link:https://github.com/mattearllongshot&gt;@mattearllongshot&lt;/denchmark-link&gt;
+! I think those stderr messages match &lt;denchmark-link:https://github.com/ray-project/ray/issues/10343&gt;#10343&lt;/denchmark-link&gt;
+ and should be fixed by the next release.
+I'm closing this issue for now since it seems like the scheduling issue is resolved for the moment. Please feel free to reopen if something else comes up!
+		</comment>
+		<comment id='33' author='mattearllongshot' date='2020-08-27T17:04:49Z'>
+		Great! Thanks for taking the time to fix this.  Looking forward to the next release.
+		</comment>
+	</comments>
+</bug>

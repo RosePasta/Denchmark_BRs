@@ -1,0 +1,686 @@
+<bug id='768' author='tmpethick' open_date='2019-06-29T09:52:45Z' closed_time='2019-06-29T17:39:02Z'>
+	<summary>[Bug] GridInterpolationKernel fails to converge on Branin with small N and grid_size</summary>
+	<description>
+&lt;denchmark-h:h1&gt;🐛 Bug&lt;/denchmark-h&gt;
+
+KISS-GP fails to converge on noiseless Branin for even small N and grid_size (N=100 and grid_size=10). In the experiment I have made sure max_cg_iterations, max_preconditioner_size and eval_cg_tolerance was not the bottleneck and I have fixed hyperparameters (learned with a vanilla GP) to avoid learning step.
+We get an RMSE of ~15,000 whereas the same code without GridInterpolationKernel achieves 0.5.
+Mind that this is not a low noise problem as it fails even with likelihood.noise set to 1e-2. Do you have any idea what could cause this mis-behaviour for a seemingly trivial problem?
+&lt;denchmark-link:https://user-images.githubusercontent.com/544312/60382539-96dd3f80-9a64-11e9-8512-271778037fca.png&gt;&lt;/denchmark-link&gt;
+
+&lt;denchmark-h:h2&gt;To reproduce&lt;/denchmark-h&gt;
+
+Helper methods
+
+import math
+
+import numpy as np
+import torch
+import gpytorch
+from matplotlib import pyplot as plt
+from gpytorch.likelihoods import GaussianLikelihood
+
+# ---------------------------- Helpers ---------------------------------
+
+class Branin(object):
+    """Scrupulously stolen from GPyOpt and modified."""
+    def __init__(self,bounds=None,a=None,b=None,c=None,r=None,s=None,t=None,sd=None):
+        self.input_dim = 2
+        if bounds is  None: self.bounds = np.array([(-5,10),(1,15)])
+        else: self.bounds = bounds
+        if a==None: self.a = 1
+        else: self.a = a           
+        if b==None: self.b = 5.1/(4*np.pi**2)
+        else: self.b = b
+        if c==None: self.c = 5/np.pi
+        else: self.c = c
+        if r==None: self.r = 6
+        else: self.r = r
+        if s==None: self.s = 10 
+        else: self.s = s
+        if t==None: self.t = 1/(8*np.pi)
+        else: self.t = t    
+        if sd==None: self.sd = 0
+        else: self.sd=sd
+        self.min = [(-np.pi,12.275),(np.pi,2.275),(9.42478,2.475)] 
+        self.fmin = 0.397887
+        self.name = 'Branin'
+    
+    def __call__(self,X):
+        n = X.shape[0]
+        if X.shape[1] != self.input_dim: 
+            return 'Wrong input dimension'  
+        else:
+            x1 = X[:,0]
+            x2 = X[:,1]
+            fval = self.a * (x2 - self.b*x1**2 + self.c*x1 - self.r)**2 + self.s*(1-self.t)*np.cos(x1) + self.s 
+            return fval.reshape(n,1)
+
+
+def random_hypercube_samples(n_samples, bounds, rng=None):
+    """Random sample from d-dimensional hypercube (d = bounds.shape[0]).
+
+    Returns: (n_samples, dim)
+    """
+    if rng is None:
+        rng = np.random.RandomState()
+
+    dims = bounds.shape[0]
+    a = rng.uniform(0, 1, (dims, n_samples))
+    bounds_repeated = np.repeat(bounds[:, :, None], n_samples, axis=2)
+    samples = a * np.abs(bounds_repeated[:,1] - bounds_repeated[:,0]) + bounds_repeated[:,0]
+    samples = np.swapaxes(samples, 0, 1)
+
+    # This handles the case where the sample is slightly above or below the bounds
+    # due to floating point precision (leading to slightly more samples from the boundary...).
+    return constrain_points(samples, bounds)
+
+
+def constrain_points(x, bounds):
+    dim = x.shape[0]
+    minx = np.repeat(bounds[:, 0][None, :], dim, axis=0)
+    maxx = np.repeat(bounds[:, 1][None, :], dim, axis=0)
+    return np.clip(x, a_min=minx, a_max=maxx)
+
+
+def plot2D(predict, f, X_train, Y_train):
+    XY, X, Y = construct_2D_grid(f.bounds)
+
+    # remove grid
+    original_grid_size = XY.shape[0]
+    XY = XY.reshape((-1, 2))
+
+    mean, var = predict(XY)
+    ground_truth = f(XY)
+
+    # recreate grid
+    mean = mean.reshape((original_grid_size, original_grid_size))
+    var = var.reshape((original_grid_size, original_grid_size))
+    ground_truth = ground_truth.reshape((original_grid_size, original_grid_size))
+
+    fig = plt.figure()
+    ax = fig.add_subplot(221)
+    ax.set_title('Ground truth $f$')
+    cont = ax.contourf(X, Y, ground_truth, 50)
+    fig.colorbar(cont)
+    ax.plot(X_train[:, 0], X_train[:, 1], '.', markersize=2)
+
+    ax = fig.add_subplot(222)
+    ax.set_title('Mean estimate $m$')
+    cont = ax.contourf(X, Y, mean, 50)
+    fig.colorbar(cont)
+    # ax.plot(model.X[:, 0], model.X[:, 1], '.', markersize=10)
+
+    ax = fig.add_subplot(223)
+    ax.set_title('Model std')
+    cont = ax.contourf(X, Y, np.sqrt(var), 50, vmin=0)
+    fig.colorbar(cont)
+    # ax.plot(model.X[:, 0], model.X[:, 1], '.', markersize=10)
+
+    ax = fig.add_subplot(224)
+    ax.set_title('Estimate Error $|f-m|$')
+    cont = ax.contourf(X, Y, np.abs(mean - ground_truth), 50)
+    fig.colorbar(cont)
+
+    plt.tight_layout()
+
+    return fig
+
+
+def construct_2D_grid(bounds, N=2500):
+    n = int(math.sqrt(N))
+    x_bounds = bounds[0]
+    y_bounds = bounds[1]
+    X = np.linspace(x_bounds[0], x_bounds[1], n)
+    Y = np.linspace(y_bounds[0], y_bounds[1], n)
+    X, Y = np.meshgrid(X, Y)
+    XY = np.stack((X,Y), axis=-1)
+
+    return XY, X, Y
+
+
+rng = np.random.RandomState(99)
+
+f = Branin()
+train_x_np = random_hypercube_samples(100, f.bounds, rng=rng)
+train_y_np = f(train_x_np)[:, 0]
+train_x = torch.tensor(train_x_np).double()
+train_y = torch.tensor(train_y_np).double()
+
+class GPRegressionModel(gpytorch.models.ExactGP):
+    def __init__(self, train_x, train_y, likelihood):
+        super(GPRegressionModel, self).__init__(train_x, train_y, likelihood)
+
+        self.mean_module = gpytorch.means.ZeroMean()
+        self.covar_module = gpytorch.kernels.ScaleKernel(
+            gpytorch.kernels.GridInterpolationKernel(
+                gpytorch.kernels.RBFKernel(ard_num_dims=2),
+                num_dims=2,
+                grid_size=10,
+            )
+        )
+
+    def forward(self, x):
+        mean_x = self.mean_module(x)
+        covar_x = self.covar_module(x)
+        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+
+fast = True
+
+likelihood = GaussianLikelihood().double()
+model = GPRegressionModel(train_x, train_y, likelihood).double()
+
+model.initialize(**{
+    'covar_module.base_kernel.base_kernel.lengthscale': torch.tensor([5, 60]).double(),
+    'covar_module.outputscale': 40,
+    'likelihood.noise': 1e-4,
+})
+
+def predict(X):
+    # Set model and likelihood into evaluation mode
+    model.eval()
+    likelihood.eval()
+
+    test_x = torch.tensor(X).double()
+    with torch.no_grad(), \
+        gpytorch.settings.fast_computations(covar_root_decomposition=fast, log_prob=fast, solves=fast), \
+        gpytorch.settings.fast_pred_var(fast),\
+        gpytorch.settings.use_toeplitz(True), \
+        gpytorch.settings.max_cg_iterations(3000),\
+        gpytorch.settings.max_preconditioner_size(10),\
+        gpytorch.settings.eval_cg_tolerance(1e-8):
+
+        observed_pred = likelihood(model(test_x))
+        pred_labels = observed_pred.mean
+        pred_var = observed_pred.variance
+        return pred_labels.detach().numpy()[:,None], pred_var.detach().numpy()
+
+plot2D(predict, f, train_x_np, train_y_np)
+
+# Calculate RMSE
+N = 2500
+X_test = random_hypercube_samples(N, f.bounds)
+Y_test = f(X_test)
+Y_hat = predict(X_test)[0]
+rmse = np.sqrt(np.sum(np.square(Y_test - Y_hat)) / N)
+print("RMSE:", rmse)
+** Stack trace/error message **
+&lt;denchmark-code&gt;// Paste the bad output here!
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h2&gt;Expected Behavior&lt;/denchmark-h&gt;
+
+Without GridInterpolationKernel we achieve 0.5
+
+import math
+
+import numpy as np
+import torch
+import gpytorch
+from matplotlib import pyplot as plt
+from gpytorch.likelihoods import GaussianLikelihood
+
+
+# ---------------------------- Helpers ---------------------------------
+
+class Branin(object):
+    """Scrupulously stolen from GPyOpt and modified."""
+    def __init__(self,bounds=None,a=None,b=None,c=None,r=None,s=None,t=None,sd=None):
+        self.input_dim = 2
+        if bounds is  None: self.bounds = np.array([(-5,10),(1,15)])
+        else: self.bounds = bounds
+        if a==None: self.a = 1
+        else: self.a = a           
+        if b==None: self.b = 5.1/(4*np.pi**2)
+        else: self.b = b
+        if c==None: self.c = 5/np.pi
+        else: self.c = c
+        if r==None: self.r = 6
+        else: self.r = r
+        if s==None: self.s = 10 
+        else: self.s = s
+        if t==None: self.t = 1/(8*np.pi)
+        else: self.t = t    
+        if sd==None: self.sd = 0
+        else: self.sd=sd
+        self.min = [(-np.pi,12.275),(np.pi,2.275),(9.42478,2.475)] 
+        self.fmin = 0.397887
+        self.name = 'Branin'
+    
+    def __call__(self,X):
+        n = X.shape[0]
+        if X.shape[1] != self.input_dim: 
+            return 'Wrong input dimension'  
+        else:
+            x1 = X[:,0]
+            x2 = X[:,1]
+            fval = self.a * (x2 - self.b*x1**2 + self.c*x1 - self.r)**2 + self.s*(1-self.t)*np.cos(x1) + self.s 
+            return fval.reshape(n,1)
+
+
+def random_hypercube_samples(n_samples, bounds, rng=None):
+    """Random sample from d-dimensional hypercube (d = bounds.shape[0]).
+
+    Returns: (n_samples, dim)
+    """
+    if rng is None:
+        rng = np.random.RandomState()
+
+    dims = bounds.shape[0]
+    a = rng.uniform(0, 1, (dims, n_samples))
+    bounds_repeated = np.repeat(bounds[:, :, None], n_samples, axis=2)
+    samples = a * np.abs(bounds_repeated[:,1] - bounds_repeated[:,0]) + bounds_repeated[:,0]
+    samples = np.swapaxes(samples, 0, 1)
+
+    # This handles the case where the sample is slightly above or below the bounds
+    # due to floating point precision (leading to slightly more samples from the boundary...).
+    return constrain_points(samples, bounds)
+
+
+def constrain_points(x, bounds):
+    dim = x.shape[0]
+    minx = np.repeat(bounds[:, 0][None, :], dim, axis=0)
+    maxx = np.repeat(bounds[:, 1][None, :], dim, axis=0)
+    return np.clip(x, a_min=minx, a_max=maxx)
+
+
+def plot2D(predict, f, X_train, Y_train):
+    XY, X, Y = construct_2D_grid(f.bounds)
+
+    # remove grid
+    original_grid_size = XY.shape[0]
+    XY = XY.reshape((-1, 2))
+
+    mean, var = predict(XY)
+    ground_truth = f(XY)
+
+    # recreate grid
+    mean = mean.reshape((original_grid_size, original_grid_size))
+    var = var.reshape((original_grid_size, original_grid_size))
+    ground_truth = ground_truth.reshape((original_grid_size, original_grid_size))
+
+    fig = plt.figure()
+    ax = fig.add_subplot(221)
+    ax.set_title('Ground truth $f$')
+    cont = ax.contourf(X, Y, ground_truth, 50)
+    fig.colorbar(cont)
+    ax.plot(X_train[:, 0], X_train[:, 1], '.', markersize=2)
+
+    ax = fig.add_subplot(222)
+    ax.set_title('Mean estimate $m$')
+    cont = ax.contourf(X, Y, mean, 50)
+    fig.colorbar(cont)
+    # ax.plot(model.X[:, 0], model.X[:, 1], '.', markersize=10)
+
+    ax = fig.add_subplot(223)
+    ax.set_title('Model std')
+    cont = ax.contourf(X, Y, np.sqrt(var), 50, vmin=0)
+    fig.colorbar(cont)
+    # ax.plot(model.X[:, 0], model.X[:, 1], '.', markersize=10)
+
+    ax = fig.add_subplot(224)
+    ax.set_title('Estimate Error $|f-m|$')
+    cont = ax.contourf(X, Y, np.abs(mean - ground_truth), 50)
+    fig.colorbar(cont)
+
+    plt.tight_layout()
+
+    return fig
+
+
+def construct_2D_grid(bounds, N=2500):
+    n = int(math.sqrt(N))
+    x_bounds = bounds[0]
+    y_bounds = bounds[1]
+    X = np.linspace(x_bounds[0], x_bounds[1], n)
+    Y = np.linspace(y_bounds[0], y_bounds[1], n)
+    X, Y = np.meshgrid(X, Y)
+    XY = np.stack((X,Y), axis=-1)
+
+    return XY, X, Y
+
+
+# ------------------------------ Main script ----------------------------
+
+rng = np.random.RandomState(99)
+
+f = Branin()
+train_x_np = random_hypercube_samples(100, f.bounds, rng=rng)
+train_y_np = f(train_x_np)[:, 0]
+train_x = torch.tensor(train_x_np).double()
+train_y = torch.tensor(train_y_np).double()
+
+class GPRegressionModel(gpytorch.models.ExactGP):
+    def __init__(self, train_x, train_y, likelihood):
+        super(GPRegressionModel, self).__init__(train_x, train_y, likelihood)
+
+        self.mean_module = gpytorch.means.ZeroMean()
+        self.covar_module = gpytorch.kernels.ScaleKernel(
+            gpytorch.kernels.RBFKernel(ard_num_dims=2),
+        )
+
+    def forward(self, x):
+        mean_x = self.mean_module(x)
+        covar_x = self.covar_module(x)
+        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+
+fast = True
+
+likelihood = GaussianLikelihood().double()
+model = GPRegressionModel(train_x, train_y, likelihood).double()
+
+model.initialize(**{
+    'covar_module.base_kernel.lengthscale': torch.tensor([5, 60]).double(),
+    'covar_module.outputscale': 40,
+    'likelihood.noise': 1e-4,
+})
+
+def predict(X):
+    # Set model and likelihood into evaluation mode
+    model.eval()
+    likelihood.eval()
+
+    test_x = torch.tensor(X).double()
+    with torch.no_grad(), \
+        gpytorch.settings.fast_computations(covar_root_decomposition=fast, log_prob=fast, solves=fast), \
+        gpytorch.settings.fast_pred_var(fast),\
+        gpytorch.settings.use_toeplitz(True), \
+        gpytorch.settings.max_cg_iterations(5000),\
+        gpytorch.settings.max_preconditioner_size(10),\
+        gpytorch.settings.eval_cg_tolerance(1e-8):
+
+        observed_pred = likelihood(model(test_x))
+        pred_labels = observed_pred.mean
+        pred_var = observed_pred.variance
+        return pred_labels.detach().numpy()[:,None], pred_var.detach().numpy()
+
+plot2D(predict, f, train_x_np, train_y_np)
+
+# Calculate RMSE
+N = 2500
+X_test = random_hypercube_samples(N, f.bounds)
+Y_test = f(X_test)
+Y_hat = predict(X_test)[0]
+rmse = np.sqrt(np.sum(np.square(Y_test - Y_hat)) / N)
+print("RMSE:", rmse)
+
+
+&lt;denchmark-h:h2&gt;System information&lt;/denchmark-h&gt;
+
+Please complete the following information:
+GPyTorch Version: 0.3.3
+PyTorch Version: 1.1.0
+Computer OS: MacOS 10.14
+&lt;denchmark-h:h2&gt;Additional context&lt;/denchmark-h&gt;
+
+Add any other context about the problem here.
+	</description>
+	<comments>
+		<comment id='1' author='tmpethick' date='2019-06-29T10:50:04Z'>
+		Some additional comments for clarification:
+
+It also fails in the more standard setting without double precision.
+Setting grid_bounds improves RMSE to ~17 for N=100 and grid_size=10 but we get weird behaviour (see attached plot). Should we set the bound slightly bigger than the constrained domain?
+Regardless of grid_bounds it fails for bigger N and grid_size as well.
+
+&lt;denchmark-link:https://user-images.githubusercontent.com/544312/60383029-0b67ac80-9a6c-11e9-8efd-bcd3bcff3f9d.png&gt;&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='2' author='tmpethick' date='2019-06-29T13:23:40Z'>
+		Okay, it seems to be the same problem I have stumble on before: KISS-GP only converges if the noise-level is very high (fixing the noise to anything less than 0.1 prevents it from converging). Even when increasing all possible knobs in gpytorch.settings is it still not possible.
+Is it true that we should only use KISS-GP for problems with significant white noise?
+		</comment>
+		<comment id='3' author='tmpethick' date='2019-06-29T17:39:02Z'>
+		In this case the issue is not anything as complicated as CG convergence or noise (which you can observe by turning fast computations off and getting identical results), the problem is that your grid size is extremely tiny relative to a function that changes extremely rapidly in certain regions.
+Unlike other inducing point methods that attempt to place the inducing points in specific locations that approximate the function well, SKI trades off having inducing points in a regularly spaced grid for the ability to use many many many more of them. When using SKI, you should be thinking "I should probably have tens of thousands or hundreds of thousands of inducing points." In this case, by setting grid_size=10 on a 2D problem, you have 10*10=100 inducing points.
+Even setting grid_size to 100 to have 100*100=10000 inducing points total gets you lower error (~20) than fiddling with the noise or any of the knobs in gpytorch.settings, e.g.:
+        self.covar_module = gpytorch.kernels.ScaleKernel(
+            gpytorch.kernels.GridInterpolationKernel(
+                gpytorch.kernels.RBFKernel(ard_num_dims=2),
+                num_dims=2,
+                grid_size=100,
+                grid_bounds=[(-5, 10), (1, 15)]
+            )
+        )
+It's still higher than the exact GP, but the branin function is an extremely bad case for inducing point methods, because you'd need extremely dense inducing point sampling in the regions near the boundary to accurately model the extreme function value increases. For example, you still get terrible error (~20) relative to the exact GP using SGPR InducingPointKernel:
+        self.covar_module = gpytorch.kernels.ScaleKernel(
+            gpytorch.kernels.InducingPointKernel(
+                gpytorch.kernels.RBFKernel(ard_num_dims=2),
+                inducing_points=torch.randn(2048, 2, dtype=train_x.dtype),
+                likelihood=likelihood,
+            )
+        )
+		</comment>
+		<comment id='4' author='tmpethick' date='2019-07-01T07:01:36Z'>
+		Thanks for the details again!
+If I understand correctly SGPR is a variational approximation to the posterior distribution. So shouldn't we expect SGPR to pick inducing points near the border if this provides the best estimate?
+For the Branin function I tried to set M and N as low as possible to make the example quick to run. My real problem is when N and M is large. Setting N&gt;1000 and M&gt;100 will make it impossible for CG to converge (even when we have more steps than observations!). This seems to have nothing to do with Branin being a particular tricky example as it is far from converged (RMSE afterwards is in order 10^5).
+For some reason I find it very tricky to configure KISS-GP in such a way that it works for the problem-classes it was build for... I must be doing something wrong.
+		</comment>
+		<comment id='5' author='tmpethick' date='2019-07-01T08:10:10Z'>
+		For the branin function I was able to use your code and set N&gt;1000 and M&gt;100 and achieve an RMSE of ~20 just fine. As far as I can tell, the issues with 10^5 RMSE may have nothing to do with convergence in this case. CG explicitly raises a warning when it fails to converge, so if you don't see a warning you are getting good solves, and I never saw those convergence issues arise running your code. Furthermore, as I mentioned above, running the code with fast_computations turned off gets identically horrible RMSEs, which would not be the case if it were a CG issue.
+SGPR will probably place many inducing points near the border, sure, but the function still changes quite rapidly as x moves towards the [-5, 0] corner, and as I mentioned fails to model the function as well. In the same way that if this were a problem with CG we'd expect Cholesky to magically do better, if this were really just a problem configuring KISS-GP, we'd expect SGPR to do better. But neither of these end up being the case.
+		</comment>
+		<comment id='6' author='tmpethick' date='2019-07-01T09:14:29Z'>
+		This seems very strange... Just to be sure we are on the same page I have included the exact code I'm running with N=1000 and M=100. This consistently gives me a CG warning and 10^5 order error.
+I am indeed on git HEAD but I imagine you are the same.
+import math
+
+import numpy as np
+import torch
+import gpytorch
+from matplotlib import pyplot as plt
+from gpytorch.likelihoods import GaussianLikelihood
+
+# ---------------------------- Helpers ---------------------------------
+
+class Branin(object):
+    """Scrupulously stolen from GPyOpt and modified."""
+    def __init__(self,bounds=None,a=None,b=None,c=None,r=None,s=None,t=None,sd=None):
+        self.input_dim = 2
+        if bounds is  None: self.bounds = np.array([(-5,10),(1,15)])
+        else: self.bounds = bounds
+        if a==None: self.a = 1
+        else: self.a = a           
+        if b==None: self.b = 5.1/(4*np.pi**2)
+        else: self.b = b
+        if c==None: self.c = 5/np.pi
+        else: self.c = c
+        if r==None: self.r = 6
+        else: self.r = r
+        if s==None: self.s = 10 
+        else: self.s = s
+        if t==None: self.t = 1/(8*np.pi)
+        else: self.t = t    
+        if sd==None: self.sd = 0
+        else: self.sd=sd
+        self.min = [(-np.pi,12.275),(np.pi,2.275),(9.42478,2.475)] 
+        self.fmin = 0.397887
+        self.name = 'Branin'
+    
+    def __call__(self,X):
+        n = X.shape[0]
+        if X.shape[1] != self.input_dim: 
+            return 'Wrong input dimension'  
+        else:
+            x1 = X[:,0]
+            x2 = X[:,1]
+            fval = self.a * (x2 - self.b*x1**2 + self.c*x1 - self.r)**2 + self.s*(1-self.t)*np.cos(x1) + self.s 
+            return fval.reshape(n,1)
+
+
+def random_hypercube_samples(n_samples, bounds, rng=None):
+    """Random sample from d-dimensional hypercube (d = bounds.shape[0]).
+
+    Returns: (n_samples, dim)
+    """
+    if rng is None:
+        rng = np.random.RandomState()
+
+    dims = bounds.shape[0]
+    a = rng.uniform(0, 1, (dims, n_samples))
+    bounds_repeated = np.repeat(bounds[:, :, None], n_samples, axis=2)
+    samples = a * np.abs(bounds_repeated[:,1] - bounds_repeated[:,0]) + bounds_repeated[:,0]
+    samples = np.swapaxes(samples, 0, 1)
+
+    # This handles the case where the sample is slightly above or below the bounds
+    # due to floating point precision (leading to slightly more samples from the boundary...).
+    return constrain_points(samples, bounds)
+
+
+def constrain_points(x, bounds):
+    dim = x.shape[0]
+    minx = np.repeat(bounds[:, 0][None, :], dim, axis=0)
+    maxx = np.repeat(bounds[:, 1][None, :], dim, axis=0)
+    return np.clip(x, a_min=minx, a_max=maxx)
+
+
+def plot2D(predict, f, X_train, Y_train):
+    XY, X, Y = construct_2D_grid(f.bounds)
+
+    # remove grid
+    original_grid_size = XY.shape[0]
+    XY = XY.reshape((-1, 2))
+
+    mean, var = predict(XY)
+    ground_truth = f(XY)
+
+    # recreate grid
+    mean = mean.reshape((original_grid_size, original_grid_size))
+    var = var.reshape((original_grid_size, original_grid_size))
+    ground_truth = ground_truth.reshape((original_grid_size, original_grid_size))
+
+    fig = plt.figure()
+    ax = fig.add_subplot(221)
+    ax.set_title('Ground truth $f$')
+    cont = ax.contourf(X, Y, ground_truth, 50)
+    fig.colorbar(cont)
+    ax.plot(X_train[:, 0], X_train[:, 1], '.', markersize=2)
+
+    ax = fig.add_subplot(222)
+    ax.set_title('Mean estimate $m$')
+    cont = ax.contourf(X, Y, mean, 50)
+    fig.colorbar(cont)
+    # ax.plot(model.X[:, 0], model.X[:, 1], '.', markersize=10)
+
+    ax = fig.add_subplot(223)
+    ax.set_title('Model std')
+    cont = ax.contourf(X, Y, np.sqrt(var), 50, vmin=0)
+    fig.colorbar(cont)
+    # ax.plot(model.X[:, 0], model.X[:, 1], '.', markersize=10)
+
+    ax = fig.add_subplot(224)
+    ax.set_title('Estimate Error $|f-m|$')
+    cont = ax.contourf(X, Y, np.abs(mean - ground_truth), 50)
+    fig.colorbar(cont)
+
+    plt.tight_layout()
+
+    return fig
+
+
+def construct_2D_grid(bounds, N=2500):
+    n = int(math.sqrt(N))
+    x_bounds = bounds[0]
+    y_bounds = bounds[1]
+    X = np.linspace(x_bounds[0], x_bounds[1], n)
+    Y = np.linspace(y_bounds[0], y_bounds[1], n)
+    X, Y = np.meshgrid(X, Y)
+    XY = np.stack((X,Y), axis=-1)
+
+    return XY, X, Y
+rng = np.random.RandomState(99)
+
+f = Branin()
+train_x_np = random_hypercube_samples(1000, f.bounds, rng=rng)
+train_y_np = f(train_x_np)[:, 0]
+train_x = torch.tensor(train_x_np).double()
+train_y = torch.tensor(train_y_np).double()
+
+class GPRegressionModel(gpytorch.models.ExactGP):
+    def __init__(self, train_x, train_y, likelihood):
+        super(GPRegressionModel, self).__init__(train_x, train_y, likelihood)
+
+        self.mean_module = gpytorch.means.ZeroMean()
+        self.covar_module = gpytorch.kernels.ScaleKernel(
+            gpytorch.kernels.GridInterpolationKernel(
+                gpytorch.kernels.RBFKernel(ard_num_dims=2),
+                num_dims=2,
+                grid_size=100,
+            )
+        )
+
+    def forward(self, x):
+        mean_x = self.mean_module(x)
+        covar_x = self.covar_module(x)
+        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+
+fast = True
+
+likelihood = GaussianLikelihood().double()
+model = GPRegressionModel(train_x, train_y, likelihood).double()
+
+model.initialize(**{
+    'covar_module.base_kernel.base_kernel.lengthscale': torch.tensor([5, 60]).double(),
+    'covar_module.outputscale': 40,
+    'likelihood.noise': 1e-4,
+})
+
+def predict(X):
+    # Set model and likelihood into evaluation mode
+    model.eval()
+    likelihood.eval()
+
+    test_x = torch.tensor(X).double()
+    with torch.no_grad(), \
+        gpytorch.settings.fast_computations(covar_root_decomposition=fast, log_prob=fast, solves=fast), \
+        gpytorch.settings.fast_pred_var(fast),\
+        gpytorch.settings.use_toeplitz(True), \
+        gpytorch.settings.max_cg_iterations(3000),\
+        gpytorch.settings.max_preconditioner_size(10),\
+        gpytorch.settings.eval_cg_tolerance(1e-8):
+
+        observed_pred = likelihood(model(test_x))
+        pred_labels = observed_pred.mean
+        pred_var = observed_pred.variance
+        return pred_labels.detach().numpy()[:,None], pred_var.detach().numpy()
+
+plot2D(predict, f, train_x_np, train_y_np)
+
+# Calculate RMSE
+N = 2500
+X_test = random_hypercube_samples(N, f.bounds)
+Y_test = f(X_test)
+Y_hat = predict(X_test)[0]
+rmse = np.sqrt(np.sum(np.square(Y_test - Y_hat)) / N)
+print("RMSE:", rmse)
+		</comment>
+		<comment id='7' author='tmpethick' date='2019-07-01T12:41:59Z'>
+		Small noise seem to be the problem. For M=100 and N=1000 a noise level of 1e-3 seems to be the spot where performance starts to degrade for the particular case
+
+
+
+likelihood.noise
+RMSE
+
+
+
+
+1e-2
+0.1
+
+
+1e-3
+100
+
+
+1e-4
+10^5
+
+
+
+The problem onlly becomes harder as N grows so it restricts us from problems with big N and low noise.
+I am sorry that I keep drilling in the same issue but to me this seems like a serious limitation. Do you know if this is a real limitation of KISS-GP or implementation specific? (that is, is it more prone to ill-conditioned covars)
+		</comment>
+	</comments>
+</bug>

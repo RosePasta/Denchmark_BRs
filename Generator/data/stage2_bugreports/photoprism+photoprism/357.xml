@@ -1,0 +1,84 @@
+<bug id='357' author='jamesemoody' open_date='2020-06-10T19:41:25Z' closed_time='2020-07-08T20:04:00Z'>
+	<summary>Backend: MySQL deadlocks when indexing large photo collections</summary>
+	<description>
+Photoprism 0610 in docker.
+Mysql 8.0.20 in docker.
+workers = 3
+With workers = 3, when scanning/indexing, I get a periodic:
+index: Error 1213: Deadlock found when trying to get lock; try restarting transaction for IMG_0123.JPG
+In itself this feels like a normal thing in a parallel system, but photoprism does not seem to retry the transaction, and as a result a number of photos do not appear in the files table in mysql after the scan is complete.
+Reducing workers to 1 fixes this, but it would be nice to have multiple workers when I run a long import over many thousands of photos.
+	</description>
+	<comments>
+		<comment id='1' author='jamesemoody' date='2020-06-10T20:06:07Z'>
+		Thanks for reporting this, thought I fixed it recently. As a workaround, you can index a second time to add missing files.
+		</comment>
+		<comment id='2' author='jamesemoody' date='2020-06-10T23:30:02Z'>
+		Cool, workaround is great for me. Not urgent, just thought you'd want to know.
+		</comment>
+		<comment id='3' author='jamesemoody' date='2020-06-23T09:43:18Z'>
+		This is related to MariaDB config options I added to fix an issue with our indexer (it stopped and didn't continue, so it looked like it is waiting for the database to do something):
+&lt;denchmark-code&gt;--innodb-rollback-on-timeout=ON --innodb-lock-wait-timeout=120
+&lt;/denchmark-code&gt;
+
+See example docker-compose.yml file:
+&lt;denchmark-link:https://github.com/photoprism/photoprism/blob/develop/docker/photoprism/docker-compose.yml&gt;https://github.com/photoprism/photoprism/blob/develop/docker/photoprism/docker-compose.yml&lt;/denchmark-link&gt;
+
+Maybe we have to revert it and use --innodb-rollback-on-timeout=OFF instead, not 100% sure what side effects this has... deadlocks are worse than a rollback.
+We'd be happy to accept advice and pull requests from our community if someone is experienced with this. If not, I'll do it as soon as I have time for reading all related manuals and perform tests with different options. Takes a while since it typically only happens when indexing many files (&gt;10.000) on a CPU with at least 3 cores (more is better for testing).
+		</comment>
+		<comment id='4' author='jamesemoody' date='2020-07-01T17:01:41Z'>
+		Reverted mysqld settings back to --innodb-rollback-on-timeout=OFF --innodb-lock-wait-timeout=50 (default).
+Docs: &lt;denchmark-link:https://dev.mysql.com/doc/refman/8.0/en/innodb-parameters.html#sysvar_innodb_rollback_on_timeout&gt;https://dev.mysql.com/doc/refman/8.0/en/innodb-parameters.html#sysvar_innodb_rollback_on_timeout&lt;/denchmark-link&gt;
+
+Not sure if this helps. As this is not an accounting / business application, we don't really use transactions. Just implicitly on the InnoDB row level, not sure what &lt;denchmark-link:https://gorm.io/&gt;GORM&lt;/denchmark-link&gt;
+ does internally.
+IMO this should not be handled in our application code if that means implementing retry loops for every single statement. Open to suggestions.
+		</comment>
+		<comment id='5' author='jamesemoody' date='2020-07-01T19:58:37Z'>
+		I am experiencing this issue as well.
+It's weird though, that this error occurs if you are not really using transactions except the ones on row level.
+I don't think that these mysql/mariadb settings are likely to solve the underlying problem.
+These settings tell the DBMS how to distinguish between long running operations and deadlock situations. Setting the timeout setting to 50s means that if a locking operation is running longer than 50s it is to be considered abnormal and one or more operations are likely stuck in a deadlock (blocking each other as they are waiting for each others locked resources). The DBMS will then forcefully solve that deadlock by aborting some transactions.
+In this case, I don't think the issue is caused by long-running transactions but rather by a real deadlock situation where two or more workers are waiting for each others locked resources. And that is because the index workers need much less time per photo than that timeout threshold - at least in my case each picture takes only few seconds. Hence, I'd think that it is indeed deadlocks that are occurring due to code design.
+But if you are really not using transactions except the row level ones, the only thing I can think of that could cause a deadlock would be if you had update/delete statements &lt;denchmark-link:https://stackoverflow.com/a/2423921/1744922&gt;that affect the same rows but in different order&lt;/denchmark-link&gt;
+.
+		</comment>
+		<comment id='6' author='jamesemoody' date='2020-07-01T20:07:36Z'>
+		Certain GORM functions like Save() might use transactions, but not our own application code.
+		</comment>
+		<comment id='7' author='jamesemoody' date='2020-07-01T20:46:43Z'>
+		Just had a look at index_worker.go .
+Using a channel for the jobs makes sure that not two workers process the same file. But what about the related files? Could it be that two workers process the same related file and try updating its row simultaneously?
+		</comment>
+		<comment id='8' author='jamesemoody' date='2020-07-01T20:49:10Z'>
+		They should not, related files are grouped together.
+		</comment>
+		<comment id='9' author='jamesemoody' date='2020-07-01T21:00:10Z'>
+		So no file can be a related file to multiple files?
+		</comment>
+		<comment id='10' author='jamesemoody' date='2020-07-01T21:02:44Z'>
+		It should not, except it's a duplicate with a different name. In that case, it may get indexed twice.
+		</comment>
+		<comment id='11' author='jamesemoody' date='2020-07-07T08:54:11Z'>
+		GORM seems to make heavy use of blocking transactions when saving &amp; updating associations automatically. Refactored some of it, situation much better now although not 100% resolved. Trying to fix more today.
+		</comment>
+		<comment id='12' author='jamesemoody' date='2020-07-07T16:35:47Z'>
+		Might be a bit early to tell, but it looks very much like all database errors are gone using the latest Docker image... You're welcome to help testing (again)!
+		</comment>
+		<comment id='13' author='jamesemoody' date='2020-07-07T16:51:14Z'>
+		Same issue exists for labels, but should be easy to fix using the same (ugly) Find &gt; Create &gt; Find strategy:
+&lt;denchmark-link:https://user-images.githubusercontent.com/301686/86815103-91a4ce80-c082-11ea-83a6-9d14190e7d63.png&gt;&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='14' author='jamesemoody' date='2020-07-08T20:04:00Z'>
+		Closing this... We can open a new issue when somebody happens to find a related error.
+		</comment>
+		<comment id='15' author='jamesemoody' date='2020-07-09T19:43:36Z'>
+		Thanks! This weekend I'll try to find time to do a bulk reindex of a large folder - that triggered it pretty reliably for me with 3 workers.
+		</comment>
+		<comment id='16' author='jamesemoody' date='2020-07-09T19:46:43Z'>
+		Not sure what strategy is ultimately best, but it should work like that. Indexed 100,000 files without issues.
+		</comment>
+	</comments>
+</bug>

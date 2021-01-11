@@ -1,0 +1,148 @@
+<bug id='16326' author='nmaxwell' open_date='2020-01-12T04:05:01Z' closed_time='2020-02-10T19:20:48Z'>
+	<summary>cv2.dft segmentation fault with MKL-linked numpy and opencv</summary>
+	<description>
+&lt;denchmark-h:h5&gt;System information&lt;/denchmark-h&gt;
+
+
+OpenCV =&gt; 3.3.4 + (all versions after 3.4.3, including 4.2.0)
+Operating System / Platform =&gt; Reproduced on Ubuntu 18.04 and 19.10
+Compiler =&gt; gcc-8
+Hardware =&gt; Reproduced on several intel systems, including Skylake, Coffee Lake.
+
+&lt;denchmark-h:h5&gt;Detailed description&lt;/denchmark-h&gt;
+
+We build numpy and opencv from source with MKL support. On Intel hardware, calls to cv2.dft cause a segmentation fault. The error does not occur on AMD hardware (tested on Threadripper). This occurs on any opencv version (including 4+), after 3.4.3. On 3.4.3, the error does not appear, so the error is likely introduced at version 3.4.4.
+I discovered a hack that appears to solve the problem: load the opencv libraries before importing numpy (eg. via ctypes).
+The following code causes segmentation fault
+&lt;denchmark-code&gt;import numpy, cv2
+cv2.dft(numpy.zeros((10,10)))
+&lt;/denchmark-code&gt;
+
+The following code does not cause a segfault
+&lt;denchmark-code&gt;import ctypes 
+ctypes.CDLL("/usr/local/lib/libopencv_core.so")
+ctypes.CDLL("/usr/local/lib/libopencv_imgproc.so")
+import numpy, cv2
+cv2.dft(numpy.zeros((10,10)))
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h5&gt;Steps to reproduce&lt;/denchmark-h&gt;
+
+I put together a minimal Dockerfile to reproduce the error
+&lt;denchmark-link:https://github.com/opencv/opencv/files/4050161/Dockerfile.txt&gt;Dockerfile.txt&lt;/denchmark-link&gt;
+
+Download "Dockerfile.txt", rename to "Dockerfile" (the github GUI wouldn't let me upload without the extension)
+&lt;denchmark-code&gt;# build the docker image
+docker build -t cv_bug .
+
+# run the docker image
+docker run -it cv_bug /bin/bash
+
+# (inside the image) run the test script, it should cause segfault
+python3 test.py
+
+# to test with the hack
+python3 test.py fix
+&lt;/denchmark-code&gt;
+
+You can also apply the hack with LD_PRELOAD
+&lt;denchmark-code&gt;LD_PRELOAD="/usr/local/lib/libopencv_core.so:/usr/local/lib/libopencv_imgproc.so" python3 test.py
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h5&gt;Investigations&lt;/denchmark-h&gt;
+
+I stepped through the opencv code, the segfault occurs on line 3112 in /opencv/modules/core/src/dxt.cpp
+&lt;denchmark-code&gt;if( getSizeFunc(opt.n, ipp_norm_flag, ippAlgHintNone, &amp;specsize, &amp;initsize, &amp;worksize) &gt;= 0 )
+&lt;/denchmark-code&gt;
+
+with
+&lt;denchmark-code&gt;getSizeFunc = ippsDFTGetSize_R_64f;
+&lt;/denchmark-code&gt;
+
+I checked that the inputs to getSizeFunc are the same, with and without the hack. I don't have source code for ippsDFTGetSize_R_64f, so could only step trough assembly. With the hack, the segfault occurs in "icv_l9_mkl_dft_avx2_z_ipp_real_get_size", without the hack, that function is never invoked.
+	</description>
+	<comments>
+		<comment id='1' author='nmaxwell' date='2020-01-17T20:50:33Z'>
+		I installed OpenCV (4.1.1) and Numpy from source with MKL and am seeing the same behavior on Ubuntu 18.04.
+		</comment>
+		<comment id='2' author='nmaxwell' date='2020-02-04T13:50:41Z'>
+		I've been able to reproduce the issue with provided docker image except I've updated MKL to 2020 and removed WITH_MKL option in OpenCV, because the problem is actually in IPP ICV. At some point it calls function from MKL:
+&lt;denchmark-code&gt;#0  0x00007fffe88b0ab7 in commit () from /opt/intel/compilers_and_libraries/linux/mkl/lib/intel64/libmkl_avx2.so
+#1  0x00007fffe5b8fda8 in icv_l9_static_dfti_commit () from /work/build/lib/libopencv_photo.so.4.2
+#2  0x00007fffdfb69140 in icv_l9_mkl_dft_avx2_dfti_get_size_dr1d () from /work/build/lib/libopencv_core.so.4.2 
+#3  0x00007fffdfb5dfeb in icv_l9_ippsDFTGetSize_R_64f () from /work/build/lib/libopencv_core.so.4.2         
+#4  0x00007fffdf745f6c in cv::OcvDftBasicImpl::init (this=0xf32970, len=10, count=10, depth=6, flags=96,
+    needBuffer=0xf318b8) at /work/opencv/modules/core/src/dxt.cpp:3112                                      
+#5  0x00007fffdf7469df in cv::hal::DFT1D::create (len=10, count=10, depth=6, flags=96, needBuffer=0xf318b8)
+    at /work/opencv/modules/core/src/dxt.cpp:3279                                                           
+#6  0x00007fffdf7449e0 in cv::OcvDftImpl::init (this=0xf31890, _width=10, _height=10, _depth=6, _src_channels=1,
+    _dst_channels=1, flags=512, _nonzero_rows=0) at /work/opencv/modules/core/src/dxt.cpp:2762              
+#7  0x00007fffdf746bda in cv::hal::DFT2D::create (width=10, height=10, depth=6, src_channels=1, dst_channels=1,
+    flags=512, nonzero_rows=0) at /work/opencv/modules/core/src/dxt.cpp:3306                                
+#8  0x00007fffdf7470ef in cv::dft (_src0=..., _dst=..., flags=0, nonzero_rows=0)
+    at /work/opencv/modules/core/src/dxt.cpp:3360  
+&lt;/denchmark-code&gt;
+
+although it should've called own function:
+&lt;denchmark-code&gt;#0  0x00007fffefda7819 in icv_l9_commit () from /work/build/lib/libopencv_core.so.4.2
+&lt;/denchmark-code&gt;
+
+Looks like we cannot workaround this problem on OpenCV side. The simpler workaround for users is to import cv2 before numpy:
+import cv2, numpy
+		</comment>
+		<comment id='3' author='nmaxwell' date='2020-02-04T15:39:14Z'>
+		Workaround for OpenCV build:
+&lt;denchmark-code&gt;cmake ... -DOPENCV_EXTRA_SHARED_LINKER_FLAGS="-Wl,--exclude-libs,libippicv.a -Wl,--exclude-libs,libippiw.a"
+&lt;/denchmark-code&gt;
+
+Possible symbols with conflict:
+&lt;denchmark-code&gt;$ nm ./lib/libopencv_core.so | grep -E '[D|U|T] mkl_'
+0000000000fddcc8 D mkl_dft_avx2_bkd_c2c_1d_rowbatch_s
+0000000000fddd08 D mkl_dft_avx2_bkd_c2c_1d_small_d
+0000000000fddd60 D mkl_dft_avx2_bkd_c2c_1d_small_s
+0000000000fc18e0 D mkl_dft_avx2_zsmallradix_forward
+0000000000fc1ae0 D mkl_dft_avx2_zsmallradix_inverse
+0000000000fdba28 D mkl_dft_avx512_bkd_c2c_1d_small_d
+0000000000fdde80 D mkl_dft_avx512_bkd_c2c_1d_small_s
+
+$ nm ./3rdparty/ippicv/ippicv_lnx/icv/lib/intel64/libippicv.a | grep -E '[D|U|T] mkl_'
+0000000000000000 D mkl_dft_avx2_zsmallradix_forward
+0000000000000200 D mkl_dft_avx2_zsmallradix_inverse
+                 U mkl_dft_avx2_bkd_c2c_1d_small_d
+                 U mkl_dft_avx2_bkd_c2c_1d_rowbatch_s
+                 U mkl_dft_avx2_bkd_c2c_1d_small_s
+                 U mkl_dft_avx2_bkd_c2c_1d_small_d
+0000000000000128 D mkl_dft_avx2_bkd_c2c_1d_rowbatch_s
+                 U mkl_dft_avx2_zsmallradix_forward
+                 U mkl_dft_avx2_zsmallradix_inverse
+                 U mkl_dft_avx2_bkd_c2c_1d_small_s
+0000000000000000 D mkl_dft_avx2_bkd_c2c_1d_small_d
+0000000000000000 D mkl_dft_avx2_bkd_c2c_1d_small_s
+                 U mkl_dft_avx512_bkd_c2c_1d_small_d
+                 U mkl_dft_avx512_bkd_c2c_1d_small_s
+                 U mkl_dft_avx512_bkd_c2c_1d_small_d
+0000000000000000 D mkl_dft_avx512_bkd_c2c_1d_small_s
+0000000000000000 D mkl_dft_avx512_bkd_c2c_1d_small_d
+                 U mkl_dft_avx512_bkd_c2c_1d_small_s
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='4' author='nmaxwell' date='2020-02-04T16:08:37Z'>
+		Thanks for the replies.
+
+Looks like we cannot workaround this problem on OpenCV side. The simpler workaround for users is to import cv2 before numpy:
+import cv2, numpy
+
+I tried switching the order of imports, that didn't help, because one of the firs things cv2.init.py does is import numpy.
+
+cmake ... -DOPENCV_EXTRA_SHARED_LINKER_FLAGS="-Wl,--exclude-libs,libippicv.a -Wl,--exclude-libs,libippiw.a"
+
+I'll give that a try. Does that mean opencv won't use ippic, or it just won't expose the symbols?
+		</comment>
+		<comment id='5' author='nmaxwell' date='2020-02-04T16:22:26Z'>
+		&lt;denchmark-link:https://github.com/nmaxwell&gt;@nmaxwell&lt;/denchmark-link&gt;
+ , try this patch: &lt;denchmark-link:https://github.com/opencv/opencv/pull/16505&gt;#16505&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,162 @@
+<bug id='11770' author='MrEsp' open_date='2018-06-14T17:55:23Z' closed_time='2018-06-26T19:55:52Z'>
+	<summary>readNetFromTensorflow doesn't load "channel first" networks / Unsupported ksize</summary>
+	<description>
+&lt;denchmark-h:h5&gt;System information (version)&lt;/denchmark-h&gt;
+
+
+OpenCV =&gt; 3.4.1. (3.3.1 is buggy too, but with a different behaviour)
+Operating System / Platform =&gt; Windows 64 Bit
+Compiler =&gt; Visual Studio 2017, x86
+
+&lt;denchmark-h:h5&gt;Detailed description&lt;/denchmark-h&gt;
+
+Let's consider the following two simple networks in  TF
+1st
+input, y_values = tf.placeholder(tf.float32, [None, 3, 224, 224], 'cnn_input_cf'), \
+tf.placeholder(tf.float32, [None, N_CLASSES], 'expected_value_input_cf')
+
+conv1 = tf.layers.conv2d(input, 2, 5, activation=tf.nn.relu, data_format = 'channels_first', name  = 'conv1_cf')
+conv1 = tf.layers.max_pooling2d(conv1, 2, 2,  name = 'pool1_cf', data_format='channels_first')
+and 2nd
+input, y_values = tf.placeholder(tf.float32, [None, 224, 224, 3], 'cnn_input_cl'), \
+tf.placeholder(tf.float32, [None, N_CLASSES], 'expected_value_input_cl')
+
+conv1 = tf.layers.conv2d(input, 2, 5, activation=tf.nn.relu, data_format = 'channels_last', name  = 'conv1_cl')
+conv1 = tf.layers.max_pooling2d(conv1, 2, 2,  name = 'pool1_cl', data_format='channels_last')
+Let's save them to pb files using  function from here (&lt;denchmark-link:https://github.com/opencv/opencv_extra/blob/master/testdata/dnn/tensorflow/generate_tf_models.py&gt;https://github.com/opencv/opencv_extra/blob/master/testdata/dnn/tensorflow/generate_tf_models.py&lt;/denchmark-link&gt;
+)
+Let's load them in C++
+        std::string modelFileCF = "bug_test_case_channels_first_net.pb";
+	std::string modelFileCL = "bug_test_case_channels_last_net.pb";
+
+	bool CF = true;
+	std::string modelFile = CF ? modelFileCF : modelFileCL;
+
+	//Load model
+	cv::dnn::Net net = readNetFromTensorflow(modelFile); //  (*)
+	auto layers = net.getLayerNames();
+It happens that when the first model is being loaded the assert is triggering
+&lt;denchmark-code&gt;&gt;	opencv_core341d.dll!cv::error(const cv::Exception &amp; exc) Line 915	C++
+ 	opencv_core341d.dll!cv::error(int _code, const cv::String &amp; _err, const char * _func, const char * _file, int _line) Line 919	C++
+ 	opencv_dnn341d.dll!cv::dnn::experimental_dnn_v4::`anonymous namespace'::setKSize(cv::dnn::experimental_dnn_v4::LayerParams &amp; layerParams, const tensorflow::NodeDef &amp; layer) Line 350	C++
+ 	opencv_dnn341d.dll!cv::dnn::experimental_dnn_v4::`anonymous namespace'::TFImporter::populateNet(cv::dnn::experimental_dnn_v4::Net dstNet) Line 1070	C++
+ 	opencv_dnn341d.dll!cv::dnn::experimental_dnn_v4::readNetFromTensorflow(const cv::String &amp; model, const cv::String &amp; config) Line 1596	C++
+&lt;/denchmark-code&gt;
+
+the problem is here in tf_importer.cpp
+void setKSize(LayerParams &amp;layerParams, const tensorflow::NodeDef &amp;layer)
+{
+    if (hasLayerAttr(layer, "ksize"))
+    {
+        const tensorflow::AttrValue&amp; val = getLayerAttr(layer, "ksize");
+        if (val.list().i_size() != 4 ||
+            val.list().i(0) != 1 || val.list().i(3) != 1)    //  (**)
+            CV_Error(Error::StsError, "Unsupported ksize");
+        layerParams.set("kernel_h", static_cast&lt;int&gt;(val.list().i(1)));
+        layerParams.set("kernel_w", static_cast&lt;int&gt;(val.list().i(2)));
+    }
+    else
+    {
+        layerParams.set("kernel_h", 1);
+        layerParams.set("kernel_w", 1);
+    }
+}
+The condition (**) is valid only for channel last networks, that's why the assertion is triggered.
+Mainly, I need my networks work, so considering facts above the following questions arise:
+
+As a workaround  can one switch to channel last networks in Tensorflow? Will they be properly converted to channel first?  From the code
+
+template &lt;typename T&gt;
+void parseTensor(const tensorflow::TensorProto &amp;tensor, Mat &amp;dstBlob)
+{
+    MatShape shape;
+    blobShapeFromTensor(tensor, shape);
+    int dims = (int)shape.size();
+
+    if (dims == 4)
+    {
+        // REORDER blob NHWC to NCHW
+        swap(shape[2], shape[3]); // NHCW
+        swap(shape[1], shape[2]); // NCHW
+    }
+it looks like that.
+1.1 But, will the pooling still work correctly?  Since it's not reordered (at least around the mentioned assertion), it's not obvious
+1.2 What about imageFromBlob? as it uses  "channels first", will the input layer be correctly reordered?
+
+Will the code break if we simply delete the (**) check ?  Thus it will not require to change the model.
+
+One more remark  - looks like 3.4.1 was attempted to fix problems with ordering introducing
+&lt;denchmark-code&gt;enum DataLayout
+{
+    DATA_LAYOUT_NHWC,
+    DATA_LAYOUT_NCHW,
+    DATA_LAYOUT_UNKNOWN
+};
+&lt;/denchmark-code&gt;
+
+but looks like with no complete success.
+	</description>
+	<comments>
+		<comment id='1' author='MrEsp' date='2018-06-15T07:54:33Z'>
+		&lt;denchmark-link:https://github.com/MrEsp&gt;@MrEsp&lt;/denchmark-link&gt;
+, the problem is that the most layers support NCHW data layout only on GPU. That is why NHWC data layout is by default in TensorFlow. Am I right that you run your model on Nvidia GPU?
+&lt;denchmark-code&gt;Default MaxPoolingOp only supports NHWC on device type CPU
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-code&gt;Generic conv implementation only supports NHWC tensor format for now.
+&lt;/denchmark-code&gt;
+
+I'll try to generate test data but may I ask you to try the following changes?
+void setStrides(LayerParams &amp;layerParams, const tensorflow::NodeDef &amp;layer)
+{
+    if (hasLayerAttr(layer, "strides"))
+    {
+        const tensorflow::AttrValue&amp; val = getLayerAttr(layer, "strides");
+        // if (val.list().i_size() != 4 ||
+        //     val.list().i(0) != 1 || val.list().i(3) != 1)
+        //     CV_Error(Error::StsError, "Unsupported strides");
+        layerParams.set("stride_h", static_cast&lt;int&gt;(val.list().i(2)));  // 1 -&gt; 2
+        layerParams.set("stride_w", static_cast&lt;int&gt;(val.list().i(3)));  // 2 -&gt; 3
+    }
+}
+void setKSize(LayerParams &amp;layerParams, const tensorflow::NodeDef &amp;layer)
+{
+    if (hasLayerAttr(layer, "ksize"))
+    {
+        const tensorflow::AttrValue&amp; val = getLayerAttr(layer, "ksize");
+        // if (val.list().i_size() != 4 ||
+        //     val.list().i(0) != 1 || val.list().i(3) != 1)
+        //     CV_Error(Error::StsError, "Unsupported ksize");
+        layerParams.set("kernel_h", static_cast&lt;int&gt;(val.list().i(2)));  // 1 -&gt; 2
+        layerParams.set("kernel_w", static_cast&lt;int&gt;(val.list().i(3)));  // 2 -&gt; 3
+    }
+    else
+    {
+        layerParams.set("kernel_h", 1);
+        layerParams.set("kernel_w", 1);
+    }
+}
+		</comment>
+		<comment id='2' author='MrEsp' date='2018-06-18T11:08:01Z'>
+		&lt;denchmark-link:https://github.com/dkurt&gt;@dkurt&lt;/denchmark-link&gt;
+ Hi!
+
+Am I right that you run your model on Nvidia GPU?
+
+You are.  I'm trying to run a model that has been previously trained on a GPU.
+
+I'll try to generate test data but may I ask you to try the following changes?
+
+I will try it eventually, OK.   For now I am going to test against "channels_last" setting.
+		</comment>
+		<comment id='3' author='MrEsp' date='2018-06-26T13:23:15Z'>
+		&lt;denchmark-link:https://github.com/MrEsp&gt;@MrEsp&lt;/denchmark-link&gt;
+, Building TensorFlow with MKL solved it (there are primitives with NCHW data format)
+&lt;denchmark-code&gt;bazel build --config=mkl --config=opt //tensorflow/tools/pip_package:build_pip_package
+&lt;/denchmark-code&gt;
+
+Please check a PR &lt;denchmark-link:https://github.com/opencv/opencv/pull/11840&gt;#11840&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

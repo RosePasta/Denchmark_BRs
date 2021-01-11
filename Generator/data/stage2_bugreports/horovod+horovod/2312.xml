@@ -1,0 +1,103 @@
+<bug id='2312' author='P-Schumacher' open_date='2020-09-22T11:07:00Z' closed_time='2020-09-23T13:03:15Z'>
+	<summary>Multiple independent model instances with GradientTape and tf.function</summary>
+	<description>
+Environment:
+
+Framework: TensorFlow
+Framework version: 2.3.0.
+Horovod version: 0.20.0
+MPI version: 4.0.3
+CUDA version: N.A.
+NCCL version: N.A.
+Python version: 3.7.4.
+Spark / PySpark version: N.A.
+OS and version: Pop!_OS 20.04 LTS
+GCC version: 9.3.0.
+CMake version: 3.17.12.
+
+Checklist:
+
+Did you search issues to find if somebody asked this question before?
+If your question is about hang, did you read this doc?
+If your question is about docker, did you read this doc?
+Did you check if you question is answered in the troubleshooting guide?
+
+Bug report:
+Please describe erroneous behavior you're observing and steps to reproduce it.
+At the moment, I am using TensorFlow 2 custom training loops, i.e. GradientTape, and then use
+tape = hvd.DistributedGradientTape(tape) 
+(and all other necessary horovod functions) to distribute training. I only use a local CPU at the moment. My run command is
+mpirun -n 4 python3 main.py
+This works fine.
+If I want to parallelize multiple different models in one program, I use this line every time I want to parallelize the gradient computation.
+This also works fine.
+If, however, I use DistributedGradientTape with multiple models in one program and I wrap the tape computation with tf.function to increase performance, I get the following error:
+One or more tensors were submitted to be reduced, gathered or broadcasted by subset of ranks and are waiting for remainder of ranks for more than 60 seconds. This may indicate that different ranks are trying to submit different tensors or that only subset of ranks is submitting tensors, which will cause deadlock.  
+I guess horovod cannot distinguish the different tape instances inside the static computation graph induced by tf.function and tries to apply gradients of one model to the other, which is not possible.
+So my question is, how can I use horovod to parallelize multiple independent models in one script, using DistributedGradientTape and tf.function?
+	</description>
+	<comments>
+		<comment id='1' author='P-Schumacher' date='2020-09-22T14:50:33Z'>
+		Hey &lt;denchmark-link:https://github.com/P-Schumacher&gt;@P-Schumacher&lt;/denchmark-link&gt;
+, can you share a minimal reproducible example of this?  I'm having a hard time picturing how exactly you're parallelizing the model training within a single tf.function.  In most cases, I would expect that the models would still be trained sequentially (alternating).
+		</comment>
+		<comment id='2' author='P-Schumacher' date='2020-09-23T08:42:55Z'>
+		I found the issue, it is not a problem with the library!
+I have a reinforcement learning setup where I have 2 models. I train model_1 every 10 iterations and model_2 every iteration.
+However, there are some contingencies which can cause model_1 to train earlier, e.g. after 7 iterations instead of 10.
+These contingencies can vary between workers as they are dependent on the environment.
+What then happens is that worker_1 is still waiting on model_1 while worker_2 wants to submit gradients for model_2, because the contingency did not happen for worker_2.
+Essentially, synchronous data parallelism is not feasible with that setup because it is inherently asynchronous.
+I created a minimal example code which reproduces the error (even if I artificially create the problem there)
+&lt;denchmark-code&gt;import tensorflow as tf
+from tensorflow import keras
+import numpy as np
+import horovod.tensorflow as hvd
+
+class MODEL:
+    def __init__(self, shape, units):
+        self.model = self.create_model(shape, 1, units)
+        self.opt = tf.optimizers.Adam(learning_rate=0.0001 * hvd.size())
+        self.loss = tf.losses.MeanSquaredError()
+        
+    def create_model(self, input_shape, output_classes, n_units):
+        model = tf.keras.models.Sequential()
+        model.add(keras.layers.Dense(units=n_units, activation=tf.nn.relu))
+        model.add(keras.layers.Dense(units=output_classes, activation='tanh'))
+        return model
+
+    @tf.function
+    def train(self, x, y):
+        with tf.GradientTape() as tape:
+            loss_val = self.loss(self.model(x), y)
+        tape = hvd.DistributedGradientTape(tape)
+        grads = tape.gradient(loss_val, self.model.trainable_variables)
+        self.opt.apply_gradients(zip(grads, self.model.trainable_variables))
+
+hvd.init()
+N = 10000
+y = tf.constant(1.)
+shape = [1,10]
+agent = MODEL(shape=shape, units=2)
+agent2 = MODEL(shape=shape, units=3)
+for i in range(N):
+    x = tf.random.uniform(shape=shape)
+    agent.train(x, y)
+    if np.random.uniform() &lt; 0.8:
+        agent2.train(x, y)
+    if i == 0:
+        hvd.broadcast_variables(agent.model.trainable_variables, root_rank=0)
+        hvd.broadcast_variables(agent.opt.variables(), root_rank=0)
+        hvd.broadcast_variables(agent2.model.trainable_variables, root_rank=0)
+        hvd.broadcast_variables(agent2.opt.variables(), root_rank=0)
+&lt;/denchmark-code&gt;
+
+I launch with
+mpirun -np 4 python3 script.py
+		</comment>
+		<comment id='3' author='P-Schumacher' date='2020-09-23T13:17:44Z'>
+		Thanks &lt;denchmark-link:https://github.com/P-Schumacher&gt;@P-Schumacher&lt;/denchmark-link&gt;
+, that makes sense.  Would it be possible to use a  or  so that all the workers can decide whether to train earlier together?  I'm not sure exactly what the criteria is, but often if it's a metric, for example, then a common solution would be average the metric across workers, etc. to enforce consistent behavior.
+		</comment>
+	</comments>
+</bug>

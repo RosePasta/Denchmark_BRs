@@ -1,0 +1,193 @@
+<bug id='1559' author='chenbiaolong' open_date='2019-12-03T09:25:05Z' closed_time='2020-02-06T17:31:09Z'>
+	<summary>tf.AUTO_REUSE cause Mismatched ALLREDUCE tensor shapes error</summary>
+	<description>
+Environment:
+
+Framework: TensorFlow
+Framework version: 1.12
+Horovod version: v0.18.2
+MPI version: 4.0.2
+CUDA version: 9.0
+NCCL version: nccl_2.5.6-1+cuda9.0_x86_64
+Python version: 3.5
+OS and version: centos7.4
+GCC version: gcc version 4.8.5 20150623 (Red Hat 4.8.5-28) (GCC)
+
+I try to use horovod to train retinanet which use tf.AUTO_REUSE  in its class and bbox subnet. some of my retinanet code show as below
+class RetinaHead(AnchorHead):
+    def __init__(self,
+                 num_classes,
+                 image_size,
+                 feature_map_shape_list,
+                 box_code_size = 4,
+                 stacked_convs = 4,
+                 conv_cfg = None,
+                 anchor_generator_cfg = None,
+                 cls_loss_cfg = None,
+                 bbox_loss_cfg = None,
+                 name = 'RetinaHead',
+                 **kwargs):
+        self._num_classes = num_classes
+        self._stacked_conv = stacked_convs
+        self._conv_cfg = conv_cfg
+        self._box_code_size = box_code_size
+        self._cls_loss_cfg = cls_loss_cfg
+        self._bbox_loss_cfg = bbox_loss_cfg
+        super(RetinaHead, self).__init__(
+            num_classes = num_classes,
+            image_size = image_size,
+            anchor_generator_cfg = anchor_generator_cfg,
+            feature_map_shape_list = feature_map_shape_list,
+            cls_loss_cfg = cls_loss_cfg,
+            bbox_loss_cfg = bbox_loss_cfg,
+            name = name,
+            **kwargs
+            )
+        # self._num_anchors get from BaseClass AnchorHead 
+        num_anchor = self._num_anchors
+
+    def cls_subnet(self, x, level_name, num_anchor_per_location, 
+                    activation = tf.nn.relu, is_training = True):
+        """ classification subnet of retinanet
+        Args:
+            num_anchor_per_location:
+                num of anchor per pixel of feature_map
+        Returns:
+            classes: tensor with shape:
+                [batch_size, num_anchor_of_this_featuemap, num_classes]
+                Note: num_classes **NOT** include the background class
+        """
+        for i in range(self._stacked_conv):
+            # this conv params will be shared among all levels
+            conv = ConvBlock(self._conv_cfg, name = 'class%d_conv'%i)
+            x = conv(x)
+            # The convolution layers in the class net are shared among all levels, but
+            # each level has its batch normlization to capture the statistical
+            # difference among different levels.
+            x = batch_norm_activation(x, is_training, activation, name = 'class-%d-bn-%s' % (i, level_name))
+        classes = tf.layers.conv2d(
+            x,
+            (self._num_classes) * num_anchor_per_location,
+            kernel_size=(1, 1),
+            bias_initializer=tf.constant_initializer(-np.log((1 - 0.01) / 0.01)),
+            kernel_initializer=tf.random_normal_initializer(stddev=0.01),
+            padding='same',
+            name='class-predict')
+        batch_size = tf.shape(classes)[0]
+        classes = tf.reshape(classes, [batch_size, -1, self._num_classes])
+        return classes
+    
+    def bbox_subnet(self, x, level_name, num_anchor_per_location, 
+            activation = tf.nn.relu, is_training = True):
+        """ bbox regression subnet of retinanet
+        Args:
+            num_anchor_per_location:
+                num of anchor per pixel of feature_map
+        Returns:
+            bbox: tensor with shape:
+                [batch_size, num_anchor_of_this_featuemap, box_coder_dim]
+
+        """
+        for i in range(self._stacked_conv):
+            # this conv params will be shared among all levels
+            conv = ConvBlock(self._conv_cfg, name = 'bbox%d_conv'%i)
+            x = conv(x)
+            # The convolution layers in the class net are shared among all levels, but
+            # each level has its batch normlization to capture the statistical
+            # difference among different levels.
+            x = batch_norm_activation(x, is_training, activation, 
+                name = 'bbox-%d-bn-%s' % (i, level_name))
+        bbox = tf.layers.conv2d(
+            x,
+            num_anchor_per_location * self._box_code_size,
+            kernel_size=(1, 1),
+            bias_initializer=tf.constant_initializer(-np.log((1 - 0.01) / 0.01)),
+            kernel_initializer=tf.random_normal_initializer(stddev=0.01),
+            padding='same',
+            name='bbox-predict')
+        batch_size = tf.shape(bbox)[0]
+        bbox = tf.reshape(bbox, [batch_size, -1, self._box_code_size])
+        return bbox
+    
+    def forward(self, features, is_training = True):
+        """ 
+        Args:
+            features : FPN feature-map tensors list in high to low resolution.
+                Each tensor in the list correspond to different feature levels.
+        Returns:
+            cls_scores: scores list
+            bbox_preds: bbox list
+        """
+        cls_scores = []
+        bbox_preds = []
+        for idx, feat in enumerate(features):
+            num_anchor_per_location = self._num_anchors_per_location[idx]
+           ## !!!!this casue the ALLREDUCE error!!!!!
+            with tf.variable_scope('class_net', reuse=tf.AUTO_REUSE):
+                cls_scores.append(self.cls_subnet(feat, 'feature%d'%idx, num_anchor_per_location, 
+                    is_training = is_training))
+            with tf.variable_scope('bbox_net', reuse=tf.AUTO_REUSE):
+                bbox_preds.append(self.bbox_subnet(feat, 'feature%d'%idx, num_anchor_per_location,
+                    is_training = is_training))
+        return cls_scores, bbox_preds
+when I ran the training code in 1 server 4 GPUs, horovod report the error(I use tensorflow1.12, not 1.14, I didn't change the virtualenv name):
+Caused by op 'DistributedRMSPropOptimizer_Allreduce/HorovodAllreduce_gradients_AddN_5_0', defined at:
+  File "./detection/models/main.py", line 86, in &lt;module&gt;
+    main()
+  File "./detection/models/main.py", line 82, in main
+    excutor.train(args.steps)
+  File "/export/chenbiaolong/imba-common/detection/detection/models/core/executor.py", line 57, in train
+    hooks=[bcast_hook]
+  File "/home/chenbiaolong/tf-r1.14/lib/python3.5/site-packages/tensorflow/python/estimator/estimator.py", line 354, in train
+    loss = self._train_model(input_fn, hooks, saving_listeners)
+  File "/home/chenbiaolong/tf-r1.14/lib/python3.5/site-packages/tensorflow/python/estimator/estimator.py", line 1207, in _train_model
+    return self._train_model_default(input_fn, hooks, saving_listeners)
+  File "/home/chenbiaolong/tf-r1.14/lib/python3.5/site-packages/tensorflow/python/estimator/estimator.py", line 1237, in _train_model_default
+    features, labels, model_fn_lib.ModeKeys.TRAIN, self.config)
+  File "/home/chenbiaolong/tf-r1.14/lib/python3.5/site-packages/tensorflow/python/estimator/estimator.py", line 1195, in _call_model_fn
+    model_fn_results = self._model_fn(features=features, **kwargs)
+  File "/export/chenbiaolong/imba-common/detection/detection/models/model_builder.py", line 56, in __call__
+    return self._model.train(features, labels)
+  File "/export/chenbiaolong/imba-common/detection/detection/models/meta_arch/retinanet.py", line 189, in train
+    train_op = self.optimize(total_loss)
+  File "/export/chenbiaolong/imba-common/detection/detection/models/core/base_model.py", line 242, in optimize
+    total_loss, global_step, var_list=train_var_list)
+  File "/home/chenbiaolong/tf-r1.14/lib/python3.5/site-packages/tensorflow/python/training/optimizer.py", line 400, in minimize
+    grad_loss=grad_loss)
+  File "/home/chenbiaolong/tf-r1.14/lib/python3.5/site-packages/horovod/tensorflow/__init__.py", line 256, in compute_gradients
+    avg_grads = self._allreduce_grads(grads)
+  File "/home/chenbiaolong/tf-r1.14/lib/python3.5/site-packages/horovod/tensorflow/__init__.py", line 210, in allreduce_grads
+    for grad in grads]
+  File "/home/chenbiaolong/tf-r1.14/lib/python3.5/site-packages/horovod/tensorflow/__init__.py", line 210, in &lt;listcomp&gt;
+    for grad in grads]
+  File "/home/chenbiaolong/tf-r1.14/lib/python3.5/site-packages/horovod/tensorflow/__init__.py", line 80, in allreduce
+    summed_tensor_compressed = _allreduce(tensor_compressed)
+  File "/home/chenbiaolong/tf-r1.14/lib/python3.5/site-packages/horovod/tensorflow/mpi_ops.py", line 89, in _allreduce
+    return MPI_LIB.horovod_allreduce(tensor, name=name)
+  File "&lt;string&gt;", line 51, in horovod_allreduce
+  File "/home/chenbiaolong/tf-r1.14/lib/python3.5/site-packages/tensorflow/python/framework/op_def_library.py", line 787, in _apply_op_helper
+    op_def=op_def)
+  File "/home/chenbiaolong/tf-r1.14/lib/python3.5/site-packages/tensorflow/python/util/deprecation.py", line 488, in new_func
+    return func(*args, **kwargs)
+  File "/home/chenbiaolong/tf-r1.14/lib/python3.5/site-packages/tensorflow/python/framework/ops.py", line 3274, in create_op
+    op_def=op_def)
+  File "/home/chenbiaolong/tf-r1.14/lib/python3.5/site-packages/tensorflow/python/framework/ops.py", line 1770, in __init__
+    self._traceback = tf_stack.extract_stack()
+
+FailedPreconditionError (see above for traceback): Mismatched ALLREDUCE tensor shapes: One rank sent a tensor of shape [540], but another rank sent a tensor of shape [1, 1, 256, 24].
+         [[node DistributedRMSPropOptimizer_Allreduce/HorovodAllreduce_gradients_AddN_5_0 (defined at &lt;string&gt;:51)  = HorovodAllreduce[T=DT_FLOAT, _device="/job:localhost/replica:0/task:0/device:GPU:0"](gradients/AddN_5)]]
+I believe it is caused by the tf.AUTO_REUSE, because when I change the network and remove the tf.AUTO_REUSE, everything seems go well. Is this a bug of horovod or did I miss something?
+my start scrip:
+mpirun -np 4 -H localhost:4 -bind-to none -map-by slot  -x NCCL_DEBUG=INFO  \
+  -x LD_LIBRARY_PATH -x PATH \
+  -x NCCL_SOCKET_IFNAME=^lo,docker0 \
+  -mca pml ob1 -mca btl ^openib \
+  -mca btl_tcp_if_exclude lo,docker0 \
+  python ./detection/models/main.py
+	</description>
+	<comments>
+		<comment id='1' author='chenbiaolong' date='2019-12-05T18:47:27Z'>
+		This error indicates that your workers are not doing the exact same thing. There is a tensor with the same name on both ends that has different shapes. You might need to dig a bit deeper, try to understand what is going on.
+		</comment>
+	</comments>
+</bug>

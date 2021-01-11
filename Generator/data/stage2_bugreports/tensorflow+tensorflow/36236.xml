@@ -1,0 +1,231 @@
+<bug id='36236' author='foxik' open_date='2020-01-27T10:01:07Z' closed_time='2020-06-09T16:53:48Z'>
+	<summary>GradientTape.gradient fails when tf.gather is used after LSTM/GRU in tf.function</summary>
+	<description>
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): No
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Linux Stretch
+Mobile device (e.g. iPhone 8, Pixel 2, Samsung Galaxy) if the issue happens on mobile device:
+TensorFlow installed from (source or binary): binary
+TensorFlow version (use command below): 2.1.0 and 2.0.0
+Python version: 3.6
+
+Describe the current behavior
+Consider the following simple model running a GRU, tf.gather, and a linear regression:
+import tensorflow as tf
+
+inputs = tf.keras.layers.Input(shape=[None, 1], dtype=tf.float32)
+hidden = tf.keras.layers.GRU(10)(inputs)
+hidden = tf.gather(hidden, [0])
+output = tf.keras.layers.Dense(1)(hidden)
+model = tf.keras.Model(inputs=inputs, outputs=output)
+
+@tf.function
+def train(x, y):
+    with tf.GradientTape() as tape:
+        predictions = model(x, training=True)
+        loss = tf.losses.mean_squared_error(y, predictions)
+    gradients = tape.gradient(loss, model.trainable_variables)
+
+train(tf.constant([[[1], [2], [3]]], dtype=tf.float32), tf.constant([[1]], dtype=tf.float32))
+Both TF 2.0.0 and TF 2.1.0 fails, with a similar error message (the following is TF 2.1):
+&lt;denchmark-code&gt;    ValueError: All inputs to `ConcreteFunction`s must be Tensors; on invocation of __backward_standard_gru_918, the 0-th input (IndexedSlices(indices=Tensor("Reshape_2:0", shape=(1,), dtype=int32), values=Tensor("Reshape_1:0", shape=(1, 10), dtype=float32), dense_shape=Tensor("Cast_2:0", shape=(2,), dtype=int32))) was not a Tensor.
+&lt;/denchmark-code&gt;
+
+Describe the expected behavior
+The code should work.
+Other info / logs
+The problem is caused by tf.gather generating tf.IndexedSlices as a derivative. However, current LSTM/GRU are graph functions and the backprop algorithm for graph functions assumes the inputs must be tf.Tensors.
+One possible workaround is not to use tf.function and use eager. Then the code works.
+Another solution is to force conversion of the derivatives from tf.IndexedSlices to tf.Tensor. The easiest solution I found is to use * 1, which adds operation Mul to the computation graph, for which the conversion from tf.IndexedSlices to Tensor works. So the following works:
+inputs = tf.keras.layers.Input(shape=[None, 1], dtype=tf.float32)
+hidden = tf.keras.layers.GRU(10)(inputs)
+hidden = tf.gather(hidden * 1, [0])
+output = tf.keras.layers.Dense(1)(hidden)
+model = tf.keras.Model(inputs=inputs, outputs=output)
+
+@tf.function
+def train(x, y):
+    with tf.GradientTape() as tape:
+        predictions = model(x, training=True)
+        loss = tf.losses.mean_squared_error(y, predictions)
+    gradients = tape.gradient(loss, model.trainable_variables)
+
+train(tf.constant([[[1], [2], [3]]], dtype=tf.float32), tf.constant([[1]], dtype=tf.float32))
+Possible solution
+I assume an automatic conversion of tf.IndexedSlices to tf.Tensor should be performed. As a proof of concept, I changed the line 
+
+
+tensorflow/tensorflow/python/eager/function.py
+
+
+         Line 1731
+      in
+      1f404dc
+
+
+
+
+
+
+ raise ValueError("All inputs to `ConcreteFunction`s must be Tensors; " 
+
+
+
+
+
+to
+  tensor_inputs.append(ops.convert_to_tensor(arg))
+and the code then works as expected (converting the tf.IndexedSlices to tf.Tensor). However, a proper fix is definitely more complicated.
+	</description>
+	<comments>
+		<comment id='1' author='foxik' date='2020-01-28T03:25:25Z'>
+		Issue replicating for &lt;denchmark-link:https://colab.sandbox.google.com/gist/oanush/8de62f184ff385f8c95404fa6b8d36f4/36236.ipynb&gt;tf-nightly&lt;/denchmark-link&gt;
+, thanks!
+		</comment>
+		<comment id='2' author='foxik' date='2020-01-28T23:43:13Z'>
+		I am having the same problem.  Removing all tf.function decorators causes the problem to go away.
+		</comment>
+		<comment id='3' author='foxik' date='2020-02-24T17:57:15Z'>
+		This is severe for performance, experiencing troubles as well!
+		</comment>
+		<comment id='4' author='foxik' date='2020-02-24T19:40:35Z'>
+		Well, the * 1 on strategic places (as described above) makes the tf.functions work again and there is no slowdown (a proper fix will do a very similar thing from the performance point of view).
+So what you can try is after every call to LSTM/GRU (or after an enclosing Bidirectional) write * 1, until the bug is fixed.
+		</comment>
+		<comment id='5' author='foxik' date='2020-02-24T19:48:01Z'>
+		
+Well, the * 1 on strategic places (as described above) makes the tf.functions work again and there is no slowdown (a proper fix will do a very similar thing from the performance point of view).
+So what you can try is after every call to LSTM/GRU (or after an enclosing Bidirectional) write * 1, until the bug is fixed.
+
+Well I am using a significantly more complex model. It feels painful to do this, I am looking forward to the fix.
+		</comment>
+		<comment id='6' author='foxik' date='2020-03-17T20:01:39Z'>
+		I keep running into this issue myself; it's a horrific regression relative to TF1.x, where no such problems existed.
+It would be really great if the TF team would fix this in the next release, for example by auto-converting to a dense tensor on entry into the backwards function. Yes, there might be more performant options, but the current behaviour is simply breaking code.
+		</comment>
+		<comment id='7' author='foxik' date='2020-04-30T22:26:14Z'>
+		Any updates on this?
+Changing this &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/eab9701d541f5b8d54a898f81c3344c7b7d672b4/tensorflow/python/eager/function.py#L1971&gt;line&lt;/denchmark-link&gt;
+ to
+&lt;denchmark-code&gt;  tensor_inputs.append(ops.convert_to_tensor(arg))
+&lt;/denchmark-code&gt;
+
+solves the issue on 2.2.0-rc3 but just wondering if there is a proper change from TF team.
+		</comment>
+		<comment id='8' author='foxik' date='2020-06-03T05:47:14Z'>
+		A gentle bump after another month -- still not working on current TF-nightly 2.3.0-dev20200602.
+		</comment>
+		<comment id='9' author='foxik' date='2020-06-03T07:34:55Z'>
+		I've raised a similar issue  &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/31952&gt;#31952&lt;/denchmark-link&gt;
+ before, which got fixed. However that fix only works when the grads are calculated outside a graph ( i.e. in eager mode). It might shed some light on how to fix it in graph mode though. cc the author of that fix: &lt;denchmark-link:https://github.com/alextp&gt;@alextp&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='10' author='foxik' date='2020-06-04T21:48:28Z'>
+		Can you send a PR changing the line and adding a test?
+		</comment>
+		<comment id='11' author='foxik' date='2020-06-05T06:08:41Z'>
+		&lt;denchmark-link:https://github.com/alextp&gt;@alextp&lt;/denchmark-link&gt;
+ I can easily do it, but I am not sure it is a correct solution. Looking at the current master:
+
+
+I assume it would make sense to test specifically for IndexedSlices only, and perform the same shape check as in the case of tf.Tensor? Hm, I think the best solution would be to do something like
+      elif isinstance(arg, (ops.Tensor, ops.IndexedSlices)): 
+        if isinstance(arg, ops.IndexedSlices):
+          tensor_inputs.append(ops.convert_to_tensor(arg))
+        else
+          tensor_inputs.append(arg)
+and then continue with the shape-checking code.
+Looking even deeper, maybe we should do the rewrite for the backward pass only? Here
+
+
+
+tensorflow/tensorflow/python/eager/function.py
+
+
+        Lines 737 to 747
+      in
+      9221044
+
+
+
+
+
+
+ cleaned_doutputs = [] 
+
+
+
+ for doutput, placeholder in zip(doutputs, self._func_graph.outputs): 
+
+
+
+ if backprop_util.IsTrainable(placeholder): 
+
+
+
+ if doutput is not None: 
+
+
+
+ cleaned_doutputs.append(doutput) 
+
+
+
+ else: 
+
+
+
+ cleaned_doutputs.append(default_gradient.zeros_like(placeholder)) 
+
+
+
+ 
+
+
+
+ # Compute the gradients using the side outputs 
+
+
+
+ return backwards_function._call_flat(  # pylint: disable=protected-access 
+
+
+
+ cleaned_doutputs, remapped_captures) 
+
+
+
+
+
+the gradients in the backward pass are collected -- it would be enough to convert the IndexedSlices to Tensors here. So that the least number of silent conversions would happen (and the backward pass is the only problematic one).
+Personally I would do the rewrite only for the backward pass -- what do you think &lt;denchmark-link:https://github.com/alextp&gt;@alextp&lt;/denchmark-link&gt;
+? If you think it is fine, I will prepare the patch (including a test).
+		</comment>
+		<comment id='12' author='foxik' date='2020-06-05T11:54:42Z'>
+		I have simplified the problematic input not to reference LSTM/GRU:
+@tf.function
+def summing_rnn(inputs):
+  return tf.reduce_sum(inputs, axis=1)
+
+@tf.function
+def gradients(inputs):
+  with tf.GradientTape() as tape:
+    tape.watch(inputs)
+    hidden = summing_rnn(inputs)
+    hidden = tf.gather(hidden, tf.constant([0]))
+    loss = tf.reduce_mean(hidden)
+  return tape.gradient(loss, inputs)
+
+gradients(tf.constant([[[1.0], [2.0]]])) # No error is raised
+I am also creating a pull request.
+		</comment>
+		<comment id='13' author='foxik' date='2020-06-09T16:53:50Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/36236&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/36236&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

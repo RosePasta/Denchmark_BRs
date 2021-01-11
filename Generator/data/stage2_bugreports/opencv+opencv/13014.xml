@@ -1,0 +1,154 @@
+<bug id='13014' author='pete1010' open_date='2018-11-01T16:43:28Z' closed_time='2019-01-23T10:36:49Z'>
+	<summary>cuda blockScanInclusive hangs with RTX 2080</summary>
+	<description>
+&lt;denchmark-h:h5&gt;System information (version)&lt;/denchmark-h&gt;
+
+
+OpenCV =&gt;4.0.0 beta
+Operating System / Platform =&gt; Windows 10 64 Bit
+Compiler =&gt; Visual Studio 2017
+Cuda =&gt; 10.0
+Driver =&gt; 416.34
+GPU =&gt; RTX 2080
+
+&lt;denchmark-h:h5&gt;Detailed description&lt;/denchmark-h&gt;
+
+The example below crashes when using RTX 2080 but works with GTX 1080.
+The example uses the opencv_contrib modules but the bug is in the files scan.hpp and warp_shuffle.hpp in opencv/modules/core/include/opencv2/cuda/
+The crash is coming from the kernel hanging inside warpScanInclusive call to cv::cuda::device::shfl_up(iData, i) on line 191 of scan.hpp
+On line 56 of warp_shuffle.hpp there is a #define for __shfl_up(x, y, z) to call __shfl_up_sync(0xFFFFFFFFU, x, y, z)
+Nvidia must have changed the sync behavior with the new cards and the __shfl_up_sync fails because the mask is being passed to sync all warp threads when all warp threads are not active doe to the check on line 238 of scan.hpp
+            if (tid &lt; (tiNumScanThreads / OPENCV_CUDA_WARP_SIZE) )// not all threads active inside here
+            {
+                //grab top warp elements
+                T val = s_Data[tid];
+                //calculate exclusive scan and write back to shared memory
+                s_Data[tid] = warpScanExclusive(val, s_Data, tid);
+            }
+
+Nvidia specifically says not to use 0xFFFFFFFF mask when updating legacy code.
+&lt;denchmark-link:https://devblogs.nvidia.com/using-cuda-warp-level-primitives/&gt;https://devblogs.nvidia.com/using-cuda-warp-level-primitives/&lt;/denchmark-link&gt;
+
+I have a workaround for scan.hpp that works for me but I am not sure how to fix it to work more generally in the entire code base.
+    template &lt;typename T&gt;
+    __device__ T warpScanInclusive(T idata, volatile T* s_Data, unsigned int tid)
+    {
+    #if __CUDA_ARCH__ &gt;= 300
+        const unsigned int laneId = cv::cuda::device::Warp::laneId();
+
+        unsigned mask = __activemask();// need to get mask for active threads
+
+        // scan on shuffl functions
+        #pragma unroll
+        for (int i = 1; i &lt;= (OPENCV_CUDA_WARP_SIZE / 2); i *= 2)
+        {
+            const T n = __shfl_up_sync(mask, idata, i, 32);//need to call with proper mask
+            if (laneId &gt;= i)
+                  idata += n;
+        }
+
+        return idata;
+    #else
+        unsigned int pos = 2 * tid - (tid &amp; (OPENCV_CUDA_WARP_SIZE - 1));
+        s_Data[pos] = 0;
+        pos += OPENCV_CUDA_WARP_SIZE;
+        s_Data[pos] = idata;
+
+        s_Data[pos] += s_Data[pos - 1];
+        s_Data[pos] += s_Data[pos - 2];
+        s_Data[pos] += s_Data[pos - 4];
+        s_Data[pos] += s_Data[pos - 8];
+        s_Data[pos] += s_Data[pos - 16];
+
+        return s_Data[pos];
+    #endif
+    }
+
+&lt;denchmark-h:h5&gt;Steps to reproduce&lt;/denchmark-h&gt;
+
+Running the following code runs the cuda kernel that hangs when using a RTX 2080.
+#include "opencv2\highgui.hpp"
+#include "opencv2\cudaimgproc.hpp"
+
+int main(int argc, char **argv)
+{
+   cv::Ptr&lt;cv::cuda::CLAHE&gt; clahe = cv::cuda::createCLAHE();
+
+   const cv::Size size(640, 480);
+
+   cv::cuda::GpuMat srcDevice(size, CV_8UC1);
+   cv::cuda::GpuMat dstDevice(size, CV_8UC1);
+
+   cv::cuda::HostMem srcHost(size, CV_8UC1);
+   cv::cuda::HostMem dstHost(size, CV_8UC1);
+
+   cv::randu(srcHost, cv::Scalar::all(0.0), cv::Scalar::all(255.0));
+   srcDevice.upload(srcHost);
+
+   clahe-&gt;apply(srcDevice, dstDevice);
+
+   dstDevice.download(dstHost);
+
+   cv::imshow("src", srcHost);
+   cv::imshow("dst", dstHost);
+
+   cv::waitKey();
+
+   return 0;
+}
+
+	</description>
+	<comments>
+		<comment id='1' author='pete1010' date='2019-01-15T16:48:36Z'>
+		IMHO, providing mask that contains the return value of __activemask() may work in some cases, but this still might not be safe in other cases.
+In &lt;denchmark-link:https://devblogs.nvidia.com/using-cuda-warp-level-primitives/&gt;the blog post&lt;/denchmark-link&gt;
+, they say:
+
+Don’t just use __activemask() as the mask value. __activemask() tells you what threads happen to be convergent when the function is called, which can be different from what you want to be in the collective operation.
+
+&lt;denchmark-link:https://stackoverflow.com/a/54055576/7724939&gt;This post from Stack Overflow&lt;/denchmark-link&gt;
+ is also a great material in understanding the behavior of .
+Maybe mask should be computed at blockScanInclusive which calls warpScanInclusive.
+		</comment>
+		<comment id='2' author='pete1010' date='2019-01-15T20:25:07Z'>
+		I can confirm the issue of &lt;denchmark-link:https://github.com/pete1010&gt;@pete1010&lt;/denchmark-link&gt;
+ . His code hangs on my RTX 2080 Ti as well. test3.cu by &lt;denchmark-link:https://github.com/nglee&gt;@nglee&lt;/denchmark-link&gt;
+ did not hang on my machine and produced the same results as test4.cu.
+		</comment>
+		<comment id='3' author='pete1010' date='2019-01-17T19:09:16Z'>
+		Hi, &lt;denchmark-link:https://github.com/HolgerFoerterer&gt;@HolgerFoerterer&lt;/denchmark-link&gt;
+ and &lt;denchmark-link:https://github.com/pete1010&gt;@pete1010&lt;/denchmark-link&gt;
+.
+I've been trying to solve this problem by correctly setting the mask value passed to __shfl_up_sync. The patch tried to maintain backward compatibility. After applying this patch, the test results were not different from the version without this patch on 1080 Ti.
+May I ask you to try this patch on 2080 or 2080 Ti?
+&lt;denchmark-link:https://github.com/opencv/opencv/files/2770214/0001-Warp-synchronous-primitives-for-CUDA-9.0.patch.gz&gt;0001-Warp-synchronous-primitives-for-CUDA-9.0.patch.gz&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='4' author='pete1010' date='2019-01-18T04:34:52Z'>
+		This works well on the 2080 Ti. The system does not hang and the result image looks like the source image.
+		</comment>
+		<comment id='5' author='pete1010' date='2019-01-18T22:41:49Z'>
+		Works on RTX 2080 and GTX Titan X (maxwell) for me.
+		</comment>
+		<comment id='6' author='pete1010' date='2019-09-30T02:07:07Z'>
+		Same here..  cv::cuda::CLAHE apply pegs my TitanV at 100% and just hangs..
+OpenCV version 3.4.3
+Driver Version: 410.129
+CUDA Version: 10.0
+&lt;denchmark-code&gt;    //apply Contrast Limited Adaptive Histogram Equalization
+    cv::Ptr&lt;cv::cuda::CLAHE&gt; gpu_clahe = cv::cuda::createCLAHE(2.0, cv::Size(16,16));
+    gpu_clahe-&gt;apply( channel_in, channel_out );
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='7' author='pete1010' date='2019-09-30T09:21:20Z'>
+		
+OpenCV version 3.4.3
+
+We can't fix already released code (and outdated actually). You should upgrade.
+		</comment>
+		<comment id='8' author='pete1010' date='2019-09-30T15:19:12Z'>
+		I'll give it a whirl on 4.1.0 that I have on another computer
+		</comment>
+	</comments>
+</bug>

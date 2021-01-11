@@ -1,0 +1,193 @@
+<bug_data>
+<bug id='13202' author='yaroslavvb' open_date='2017-09-21T03:44:15Z' closed_time='2018-04-02T04:20:16Z'>
+ 	<summary>tf.InteractiveSession leaks sessions</summary>
+ 	<description>
+ The following works fine with tf.Session() but will fail to release resources in tf.InteractiveSession
+ &lt;denchmark-code&gt;sess = tf.InteractiveSession()
+ # do stuff  
+ sess.close()
+ del sess
+ &lt;/denchmark-code&gt;
+ 
+ The reason is that interactive session enters a context using __enter()__ and never quits it, leaving a reference from a DefaultStack object. I found this when debugging why my notebook was hogging all GPU RAM.
+ The two work-arounds:
+ 
+ Force C_API to close the session using sess.__del__()
+ Get rid of the dangling reference
+ 
+ &lt;denchmark-code&gt;    sess._default_session.__exit__(None, None, None)
+     del sess
+     import gc
+     gc.collect()
+ &lt;/denchmark-code&gt;
+ 
+ I think a better solution would be to have sess.close() call both TF_CloseSession and TF_DeleteSession, or have a method that will reset all sessions like session_lib.Reset
+ 	</description>
+ 	<comments>
+ 		<comment id='1' author='yaroslavvb' date='2017-09-21T15:31:16Z'>
+ 		&lt;denchmark-link:https://github.com/mrry&gt;@mrry&lt;/denchmark-link&gt;
+  do you know if anyone's planning to make  work for local sessions?
+ 		</comment>
+ 		<comment id='2' author='yaroslavvb' date='2017-09-21T16:39:15Z'>
+ 		Derek, could you please take a look. Thanks!
+ 		</comment>
+ 		<comment id='3' author='yaroslavvb' date='2017-09-21T16:44:55Z'>
+ 		&lt;denchmark-link:https://github.com/yaroslavvb&gt;@yaroslavvb&lt;/denchmark-link&gt;
+  I'm confused by your diagnosis, because the  method &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/e9d5ee1ebffba25cef65f1f354b9e4ca9bcea10c/tensorflow/python/client/session.py#L1627&gt;explicitly calls __exit__()&lt;/denchmark-link&gt;
+  on the context managers it enters in the constructor. Where is the dangling reference?
+  is &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/e9d5ee1ebffba25cef65f1f354b9e4ca9bcea10c/tensorflow/core/common_runtime/direct_session.cc#L183&gt;implemented&lt;/denchmark-link&gt;
+  for local sessions, but it's not clear what you think it should do....
+ 		</comment>
+ 		<comment id='4' author='yaroslavvb' date='2017-09-21T16:47:26Z'>
+ 		I'm experiencing the same with the normal tf.Session and also while using the C API directly. The following code keeps the memory on the GPU allocated until it exits.
+ &lt;denchmark-code&gt;#include &lt;tensorflow/c/c_api.h&gt;
+ #include &lt;unistd.h&gt;  // usleep
+ 
+ 
+ int main() {
+     TF_Graph* graph = TF_NewGraph();
+     TF_SessionOptions* options = TF_NewSessionOptions();
+     TF_Status* status = TF_NewStatus();
+     TF_Session* sess = TF_NewSession(graph, options, status);
+     TF_CloseSession(sess, status);
+     TF_DeleteSession(sess, status);
+     TF_DeleteSessionOptions(options);
+     TF_DeleteGraph(graph);
+     TF_DeleteStatus(status);
+     usleep(5000000);  // gpu resources are still allocated here
+ }
+ &lt;/denchmark-code&gt;
+ 
+ I'm running Ubuntu 16.04, cudnn 6.0, cuda 8.0, tensorflow-master build is 2 hours old.
+ 		</comment>
+ 		<comment id='5' author='yaroslavvb' date='2017-09-21T17:04:15Z'>
+ 		&lt;denchmark-link:https://github.com/PhilJd&gt;@PhilJd&lt;/denchmark-link&gt;
+  that's a different issue -- the memory allocator is global to the process, so it will keep the memory allocated even if the session gets closed.
+ &lt;denchmark-link:https://github.com/mrry&gt;@mrry&lt;/denchmark-link&gt;
+  indeed that method gets called, but somehow session doesn't get garbage collected. I assumed DefaultStack was to blame by looking at 
+ CPython is supposed to call __del__ immediately after ref-count gets decremented to 0, and somehow it doesn't. Adding import gc; gc.collect() after __exit__ seems to remove the leak as well
+ Repro: &lt;denchmark-link:https://github.com/yaroslavvb/stuff/blob/master/resnet_leak_report.py&gt;https://github.com/yaroslavvb/stuff/blob/master/resnet_leak_report.py&lt;/denchmark-link&gt;
+ 
+ When I run it, I see
+ &lt;denchmark-code&gt;Run 0, GB's in use 2.1
+ Run 1, GB's in use 3.4
+ Run 2, GB's in use 5.0
+ &lt;OOM crash&gt;
+ 
+ Calling __del__
+ Calling __del__
+ Calling __del__
+ &lt;/denchmark-code&gt;
+ 
+ I'll update this issue if I find why CPython doesn't call del
+ 		</comment>
+ 		<comment id='6' author='yaroslavvb' date='2017-09-21T18:58:48Z'>
+ 		OK, looks like  isn't called because there's a cycle and ref count never goes to zero.
+  points back to sess (args are filled in &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/03619fab3f4dd6f28b67418455a953b0fccdd9bf/tensorflow/python/framework/ops.py#L4507&gt;here&lt;/denchmark-link&gt;
+ ), but there's no such cycle when using 
+ Running gc.collect detects cycles and cleans them up.
+ 		</comment>
+ 		<comment id='7' author='yaroslavvb' date='2017-09-21T19:25:04Z'>
+ 		Ironically InteractiveSession only causes this problem during interactive use, when you have a notebook open and create new graphs/sessions without restarting the process.
+ The underlying issue is that sess needs to keep a reference to the default context manager (otherwise it gets garbage collected and closed), whereas default context manager must link back to session. This seems hard to fix this issue without big refactoring of context manager logic. Perhaps it should be a docs issue and mentioned in docs of InteractiveSession that gc.collect must be called to reclaim resources
+ 		</comment>
+ 		<comment id='8' author='yaroslavvb' date='2017-09-25T21:50:44Z'>
+ 		Would it make sense to make tf.InteractiveSession() a singleton and add a warnings.warn('Use tf.Session() instead if you intend to have multiple sessions') upon the second call? Singletons are typically bad, but maybe very fitting in this particular case.
+ 		</comment>
+ 		<comment id='9' author='yaroslavvb' date='2017-09-25T21:56:26Z'>
+ 		I think that would be better than status quo which is "1. create multiple interactive sessions by accident. 2. run out of GPU memory 3. restart notebook server"
+ 		</comment>
+ 		<comment id='10' author='yaroslavvb' date='2017-12-20T01:13:14Z'>
+ 		It has been 14 days with no activity and this issue has an assignee.Please update the label and/or status accordingly.
+ 		</comment>
+ 		<comment id='11' author='yaroslavvb' date='2018-01-03T19:15:24Z'>
+ 		It has been 14 days with no activity and this issue has an assignee.Please update the label and/or status accordingly.
+ 		</comment>
+ 		<comment id='12' author='yaroslavvb' date='2018-01-18T19:16:00Z'>
+ 		Nagging Assignee: It has been 14 days with no activity and this issue has an assignee. Please update the label and/or status accordingly.
+ 		</comment>
+ 		<comment id='13' author='yaroslavvb' date='2018-01-18T20:49:23Z'>
+ 		Fix in progress...
+ 		</comment>
+ 		<comment id='14' author='yaroslavvb' date='2018-02-06T07:47:49Z'>
+ 		Nagging Assignee: It has been 14 days with no activity and this issue has an assignee. Please update the label and/or status accordingly.
+ 		</comment>
+ 		<comment id='15' author='yaroslavvb' date='2018-02-20T19:40:31Z'>
+ 		Nagging Assignee: It has been 14 days with no activity and this issue has an assignee. Please update the label and/or status accordingly.
+ 		</comment>
+ 		<comment id='16' author='yaroslavvb' date='2018-03-07T13:18:22Z'>
+ 		Nagging Assignee &lt;denchmark-link:https://github.com/mrry&gt;@mrry&lt;/denchmark-link&gt;
+ : It has been 14 days with no activity and this issue has an assignee. Please update the label and/or status accordingly.
+ 		</comment>
+ 		<comment id='17' author='yaroslavvb' date='2018-03-15T16:21:46Z'>
+ 		So after implementing a couple of fixes for this, it seems there's no way to stop the leak without breaking an existing use case. The "fix" will be a warning, as &lt;denchmark-link:https://github.com/carlthome&gt;@carlthome&lt;/denchmark-link&gt;
+  suggested, and we will investigate a more principled fix for TensorFlow 2.0.
+ 		</comment>
+ 		<comment id='18' author='yaroslavvb' date='2018-03-16T23:15:53Z'>
+ 		PS, the work-around is to do the following
+ &lt;denchmark-code&gt;sess = tf.InteractiveSession()
+ import gc; gc.collect()
+ &lt;/denchmark-code&gt;
+ 
+ That will run cyclic garbage collector and remove all the dangling sessions
+ 		</comment>
+ 		<comment id='19' author='yaroslavvb' date='2018-03-16T23:25:50Z'>
+ 		Note that we've had to roll back &lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/0f508d4de379e800ad7f990de08959bbd6fcabb5&gt;0f508d4&lt;/denchmark-link&gt;
+  internally, because it has a bug that produces spurious warnings. We will fix it after the weekend, but in the mean time the nightly build will have the spurious messages.
+ 		</comment>
+ 		<comment id='20' author='yaroslavvb' date='2018-03-16T23:31:18Z'>
+ 		&lt;denchmark-link:https://github.com/mrry&gt;@mrry&lt;/denchmark-link&gt;
+  maybe you can just do  in the first call to  of InteractiveSession
+ 		</comment>
+ 		<comment id='21' author='yaroslavvb' date='2018-03-16T23:41:00Z'>
+ 		&lt;denchmark-link:https://github.com/yaroslavvb&gt;@yaroslavvb&lt;/denchmark-link&gt;
+  The  trick doesn't solve the problem for me.  Not sure why yet.
+ 		</comment>
+ 		<comment id='22' author='yaroslavvb' date='2018-03-31T18:25:56Z'>
+ 		Nagging Assignee &lt;denchmark-link:https://github.com/mrry&gt;@mrry&lt;/denchmark-link&gt;
+ : It has been 14 days with no activity and this issue has an assignee. Please update the label and/or status accordingly.
+ 		</comment>
+ 		<comment id='23' author='yaroslavvb' date='2018-04-02T04:20:16Z'>
+ 		The warning was re-added in &lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/a80fb2b1cad1bb9c868222b8c25f162d69a509e6&gt;a80fb2b&lt;/denchmark-link&gt;
+  so I'm marking this as closed.
+ 		</comment>
+ 	</comments>
+ </bug>
+<commit id='0f508d4de379e800ad7f990de08959bbd6fcabb5' author='Derek Murray' date='2018-03-15 12:37:47-07:00'>
+ 	<dmm_unit complexity='1.0' interfacing='0.7837837837837838' size='0.0'></dmm_unit>
+ 	<modification change_type='MODIFY' old_name='tensorflow\python\client\session.py' new_name='tensorflow\python\client\session.py'>
+ 		<file_info nloc='864' complexity='211' token_count='5213'></file_info>
+ 		<method name='__init__' parameters='self,target,graph,config'>
+ 				<method_info nloc='22' complexity='4' token_count='154' nesting_level='1' start_line='1631' end_line='1675'></method_info>
+ 			<added_lines>1659,1660,1661,1662,1663,1664,1665,1666,1667</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<method name='close' parameters='self'>
+ 				<method_info nloc='11' complexity='3' token_count='72' nesting_level='1' start_line='1677' end_line='1688'></method_info>
+ 			<added_lines>1680,1681,1682,1683,1684,1685</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines>24,1628,1629,1630</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='tensorflow\python\client\session_test.py' new_name='tensorflow\python\client\session_test.py'>
+ 		<file_info nloc='1658' complexity='165' token_count='17310'></file_info>
+ 		<method name='setUp' parameters='self'>
+ 				<method_info nloc='3' complexity='1' token_count='21' nesting_level='1' start_line='70' end_line='72'></method_info>
+ 			<added_lines>70,71,72</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<method name='testMultipleInteractiveSessionsWarning' parameters='self'>
+ 				<method_info nloc='20' complexity='1' token_count='148' nesting_level='1' start_line='1199' end_line='1223'></method_info>
+ 			<added_lines>1199,1200,1201,1202,1203,1204,1205,1206,1207,1208,1209,1210,1211,1212,1213,1214,1215,1216,1217,1218,1219,1220,1221,1222,1223</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines>25,73,1224</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ </commit>
+</bug_data>

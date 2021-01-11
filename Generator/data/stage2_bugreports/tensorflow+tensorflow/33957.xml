@@ -1,0 +1,521 @@
+<bug id='33957' author='murdockhou' open_date='2019-11-04T06:48:39Z' closed_time='2020-01-30T23:34:50Z'>
+	<summary>model restore error/confict in tensorflow</summary>
+	<description>
+Please make sure that this is a bug. As per our GitHub Policy, we only address code/doc bugs, performance issues, feature requests and build/installation issues on GitHub. tag:bug_template
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): Yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Linux Ubuntu 16.04
+Mobile device (e.g. iPhone 8, Pixel 2, Samsung Galaxy) if the issue happens on mobile device:
+TensorFlow installed from (source or binary): binary
+TensorFlow version (use command below): sudo pip3 install tensorflow-gpu==2.0.0
+Python version: 3.6
+Bazel version (if compiling from source):
+GCC/Compiler version (if compiling from source):
+CUDA/cuDNN version: 10.0.130/7.6.2
+GPU model and memory:
+
+You can collect some of this information using our environment capture
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/tree/master/tools/tf_env_collect.sh&gt;script&lt;/denchmark-link&gt;
+
+You can also obtain the TensorFlow version with: 1. TF 1.0:  2. TF 2.0: 
+Describe the current behavior
+I have saved one model (with more than two layers) using model.save_weights and want to restore its weights and only use the front conv layers. But when I using model.load_weights, I got two different results:
+
+First, when I load weights only for the front conv layers, one bigger model can load successfully but another smaller model can not load.
+Two, the bigger model load success but the weights of the last layer is wrong but any other layers weiight is right.
+
+Describe the expected behavior
+I want to load a .ckpt into a smaller model successfully.
+Code to reproduce the issue
+Here is my bigger model definition:
+&lt;denchmark-code&gt;import tensorflow as tf
+import math
+
+NUM_CLASSES = 10
+
+def swish(x):
+    return x * tf.keras.activations.sigmoid(x)
+
+def round_filters(filters, multiplier):
+    depth_divisor = 8
+    min_depth = None
+    min_depth = min_depth or depth_divisor
+    filters = filters * multiplier
+    new_filters = max(min_depth, int(filters + depth_divisor / 2) // depth_divisor * depth_divisor)
+    if new_filters &lt; 0.9 * filters:
+        new_filters += depth_divisor
+    return int(new_filters)
+
+def round_repeats(repeats, multiplier):
+    if not multiplier:
+        return repeats
+    return int(math.ceil(multiplier * repeats))
+
+def SEBlock(inputs, input_channels, ratio=0.25):
+
+    num_reduced_filters = max(1, int(input_channels * ratio))
+    branch = tf.keras.layers.GlobalAveragePooling2D()(inputs)
+    # branch = tf.keras.layers.Lambda(lambda branch: tf.expand_dims(input=branch, axis=1))(branch)
+    branch = tf.keras.backend.expand_dims(branch, 1)
+    branch = tf.keras.backend.expand_dims(branch, 1)
+    # branch = tf.keras.layers.Lambda(lambda branch: tf.expand_dims(input=branch, axis=1))(branch)
+    branch = tf.keras.layers.Conv2D(filters=num_reduced_filters, kernel_size=(1, 1), strides=1, padding="same")(branch)
+    branch = swish(branch)
+    branch = tf.keras.layers.Conv2D(filters=input_channels, kernel_size=(1, 1), strides=1, padding='same')(branch)
+    branch = tf.keras.activations.sigmoid(branch)
+    output = inputs * branch
+
+    return output
+
+def MBConv(in_channels, out_channels, expansion_factor, stride, k, drop_connect_rate, inputs, training=False):
+    x = tf.keras.layers.Conv2D(filters=in_channels * expansion_factor,kernel_size=(1, 1),strides=1,padding="same")(inputs)
+    x = tf.keras.layers.BatchNormalization()(x, training=training)
+    x = swish(x)
+    x = tf.keras.layers.DepthwiseConv2D(kernel_size=(k, k), strides=stride, padding="same")(x)
+    x = tf.keras.layers.BatchNormalization()(x, training=training)
+    x = SEBlock(x, in_channels*expansion_factor)
+    x = swish(x)
+    x = tf.keras.layers.Conv2D(filters=out_channels,kernel_size=(1, 1),strides=1,padding="same")(x)
+    x = tf.keras.layers.BatchNormalization()(x, training=training)
+    if stride == 1 and in_channels == out_channels:
+        if drop_connect_rate:
+            x = tf.keras.layers.Dropout(rate=drop_connect_rate)(x, training=training)
+        x = tf.keras.layers.Add()([x, inputs])
+
+    return x
+
+def build_mbconv_block(inputs, in_channels, out_channels, layers, stride, expansion_factor, k, drop_connect_rate, training):
+
+    x = inputs
+    for i in range(layers):
+        if i == 0:
+            x = MBConv(in_channels=in_channels, out_channels=out_channels, expansion_factor=expansion_factor,
+                       stride=stride, k=k, drop_connect_rate=drop_connect_rate, inputs=x, training=training)
+        else:
+            x = MBConv(in_channels=out_channels, out_channels=out_channels, expansion_factor=expansion_factor,
+                       stride=1, k=k, drop_connect_rate=drop_connect_rate, inputs=x, training=training)
+
+    return x
+
+
+def EfficientNet(inputs, width_coefficient, depth_coefficient, dropout_rate, drop_connect_rate=0.2, training=False):
+
+    features = []
+
+    x = tf.keras.layers.Conv2D(filters=round_filters(32, width_coefficient),kernel_size=(3, 3),strides=2, padding="same") (inputs)
+    x = tf.keras.layers.BatchNormalization()(x, training=training)
+    x = swish(x)
+
+    x = build_mbconv_block(x, in_channels=round_filters(32, width_coefficient),
+                           out_channels=round_filters(16, width_coefficient),
+                           layers=round_repeats(1, depth_coefficient),
+                           stride=1,
+                           expansion_factor=1, k=3,
+                           drop_connect_rate=drop_connect_rate,
+                           training=training)
+    features.append(x)
+
+    x = build_mbconv_block(x, in_channels=round_filters(16, width_coefficient),
+                           out_channels=round_filters(24, width_coefficient),
+                           layers=round_repeats(2, depth_coefficient),
+                           stride=1,
+                           expansion_factor=6, k=3,
+                           drop_connect_rate=drop_connect_rate,
+                           training=training)
+    features.append(x)
+
+    x = build_mbconv_block(x, in_channels=round_filters(24, width_coefficient),
+                           out_channels=round_filters(40, width_coefficient),
+                           layers=round_repeats(2, depth_coefficient),
+                           stride=2,
+                           expansion_factor=6, k=5,
+                           drop_connect_rate=drop_connect_rate,
+                           training=training)
+    features.append(x)
+
+    x = build_mbconv_block(x, in_channels=round_filters(40, width_coefficient),
+                           out_channels=round_filters(80, width_coefficient),
+                           layers=round_repeats(3, depth_coefficient),
+                           stride=2,
+                           expansion_factor=6, k=3,
+                           drop_connect_rate=drop_connect_rate,
+                           training=training)
+    features.append(x)
+
+    x = build_mbconv_block(x, in_channels=round_filters(80, width_coefficient),
+                           out_channels=round_filters(112, width_coefficient),
+                           layers=round_repeats(3, depth_coefficient),
+                           stride=1,
+                           expansion_factor=6, k=5,
+                           drop_connect_rate=drop_connect_rate,
+                           training=training)
+    features.append(x)
+
+    x = build_mbconv_block(x, in_channels=round_filters(112, width_coefficient),
+                           out_channels=round_filters(192, width_coefficient),
+                           layers=round_repeats(4, depth_coefficient),
+                           stride=2,
+                           expansion_factor=6, k=5,
+                           drop_connect_rate=drop_connect_rate,
+                           training=training)
+    features.append(x)
+
+    x = build_mbconv_block(x, in_channels=round_filters(192, width_coefficient),
+                           out_channels=round_filters(320, width_coefficient),
+                           layers=round_repeats(1, depth_coefficient),
+                           stride=1,
+                           expansion_factor=6, k=3,
+                           drop_connect_rate=drop_connect_rate,
+                           training=training)
+    features.append(x)
+
+    x = tf.keras.layers.Conv2D(filters=round_filters(1280, width_coefficient), kernel_size=(1, 1), strides=1, padding='same')(x)
+    x = tf.keras.layers.BatchNormalization()(x, training=training)
+    x = swish(x)
+    x = tf.keras.layers.GlobalAveragePooling2D()(x)
+    x = tf.keras.layers.Dropout(rate=dropout_rate)(x, training=training)
+    x = tf.keras.layers.Dense(units=1, activation=tf.keras.activations.softmax)(x)
+
+    return x, features
+
+
+def efficient_net_b0(inputs, training):
+    return EfficientNet(inputs,
+                        width_coefficient=1.0,
+                        depth_coefficient=1.0,
+                        dropout_rate=0.2,
+                        drop_connect_rate=0.2,
+                        training=training)
+
+def up_sample(inputs, training=True):
+    x = tf.keras.layers.UpSampling2D()(inputs)
+    x = tf.keras.layers.BatchNormalization()(x, training=training)
+    x = tf.keras.layers.ReLU()(x)
+    return x
+
+def biggerModel(inputs, outc, training=True):
+
+    _, features =  efficient_net_b0(inputs=inputs, training=training)
+
+    # [ 1/2, 1/4, 1/8, 1/8, 1/16]
+    outputs = []
+    for i, name in enumerate(features):
+        x = features[i]
+        if x.shape[1] &gt; inputs.shape[1] // 4:
+            continue
+        while x.shape[1] &lt; (inputs.shape[1]//4):
+            x = up_sample(x, training)
+        outputs.append(x)
+
+    quater_res = tf.keras.layers.Concatenate()(outputs)
+    quater_res = tf.keras.layers.Conv2D(512, 3, 1, 'same', activation=tf.nn.relu)(quater_res)
+    quater_res = tf.keras.layers.Conv2D(512, 3, 1, 'same', activation=tf.nn.relu)(quater_res)
+    quater_res_out = tf.keras.layers.Conv2D(outc, 1, 1, 'same', name='quater', activation=None)(quater_res)
+
+    half_res = up_sample(quater_res, training)
+    half_res = tf.keras.layers.Conv2D(512, 3, 1, 'same', activation=tf.nn.relu)(half_res)
+    half_res = tf.keras.layers.Conv2D(512, 3, 1, 'same', activation=tf.nn.relu)(half_res)
+    half_res_out = tf.keras.layers.Conv2D(outc, 1, 1, 'same', name='half', activation=None)(half_res)
+    
+    if training:
+        return quater_res_out, half_res_out
+    else:
+        return quater_res_out
+&lt;/denchmark-code&gt;
+
+And here is my smaller model definition:
+&lt;denchmark-code&gt;def smallModel(inputs, outc, training=True):
+
+
+    quater_res = tf.keras.layers.Conv2D(512, 3, 1, 'same', activation=tf.nn.relu)(inputs)
+    quater_res = tf.keras.layers.Conv2D(512, 3, 1, 'same', activation=tf.nn.relu)(quater_res)
+    quater_res_out = tf.keras.layers.Conv2D(outc, 1, 1, 'same',  activation=None)(quater_res)
+
+
+    half_res = tf.keras.layers.Conv2D(512, 3, 1, 'same', activation=tf.nn.relu)(quater_res)
+    half_res = tf.keras.layers.Conv2D(512, 3, 1, 'same', activation=tf.nn.relu)(half_res)
+    half_res_out = tf.keras.layers.Conv2D(outc, 1, 1, 'same', activation=None)(half_res)
+
+    if training:
+        return quater_res_out, half_res_out
+    else:
+        return quater_res_out
+&lt;/denchmark-code&gt;
+
+About bigger model, first, I save weights and print layer named 'quater' weights :
+&lt;denchmark-code&gt;if __name__ == '__main__':
+    import os
+    os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+    inputs = tf.keras.Input(shape=(224, 224, 3), name='modelInput')
+    outputs = biggerModel(inputs, outc=18 + 1, training=True)
+    model = tf.keras.Model(inputs, outputs)
+    # model.summary()
+
+    model.save_weights('models/test/test')
+    # model.load_weights('models/test/test')
+
+    print(model.get_layer('quater').get_weights()[0][0][0][0:4])
+&lt;/denchmark-code&gt;
+
+and I get this:
+&lt;denchmark-link:https://user-images.githubusercontent.com/18358653/68102867-8441ae00-ff0f-11e9-9d00-3fb77fb126c7.png&gt;&lt;/denchmark-link&gt;
+
+and then I restore weight by setting parameter  and print :
+&lt;denchmark-code&gt;if __name__ == '__main__':
+
+    import os
+    os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+    inputs = tf.keras.Input(shape=(224, 224, 3), name='modelInput')
+    outputs = biggerModel(inputs, outc=18 + 1, training=False)
+    model = tf.keras.Model(inputs, outputs)
+    # model.summary()
+
+    # model.save_weights('models/test/test')
+    model.load_weights('models/test/test')
+
+    print(model.get_layer('quater').get_weights()[0][0][0][0:4])
+&lt;/denchmark-code&gt;
+
+and got result like this:
+&lt;denchmark-link:https://user-images.githubusercontent.com/18358653/68103002-12b62f80-ff10-11e9-8912-b0364f2d39fc.png&gt;&lt;/denchmark-link&gt;
+
+We can see that this two outputs are different, but I have checkout all other layers weights are same resutlts, so, it's really weird.
+For smaller model, as like in bigger model I have done, first save weights and print quater layer weights:
+&lt;denchmark-code&gt;
+if __name__ == '__main__':
+
+    import os
+    os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+    inputs = tf.keras.Input(shape=(224, 224, 3), name='modelInput')
+    outputs = smallModel(inputs, outc=18 + 1, training=True)
+    model = tf.keras.Model(inputs, outputs)
+    # model.summary()
+
+    # model.save_weights('models/test/test')
+    model.load_weights('models/test/test')
+
+    print(model.get_layer('quater').get_weights()[0][0][0][0:4])
+&lt;/denchmark-code&gt;
+
+and result is:
+&lt;denchmark-link:https://user-images.githubusercontent.com/18358653/68103215-d931f400-ff10-11e9-9e32-32bcf90239d1.png&gt;&lt;/denchmark-link&gt;
+
+Then I tried to restore this and setting parameter :
+&lt;denchmark-code&gt;if __name__ == '__main__':
+
+    import os
+    os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+    inputs = tf.keras.Input(shape=(224, 224, 3), name='modelInput')
+    outputs = smallModel(inputs, outc=18 + 1, training=False)
+    model = tf.keras.Model(inputs, outputs)
+    # model.summary()
+
+    # model.save_weights('models/test/test')
+    model.load_weights('models/test/test')
+
+    print(model.get_layer('quater').get_weights()[0][0][0][0:4])
+&lt;/denchmark-code&gt;
+
+I got this error:
+&lt;denchmark-link:https://user-images.githubusercontent.com/18358653/68103275-0bdbec80-ff11-11e9-92d9-ba878cc2c4be.png&gt;&lt;/denchmark-link&gt;
+
+How can I fix this?
+Other info / logs
+Include any logs or source code that would be helpful to diagnose the problem. If including tracebacks, please include the full traceback. Large logs and files should be attached.
+	</description>
+	<comments>
+		<comment id='1' author='murdockhou' date='2019-11-05T08:26:06Z'>
+		&lt;denchmark-link:https://github.com/murdockhou&gt;@murdockhou&lt;/denchmark-link&gt;
+, Thanks for reporting this issue.
+I tried to execute the smaller model but ended up in some error. Please take a look at the &lt;denchmark-link:https://colab.sandbox.google.com/gist/gadagashwini/52e93f6695ab783769e3c234ca2270ad/untitled235.ipynb&gt;gist&lt;/denchmark-link&gt;
+.
+Please help us to reproduce the reported issue. Thanks!
+		</comment>
+		<comment id='2' author='murdockhou' date='2019-11-05T11:38:02Z'>
+		&lt;denchmark-link:https://github.com/gadagashwini&gt;@gadagashwini&lt;/denchmark-link&gt;
+,
+Hi, for smaller model, you need also run  first, and then run  and will find that we can not load it. In this &lt;denchmark-link:https://colab.research.google.com/gist/gadagashwini/52e93f6695ab783769e3c234ca2270ad/untitled235.ipynb#scrollTo=yeS7bTQYo_xd&gt;gist&lt;/denchmark-link&gt;
+, you just load weights from bigger model save which is not right. By the way, the smaller model do not need any other func except  func.
+		</comment>
+		<comment id='3' author='murdockhou' date='2019-11-06T11:37:34Z'>
+		
+@gadagashwini,
+Hi, for smaller model, you need also run model.save_weights('models/test/test') first, and then run model.load_weights('models/test/test') and will find that we can not load it. In this gist, you just load weights from bigger model save which is not right. By the way, the smaller model do not need any other func except def smallModel(inputs, outc, training=True) func.
+
+Changed the code accordingly and tried to replicate the issue but got a different error. Please see the gist &lt;denchmark-link:https://colab.sandbox.google.com/gist/gadagashwini/5379f634a5c37b1eb9ef48aa81e38e0c/untitled239.ipynb&gt;here&lt;/denchmark-link&gt;
+. Thanks!
+		</comment>
+		<comment id='4' author='murdockhou' date='2019-11-07T03:53:21Z'>
+		&lt;denchmark-link:https://github.com/gadagashwini&gt;@gadagashwini&lt;/denchmark-link&gt;
+ , its my fault, I forget to set names for output layer, please  use the following  instead of the previous one.
+&lt;denchmark-code&gt;def smallModel(inputs, outc, training=True):
+
+    quater_res = tf.keras.layers.Conv2D(512, 3, 1, 'same', activation=tf.nn.relu)(inputs)
+    quater_res = tf.keras.layers.Conv2D(512, 3, 1, 'same', activation=tf.nn.relu)(quater_res)
+    quater_res_out = tf.keras.layers.Conv2D(outc, 1, 1, 'same', name='quater', activation=None)(quater_res)
+
+    half_res = tf.keras.layers.Conv2D(512, 3, 1, 'same', activation=tf.nn.relu)(quater_res)
+    half_res = tf.keras.layers.Conv2D(512, 3, 1, 'same', activation=tf.nn.relu)(half_res)
+    half_res_out = tf.keras.layers.Conv2D(outc, 1, 1, 'same', name='half', activation=None)(half_res)
+
+    if training:
+        return quater_res_out, half_res_out
+    else:
+        return quater_res_out
+&lt;/denchmark-code&gt;
+
+And please remember that when save_weights we set parameter training = True but will be False when load_weights.
+		</comment>
+		<comment id='5' author='murdockhou' date='2019-11-07T08:56:50Z'>
+		Issue is replicating with TF 2.0.0 on colab. Please take a look at the &lt;denchmark-link:https://colab.sandbox.google.com/gist/gadagashwini/13c417c65cbf1a5753d75af39377059b/untitled239.ipynb&gt;gist&lt;/denchmark-link&gt;
+. Thanks!
+		</comment>
+		<comment id='6' author='murdockhou' date='2019-12-04T23:11:12Z'>
+		&lt;denchmark-link:https://github.com/murdockhou&gt;@murdockhou&lt;/denchmark-link&gt;
+ I looked into . When you set , function returns a model that has weights of 6 layers (excluding input layer) that you are saving using . Then when you set , function returns a model that has 3 layers (excluding input layer). When you try to load weights of 6 layers (saved earlier) into a model that has 3 layers, then the code throws an error. I hope it is clear.
+&lt;denchmark-code&gt;## model.summary (with 6 layers)
+
+Model: "model_1"
+__________________________________________________________________________________________________
+Layer (type)                    Output Shape         Param #     Connected to                     
+==================================================================================================
+modelInput (InputLayer)         [(None, 224, 224, 3) 0                                            
+__________________________________________________________________________________________________
+Conv2_1 (Conv2D)                (None, 224, 224, 512 14336       modelInput[0][0]                 
+__________________________________________________________________________________________________
+Conv2_2 (Conv2D)                (None, 224, 224, 512 2359808     Conv2_1[0][0]                    
+__________________________________________________________________________________________________
+conv2d_4 (Conv2D)               (None, 224, 224, 512 2359808     Conv2_2[0][0]                    
+__________________________________________________________________________________________________
+conv2d_5 (Conv2D)               (None, 224, 224, 512 2359808     conv2d_4[0][0]                   
+__________________________________________________________________________________________________
+quater (Conv2D)                 (None, 224, 224, 19) 9747        Conv2_2[0][0]                    
+__________________________________________________________________________________________________
+half (Conv2D)                   (None, 224, 224, 19) 9747        conv2d_5[0][0]                   
+==================================================================================================
+Total params: 7,113,254
+Trainable params: 7,113,254
+Non-trainable params: 0
+
+## model.summary (with 3 layers)
+
+Model: "model_2"
+_________________________________________________________________
+Layer (type)                 Output Shape              Param #   
+=================================================================
+modelInput (InputLayer)      [(None, 224, 224, 3)]     0         
+_________________________________________________________________
+Conv2_1 (Conv2D)             (None, 224, 224, 512)     14336     
+_________________________________________________________________
+Conv2_2 (Conv2D)             (None, 224, 224, 512)     2359808   
+_________________________________________________________________
+quater (Conv2D)              (None, 224, 224, 19)      9747      
+=================================================================
+Total params: 2,383,891
+Trainable params: 2,383,891
+Non-trainable params: 0
+_________________________________________________________________
+&lt;/denchmark-code&gt;
+
+Please close the issue it this was resolved. Please post this kind of support questions in Stackoverflow where we can resolve. GitHub is mainly for Bug/Performance issue only. Thanks!
+		</comment>
+		<comment id='7' author='murdockhou' date='2019-12-05T02:09:55Z'>
+		I understand what's your means. But the bigger model is also set
+`training=False` when load it and I can successfully load it with wrong
+weights of the last layer, but the smaller model can not load anymore. What
+I think is that they should be consistent but actually not.
+
+Vishnuvardhan Janapati &lt;notifications@github.com&gt; 于2019年12月5日周四 上午7:11写道：
+&lt;denchmark-link:#&gt;…&lt;/denchmark-link&gt;
+
+
+ @murdockhou &lt;https://github.com/murdockhou&gt; I looked into smallModel.
+ When you set training=True, function returns a model that has weights of
+ 6 layers (excluding input layer) that you are saving using save_weights.
+ Then when you set training=False, function returns a model that has 3
+ layers (excluding input layer). When you try to load weights of 6 layers
+ (saved earlier) into a model that has 3 layers, then the code throws an
+ error. I hope it is clear.
+
+ ## model.summary (with 6 layers)
+
+ Model: "model_1"
+ __________________________________________________________________________________________________
+ Layer (type)                    Output Shape         Param #     Connected to
+ ==================================================================================================
+ modelInput (InputLayer)         [(None, 224, 224, 3) 0
+ __________________________________________________________________________________________________
+ Conv2_1 (Conv2D)                (None, 224, 224, 512 14336       modelInput[0][0]
+ __________________________________________________________________________________________________
+ Conv2_2 (Conv2D)                (None, 224, 224, 512 2359808     Conv2_1[0][0]
+ __________________________________________________________________________________________________
+ conv2d_4 (Conv2D)               (None, 224, 224, 512 2359808     Conv2_2[0][0]
+ __________________________________________________________________________________________________
+ conv2d_5 (Conv2D)               (None, 224, 224, 512 2359808     conv2d_4[0][0]
+ __________________________________________________________________________________________________
+ quater (Conv2D)                 (None, 224, 224, 19) 9747        Conv2_2[0][0]
+ __________________________________________________________________________________________________
+ half (Conv2D)                   (None, 224, 224, 19) 9747        conv2d_5[0][0]
+ ==================================================================================================
+ Total params: 7,113,254
+ Trainable params: 7,113,254
+ Non-trainable params: 0
+
+ ## model.summary (with 3 layers)
+
+ Model: "model_2"
+ _________________________________________________________________
+ Layer (type)                 Output Shape              Param #
+ =================================================================
+ modelInput (InputLayer)      [(None, 224, 224, 3)]     0
+ _________________________________________________________________
+ Conv2_1 (Conv2D)             (None, 224, 224, 512)     14336
+ _________________________________________________________________
+ Conv2_2 (Conv2D)             (None, 224, 224, 512)     2359808
+ _________________________________________________________________
+ quater (Conv2D)              (None, 224, 224, 19)      9747
+ =================================================================
+ Total params: 2,383,891
+ Trainable params: 2,383,891
+ Non-trainable params: 0
+ _________________________________________________________________
+
+ —
+ You are receiving this because you were mentioned.
+ Reply to this email directly, view it on GitHub
+ &lt;#33957?email_source=notifications&amp;email_token=AEMCC7OCXZ3TT2JSJYSQN4DQXA2JNA5CNFSM4JIPT5D2YY3PNVWWK3TUL52HS4DFVREXG43VMVBW63LNMVXHJKTDN5WW2ZLOORPWSZGOEF62TFA#issuecomment-561883540&gt;,
+ or unsubscribe
+ &lt;https://github.com/notifications/unsubscribe-auth/AEMCC7NUP77MSTV2TLZCQKDQXA2JNANCNFSM4JIPT5DQ&gt;
+ .
+
+
+
+		</comment>
+		<comment id='8' author='murdockhou' date='2020-01-30T23:33:15Z'>
+		This is happening because model.save/load_weights creates a tf.train.Checkpoint which assumes  the models have the same structure. If you're changing the model structure between saving and loading, you should create a tf.train.Checkpoint object that is compatible with both models.
+For example, if the layer names are consistent, then you could create a tf.train.Checkpoint that maps layer names to layers:
+&lt;denchmark-code&gt;def create_checkpoint(model):
+  return tf.train.Checkpoint(**{layer.name: layer for layer in model.layers})
+
+model = ...
+ckpt = create_checkpoint(model)
+ckpt_path = ckpt.save("/path/to/ckpt")
+
+# loading
+model = ...
+ckpt = create_checkpoint(model)
+ckpt.restore(ckpt_path)
+&lt;/denchmark-code&gt;
+
+I'm closing this issue since there's nothing we can really do. When the model structure changes between saving/loading, any assumptions we make about the variables to load would be unsafe.
+		</comment>
+		<comment id='9' author='murdockhou' date='2020-01-30T23:34:52Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/33957&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/33957&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

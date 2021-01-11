@@ -1,0 +1,100 @@
+<bug id='6624' author='elibixby' open_date='2017-01-04T02:32:48Z' closed_time='2018-02-07T23:51:31Z'>
+	<summary>Fail with error (rather than hanging) when init_op requires starting queues (ManagedSesssion etc)</summary>
+	<description>
+In 0.12 and in master
+MonitoredSession wraps the original SessionCreator in a _CoordinatedSessionCreator in an attempt to ensure queue runners are started before the session is run, however the original session has to be created first (as it is an argument to start_queue_runner). In the case of ChiefSessionCreator, ChiefSessionCreator.create_session calls ChiefSessionCreator._get_session_manager
+which instantiates a new SessionManager and returns it. Then ChiefSessionCreator.create_session calls SessionManager.prepare_session which calls sess.run(init_op). Thus resulting in sess.run(init_op) being run before start_queue_runner is called.
+This makes it impossible to initialize variables from queues. Even if this is intended behavior, it causes the initialization of MonitoredSession to stall without any logging output, and not respond to SIGTERM.
+It seems that prepare_session may need to be split into two calls for this use case.
+	</description>
+	<comments>
+		<comment id='1' author='elibixby' date='2017-01-04T04:16:39Z'>
+		Unless I'm mistaken, it's quite important for initialization to happen before starting the queue runners, because &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/7c36309c37b04843030664cdc64aca2bb7d6ecaa/tensorflow/python/training/input.py#L101&gt;input_producer()&lt;/denchmark-link&gt;
+ calls &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/7c36309c37b04843030664cdc64aca2bb7d6ecaa/tensorflow/python/training/input.py#L69&gt;limit_epochs()&lt;/denchmark-link&gt;
+, which sometimes creates a variable... that needs to be initialized before starting the queue runner (for the input producer).
+What's the use case for initializing a variable from a queue? It sounds quite exotic, so perhaps it would be possible to achieve with a workaround in the user program.
+		</comment>
+		<comment id='2' author='elibixby' date='2017-01-04T17:55:18Z'>
+		Ahh shoot. You're right. I was just testing my code with constants upstream from the enqueue_ops (and initializing from a queue worked fine, because I could start the queue before running the init_op) but if I put variables upstream from the enqueue ops it throws a failed precondition.
+Going to rescope this bug to failing more noisily when unstarted queues are inputs to ops. FYI my exotic use case was just a regular old rolling window pattern: &lt;denchmark-link:https://gist.github.com/elibixby/cedd3be67020169ff3efc47dbb603af6&gt;https://gist.github.com/elibixby/cedd3be67020169ff3efc47dbb603af6&lt;/denchmark-link&gt;
+
+I'll try to find another way to do it.
+		</comment>
+		<comment id='3' author='elibixby' date='2017-03-27T15:31:07Z'>
+		I had the same issue when I wanted to use data dependent initialization in my neural net. I general, data dependent initialization is not an exotic thing to do, is it? Is there a better workaround than using assign ops after initialization is completed?
+		</comment>
+		<comment id='4' author='elibixby' date='2017-06-16T21:02:32Z'>
+		&lt;denchmark-link:https://github.com/elibixby&gt;@elibixby&lt;/denchmark-link&gt;
+ What's the status of this issue?
+		</comment>
+		<comment id='5' author='elibixby' date='2017-06-16T23:36:11Z'>
+		Not sure there is any fix in the works. But I believe there may be a workaround, where you can create a separate GraphKey for variables that are downstream of Queues, and run initialization of those variables after queue initialization. Have to test it but believe it should work.
+		</comment>
+		<comment id='6' author='elibixby' date='2017-06-19T15:48:41Z'>
+		Actually, did &lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/b25d1c7d3e9f30925aa132ba62e79d281191a3dc&gt;b25d1c7&lt;/denchmark-link&gt;
+ fix this?  It makes  not reinitialize already initialized variables, which should make data dependent initialization quite a bit easier.
+		</comment>
+		<comment id='7' author='elibixby' date='2017-06-19T15:59:03Z'>
+		It's possible, busy today but I can test tomorrow if no-one beats me to it.
+		</comment>
+		<comment id='8' author='elibixby' date='2017-06-22T17:46:30Z'>
+		&lt;denchmark-link:https://github.com/girving&gt;@girving&lt;/denchmark-link&gt;
+ Yep! Good catch! This use case is now possible, if you remember to start queue runners, , it still hangs indefinitely if you do not start queue runners. It should be possible for evaluation of graph nodes to determine if there are upstream queue nodes, and queues have not been started, which would help immensely in debugging this common error (whether it's worth the effort given  is coming, is another question).
+To be clear with the following graph:
+&lt;denchmark-code&gt;import tensorflow as tf
+
+graph = tf.Graph()
+with graph.as_default():
+   queue = tf.train.string_input_producer(['foo', 'bar', 'baz'])
+   var = tf.Variable(queue.dequeue_many(3))
+&lt;/denchmark-code&gt;
+
+The following code works:
+&lt;denchmark-code&gt;with tf.Session(graph=graph) as sess:
+   tf.train.start_queue_runners(sess=sess)
+   tf.global_variables_initializer().run()
+   print(sess.run(var))
+&lt;/denchmark-code&gt;
+
+But the easy mistake of reversing two lines:
+&lt;denchmark-code&gt;with tf.Session(graph=graph) as sess:
+   tf.global_variables_initializer().run()
+   tf.train.start_queue_runners(sess=sess)
+   print(sess.run(var))
+&lt;/denchmark-code&gt;
+
+Results in a program that hangs indefinitely
+EDIT: This is in TF 1.2
+		</comment>
+		<comment id='9' author='elibixby' date='2017-06-23T16:57:53Z'>
+		&lt;denchmark-link:https://github.com/mrry&gt;@mrry&lt;/denchmark-link&gt;
+ Do you think it's feasible to programmatically warn about  not being started?  The warning could even point people to . :)
+		</comment>
+		<comment id='10' author='elibixby' date='2017-06-23T17:11:48Z'>
+		&lt;denchmark-link:https://github.com/girving&gt;@girving&lt;/denchmark-link&gt;
+ I once hacked up something that added to each  the set of queue runners on which it depended, and printed a warning when you tried to evaluate a tensor that depended on a queue runner that hadn't been started. I think it foundered because people ignore warnings and want errors, but there was a concern about false positives (e.g. perhaps you could feed a value to avoid depending on the queue, or it could be control-flow sensitive, and it wasn't clear how much metadata we should track to avoid the problem).
+		</comment>
+		<comment id='11' author='elibixby' date='2017-06-23T17:34:41Z'>
+		At the very least, I find it concerning that running of the initialization op doesn't respond to SIGTERM and only responds to SIGKILL when it's waiting for a queue dependency. What gives there?
+		</comment>
+		<comment id='12' author='elibixby' date='2017-06-23T19:47:28Z'>
+		&lt;denchmark-link:https://stackoverflow.com/q/14707049/3574081&gt;This Stack Overflow answer&lt;/denchmark-link&gt;
+ goes into some of the details. Short answer: invoking native code on the main thread of a Python process can prevent the signal from being delivered.
+		</comment>
+		<comment id='13' author='elibixby' date='2017-12-20T19:26:36Z'>
+		It has been 14 days with no activity and this issue has an assignee.Please update the label and/or status accordingly.
+		</comment>
+		<comment id='14' author='elibixby' date='2017-12-21T18:04:51Z'>
+		Given that I think queues are now mostly deprecated, should we mark this wontfix? If no response after a while, we will close this.
+		</comment>
+		<comment id='15' author='elibixby' date='2018-01-05T19:10:22Z'>
+		Nagging Awaiting Response: It has been 14 days with no activityand the awaiting response label was assigned. Is this still an issue?
+		</comment>
+		<comment id='16' author='elibixby' date='2018-01-24T13:19:31Z'>
+		Nagging Awaiting Response: It has been 14 days with no activityand the awaiting response label was assigned. Is this still an issue?
+		</comment>
+		<comment id='17' author='elibixby' date='2018-02-07T23:51:31Z'>
+		I think this is no longer relevant in the world of tf.data, so closing. Please reopen if it's still an issue.
+		</comment>
+	</comments>
+</bug>

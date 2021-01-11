@@ -1,0 +1,110 @@
+<bug id='11138' author='bensowden' open_date='2017-06-29T11:56:41Z' closed_time='2018-11-16T23:18:40Z'>
+	<summary>Hang when fitting tensorflow learn model which contains crossed sparse_column_with_* columns and the data is loaded with pandas_input_fn</summary>
+	<description>
+&lt;denchmark-h:h3&gt;System information&lt;/denchmark-h&gt;
+
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): Yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Run on Databricks GPU cluster (Ubuntu 16.04.1 LTS)
+TensorFlow installed from (source or binary): pip installed tensorflow-gpu
+TensorFlow version (use command below): v1.2.0-rc2-21-g12f033d 1.2.0
+Bazel version (if compiling from source): n/a
+CUDA/cuDNN version: CUDA: Version 8.0, cuDNN: Version 5.1 for CUDA 8.0
+GPU model and memory:
+Exact command to reproduce:
+
+&lt;denchmark-h:h3&gt;Describe the problem&lt;/denchmark-h&gt;
+
+When building Linear models with the tensorflow learn libraries the program hangs if the pandas input function (tensorflow.estimator.inputs.pandas_input_fn) is used and a crossed_column (tensorflow.contrib.layers.crossed_column) is constructed from a sparse_column_with_*. This issue is not seen in the tensorflow tutorials as they use constant tensor's to input the data which does not scale to large datasets. This also only occurs if crossing sparse_column_with_* columns, bucketized continuous columns do not cause a hang.
+The final line of output before the code hangs is: INFO:tensorflow:Create CheckpointSaverHook.
+&lt;denchmark-h:h3&gt;Source code / logs&lt;/denchmark-h&gt;
+
+Minimum working example of bug (with example of code that works and code that breaks):
+import pandas as pd
+import tensorflow as tf
+
+# Some sample data
+df = pd.DataFrame({'label' : [0,1,1,0], 'con1' : [10,20,30,40], 'con2' : [1,4,9,16], 'cat1' : ['a','a','b','b'], 'cat2' : ['c','d','c','d']})
+
+# Sparse base columns
+from tensorflow.contrib.layers import sparse_column_with_keys, sparse_column_with_hash_bucket
+sparse_cat1 = sparse_column_with_keys('cat1', keys=['a','b'])
+sparse_cat2 = sparse_column_with_hash_bucket('cat2', hash_bucket_size=10)
+
+# Bucketised columns
+from tensorflow.contrib.layers import real_valued_column, bucketized_column
+bucket_con1 = bucketized_column(real_valued_column('con1'), boundaries=[5,15,25,35])
+bucket_con2 = bucketized_column(real_valued_column('con2'), boundaries=[5,15,25,35])
+
+# Crossed columns
+from tensorflow.contrib.layers import crossed_column
+# This works with both inputs:
+cross_bb = crossed_column([bucket_con1, bucket_con2], hash_bucket_size=100)
+# Both these hang with pandas input:
+cross_cc = crossed_column([sparse_cat1, sparse_cat2], hash_bucket_size=100)
+cross_bc = crossed_column([bucket_con1, sparse_cat1], hash_bucket_size=100)
+
+feature_columns = [sparse_cat1, sparse_cat2, cross_bb, cross_cc, cross_bc]
+model = tf.contrib.learn.LinearClassifier(feature_columns=feature_columns)
+
+# Use pandas input - doesn't work
+train_gen_fun = tf.estimator.inputs.pandas_input_fn(df, batch_size=len(df), num_epochs=None, shuffle=True)
+# Split out the label from the features
+def input_fn1(gen) :
+  features = gen()
+  target = features.pop('label')
+  return features, target
+
+# Use constant input - does work
+def input_fn2(df):
+  feature_cols = {
+    'con1' : tf.constant(df['con1'].values),
+    'con2' : tf.constant(df['con2'].values),
+    'cat1' : tf.SparseTensor(indices=[[i, 0] for i in range(df['cat1'].size)],
+                             values=df['cat1'].values, dense_shape=[df['cat1'].size, 1]),
+    'cat2' : tf.SparseTensor(indices=[[i, 0] for i in range(df['cat2'].size)],
+                             values=df['cat2'].values, dense_shape=[df['cat2'].size, 1]),
+  }
+  label = tf.constant(df['label'].values)
+  return feature_cols, label
+
+# This hangs
+model.fit(input_fn=lambda:input_fn1(train_gen_fun), steps=10)
+
+# This works
+model.fit(input_fn=lambda:input_fn2(df), steps=10)
+	</description>
+	<comments>
+		<comment id='1' author='bensowden' date='2017-07-07T22:30:10Z'>
+		I tried running your script inside the latest nightly docker image, and got:
+NameError: name 'real_valued_column' is not defined
+So I tried patching it with
+from tensorflow.contrib.layers import real_valued_column
+and got some errors that suggest that wasn't the right thing to do:
+WARNING:tensorflow:Rank of input Tensor (1) should be the same as output_rank (2) for column. Will attempt to expand dims. It is highly recommended that you resize your input, as this behavior may change.
+I'll go look for the v1.2.0-rc2 image, but is there any chance that your script is missing a piece?
+		</comment>
+		<comment id='2' author='bensowden' date='2017-07-11T11:21:58Z'>
+		I am sorry I missed the include for real_valued_column I accidentally removed it when simplifying the code to share, as you say simply adding the line from tensorflow.contrib.layers import real_valued_column fixes this. I will edit the original to fix this.
+The warnings you see are warnings not errors and as such are not expected to prevent the algorithm from correctly training. These are also related to the use of the pandas_input_fn I believe but I have not managed to fully understand their source when investigating. They do not prevent the successful running of the above code with the crossed_columns removed and I believe they are unrelated to this problem.
+I have run this script on multiple systems and encountered the same issue so I don't believe it is missing anything. Please also note there are two model.fit lines at the bottom, the script will not complete successfully if both these are uncommented I provided both to demonstrate a working case and a not working case. In my running I have found that the bug in the first prevents the running of the second but in the case the first is commented out the second will run. Also if the line feature_columns = [sparse_cat1, sparse_cat2, cross_bb, cross_cc, cross_bc] is changed to feature_columns = [sparse_cat1, sparse_cat2, cross_bb] then the first will run and it will crash on the second if left uncommented.
+In your testing did the script complete successfully or did it hang as I saw in my testing? You simply state you saw a warning message not what happened after the warning message.
+		</comment>
+		<comment id='3' author='bensowden' date='2017-08-28T03:05:38Z'>
+		&lt;denchmark-link:https://github.com/ispirmustafa&gt;@ispirmustafa&lt;/denchmark-link&gt;
+ are you able to take a look or reassign to someone who can?
+		</comment>
+		<comment id='4' author='bensowden' date='2017-12-27T18:12:32Z'>
+		&lt;denchmark-link:https://github.com/xiejw&gt;@xiejw&lt;/denchmark-link&gt;
+ could you please take a look? it may be related to .
+		</comment>
+		<comment id='5' author='bensowden' date='2018-09-15T02:19:26Z'>
+		&lt;denchmark-link:https://github.com/bensowden&gt;@bensowden&lt;/denchmark-link&gt;
+ is this still an issue?
+		</comment>
+		<comment id='6' author='bensowden' date='2018-11-13T18:53:21Z'>
+		Nagging Assignee &lt;denchmark-link:https://github.com/xiejw&gt;@xiejw&lt;/denchmark-link&gt;
+: It has been 59 days with no activity and this issue has an assignee. Please update the label and/or status accordingly.
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,536 @@
+<bug id='10856' author='anirudh2290' open_date='2018-05-09T00:49:04Z' closed_time='2019-12-09T08:19:29Z'>
+	<summary>Failed OpenMP assertion when loading MXNet compiled with DEBUG=1</summary>
+	<description>
+Reproduction steps:
+&lt;denchmark-code&gt;cmake -DUSE_CUDA=ON -DUSE_CUDNN=ON -DUSE_MKLDNN=ON -DBLAS=Open -DUSE_DEBUG=1 -DCMAKE_BUILD_TYPE=Debug -GNinja .. &amp;&amp; ninja &amp;&amp; cd ..
+
+[INFO] Setting module np/mx/python random seeds, use MXNET_MODULE_SEED=1107463865 to reproduce.
+Test should successfully run its course of multi-process/forked data loader without errors ... Assertion failure at kmp_runtime.cpp(6481): __kmp_team_pool == __null.
+OMP: Error #13: Assertion failure at kmp_runtime.cpp(6481).
+OMP: Hint: Please submit a bug report with this message, compile and run commands used, and machine configuration info including native compiler and operating system versions. Faster response will be obtained by including all program sources. For information on submitting this issue, please see https://bugs.llvm.org/.
+Assertion failure at kmp_runtime.cpp(6481): __kmp_team_pool == __null.
+OMP: Error #13: Assertion failure at kmp_runtime.cpp(6481).
+OMP: Hint: Please submit a bug report with this message, compile and run commands used, and machine configuration info including native compiler and operating system versions. Faster response will be obtained by including all program sources. For information on submitting this issue, please see https://bugs.llvm.org/.
+^C[INFO] Setting test np/mx/python random seeds, use MXNET_TEST_SEED=39684479 to reproduce.
+
+----------------------------------------------------------------------
+Ran 1 test in 2.106s
+
+OK
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-code&gt;----------System Info----------
+('Platform     :', 'Linux-4.4.0-1055-aws-x86_64-with-Ubuntu-16.04-xenial')
+('system       :', 'Linux')
+('node         :', 'ip-172-31-21-146')
+('release      :', '4.4.0-1055-aws')
+('version      :', '#64-Ubuntu SMP Thu Apr 5 17:06:36 UTC 2018')
+----------Hardware Info----------
+('machine      :', 'x86_64')
+('processor    :', 'x86_64')
+Architecture:          x86_64
+CPU op-mode(s):        32-bit, 64-bit
+Byte Order:            Little Endian
+CPU(s):                32
+On-line CPU(s) list:   0-31
+Thread(s) per core:    2
+Core(s) per socket:    16
+Socket(s):             1
+NUMA node(s):          1
+Vendor ID:             GenuineIntel
+CPU family:            6
+Model:                 79
+Model name:            Intel(R) Xeon(R) CPU E5-2686 v4 @ 2.30GHz
+Stepping:              1
+CPU MHz:               2699.984
+CPU max MHz:           3000.0000
+CPU min MHz:           1200.0000
+BogoMIPS:              4600.18
+Hypervisor vendor:     Xen
+Virtualization type:   full
+L1d cache:             32K
+L1i cache:             32K
+L2 cache:              256K
+L3 cache:              46080K
+NUMA node0 CPU(s):     0-31
+Flags:                 fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology nonstop_tsc aperfmperf eagerfpu pni pclmulqdq ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch invpcid_single retpoline kaiser fsgsbase bmi1 hle avx2 smep bmi2 erms invpcid rtm rdseed adx xsaveopt
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='anirudh2290' date='2018-08-07T11:57:57Z'>
+		I'd suggest tweaking this description slightly.  Instead of "test_multi_worker_forked_data_loader fails with DEBUG=" I'd suggest "Failed OpenMP assertion when loading MXNet compiled with DEBUG=1".
+It's happening for me (and Pedro) in non-dataloading scenarios.  Seems to happen as soon as the thread pool is created.
+		</comment>
+		<comment id='2' author='anirudh2290' date='2018-08-22T16:30:22Z'>
+		I don't see a root cause listed here.
+		</comment>
+		<comment id='3' author='anirudh2290' date='2018-08-22T16:31:51Z'>
+		So, why is __kmp_team_pool == __null assertion hitting?  Intel OpenMP is compatible with process forking, so this is probably a symptom of something else wrong leading up to this.
+		</comment>
+		<comment id='4' author='anirudh2290' date='2018-11-06T18:40:06Z'>
+		This is really problematic, is there a suggestion for anything that we can do to fix this?
+		</comment>
+		<comment id='5' author='anirudh2290' date='2019-01-12T12:08:18Z'>
+		Stuck for 46h running unit tests with the following error message:
+&lt;denchmark-code&gt;OMP: Error #13: Assertion failure at kmp_runtime.cpp(6479).
+OMP: Hint: Please submit a bug report with this message, compile and run commands used, and machine configuration info including native compiler and operating system versions. Faster response will be obtained by including all program sources. For information on submitting this issue, please see https://bugs.llvm.org/.
+Assertion failure at kmp_runtime.cpp(6479): __kmp_thread_pool == __null.
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='6' author='anirudh2290' date='2019-01-18T17:53:22Z'>
+		I spent some time looking at this, I can say I understand what's the problem, this happens when the omp engine is initialized after destructors are called on thread creation. Usually involves the pthread_at_fork fiasco in initialize.cc
+Iinitalization is triggered from __nptl_deallocate_tsd (); &lt;denchmark-link:https://code.woboq.org/userspace/glibc/nptl/pthread_create.c.html#497&gt;https://code.woboq.org/userspace/glibc/nptl/pthread_create.c.html#497&lt;/denchmark-link&gt;
+
+__kmp_team_pool is a volatile which gets changed continously across threads for reuse of the last kmp team.
+This happens if omp is initialized twice for some reason, so __kmp_team_pool is not NULL because there's a thread running omp functions, kmp_team_pool can be non-NULL
+		</comment>
+		<comment id='7' author='anirudh2290' date='2019-01-18T17:55:13Z'>
+		What's worse is that when executing this test, you can easily create a segmentation fault, by hitting ^C so we are UB land:
+&lt;denchmark-code&gt;python tests/python/unittest/test_gluon_data.py
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-code&gt;OMP: Error #13: Assertion failure at kmp_runtime.cpp(6479).
+OMP: Hint: Please submit a bug report with this message, compile and run commands used, and machine configuration info including native compiler and operating system versions. Faster response will be obtained by including all program sources. For information on submitting this issue, please see https://bugs.llvm.org/.
+Assertion failure at kmp_runtime.cpp(6479): __kmp_thread_pool == __null.
+OMP: Error #13: Assertion failure at kmp_runtime.cpp(6479).
+OMP: Hint: Please submit a bug report with this message, compile and run commands used, and machine configuration info including native compiler and operating system versions. Faster response will be obtained by including all program sources. For information on submitting this issue, please see https://bugs.llvm.org/.
+Assertion failure at kmp_runtime.cpp(6479): __kmp_thread_pool == __null.
+OMP: Error #13: Assertion failure at kmp_runtime.cpp(6479).
+OMP: Hint: Please submit a bug report with this message, compile and run commands used, and machine configuration info including native compiler and operating system versions. Faster response will be obtained by including all program sources. For information on submitting this issue, please see https://bugs.llvm.org/.
+^C[INFO] Setting test np/mx/python random seeds, use MXNET_TEST_SEED=1709269671 to reproduce.
+
+----------------------------------------------------------------------
+Ran 3 tests in 12.296s
+
+OK
+
+Segmentation fault: 11
+
+Stack trace returned 10 entries:
+[bt] (0) /home/piotr/devel/mxnet/mxnet/python/mxnet/../../build/libmxnet.so(dmlc::StackTrace[abi:cxx11]()+0x54) [0x7fef667f38e5]
+[bt] (1) /home/piotr/devel/mxnet/mxnet/python/mxnet/../../build/libmxnet.so(+0x4ba60be) [0x7fef69ba40be]
+[bt] (2) /lib/x86_64-linux-gnu/libc.so.6(+0x354b0) [0x7fefbeb324b0]
+[bt] (3) /home/piotr/devel/mxnet/mxnet/build/3rdparty/openmp/runtime/src/libomp.so(+0xc7c0d) [0x7fefb8857c0d]
+[bt] (4) /home/piotr/devel/mxnet/mxnet/build/3rdparty/openmp/runtime/src/libomp.so(+0xc7d02) [0x7fefb8857d02]
+[bt] (5) /home/piotr/devel/mxnet/mxnet/build/3rdparty/openmp/runtime/src/libomp.so(+0x6ebca) [0x7fefb87febca]
+[bt] (6) /home/piotr/devel/mxnet/mxnet/build/3rdparty/openmp/runtime/src/libomp.so(+0x56e9d) [0x7fefb87e6e9d]
+[bt] (7) /home/piotr/devel/mxnet/mxnet/build/3rdparty/openmp/runtime/src/libomp.so(+0x5727c) [0x7fefb87e727c]
+[bt] (8) /home/piotr/devel/mxnet/mxnet/build/3rdparty/openmp/runtime/src/libomp.so(+0x576b4) [0x7fefb87e76b4]
+[bt] (9) /home/piotr/devel/mxnet/mxnet/build/3rdparty/openmp/runtime/src/libomp.so(+0x56d4f) [0x7fefb87e6d4f]
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='8' author='anirudh2290' date='2019-06-12T19:35:24Z'>
+		This is not related to Data-loading, but is an issue with OpenMP. Removing the data-loading label.
+&lt;denchmark-link:https://github.com/mxnet-label-bot&gt;@mxnet-label-bot&lt;/denchmark-link&gt;
+ Update [Backend, Bug]
+		</comment>
+		<comment id='9' author='anirudh2290' date='2019-06-24T18:37:24Z'>
+		Getting crashes in master when using debug version with OpenMP and MKL for development:
+&lt;denchmark-code&gt;Assertion failure at kmp_runtime.cpp(6481): __kmp_team_pool == __null.
+OMP: Error #13: Assertion failure at kmp_runtime.cpp(6481).
+OMP: Hint: Please submit a bug report with this message, compile and run commands used, and machine configuration info including native compiler and operating system versions. Faster response will be obtained by including all program sources. For information on submitting this issue, please see https://bugs.llvm.org/.
+Assertion failure at kmp_runtime.cpp(6481): __kmp_team_pool == __null.
+OMP: Error #13: Assertion failure at kmp_runtime.cpp(6481).
+OMP: Hint: Please submit a bug report with this message, compile and run commands used, and machine configuration info including native compiler and operating system versions. Faster response will be obtained by including all program sources. For information on submitting this issue, please see https://bugs.llvm.org/.
+w odict_values([Parameter sequential0_dense0_weight (shape=(3, 0), dtype=float32), Parameter sequential0_dense0_bias (shape=(3,), dtype=float32)])
+OMP: Error #15: Initializing libiomp5.so, but found libomp.so already initialized.
+OMP: Hint This means that multiple copies of the OpenMP runtime have been linked into the program. That is dangerous, since it can degrade performance or cause incorrect results. The best thing to do is to ensure that only a single OpenMP runtime is linked into the process, e.g. by avoiding static linking of the OpenMP runtime in any library. As an unsafe, unsupported, undocumented workaround you can set the environment variable KMP_DUPLICATE_LIB_OK=TRUE to allow the program to continue to execute, but that may cause crashes or silently produce incorrect results. For more information, please see http://www.intel.com/software/products/support/.
+fish: “./fc_mx.py” terminated by signal SIGABRT (Abort)
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='10' author='anirudh2290' date='2019-06-24T18:40:19Z'>
+		&lt;denchmark-code&gt;(py3_venv) pllarroy@elite:134: ~/d/GradOptMXNet [autograd_fixes]&gt; cat fc_mx.py
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+import mxnet as mx
+import mxnet.autograd as ag
+from mxnet import nd
+from mxnet import gluon
+import sys
+
+
+def main():
+    x = nd.array([[0.2131, 0.5449, 0.9910],
+        [0.1600, 0.1665, 0.1387],
+        [0.6242, 0.0409, 0.0663],
+        [0.6590, 0.9822, 0.3108],
+        [0.8566, 0.3848, 0.8385]])
+    x.attach_grad()
+    net = gluon.nn.Sequential()
+    with net.name_scope():
+        net.add(gluon.nn.Dense(3))
+        #net.initialize()
+    net.initialize(mx.init.Xavier(magnitude=2.24))
+    w = net.collect_params().values()
+    print(f"w {w}")
+    with ag.record():
+        y = net.forward(x)
+        x_grad = ag.grad(y, x, create_graph=True, retain_graph=True)[0]
+    print(x_grad)
+    return 1
+
+if __name__ == '__main__':
+    sys.exit(main())
+&lt;/denchmark-code&gt;
+
+Build options, defaults as in &lt;denchmark-link:https://github.com/apache/incubator-mxnet/blob/master/cmake/cmake_options.yml&gt;https://github.com/apache/incubator-mxnet/blob/master/cmake/cmake_options.yml&lt;/denchmark-link&gt;
+
+The crash happened as I was running the script above.
+		</comment>
+		<comment id='11' author='anirudh2290' date='2019-06-24T18:52:35Z'>
+		I tried with the PR from Anton, and I also get a crash, in that version we are only linking with MKL's openmp:
+&lt;denchmark-code&gt;(py3_venv) pllarroy@elite:1: ~/d/GradOptMXNet [autograd_fixes]&gt; ./fc_mx.py
+w odict_values([Parameter sequential0_dense0_weight (shape=(3, 0), dtype=float32), Parameter sequential0_dense0_bias (shape=(3,), dtype=float32)])
+OMP: Error #15: Initializing libiomp5.so, but found libiomp5.so already initialized.
+OMP: Hint This means that multiple copies of the OpenMP runtime have been linked into the program. That is dangerous, since it can degrade performance or cause incorrect results. The best thing to do is to ensure that only a single OpenMP runtime is linked into the process, e.g. by avoiding static linking of the OpenMP runtime in any library. As an unsafe, unsupported, undocumented workaround you can set the environment variable KMP_DUPLICATE_LIB_OK=TRUE to allow the program to continue to execute, but that may cause crashes or silently produce incorrect results. For more information, please see http://www.intel.com/software/products/support/.
+fish: “./fc_mx.py” terminated by signal SIGABRT (Abort)
+(py3_venv) pllarroy@elite:134: ~/d/GradOptMXNet [autograd_fixes]&gt; ldd /home/ANT.AMAZON.COM/pllarroy/devel/mxnet/python/mxnet/../../build/libmxnet.so | grep -i openmp
+(py3_venv) pllarroy@elite:1: ~/d/GradOptMXNet [autograd_fixes]&gt; ldd /home/ANT.AMAZON.COM/pllarroy/devel/mxnet/python/mxnet/../../build/libmxnet.so | grep -i omp
+	libiomp5.so =&gt; /home/ANT.AMAZON.COM/pllarroy/devel/mxnet/build/mklml/mklml_lnx_2019.0.5.20190502/lib/libiomp5.so (0x00007f60c8446000)
+(py3_venv) pllarroy@elite:0: ~/d/GradOptMXNet [autograd_fixes]&gt; ipython
+Python 3.6.8 (default, Jan 14 2019, 11:02:34) 
+Type 'copyright', 'credits' or 'license' for more information
+IPython 7.5.0 -- An enhanced Interactive Python. Type '?' for help.
+
+In [1]: import mxnet as mx                                                                                                                                                                         
+mx.li
+In [2]: mx.libinfo.find_lib_path()                                                                                                                                                                 
+Out[2]: ['/home/ANT.AMAZON.COM/pllarroy/devel/mxnet/python/mxnet/../../build/libmxnet.so']
+
+In [3]:                                                                                                                                                                                            
+Do you really want to exit ([y]/n)? y
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-link:https://github.com/apache/incubator-mxnet/pull/12160&gt;#12160&lt;/denchmark-link&gt;
+
+When compiling without OpenMP the example above doesn't crash.
+		</comment>
+		<comment id='12' author='anirudh2290' date='2019-06-24T18:52:42Z'>
+		&lt;denchmark-link:https://github.com/mxnet-label-bot&gt;@mxnet-label-bot&lt;/denchmark-link&gt;
+ add [MKL]
+		</comment>
+		<comment id='13' author='anirudh2290' date='2019-06-24T20:16:39Z'>
+		Adding stack trace. Tried to reproduce in another machine and the crash didn't happen, but get assertion now and then.
+&lt;denchmark-link:https://github.com/apache/incubator-mxnet/files/3322437/bt.txt&gt;bt.txt&lt;/denchmark-link&gt;
+
+&lt;denchmark-code&gt;Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
+Core was generated by `py3_venv/bin/python fc.py'.
+Program terminated with signal SIGABRT, Aborted.
+#0  __GI_raise (sig=sig@entry=6) at ../sysdeps/unix/sysv/linux/raise.c:51
+[Current thread is 1 (Thread 0x7fbd94581700 (LWP 17687))]
+#0  __GI_raise (sig=sig@entry=6) at ../sysdeps/unix/sysv/linux/raise.c:51
+#1  0x00007fbda3583801 in __GI_abort () at abort.c:79
+#2  0x00007fbd3dcda8b3 in __kmp_abort_process () at ../../src/kmp_runtime.cpp:492
+#3  0x00007fbd3dcc6277 in __kmp_fatal (message=...) at ../../src/kmp_i18n.cpp:894
+#4  0x00007fbd3dcd86d5 in __kmp_register_library_startup () at ../../src/kmp_runtime.cpp:6702
+#5  0x00007fbd3dcd99d4 in _INTERNAL_25_______src_kmp_runtime_cpp_6dd760e2::__kmp_do_serial_initialize () at ../../src/kmp_runtime.cpp:6821
+#6  _INTERNAL_25_______src_kmp_runtime_cpp_6dd760e2::__kmp_do_middle_initialize () at ../../src/kmp_runtime.cpp:7137
+#7  __kmp_middle_initialize () at ../../src/kmp_runtime.cpp:7246
+#8  0x00007fbd3dcbb44e in __kmp_api_omp_get_num_procs () at ../../src/kmp_ftn_entry.h:615
+#9  0x00007fbd35d2b9ce in mkl_serv_get_num_stripes () from /opt/intel/mkl/lib/intel64/libmkl_intel_thread.so
+#10 0x00007fbd35e9bdd4 in mkl_blas_sgemm () from /opt/intel/mkl/lib/intel64/libmkl_intel_thread.so
+#11 0x00007fbd3d245719 in sgemm_ () from /opt/intel/mkl/lib/intel64/libmkl_intel_lp64.so
+#12 0x00007fbd3d2a5510 in cblas_sgemm () from /opt/intel/mkl/lib/intel64/libmkl_intel_lp64.so
+#13 0x00007fbd9e4654f9 in mkldnn::impl::cpu::extended_sgemm (transa=0x7fbd9e93183f "T", transb=0x7fbd9e931841 "N", M=0x7fbd9457f744, N=0x7fbd9457f740, K=0x7fbd9457f748, 
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='14' author='anirudh2290' date='2019-06-24T20:18:34Z'>
+		Added a dockerfile for reproduction:
+&lt;denchmark-link:https://github.com/larroy/mxnet_omp&gt;https://github.com/larroy/mxnet_omp&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='15' author='anirudh2290' date='2019-08-01T00:59:47Z'>
+		This breaks ipython, can't execute external commands anymore:
+&lt;denchmark-code&gt;
+In [2]: !git show
+commit 9d7fc7cbee09de2694022995d0601cb4316e4988 (HEAD -&gt; master, upstream/master)
+Author: Cody Allen &lt;ceedubs@gmail.com&gt;
+Date:   Wed Jul 31 16:09:23 2019 -0700
+
+    Fix Scala Symbolic API some/Some typo (#15687)
+
+diff --git a/docs/api/scala/symbol.md b/docs/api/scala/symbol.md
+index aaddc2a8a..f92548e48 100644
+--- a/docs/api/scala/symbol.md
++++ b/docs/api/scala/symbol.md
+@@ -41,7 +41,7 @@ The following example configures a two-layer neural network.
+     val data = Symbol.Variable("data")
+     val fc1 = Symbol.api.FullyConnected(Some(data), num_hidden = 128, name = "fc1")
+     val act1 = Symbol.api.Activation(Some(fc1), "relu", "relu1")
+-    val fc2 = Symbol.api.FullyConnected(some(act1), num_hidden = 64, name = "fc2")
++    val fc2 = Symbol.api.FullyConnected(Some(act1), num_hidden = 64, name = "fc2")
+     val net = Symbol.api.SoftmaxOutput(Some(fc2), name = "out")
+     :type net
+     // org.apache.mxnet.Symbol
+
+In [3]: import mxnet as mx
+Assertion failure at kmp_runtime.cpp(6481): __kmp_team_pool == __null.
+OMP: Error #13: Assertion failure at kmp_runtime.cpp(6481).
+OMP: Hint: Please submit a bug report with this message, compile and run commands used, and machine configuration info including native compiler and operating system versions. Faster response will be obtained by including all program sources. For information on submitting this issue, please see https://bugs.llvm.org/.
+
+In [4]: !ls
+Assertion failure at kmp_runtime.cpp(6481): __kmp_team_pool == __null.
+OMP: Error #13: Assertion failure at kmp_runtime.cpp(6481).
+OMP: Hint: Please submit a bug report with this message, compile and run commands used, and machine configuration info including native compiler and operating system versions. Faster response will be obtained by including all program sources. For information on submitting this issue, please see https://bugs.llvm.org/.
+
+In [5]: !git show
+Assertion failure at kmp_runtime.cpp(6481): __kmp_team_pool == __null.
+OMP: Error #13: Assertion failure at kmp_runtime.cpp(6481).
+OMP: Hint: Please submit a bug report with this message, compile and run commands used, and machine configuration info including native compiler and operating system versions. Faster response will be obtained by including all program sources. For information on submitting this issue, please see https://bugs.llvm.org/.
+
+In [6]: 
+
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='16' author='anirudh2290' date='2019-08-01T18:35:07Z'>
+		Using the code provided in this example, the code in the train process is never executed:
+&lt;denchmark-link:https://github.com/apache/incubator-mxnet/issues/14979&gt;#14979&lt;/denchmark-link&gt;
+
+I think we can confirm that this a big issue and is producing incorrect results.
+		</comment>
+		<comment id='17' author='anirudh2290' date='2019-08-01T19:06:13Z'>
+		I have a private branch which fixes this issue, but need to verify side effects further.
+		</comment>
+		<comment id='18' author='anirudh2290' date='2019-08-01T19:06:38Z'>
+		&lt;denchmark-link:https://github.com/larroy/mxnet/tree/openmp_improv&gt;https://github.com/larroy/mxnet/tree/openmp_improv&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='19' author='anirudh2290' date='2019-08-01T19:25:45Z'>
+		I revisited this yesterday when I was working on one issue. I see that this assertion hits only when DNDEBUG and -g flags are passed when building 3rdparty/openmp. I tweaked my CMakeLists to remove those DNDEBUG and -g flags to 3rdparty/openmp and those assertions go away. I don't think I will ever get to debugging openmp code so I am good.
+		</comment>
+		<comment id='20' author='anirudh2290' date='2019-08-01T22:02:53Z'>
+		well, it's not executing code that should be executed, if you see the linked issue.  Plus producing a crash...  so it does have customer impact...
+		</comment>
+		<comment id='21' author='anirudh2290' date='2019-08-01T22:03:40Z'>
+		related: &lt;denchmark-link:https://github.com/apache/incubator-mxnet/issues/14979&gt;#14979&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='22' author='anirudh2290' date='2019-08-01T22:42:11Z'>
+		&lt;denchmark-link:https://github.com/cjolivier01&gt;@cjolivier01&lt;/denchmark-link&gt;
+ I think you haven't carefully taken all the data provided into consideration, including my latest responses in the &lt;denchmark-link:https://github.com/dev&gt;@dev&lt;/denchmark-link&gt;
+ mailing list regarding this issue, which are unanswered. Also I have linked the issue above which shows customer code not being executed. I will send a PR with a fix, feel free to comment on that, but please refrain from making uninformed comments without making any attempt to run code, use a debugger or perform properly documented experiments. I have posted in the thread of this issue my experiments, which show the relation with this:
+&lt;denchmark-link:https://github.com/apache/incubator-mxnet/issues/14979&gt;#14979&lt;/denchmark-link&gt;
+
+Note that I don't claim that using llvm's openmp is the root cause of the problem but rather re-entrancy coming from pthread_at_fork handlers. My suggestion is to remove those.
+Also I don't understand what you mean by "just make it not re-run the kernel tuning stuff at fork time.". Please be specific with your suggestions to avoid wasting time in miscommunication.
+		</comment>
+		<comment id='23' author='anirudh2290' date='2019-08-01T23:28:25Z'>
+		
+Please specify what problems do you think it introduces to remove pthread_at_fork.
+
+Multiprocessing will stop working after you remove pthread_at_fork at handler. Many of mxnet users like &lt;denchmark-link:https://github.com/YutingZhang&gt;@YutingZhang&lt;/denchmark-link&gt;
+ depend on that. MXNet Model Server uses it &lt;denchmark-link:https://github.com/vdantu&gt;@vdantu&lt;/denchmark-link&gt;
+ .
+I think you should either do the workaround, or if you want to really debug openmp code, explore the option that &lt;denchmark-link:https://github.com/cjolivier01&gt;@cjolivier01&lt;/denchmark-link&gt;
+ suggests.
+		</comment>
+		<comment id='24' author='anirudh2290' date='2019-08-01T23:31:11Z'>
+		Thanks. Do you know why it stops working? Could you elaborate?
+		</comment>
+		<comment id='25' author='anirudh2290' date='2019-08-01T23:41:24Z'>
+		To rephrase your question , you are asking why we need pthread_atfork ?
+This is to suspend all the active threads prior to forking. Otherwise we can run into issues as documented here: &lt;denchmark-link:http://pubs.opengroup.org/onlinepubs/009695399/functions/pthread_atfork.html&gt;http://pubs.opengroup.org/onlinepubs/009695399/functions/pthread_atfork.html&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='26' author='anirudh2290' date='2019-08-01T23:58:20Z'>
+		Ok I got what you meant now. I don't think the kernel tunning is a problem there. I see that there's problems with multiprocessing when removing pthread_at_fork. Please suggest another approach for the issue linked above. Why is kernel tuning related to the crash linked above?  Yes the warning comes from kernel tuning, but the crash??
+		</comment>
+		<comment id='27' author='anirudh2290' date='2019-08-02T00:02:53Z'>
+		Thanks &lt;denchmark-link:https://github.com/anirudh2290&gt;@anirudh2290&lt;/denchmark-link&gt;
+ for the record, I think you are right about problems with Multiprocessing that will be caused by removing completely the handlers. I think we need to find a way to avoid the other problematic side-effects that are causing problems and crashes. Suggestions welcome.
+		</comment>
+		<comment id='31' author='anirudh2290' date='2019-12-06T08:44:46Z'>
+		Assertion still fails with latest master and cmake -DUSE_CUDA=0 -DUSE_MKLDNN=0 -DCMAKE_EXPORT_COMPILE_COMMANDS=1 -DBUILD_CYTHON_MODULES=0 -DCMAKE_BUILD_TYPE=Debug .. build.
+&lt;denchmark-code&gt;
+Assertion failure at kmp_runtime.cpp(6481): __kmp_team_pool == __null.
+OMP: Error #13: Assertion failure at kmp_runtime.cpp(6481).
+OMP: Hint: Please submit a bug report with this message, compile and run commands used, and machine configuration info including native compiler and operating system versions. Faster response will be obtained by including all program sources. For information on submitting this issue, please see https://bugs.llvm.org/.
+
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='32' author='anirudh2290' date='2019-12-06T16:13:50Z'>
+		the theory for fix for that is stated in that issue regarding OMP calls during kernel tuning which may be erroneously re-executing static’s init after fork. it is probably correct.
+		</comment>
+		<comment id='35' author='anirudh2290' date='2019-12-07T13:16:12Z'>
+		This also affects compiling Cython extensions. It's impossible to compile Cython extensions in debug mode as long as this issue remains unfixed:
+&lt;denchmark-code&gt;[1/2] Cythonizing mxnet/cython/ndarray.pyx
+/home/ubuntu/.pyenv/versions/3.7.3/lib/python3.7/site-packages/Cython/Compiler/Main.py:369: FutureWarning: Cython directive 'language_level' not set, using 2 for now (Py2). This will change in a later release! File: /home/ubuntu/src/mxnet/python/mxnet/cython/ndarray.pyx
+  tree = Parsing.p_module(s, pxd, full_module_name)
+[2/2] Cythonizing mxnet/cython/symbol.pyx
+/home/ubuntu/.pyenv/versions/3.7.3/lib/python3.7/site-packages/Cython/Compiler/Main.py:369: FutureWarning: Cython directive 'language_level' not set, using 2 for now (Py2). This will change in a later release! File: /home/ubuntu/src/mxnet/python/mxnet/cython/symbol.pyx
+  tree = Parsing.p_module(s, pxd, full_module_name)
+running build_ext
+building 'mxnet._cy3.symbol' extension
+gcc -pthread -Wno-unused-result -Wsign-compare -DNDEBUG -g -fwrapv -O3 -Wall -fPIC -I../include/ -I../3rdparty/tvm/nnvm/include -I/home/ubuntu/.pyenv/versions/3.7.3/include/python3.7m -c mxnet/cython/symbol.cpp -o build/temp.linux-x86_64-3.7/mxnet/cython/symbol.o
+Assertion failure at kmp_runtime.cpp(6481): __kmp_team_pool == __null.
+OMP: Error #13: Assertion failure at kmp_runtime.cpp(6481).
+OMP: Hint: Please submit a bug report with this message, compile and run commands used, and machine configuration info including native compiler and operating system versions. Faster response will be obtained by including all program sources. For information on submitting this issue, please see https://bugs.llvm.org/.
+error: command 'gcc' terminated by signal 6
+CMakeFiles/mxnet.dir/build.make:96: recipe for target 'libmxnet.so' failed
+&lt;/denchmark-code&gt;
+
+cmake -DUSE_CUDA=0 -DUSE_MKLDNN=0 -DCMAKE_EXPORT_COMPILE_COMMANDS=1 -DBUILD_CYTHON_MODULES=1 -DCMAKE_BUILD_TYPE=Debug ..
+		</comment>
+		<comment id='36' author='anirudh2290' date='2019-12-07T15:07:16Z'>
+		so fix the bug that’s causing the assert or switch omp to build in release mode.  the former is preferred.
+btw i compiled a lot of cython (see my cython branch in the repo) without incident.
+asserts should be root causes and not swept under the rug.
+		</comment>
+		<comment id='37' author='anirudh2290' date='2019-12-07T15:48:52Z'>
+		It should be root caused. But this issue is open since 1.5 years and no-one stepped up to do it / was able to do it. Are you willing to root-cause it?
+Otherwise, could you provide more information on why you believe linking with  is needed? &lt;denchmark-link:https://github.com/apache/incubator-mxnet/pull/8730&gt;#8730&lt;/denchmark-link&gt;
+ doesn't provide any reasoning.
+Regarding Cython, the comment is about the cmake -DUSE_CUDA=0 -DUSE_MKLDNN=0 -DCMAKE_EXPORT_COMPILE_COMMANDS=1 -DBUILD_CYTHON_MODULES=1 -DCMAKE_BUILD_TYPE=Debug .. setting, which you supposedly didn't use as you didn't observe the error.
+		</comment>
+		<comment id='38' author='anirudh2290' date='2019-12-07T16:06:49Z'>
+		It appears to me that this issue only occurs when having multiple openmp libraries at runtime. I don't understand why we need to support this use-case. MKL-DNN works with whatever openmp runtime is provided by the compiler [&lt;denchmark-link:https://github.com/intel/mkl-dnn/blob/433e086bf5d9e5ccfc9ec0b70322f931b6b1921d/doc/build/build_options.md#openmp&gt;1&lt;/denchmark-link&gt;
+]. If you think this use-case is important, please give some more reasoning. If you convince me I'm happy to help to root-cause it.
+Otherwise I suggest to follow the simplistic approach of using the compiler openmp runtime. If any specific openmp runtime is needed, then we can compile with the associated compiler (GCC, LLVM, Intel Compiler).
+		</comment>
+		<comment id='39' author='anirudh2290' date='2019-12-07T17:06:34Z'>
+		if it is really a problem, then it would be prioritized. all the necessary
+info is in that issue (and i already mentioned just yesterday or today on
+that ticket) what it was again and it’s like i was talking to no one, as it
+has been, simply an immediate revert to “remove the library”.  in the time
+wasted on all this, it could have been resolved 100 times over.
+
+
+I can remove just about every bug from mxnet by turning off ALL of the
+features in CMakeLists.txt. no features, no bugs. This is roughly
+equivalent to the approach that has been taken so far for 1.5 years, which
+is not good engineering practice, ad a suggestion that I am surprised to
+see championed by a committer.
+
+
+Here’s another example:
+
+
+Not too long ago (maybe 8 months?) there was a crash at shutdown in debug
+mode in tcmalloc (gperf version of malloc, which is similar to jemalloc)
+with an error message about bad pointer to free() or something like that.  At
+the time, I didn’t know what caused it and so I did not block it’s removal.
+
+
+fast-forward to about two months ago, where I saw the same error in a
+different code base. Since it was happening to me, I was in a position to
+debug it, so I did and found that a the same small static library was
+linked into two different shared objects, and occasionally (depending upon
+link order, I presume), a global string variable was created and destroyed
+twice, because when linking, both shared object c-runtime init functions
+had the same name, so mapped to the same startup routine and global data
+address, so when both shared objects initialized, they called the same
+address. This caused both a memory leak because the first startup string
+memory allocation was discarded by the second call to the constructor and
+at shutdown,  an assert in tcmalloc because the same second memory pointer
+allocated was freed twice.  When tcmalloc was removed, the assert went away
+but the bug, to the best of my knowledge, is still there.  If I knew then
+what I know now, I would have asked the bug to be fixed rather than remove
+tcmalloc.  Not because of a love for tcmalloc, but because there is
+something telling you there is a bug and the bug should be fixed, because
+if you just hide the bug (comment out the assert) then it’s likely to cause
+other (harder to track down) problems later. So now that bug is probably
+still there causing who-knows-what random crashes or undefined behavior.
+
+
+This is the kind of root causing that should be done and not effectively
+commenting out the assert. I believe we should insist on the highest
+standards. I understand if a person does CI all day and if they find
+something they can do via CI (ie turn off a feature) which makes the
+problem go away, then they might feel compelled to champion that option.
+Like the saying goes, “When you have a hammer in your hand, everything
+looks like a nail”.
+
+
+But this is not always the best solution for the project. There is a bug,
+and it should be fixed because commenting out the assert just hides the bug
+from plain view, but the bug remains.  Or sufficient evidence otherwise.
+&lt;denchmark-link:#&gt;…&lt;/denchmark-link&gt;
+
+
+-Chris
+On Sat, Dec 7, 2019 at 8:06 AM Leonard Lausen ***@***.***&gt; wrote:
+ It appears to me that this issue only occurs when having multiple openmp
+ libraries at runtime. I don't understand why we need to support this
+ use-case. MKL-DNN works with whatever openmp runtime is provided by the
+ compiler [1
+ &lt;https://github.com/intel/mkl-dnn/blob/433e086bf5d9e5ccfc9ec0b70322f931b6b1921d/doc/build/build_options.md#openmp&gt;].
+ If you think this use-case is important, please give some more reasoning.
+ If you convince me I'm happy to help to root-cause it.
+
+ Otherwise I suggest to follow the simplistic approach of using the compile
+ openmp runtime. If any specific openmp runtime is needed, then we can
+ compile with the associated compiler (GCC, LLVM, Intel Compiler).
+
+ —
+ You are receiving this because you were mentioned.
+ Reply to this email directly, view it on GitHub
+ &lt;#10856?email_source=notifications&amp;email_token=ACVWZ7MIEQL7BQDDEKJT7G3QXPCZXA5CNFSM4E66F4P2YY3PNVWWK3TUL52HS4DFVREXG43VMVBW63LNMVXHJKTDN5WW2ZLOORPWSZGOEGGJ5MA#issuecomment-562863792&gt;,
+ or unsubscribe
+ &lt;https://github.com/notifications/unsubscribe-auth/ACVWZ7MC2MIHMWK72IDVX4TQXPCZXANCNFSM4E66F4PQ&gt;
+ .
+
+
+
+		</comment>
+		<comment id='40' author='anirudh2290' date='2019-12-07T17:38:41Z'>
+		Chris, I'm trying to understand the situation better exactly because I think
+this bug is important and I would like to address it. Therefore I asked you a
+question, expecting your answer would be helpful to solve this problem.
+Unfortunately it seems to me that your answer misses the point of my question.
+Let me reiterate the question and provide more background information.
+
+
+It is my understanding that Intel OpenMP and LLVM OpenMP runtime differ
+essentially only in the compiler used to compile them 1
+
+
+It is my understanding that it is generally accepted that GCC does not work
+well with anything but gomp. GCC wants to force the use of libgomp at the linker
+stage and this leads to a undefined situation that can cause problems like the
+one we observe. Specifically, Stackoverflow describes the problem for Intel OMP
+at 2.
+
+
+There is no reason for compiling MXNet + LLVM OpenMP using the GCC compiler.
+If we want LLVM OpenMP or Intel OpenMP, we can compile with LLVM. If we want
+gomp, we can compile with GCC. Doing anything else seems to be only asking for
+trouble. Thus I suggest we use always use the compiler provided OpenMP.
+
+
+You state that my suggestion equals commenting out the assertion instead of
+fixing the problem. It is my understanding, that the problem only occurs when 2
+OpenMP libraries are linked. However, according to 2, linking 2 OpenMP
+libraries is a "recipe for disaster". Why do we need to go with the "recipe for
+disaster", based on the solution I suggest in point 3).
+
+
+I fully understand that I don't have anywhere near your experience with OpenMP.
+Therefore, help out to clarify any specific wrong conclusions or assumptions in
+above point. Keep in mind:
+
+Those who are asked should be responsive and helpful, within the context of
+our shared goal of improving Apache project code.
+https://www.apache.org/foundation/policies/conduct#specific-guidelines
+
+Your previous answer has not addressed my code change suggestion. The code
+change is specifically about avoiding to have 2 OpenMP runtimes. You have at no
+point justified why you think we need to have 2 runtimes at the same time. You
+must provide a technical justification showing why having only 1 runtime would
+be bad, or your veto is considered invalid according to Apache's rules.
+
+To prevent vetos from being used capriciously, they must be accompanied by a
+technical justification showing why the change is bad (opens a security
+exposure, negatively affects performance, etc. ). A veto without a
+justification is invalid and has no weight.
+https://www.apache.org/foundation/voting.html
+
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,147 @@
+<bug id='381' author='Litee' open_date='2018-06-03T19:36:54Z' closed_time='2019-03-25T21:24:37Z'>
+	<summary>Zeros on first tensor concatenation op</summary>
+	<description>
+&lt;denchmark-h:h4&gt;TensorFlow.js version&lt;/denchmark-h&gt;
+
+0.11.4
+&lt;denchmark-h:h4&gt;Browser version&lt;/denchmark-h&gt;
+
+Chrome 66.0.3359.181
+Windows 10
+&lt;denchmark-h:h4&gt;Describe the problem or feature request&lt;/denchmark-h&gt;
+
+model.predict() results contain a range of all zeros - it looks like the first concatenate operation with result longer than 8192 produces zeros. Here is what I see when I look at results (see minimal sample code below):
+...
+Slice:  818 Tensor
+[[0.039277, 0.0680138, 0.0480547, 0.0202137, 0.0317248, 0.0945501, 0.0599228, 0.0707796, 0.4984992, 0.0689642],]
+Slice:  819 Tensor
+[[0.0227662, 0.2433799, 0, 0, 0, 0, 0, 0, 0, 0],]
+Slice:  820 Tensor
+[[0, 0, 0, 0, 0, 0, 0, 0, 0, 0],]
+...
+Slice:  1630 Tensor
+[[0, 0, 0, 0, 0, 0, 0, 0, 0, 0],]
+Slice:  1631 Tensor
+[[0, 0, 0, 0, 0, 0, 0, 0, 0, 0],]
+Slice:  1632 Tensor
+[[0.0360319, 0.2653748, 0.0344116, 0.031091, 0.0786578, 0.0866721, 0.054291, 0.0158215, 0.3704009, 0.0272476],]
+Slice:  1633 Tensor
+[[0.01593, 0.1220765, 0.028846, 0.0361838, 0.0279004, 0.0885607, 0.0406828, 0.0039507, 0.5233707, 0.1124983],]
+...
+&lt;denchmark-h:h4&gt;Code to reproduce the bug / link to feature request&lt;/denchmark-h&gt;
+
+&lt;denchmark-code&gt;const model = tf.sequential();
+
+model.add(tf.layers.dense({
+  inputShape: [28 * 28],
+  units: 10,
+  kernelInitializer: 'varianceScaling',
+  activation: 'softmax'
+}));
+
+model.compile({
+  optimizer: 'sgd',
+  loss: 'categoricalCrossentropy',
+  metrics: ['accuracy'],
+});
+
+// No training
+
+tf.tidy(() =&gt; {
+  console.log('Generating prediction data...');
+  const toPredict = tf.randomUniform([1700, 28 * 28]);
+  console.log('Predicting...');
+  const prediction = model.predict(toPredict);
+  for (let i = 0; i &lt; prediction.shape[0]; i++) {
+    console.log('Slice: ', i, prediction.slice(i, 1).toString());
+  }
+});
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='Litee' date='2018-06-06T17:30:49Z'>
+		Another simple way to reproduce is to increase the number of predictions in MNIST example from 100 to 1000 and run the script. If you have this problem on your machine you will see many "0" predictions:
+&lt;denchmark-link:https://user-images.githubusercontent.com/400234/41054924-77d4cd6a-69c8-11e8-81d7-26356c12a0a9.png&gt;&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='2' author='Litee' date='2018-06-06T19:45:39Z'>
+		OK, it seems to have something to do with concatenation shader and MAX_TEXTURE_SIZE. My default MAX_TEXTURE_SIZE is 16384, but if I fake it to 8192 in code then the problem disappears. Unfortunately, I have zero experience with shaders, so maybe someone can help? Here is the generated shader code when concatenating tensors of 8000 and 320 lengths (first time zeros happen):
+&lt;denchmark-code&gt;  precision highp float;
+  precision highp int;
+  varying vec2 resultUV;
+  const vec2 halfCR = vec2(0.5, 0.5);
+
+  vec2 UVfrom1D(int texNumR, int texNumC, int index) {
+    int texR = index / texNumC;
+    int texC = index - texR * texNumC;
+    return (vec2(texC, texR) + halfCR) / vec2(texNumC, texNumR);
+  }
+    
+  float sampleTexture(sampler2D textureSampler, vec2 uv) {
+    return texture2D(textureSampler, uv).r;
+  }
+
+  void setOutput(float val) {
+    gl_FragColor = vec4(val, 0, 0, 0);
+  }
+
+  uniform sampler2D A;
+  uniform sampler2D B;
+
+  ivec2 getOutputCoords() {
+    return ivec2(resultUV.yx * vec2(1, 8320));
+  }
+
+
+  float getAFlat(int index) {
+    vec2 uv = vec2((float(index) + 0.5) / 8000.0, 0.5);
+    return sampleTexture(A, uv);
+  }
+  
+  float getA(int row, int col) {
+    vec2 uv = (vec2(col, row) + halfCR) / vec2(8000.0, 1.0);
+    return sampleTexture(A, uv);
+  }
+
+
+  float getBFlat(int index) {
+    vec2 uv = UVfrom1D(32, 10, index);
+    return sampleTexture(B, uv);
+  }
+
+    
+  float getB(int index) {
+    return getBFlat(index);
+  }
+
+  float getB(int row, int col) {
+    return getB(col);
+  }
+
+  void main() {
+    ivec2 coords = getOutputCoords();
+    int yR = coords.x;
+    int yC = coords.y;
+
+    float value = 0.0;
+    if (yC &lt; 8000) {
+      value = getA(yR, yC);
+    } else {
+      yC -= 8000;
+      value = getB(yR, yC);
+    }
+
+    setOutput(value);
+  }
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='3' author='Litee' date='2019-03-25T21:24:37Z'>
+		We got a windows machine with Intel GPU and we are unable to reproduce at problem at tfj@1.0.2. Feel free to reopen if you still run into this problem.
+		</comment>
+		<comment id='4' author='Litee' date='2019-03-31T11:33:18Z'>
+		Thanks, I cannot reproduce the problem anymore.
+		</comment>
+	</comments>
+</bug>

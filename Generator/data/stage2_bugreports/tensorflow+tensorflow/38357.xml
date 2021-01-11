@@ -1,0 +1,231 @@
+<bug id='38357' author='chychen' open_date='2020-04-08T12:31:17Z' closed_time='2020-05-10T05:27:43Z'>
+	<summary>[MixedPrecision] DynamicLossScale should accept scale_loss smaller than one</summary>
+	<description>
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/r2.2/tensorflow/python/training/experimental/loss_scale.py#L391&gt;https://github.com/tensorflow/tensorflow/blob/r2.2/tensorflow/python/training/experimental/loss_scale.py#L391&lt;/denchmark-link&gt;
+
+new_loss_scale = math_ops.maximum(
+      self._current_loss_scale / self._multiplier, 1)
+self._current_loss_scale &gt;=1 is unnecessary and wrong.
+In some use cases, loss is possible overflow inf in float16, therefore self._current_loss_scale&lt;1 is necessary for mixed precision training.
+	</description>
+	<comments>
+		<comment id='1' author='chychen' date='2020-04-09T05:06:31Z'>
+		&lt;denchmark-link:https://github.com/chychen&gt;@chychen&lt;/denchmark-link&gt;
+, Will it possible to provide the sample code to analyze the reported issue. Thanks!
+		</comment>
+		<comment id='2' author='chychen' date='2020-04-09T09:18:41Z'>
+		&lt;denchmark-link:https://github.com/gadagashwini&gt;@gadagashwini&lt;/denchmark-link&gt;
+ Please see Before/After in following pdf file.
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/files/4455245/TF2.38357.pdf&gt;TF2#38357.pdf&lt;/denchmark-link&gt;
+
+(I fake it by multiply loss with a large constant.)
+		</comment>
+		<comment id='3' author='chychen' date='2020-04-14T12:28:23Z'>
+		&lt;denchmark-link:https://github.com/chychen&gt;@chychen&lt;/denchmark-link&gt;
+, Instead of pdf can you share the executable code or provide the colab gist to reproduce the issue . Thanks
+		</comment>
+		<comment id='4' author='chychen' date='2020-04-14T15:03:49Z'>
+		import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+from tensorflow.keras.mixed_precision import experimental as mixed_precision
+
+policy = mixed_precision.Policy('mixed_float16')
+mixed_precision.set_policy(policy)
+print('Compute dtype: %s' % policy.compute_dtype)
+print('Variable dtype: %s' % policy.variable_dtype)
+inputs = keras.Input(shape=(784,), name='digits')
+num_units = 4096
+dense1 = layers.Dense(num_units, activation='relu', name='dense_1')
+x = dense1(inputs)
+dense2 = layers.Dense(1, activation='relu', name='dense_2')
+outputs = dense2(x)
+
+model = keras.Model(inputs=inputs, outputs=outputs)
+
+(x_train, y_train), (x_test, y_test) = keras.datasets.mnist.load_data()
+x_train = x_train.reshape(60000, 784).astype('float32') / 255
+
+optimizer = keras.optimizers.RMSprop()
+optimizer = mixed_precision.LossScaleOptimizer(optimizer, loss_scale='dynamic')
+loss_object = tf.keras.losses.MeanSquaredError()
+train_dataset = (tf.data.Dataset.from_tensor_slices((x_train, y_train))
+                 .shuffle(10000).batch(1024))
+
+@tf.function
+def train_step(x, y):
+    with tf.GradientTape() as tape:
+        predictions = model(x)
+        loss = loss_object(y, predictions) * 10000.
+        scaled_loss = optimizer.get_scaled_loss(loss)
+    scaled_gradients = tape.gradient(scaled_loss, model.trainable_variables)
+    gradients = optimizer.get_unscaled_gradients(scaled_gradients)
+    optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+    return loss
+
+for epoch in range(2):
+    for i, (x, y) in enumerate(train_dataset):
+        mp_loss_scale = optimizer.loss_scale().numpy()
+        loss = train_step(x, y)
+        print('epoch {}: step {}: loss={}, loss_scale={}'.format(epoch, i, loss, mp_loss_scale))
+Compute dtype: float16
+Variable dtype: float32
+epoch 0: step 0: loss=inf, loss_scale=32768.0
+epoch 0: step 1: loss=inf, loss_scale=16384.0
+epoch 0: step 2: loss=inf, loss_scale=8192.0
+epoch 0: step 3: loss=inf, loss_scale=4096.0
+epoch 0: step 4: loss=inf, loss_scale=2048.0
+epoch 0: step 5: loss=inf, loss_scale=1024.0
+epoch 0: step 6: loss=inf, loss_scale=512.0
+epoch 0: step 7: loss=inf, loss_scale=256.0
+epoch 0: step 8: loss=inf, loss_scale=128.0
+epoch 0: step 9: loss=inf, loss_scale=64.0
+epoch 0: step 10: loss=inf, loss_scale=32.0
+epoch 0: step 11: loss=inf, loss_scale=16.0
+epoch 0: step 12: loss=inf, loss_scale=8.0
+epoch 0: step 13: loss=inf, loss_scale=4.0
+epoch 0: step 14: loss=inf, loss_scale=2.0
+epoch 0: step 15: loss=inf, loss_scale=1.0
+epoch 0: step 16: loss=inf, loss_scale=1.0
+epoch 0: step 17: loss=inf, loss_scale=1.0
+epoch 0: step 18: loss=inf, loss_scale=1.0
+... (inf loss is overflow...)
+		</comment>
+		<comment id='5' author='chychen' date='2020-04-16T20:24:15Z'>
+		In practice, I have never seen losses or intermediate gradients so large that they overflow in float16 when the loss scale is 1. The max float16 value is 65504, which be an enormous gradient. The reason the loss scale cannot go below 1 is that conceptually the purpose of a loss scale is to avoid underflow.
+&lt;denchmark-link:https://github.com/nluehr&gt;@nluehr&lt;/denchmark-link&gt;
+, &lt;denchmark-link:https://github.com/benbarsdell&gt;@benbarsdell&lt;/denchmark-link&gt;
+, any thoughts on having a loss scale below 1? I don't think this would happen in practice much, and if it did, I imagine the model would not converge to a good accuracy. The current behavior of keeping the loss scale at 1 also would converge poorly, as it just causes every step to be skipped.
+		</comment>
+		<comment id='6' author='chychen' date='2020-04-17T04:19:44Z'>
+		I could replicate the issue with Tf 2.2rc2.
+Please find the gist &lt;denchmark-link:https://colab.sandbox.google.com/gist/gadagashwini/d0a5487ee6374076d6c7d6d3a6f20098/untitled509.ipynb&gt;here&lt;/denchmark-link&gt;
+. Thanks
+		</comment>
+		<comment id='7' author='chychen' date='2020-04-17T16:00:25Z'>
+		In the example above, the INF is generated in the forward pass. Running in FP32, I see an initial loss of 279232.1875, which exceeds the representable range of fp16. Loss scaling gets applied after the loss is computed, so no value of loss scale will help in this case.
+		</comment>
+		<comment id='8' author='chychen' date='2020-04-18T00:20:45Z'>
+		True, in this case it wouldn't help, but what about in general? Do you think it's likely the backwards pass could overflow without the forwards pass overflowing? Even if it's unlikely, should we allow the loss scale to go below 1?
+		</comment>
+		<comment id='9' author='chychen' date='2020-04-18T02:37:49Z'>
+		&lt;denchmark-link:https://github.com/nluehr&gt;@nluehr&lt;/denchmark-link&gt;
+  in many cases, we should cast loss to fp32 before scaling, and cast back to fp16 after scaling.
+&lt;denchmark-link:https://github.com/reedwm&gt;@reedwm&lt;/denchmark-link&gt;
+ agree with you, I don't understand why not?
+		</comment>
+		<comment id='10' author='chychen' date='2020-04-20T23:00:13Z'>
+		
+in many cases, we should cast loss to fp32 before scaling, and cast back to fp16 after scaling.
+
+Just casting the loss is not sufficient; it it is already NAN in fp16 and will be NAN when cast to fp32. The forward pass needs to cast the unsafe ops that produced the NAN values to fp32. When this is done, the corresponding backward ops will also use fp32, so those should have no numerical issues if the loss scale clamps at one. Other ops did not produce NANs on the forward pass, and are expected to produce smaller values in backward, so a loss scale of one should be fine here as well.
+In the provided example, the second dense layer is essentially serving as a reduction. When it is performed with dtype=tf.float32, the nan losses are avoided and the loss scale initially drops no lower than 4 before rising back up to 128 (if you extend training for many epochs).
+4 is rather close to 1, so it is possible a loss scale below 1 could be required in some corner case. In practice I have not seen such a case. On the other hand, the loss scale cannot be used to work around a NaN in the loss, that requires assigning ops to fp32.
+Some lower bound on the loss scale is necessary (letting it be reduced all the way to zero, for example, has obvious problems). Setting the lower bound to the point where loss scaling becomes a numerical no-op (i.e., multiply by one) is appealing, but not strictly necessary. However, we would need an example model requiring a lower loss scale in order to determine where to set a new lower bound.
+		</comment>
+		<comment id='11' author='chychen' date='2020-05-03T10:00:53Z'>
+		Dear &lt;denchmark-link:https://github.com/nluehr&gt;@nluehr&lt;/denchmark-link&gt;
+,
+I don't see any strong reasons you insisted not to adjust it.
+I reported here because it trapped my research project. (related to random network distillation on anomaly detection task, and I can't post my project code here surely.)
+if possible the scale smaller than one, why not just relax it? I really can't understand.
+		</comment>
+		<comment id='12' author='chychen' date='2020-05-04T15:22:37Z'>
+		&lt;denchmark-link:https://github.com/chychen&gt;@chychen&lt;/denchmark-link&gt;
+, I am not insisting against reducing the lower bound below one. However, I do think some lower bound is needed. It is better to error out with overflowing gradients than let the loss scale drop near zero and silently quench convergence (because many/most gradients underflow to zero).
+It is difficult for me to decide what the lower bound on the loss scaler should be without some typical models that need this change. I would also like to understand the problem in more detail in order to evaluate whether reducing the loss_scale is the best solution. It might be better to cast some additional layers to float32 because an agressively small loss scale will cause underflow in a subset of the model parameters and could result in poor convergence compared to fp32.
+I'm curious, have you adjusted the loss scale interval in your TF installation to unblock your research? With this change did your models train all the way to expected accuracy? What was the smallest required loss scale?
+Given the uncertainties and risks, I would rather not change the default behavior. Perhaps a custom loss scale interval could be optionally provided when constructing the optimizer. &lt;denchmark-link:https://github.com/reedwm&gt;@reedwm&lt;/denchmark-link&gt;
+, any thoughts?
+		</comment>
+		<comment id='13' author='chychen' date='2020-05-05T06:27:31Z'>
+		in my experience, yes, adjust the loss scale unblock my research.
+in the beginning of training, L2 loss is large so scale smaller than one is required. after few training steps, loss become stabler and ok with larger scale.
+I think custom interval is a good solution. or maybe check whether loss is zero to scale back the factor? just like the solution for nan overflow situation.
+		</comment>
+		<comment id='14' author='chychen' date='2020-05-05T22:38:49Z'>
+		As &lt;denchmark-link:https://github.com/nluehr&gt;@nluehr&lt;/denchmark-link&gt;
+ stated, it's difficult to come to a decision here without knowing of any model that requires a loss scale below 1.
+One potential workaround is to copy the &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/30559f13a1a68ab6933b0078515a5f54bdb2dc89/tensorflow/python/training/experimental/loss_scale.py#L290&gt;DynamicLossScale implementation&lt;/denchmark-link&gt;
+, but change the &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/30559f13a1a68ab6933b0078515a5f54bdb2dc89/tensorflow/python/training/experimental/loss_scale.py#L392&gt;minimum loss scale&lt;/denchmark-link&gt;
+ from 1 to some lower number. Note the loss scale classes are still experimental so the copied class may break in a future version of TensorFlow.
+
+in the beginning of training, L2 loss is large so scale smaller than one is required
+
+Perhaps the variable initialization should be modified so the L2 loss is not as big. Altneratively, you can start training in float32 for the first few steps, then switch to mixed precision training. This can be accomplished by saving a checkpoint from a float32 model then restoring the checkpoint into an equivalent mixed precision model.
+		</comment>
+		<comment id='15' author='chychen' date='2020-05-10T05:27:44Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/38357&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/38357&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='16' author='chychen' date='2020-11-11T08:11:51Z'>
+		Hi there &lt;denchmark-link:https://github.com/reedwm&gt;@reedwm&lt;/denchmark-link&gt;
+ and &lt;denchmark-link:https://github.com/nluehr&gt;@nluehr&lt;/denchmark-link&gt;
+. Im currently having the same problem as &lt;denchmark-link:https://github.com/chychen&gt;@chychen&lt;/denchmark-link&gt;
+.
+
+I would also like to understand the problem in more detail in order to evaluate whether reducing the loss_scale is the best solution. It might be better to cast some additional layers to float32 because an agressively small loss scale will cause underflow in a subset of the model parameters and could result in poor convergence compared to fp32.
+I'm curious, have you adjusted the loss scale interval in your TF installation to unblock your research? With this change did your models train all the way to expected accuracy? What was the smallest required loss scale?
+
+I have monkey-patched the update method to allow a loss_scale below 1 (I removed the lower limit completely). This worked, and my models now train to the same validation loss as with float32, which means I can now double the batch_size and get better/faster convergence.
+I my case the loss scale drops to around 0.01-0.06 in the very beginning, then doubles every 2000 steps until it reached 64. My loss a Focal Loss used to detect areas of interest in a 1024x512 pixel image with sigmoid output activations.
+
+Perhaps a custom loss scale interval could be optionally provided when constructing the optimizer.
+
+That would be great. But why not remove the constraint completely? It sound like the argument is "We want to always prevent underflow, and for that reason we put a limit which will cause overflow.". I mean, if the worst thing that can happen is underflow, why should that be a reason to enforce an overflow?
+I would be happy to try other approaches to lower the loss if you have any sensible (best practice) suggestions, but I will not hack my way around it.
+		</comment>
+		<comment id='17' author='chychen' date='2020-11-11T08:14:06Z'>
+		Here is the loss scale in two different training runs
+&lt;denchmark-link:https://user-images.githubusercontent.com/665484/98786320-3bfc7c00-23fe-11eb-9802-f22381168245.png&gt;&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='18' author='chychen' date='2020-11-11T20:55:04Z'>
+		It is difficult to make a decision in the  itself without a specific example of a model that requires a loss scale below 1. &lt;denchmark-link:https://github.com/elgehelge&gt;@elgehelge&lt;/denchmark-link&gt;
+, can you provide the model which had the loss scale drop to 0.01-0.06?
+Also, LossScale is now deprecated and the new non-experimental tf.keras.mixed_precision.LossScaleOptimizer directly implements loss scaling, so monkey patching update will no longer work in TF 2.4 and the TF nightlies. The best workaround in 2.4 and tf-nightly is to override the get_scaled_loss and get_scaled_gradients to use a lower loss scale than self.loss_scale, which effectively treats the loss scale as being lower than it actually is. For example:
+class LossScaleBelowOneOptimizer(tf.keras.mixed_precision.LossScaleOptimizer):
+
+  MULTIPLIER = 2 ** 10
+
+  @property
+  def actual_loss_scale(self):
+    return self.loss_scale / self.MULTIPLIER
+
+  def get_scaled_loss(self, loss):
+    if callable(loss):
+      def new_loss():
+        loss_val = loss()
+        return loss_val * tf.cast(self.actual_loss_scale, loss_val.dtype)
+      return new_loss
+    else:
+      return loss * tf.cast(self.actual_loss_scale, loss.dtype)
+
+  def get_unscaled_gradients(self, grads):
+    reciprocal = 1. / self.actual_loss_scale
+    return [g * reciprocal if g is not None else None for g in grads]
+This allows the effective loss scale to go as low as 1 / self.MULTIPLIER, which is approximately 0.001.
+
+But why not remove the constraint completely? It sound like the argument is "We want to always prevent underflow, and for that reason we put a limit which will cause overflow.". I mean, if the worst thing that can happen is underflow, why should that be a reason to enforce an overflow?
+
+I am worried that allowing the loss scale to go below 1 will cause confusion. A model may get NaNs on the forward pass, in which case the gradients will be NaN regardless of the loss scale. If the loss scale could go below 1, the loss scale would be repeatedly lowered every step until it reached zero.
+I think we should raise an error if the loss scale reaches 1 or if the loss is NaN, but this is tricky to implement without reducing performance. If we find there are a significant number of models which benefit from a loss scale below 1, we can also add a  argument. &lt;denchmark-link:https://github.com/fchollet&gt;@fchollet&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/nluehr&gt;@nluehr&lt;/denchmark-link&gt;
+, let me know if you have any thoughts.
+		</comment>
+		<comment id='19' author='chychen' date='2020-11-13T09:20:52Z'>
+		Thanks for the pointer on how to adjust for newer versions of tensorflow. Appreciate it.
+
+I think we should raise an error if the loss scale reaches 1 or if the loss is NaN, but this is tricky to implement without reducing performance.
+
+Agree. I took me quite some digging to find out why my loss did not converge, would have been very helpful with an error message.
+
+@elgehelge, can you provide the model which had the loss scale drop to 0.01-0.06?
+
+It is for commercial use so I cannot go into a lot of details unfortunately. But it an hourglass network with a lot of 3x3 convolutions.
+		</comment>
+	</comments>
+</bug>

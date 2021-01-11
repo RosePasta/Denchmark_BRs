@@ -1,0 +1,278 @@
+<bug id='34426' author='burnmg' open_date='2019-11-19T20:54:39Z' closed_time='2020-01-22T23:42:39Z'>
+	<summary>Error on distributed training " Variable is unhashable if Tensor equality is enabled. Instead, use tensor.experimental_ref() as the key."</summary>
+	<description>
+I have this issue when I try to run distributed training with my own custom training loop.
+There is something going wrong when calling apply_gradient.
+System information
+Test on Google Colab with GPU TF 2.0
+Code to reproduce the issue
+&lt;denchmark-code&gt;def model_builder():
+    resnet = ResNet50(include_top=False, weights='imagenet')
+    model = Sequential()
+    model.add(resnet)
+    
+    model.add(Dense(100, activation="softmax"))
+
+    return model
+
+def experiment_dist(model_builder, x_train, y_train, x_test, y_test):  
+    train_ds = tf.data.Dataset.from_tensor_slices((x_train, y_train)).shuffle(10000).batch(64)
+    test_ds = tf.data.Dataset.from_tensor_slices((x_test, y_test)).batch(64)
+    
+    mirrored_strategy = tf.distribute.MirroredStrategy()
+    train_ds = mirrored_strategy.experimental_distribute_dataset(train_ds)
+    test_ds = mirrored_strategy.experimental_distribute_dataset(test_ds)
+   
+    
+
+    with mirrored_strategy.scope():
+
+        test_loss = tf.keras.metrics.Mean(name='test_loss')
+
+        train_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(
+            name='train_accuracy')
+        test_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(
+            name='test_accuracy')
+
+        model = model_builder()
+        # model = ResNet50(include_top=False, weights='imagenet')
+
+        optimizer = tf.keras.optimizers.SGD()
+        loss_object = tf.keras.losses.SparseCategoricalCrossentropy(
+            reduction=tf.keras.losses.Reduction.NONE)
+        def train_step(inputs):
+            x, y = inputs
+            x = tf.dtypes.cast(x, tf.float32)
+            with tf.GradientTape() as tape:
+                predictions = model(x)
+                loss = loss_object(y, predictions)
+            gradients = tape.gradient(loss, model.trainable_variables)
+            optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+            
+            train_loss(loss)
+            train_accuracy(y, predictions)
+
+        def test_step(inputs) :
+            x, y = inputs
+            x = tf.dtypes.cast(x, tf.float32)
+
+            predictions = model(x)
+            t_loss = loss_object(y, predictions)
+
+            test_loss(t_loss)
+            test_accuracy(y, predictions)
+
+        @tf.function
+        def distributed_train_step(inputs):
+            per_replica_losses = strategy.experimental_run_v2(train_step,
+                                                            args=(inputs, ))
+            return strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses,
+                                axis=None)
+        
+        @tf.function
+        def distributed_test_step(inputs):
+            return strategy.experimental_run_v2(test_step, args=(inputs, ))            
+    iter_count = 0
+    MAX_ITER = 95000
+
+    while True:
+        print("start")
+        for inputs in train_ds:
+            print("train_loop")
+            train_step(inputs)
+            iter_count += 1
+            if iter_count &gt; MAX_ITER:
+                break
+
+
+        for test_images, test_labels in test_ds:
+            images = tf.dtypes.cast(images, tf.float32)
+            test_step(test_images, test_labels)
+
+        template = 'Iteration {}, Loss: {}, Accuracy: {}, Test Loss: {}, Test Accuracy: {}'
+        print(template.format(iter_count,
+                                train_loss.result(),
+                                train_accuracy.result()*100,
+                                test_loss.result(),
+                                test_accuracy.result()*100))
+
+        # Reset the metrics for the next epoch
+        train_loss.reset_states()
+        train_accuracy.reset_states()
+        test_loss.reset_states()
+        test_accuracy.reset_states()
+
+        if iter_count &gt; MAX_ITER:
+            break
+    
+experiment_dist(model_builder, x_train, y_train, x_test, y_test)
+&lt;/denchmark-code&gt;
+
+Error Track
+&lt;denchmark-code&gt;WARNING:tensorflow:There is non-GPU devices in `tf.distribute.Strategy`, not using nccl allreduce.
+start
+train_loop
+---------------------------------------------------------------------------
+TypeError                                 Traceback (most recent call last)
+&lt;ipython-input-29-d2da1a38aa3a&gt; in &lt;module&gt;()
+----&gt; 1 experiment_dist(model_builder, x_train, y_train, x_test, y_test)
+
+14 frames
+&lt;ipython-input-28-357ae31bb355&gt; in experiment_dist(model_builder, x_train, y_train, x_test, y_test)
+     72         for inputs in train_ds:
+     73             print("train_loop")
+---&gt; 74             train_step(inputs)
+     75             iter_count += 1
+     76             if iter_count &gt; MAX_ITER:
+
+&lt;ipython-input-28-357ae31bb355&gt; in train_step(inputs)
+     40                 loss = loss_object(y, predictions)
+     41             gradients = tape.gradient(loss, model.trainable_variables)
+---&gt; 42             optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+     43 
+     44             train_loss(loss)
+
+/tensorflow-2.0.0/python3.6/tensorflow_core/python/keras/optimizer_v2/optimizer_v2.py in apply_gradients(self, grads_and_vars, name)
+    439           functools.partial(self._distributed_apply, apply_state=apply_state),
+    440           args=(grads_and_vars,),
+--&gt; 441           kwargs={"name": name})
+    442 
+    443   def _distributed_apply(self, distribution, grads_and_vars, name, apply_state):
+
+/tensorflow-2.0.0/python3.6/tensorflow_core/python/distribute/distribute_lib.py in merge_call(self, merge_fn, args, kwargs)
+   1915     if kwargs is None:
+   1916       kwargs = {}
+-&gt; 1917     return self._merge_call(merge_fn, args, kwargs)
+   1918 
+   1919   def _merge_call(self, merge_fn, args, kwargs):
+
+/tensorflow-2.0.0/python3.6/tensorflow_core/python/distribute/distribute_lib.py in _merge_call(self, merge_fn, args, kwargs)
+   1922         distribution_strategy_context._CrossReplicaThreadMode(self._strategy))  # pylint: disable=protected-access
+   1923     try:
+-&gt; 1924       return merge_fn(self._strategy, *args, **kwargs)
+   1925     finally:
+   1926       _pop_per_thread_mode()
+
+/tensorflow-2.0.0/python3.6/tensorflow_core/python/keras/optimizer_v2/optimizer_v2.py in _distributed_apply(self, distribution, grads_and_vars, name, apply_state)
+    483           update_ops.extend(
+    484               distribution.extended.update(
+--&gt; 485                   var, apply_grad_to_update_var, args=(grad,), group=False))
+    486 
+    487       any_symbolic = any(isinstance(i, ops.Operation) or
+
+/tensorflow-2.0.0/python3.6/tensorflow_core/python/distribute/distribute_lib.py in update(self, var, fn, args, kwargs, group)
+   1528       kwargs = {}
+   1529     with self._container_strategy().scope():
+-&gt; 1530       return self._update(var, fn, args, kwargs, group)
+   1531 
+   1532   def _update(self, var, fn, args, kwargs, group):
+
+/tensorflow-2.0.0/python3.6/tensorflow_core/python/distribute/distribute_lib.py in _update(self, var, fn, args, kwargs, group)
+   2140     # The implementations of _update() and _update_non_slot() are identical
+   2141     # except _update() passes `var` as the first argument to `fn()`.
+-&gt; 2142     return self._update_non_slot(var, fn, (var,) + tuple(args), kwargs, group)
+   2143 
+   2144   def _update_non_slot(self, colocate_with, fn, args, kwargs, should_group):
+
+/tensorflow-2.0.0/python3.6/tensorflow_core/python/distribute/distribute_lib.py in _update_non_slot(self, colocate_with, fn, args, kwargs, should_group)
+   2146     # once that value is used for something.
+   2147     with UpdateContext(colocate_with):
+-&gt; 2148       result = fn(*args, **kwargs)
+   2149       if should_group:
+   2150         return result
+
+/tensorflow-2.0.0/python3.6/tensorflow_core/python/keras/optimizer_v2/optimizer_v2.py in apply_grad_to_update_var(var, grad)
+    465       if "apply_state" in self._dense_apply_args:
+    466         apply_kwargs["apply_state"] = apply_state
+--&gt; 467       update_op = self._resource_apply_dense(grad, var, **apply_kwargs)
+    468       if var.constraint is not None:
+    469         with ops.control_dependencies([update_op]):
+
+/tensorflow-2.0.0/python3.6/tensorflow_core/python/keras/optimizer_v2/gradient_descent.py in _resource_apply_dense(self, grad, var, apply_state)
+    106 
+    107   def _resource_apply_dense(self, grad, var, apply_state=None):
+--&gt; 108     var_device, var_dtype = var.device, var.dtype.base_dtype
+    109     coefficients = ((apply_state or {}).get((var_device, var_dtype))
+    110                     or self._fallback_apply_state(var_device, var_dtype))
+
+/tensorflow-2.0.0/python3.6/tensorflow_core/python/distribute/values.py in device(self)
+    735   @property
+    736   def device(self):
+--&gt; 737     return self._get_closest().device
+    738 
+    739   @property
+
+/tensorflow-2.0.0/python3.6/tensorflow_core/python/distribute/values.py in _get_closest(self)
+    663     if device is None:
+    664       device = device_util.canonicalize(device_util.current())
+--&gt; 665     replica_id = self._device_map.replica_for_device(device)
+    666     if replica_id is None:
+    667       return self.primary
+
+/tensorflow-2.0.0/python3.6/tensorflow_core/python/distribute/values.py in replica_for_device(self, device)
+    210 
+    211   def replica_for_device(self, device):
+--&gt; 212     return self._device_to_replica.get(device)
+    213 
+    214   def select_for_device(self, values, device):
+
+/tensorflow-2.0.0/python3.6/tensorflow_core/python/ops/variables.py in __hash__(self)
+   1084   def __hash__(self):
+   1085     if ops.Tensor._USE_EQUALITY and ops.executing_eagerly_outside_functions():  # pylint: disable=protected-access
+-&gt; 1086       raise TypeError("Variable is unhashable if Tensor equality is enabled. "
+   1087                       "Instead, use tensor.experimental_ref() as the key.")
+   1088     else:
+
+TypeError: Variable is unhashable if Tensor equality is enabled. Instead, use tensor.experimental_ref() as the key.
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='burnmg' date='2019-11-21T06:01:51Z'>
+		&lt;denchmark-link:https://github.com/burnmg&gt;@burnmg&lt;/denchmark-link&gt;
+ ,
+Hi, When tried executing the given code  was faced, Kindly find the &lt;denchmark-link:https://colab.sandbox.google.com/gist/oanush/32a572dae4f19281f8c53c277eb09499/34426.ipynb&gt;gist&lt;/denchmark-link&gt;
+ of colab. Can you please provide complete code to reproduce the error mentioned here.Thanks!
+		</comment>
+		<comment id='2' author='burnmg' date='2019-12-03T10:50:34Z'>
+		&lt;denchmark-link:https://github.com/burnmg&gt;@burnmg&lt;/denchmark-link&gt;
+ ,
+Any update on the issue ?Thanks!
+		</comment>
+		<comment id='3' author='burnmg' date='2019-12-03T19:24:31Z'>
+		Hi,
+Thanks for the message
+I have reimplemented my code by using another way.
+Let me try to recover my previous code if possible.
+		</comment>
+		<comment id='4' author='burnmg' date='2019-12-03T19:26:50Z'>
+		x_train here is a CIFAR-10 dataset
+		</comment>
+		<comment id='5' author='burnmg' date='2019-12-06T08:54:37Z'>
+		&lt;denchmark-link:https://github.com/burnmg&gt;@burnmg&lt;/denchmark-link&gt;
+ ,
+Thank you for responding, can you provide the actual code being used to replicate the issue from our side with input dataset as ?
+		</comment>
+		<comment id='6' author='burnmg' date='2019-12-17T22:21:04Z'>
+		&lt;denchmark-link:https://github.com/burnmg&gt;@burnmg&lt;/denchmark-link&gt;
+ Can you please explain how you were able to resolve this issue so that it will be useful to the community. Thanks!
+		</comment>
+		<comment id='7' author='burnmg' date='2019-12-27T00:40:52Z'>
+		&lt;denchmark-link:https://github.com/burnmg&gt;@burnmg&lt;/denchmark-link&gt;
+ friendly ping. Let us know if you were able to resolve this issue. Thanks!
+		</comment>
+		<comment id='8' author='burnmg' date='2020-01-10T12:37:33Z'>
+		It has been 14 days with no activity and the awaiting response label was assigned. Is this still an issue?
+		</comment>
+		<comment id='9' author='burnmg' date='2020-01-22T23:42:38Z'>
+		I am closing this issue as it has been resolved. Please add additional comments and we can open this issue again. Thanks!
+		</comment>
+		<comment id='10' author='burnmg' date='2020-01-22T23:42:41Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/34426&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/34426&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

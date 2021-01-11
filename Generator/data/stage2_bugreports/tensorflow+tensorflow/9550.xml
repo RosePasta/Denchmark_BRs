@@ -1,0 +1,147 @@
+<bug id='9550' author='JuliusKunze' open_date='2017-04-30T10:22:38Z' closed_time='2018-09-09T16:25:48Z'>
+	<summary>ctc_greedy_decoder inconsistent with ctc_beam_search_decoder</summary>
+	<description>
+The following extract from the the ctc_beam_search_decoder documentation seems to be misleading:
+"The ctc_greedy_decoder is a special case of the ctc_beam_search_decoder with top_paths=1 and beam_width=1 (but that decoder is faster for this special case)."
+Instead, the following results can be observed:
+
+
+
+Decoding "AA&lt;ctc_blank&gt;AA" using
+merge_repeated=True
+merge_repeated=False
+
+
+
+
+tf.nn.ctc_beam_search_decoder(top_paths=1, beam_width=1)
+"A"
+"AA"
+
+
+tf.nn.ctc_greedy_decoder()
+"AA"
+"AAAA"
+
+
+
+To reproduce:
+import numpy as np
+import tensorflow as tf
+from unittest import TestCase
+
+
+class CtcDecodersTest(TestCase):
+    def test(self):
+        def decode_greedily(beam_search: bool, merge_repeated: bool):
+            aa_ctc_blank_aa_logits = tf.constant(np.array([[[1.0, 0.0]], [[1.0, 0.0]], [[0.0, 1.0]],
+                                                    [[1.0, 0.0]], [[1.0, 0.0]]], dtype=np.float32))
+            sequence_length = tf.constant(np.array([5], dtype=np.int32))
+
+            (decoded_list,), log_probabilities = \
+                tf.nn.ctc_beam_search_decoder(inputs=aa_ctc_blank_aa_logits,
+                                              sequence_length=sequence_length,
+                                              merge_repeated=merge_repeated,
+                                              beam_width=1) \
+                    if beam_search else \
+                    tf.nn.ctc_greedy_decoder(inputs=aa_ctc_blank_aa_logits,
+                                             sequence_length=sequence_length,
+                                             merge_repeated=merge_repeated)
+
+            return list(tf.Session().run(tf.sparse_tensor_to_dense(decoded_list)[0]))
+
+        self.assertEqual([0], decode_greedily(beam_search=True, merge_repeated=True))
+        self.assertEqual([0, 0], decode_greedily(beam_search=True, merge_repeated=False))
+        self.assertEqual([0, 0], decode_greedily(beam_search=False, merge_repeated=True))
+        self.assertEqual([0, 0, 0, 0], decode_greedily(beam_search=False, merge_repeated=False))
+This is confusing and probably not intended.
+How to solve this:
+
+Adapt the documentation or
+Adapt the ctc_beam_search_decoder implementation to that of ctc_greedy_decoder or vice versa. Both directions would cover my use case ("AA"), this decision would depend on which of the other behaviors ("A" or "AAAA") is needed and which of them could be dropped.
+
+&lt;denchmark-h:h3&gt;System information&lt;/denchmark-h&gt;
+
+OSX 12.4, TensorFlow 1.1.0 CPU from binary
+	</description>
+	<comments>
+		<comment id='1' author='JuliusKunze' date='2017-05-16T17:58:59Z'>
+		I stumbled upon this today, too. Why are the results not fully equivalent when ctc_beam_search_decoder uses top_paths=1 and beam_size=1?
+		</comment>
+		<comment id='2' author='JuliusKunze' date='2017-06-16T22:50:47Z'>
+		Ping!
+&lt;denchmark-link:https://github.com/ebrevdo&gt;@ebrevdo&lt;/denchmark-link&gt;
+ any comments?
+I know there are a lot of issues assigned to you, so could you reassign this one who may have time to investigate this?
+		</comment>
+		<comment id='3' author='JuliusKunze' date='2017-08-30T02:13:48Z'>
+		Also encounter this problem as well.
+And test with this data set:
+Logits: [ [[200.0,1.0]] , [[-100.0,200.0]] , [[200.0,1.0]] ]
+Which should give 'AA',
+The greedy decoder is correct, but the beam search decoder only give 'A'
+And the beam search deocder work on this dataset:
+[ [[log(0.4),log(0.6)]] , [[log(0.4),log(0.6)]]  ]
+Greedy decoder gives an empty output, where the beam search decoder gives the true output  'A'.
+Which is known would fail in best path greedy decoding.
+But they both fail on this dataset:
+[ [[log(0.4),log(0.6)]] , [[log(0.4),log(0.6)]], [[-200.0,200.0]] , [[200.0,-200.0]] ]
+Where the true output is 'AA', but both decoders give 'A'.
+But I guess they fail in the different place, beam_search decoder seems unable to give the correct answer for 'AbA'-type path, where greedy decoder failed in the first two logits.
+To reproduce:
+&lt;denchmark-code&gt;logits = tf.Variable(initial_value = [[[np.log(0.4),np.log(0.6)]],[[np.log(0.4),np.log(0.6)]],[[-200.0,200.0]],[[200.0,-200.0]]])
+output= tf.nn.ctc_beam_search_decoder(inputs = logits,sequence_length=[4],top_paths = 3,beam_width = 500)
+greedy_output = tf.nn.ctc_greedy_decoder(inputs = logits,sequence_length = [4])
+sess = tf.Session()
+sess.run(tf.global_variables_initializer())
+decode_val = sess.run(output)
+greedy_val = sess.run(greedy_output)
+print decode_val,'\n',greedy_val
+&lt;/denchmark-code&gt;
+
+##System information
+Ubuntu 14.04, Tensorflow 1.3.0 CPU from pip install.
+		</comment>
+		<comment id='4' author='JuliusKunze' date='2017-09-21T06:48:03Z'>
+		same issue and look forward to solving that
+		</comment>
+		<comment id='5' author='JuliusKunze' date='2017-10-26T05:53:04Z'>
+		any updates? having the same issue as well.
+		</comment>
+		<comment id='6' author='JuliusKunze' date='2017-10-27T02:53:22Z'>
+		I spent a good fraction of the day debugging this before coming to a somewhat obvious realization. If you read the Graves paper, CTC beam decoding implicitly collapses repeated characters as part of calculating the optimal path (i.e. 'AAA' will contribute probability mass through the path 'A').
+So the correct CTC decoding behavior occurs when merge_repeated=False. In this case, it DOES merge repeated characters. The merge_repeated flag, when true, will merge repeated characters after characters have already been merged/blank symbols removed. This parameter should simply be removed. As it stands now, the behavior is extremely misleading.
+I'm happy to provide a PR for this change if it's something a tensorflower would be amenable with. cc &lt;denchmark-link:https://github.com/ebrevdo&gt;@ebrevdo&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/gunan&gt;@gunan&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='7' author='JuliusKunze' date='2017-10-27T03:59:57Z'>
+		Let's use the example from above: "AA&lt;ctc_blank&gt;AA"
+Expected behavior:
+when merge_repeated=False, "AA&lt;ctc_blank&gt;AA" should give AAAA
+when merge_repeated=True, "AA&lt;ctc_blank&gt;AA" should give AA
+Only tf.nn.ctc_greedy_decoder() is working as expected, but tf.nn.ctc_beam_search_decoder(top_paths=1, beam_width=1) is not.
+&lt;denchmark-link:https://github.com/ryanleary&gt;@ryanleary&lt;/denchmark-link&gt;
+ are you saying  merged symbols twice? I think I might be able to help out in amending the decoder.
+		</comment>
+		<comment id='8' author='JuliusKunze' date='2017-10-27T04:09:19Z'>
+		I agree that merge_repeated=True should give AA is the correct behavior. What I'm saying is that having a case where merge_repeated=False in a beam decoder doesn't make a whole lot of sense. Further, the merging is somewhat fundamental to the way the algorithm handles summing probabilities across multiple paths.
+In the current implementation of the beam decoder, if merge_repeated=False, repeated characters are merged once. If merge_repeated=True, they are merged again, returning nonsensical results.
+I'm advocating for removing the flag, and the only behavior to be where repeated characters are merged (but equivalent to the merge_repeated=False current functionality).
+		</comment>
+		<comment id='9' author='JuliusKunze' date='2018-01-04T16:48:29Z'>
+		following up on PR
+		</comment>
+		<comment id='10' author='JuliusKunze' date='2018-08-09T16:53:24Z'>
+		Since this is a backwards breaking API change, I'll remove the argument for TF 2.0.  Thank you all for the report &amp; detailed analysis.
+		</comment>
+		<comment id='11' author='JuliusKunze' date='2018-09-08T18:34:16Z'>
+		Nagging Assignee &lt;denchmark-link:https://github.com/ebrevdo&gt;@ebrevdo&lt;/denchmark-link&gt;
+: It has been 29 days with no activity and this issue has an assignee. Please update the label and/or status accordingly.
+		</comment>
+		<comment id='12' author='JuliusKunze' date='2018-09-09T16:25:46Z'>
+		Fixed by &lt;denchmark-link:https://github.com/tensorflow/tensorflow/pull/21187&gt;#21187&lt;/denchmark-link&gt;
+.
+		</comment>
+	</comments>
+</bug>

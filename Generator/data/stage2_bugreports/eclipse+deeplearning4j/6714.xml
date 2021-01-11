@@ -1,0 +1,111 @@
+<bug id='6714' author='dnitzan' open_date='2018-11-15T02:13:27Z' closed_time='2018-11-17T01:23:22Z'>
+	<summary>Long GC pauses when calling Transforms ops</summary>
+	<description>
+When calling Transforms.cosineSim (among other ops) repeatedly, minor GC pauses are frequent and relatively long, in the order of hundreds of milliseconds. Instead, when caching an op object, like CosineSimilarity and repeatedly calling Nd4j.getExecutioner().execAndReturn on it, GC pauses are sub-millisecond.
+This code reproduces the issue (enable GC output):
+&lt;denchmark-code&gt;INDArray vec1 = Nd4j.rand(1, 128);
+INDArray vec2 = Nd4j.rand(1, 128);
+while (true) {
+    Transforms.cosineSim(vec1, vec2);
+}
+&lt;/denchmark-code&gt;
+
+This code is the workaround (enable GC output):
+&lt;denchmark-code&gt;INDArray vec1 = Nd4j.rand(1, 128);
+INDArray vec2 = Nd4j.rand(1, 128);
+CosineSimilarity cs = new CosineSimilarity(vec1, vec2);
+while (true) {
+    Nd4j.getExecutioner().execAndReturn(cs).getFinalResult().doubleValue();
+}
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='dnitzan' date='2018-11-15T02:25:45Z'>
+		Try using workspaces please. &lt;denchmark-link:https://deeplearning4j.org/docs/latest/deeplearning4j-config-workspaces&gt;https://deeplearning4j.org/docs/latest/deeplearning4j-config-workspaces&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='2' author='dnitzan' date='2018-11-15T03:24:48Z'>
+		I'm using a workspace and it does seem to have solved the GC issue:
+&lt;denchmark-code&gt;WorkspaceConfiguration initialConfig = WorkspaceConfiguration.builder()
+			.policyAllocation(AllocationPolicy.STRICT)
+			.policyLearning(LearningPolicy.FIRST_LOOP)
+			.build();
+while (true) {
+    try (MemoryWorkspace ws = Nd4j.getWorkspaceManager().getAndActivateWorkspace(initialConfig, "SOME_ID")) {
+	Transforms.cosineSim(vec1, vec2);
+    }
+}
+&lt;/denchmark-code&gt;
+
+However, this loop performs around x7 slower than the loop that executes one pre-created CosineSimilarity object, as shown in my original post. How can it be explained?
+		</comment>
+		<comment id='3' author='dnitzan' date='2018-11-15T03:27:59Z'>
+		&lt;denchmark-link:https://github.com/dnitzan&gt;@dnitzan&lt;/denchmark-link&gt;
+ please write a proper benchmark. &lt;denchmark-link:http://tutorials.jenkov.com/java-performance/jmh.html&gt;http://tutorials.jenkov.com/java-performance/jmh.html&lt;/denchmark-link&gt;
+ Thanks!
+		</comment>
+		<comment id='4' author='dnitzan' date='2018-11-15T04:27:36Z'>
+		&lt;denchmark-link:https://github.com/dnitzan&gt;@dnitzan&lt;/denchmark-link&gt;
+ how big are your vec1 and vec2 arrays?
+		</comment>
+		<comment id='5' author='dnitzan' date='2018-11-15T04:30:20Z'>
+		P.s. you can pre-create your CosineSimilarity object as well in that loop. Nobody stops you from doing that.
+		</comment>
+		<comment id='6' author='dnitzan' date='2018-11-15T04:39:04Z'>
+		Benchmarks below. Second one (cached) throughput is x7 greater.
+&lt;denchmark-code&gt;  public class MyBenchmark {
+
+    @State(Scope.Thread)
+    public static class MyState1 {
+	INDArray vec1 = Nd4j.rand(1, 128);
+	INDArray vec2 = Nd4j.rand(1, 128);
+	WorkspaceConfiguration initialConfig = WorkspaceConfiguration.builder().policyAllocation(AllocationPolicy.STRICT).policyLearning(LearningPolicy.FIRST_LOOP).build();
+    }
+
+    @State(Scope.Thread)
+    public static class MyState2 {
+	    INDArray vec1 = Nd4j.rand(1, 128);
+	    INDArray vec2 = Nd4j.rand(1, 128);
+	    CosineSimilarity cs = new CosineSimilarity(vec1, vec2);
+    }
+
+    @Benchmark
+    @BenchmarkMode(Mode.Throughput)
+    @OutputTimeUnit(TimeUnit.SECONDS)
+    public double withWorkspace(MyState1 state) {
+	try (MemoryWorkspace ws = Nd4j.getWorkspaceManager().getAndActivateWorkspace(state.initialConfig, "SOME_ID")) {
+		return Transforms.cosineSim(state.vec1, state.vec2);
+	}
+    }
+
+    @Benchmark
+    @BenchmarkMode(Mode.Throughput)
+    @OutputTimeUnit(TimeUnit.SECONDS)
+    public double cached(MyState2 state) {
+        return Nd4j.getExecutioner().execAndReturn(state.cs).getFinalResult().doubleValue();
+    }
+}
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='7' author='dnitzan' date='2018-11-15T16:25:55Z'>
+		I profiled the code and found the culprit - it's the UUID.randomUUID().toString() in DifferentialFunction.setInstanceId called from the constructor when creating ops. It basically kills performance.
+		</comment>
+		<comment id='8' author='dnitzan' date='2018-11-15T16:39:15Z'>
+		Good catch
+		</comment>
+		<comment id='9' author='dnitzan' date='2018-11-17T01:23:22Z'>
+		So I'm able to run that loop at around 300-500,000 iterations per second
+So even removing the UUID, we'll still have GC pressure due to the fact that you're creating literally hundreds of thousands of objects each and every second.
+I wouldn't consider this a particularly common or realistic use case, nor would I consider hundreds of milliseconds for GC unreasonable for hundreds of thousands of objects.
+Anyway, I've made it so the instance IDs aren't created when the ops aren't used for SameDiff, here: &lt;denchmark-link:https://github.com/deeplearning4j/deeplearning4j/pull/6729&gt;https://github.com/deeplearning4j/deeplearning4j/pull/6729&lt;/denchmark-link&gt;
+
+After implementing that fix, I can run this at around 600-800,000 iterations per second.
+Beyond that: reuse the op as you're already doing to reduce the amount of object creation.
+		</comment>
+		<comment id='10' author='dnitzan' date='2018-12-17T01:37:21Z'>
+		This thread has been automatically locked since there has not been any recent activity after it was closed. Please open a new issue for related bugs.
+		</comment>
+	</comments>
+</bug>

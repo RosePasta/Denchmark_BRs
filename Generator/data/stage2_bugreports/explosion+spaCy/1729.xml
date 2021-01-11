@@ -1,0 +1,151 @@
+<bug id='1729' author='Bri-Will' open_date='2017-12-15T19:53:16Z' closed_time='2018-12-08T11:29:25Z'>
+	<summary>Threading/multi-processing issues with Spacy 1.9/2.0 and Flask app</summary>
+	<description>
+I'm trying to build a single Flask app using spaCy that would power two simple REST APIs:
+
+A /tag API that takes in a block of text and returns a tagged set of entities
+A /train API that takes in strings of text along with associated lists of annotated entities.
+
+The idea is that a client app sends text to be tagged to the /tag API, allows a user to adjust/correct the entities as needed, and then resubmits the corrected entities to the /train API. I believe this is essentially what the Prodigy service does under the covers. Over time, the model learns and improves the entity recognition based on the specific context and specific entity types in our domain. I currently have a bare-bones prototype working (sort of) using Flask and Apache (code below), and I have not done anything inside the app to explicitly deal with multi-threading or multi-processing.
+I had a lot of problems just getting the simple tagging API going, due to (what I believe are) threading problems in spaCy 2.0. Some requests would be served, but there would also be intermittent server hangs. This has been observed by others and is discussed in issue &lt;denchmark-link:https://github.com/explosion/spaCy/issues/1571&gt;#1571&lt;/denchmark-link&gt;
+.  I downgraded to spaCy 1.9, and this issue is now resolved; the /tag API responds very consistently with no issues.
+However, even with spaCy 1.9 the /train API exhibits similar issues as what I saw with /tag: the server provides intermittent responses, and eventually hangs. I've verified that it hangs on the nlp.update() step, sometimes after a few requests, other times after 50 or more. If I run the train_new_entity_type.py example, I don't get any hanging on this step, suggesting there is an issue with how spaCy gets used inside of the Flask app, and my suspicion is that it is again threading-related
+If I can't get this going, I'll just train the model "offline". But "online" training is a very appealing concept.
+If anyone has any insights on what is going on, I would appreciate it.
+Prototype code is below:
+&lt;denchmark-code&gt;from flask import Flask, render_template, request, json, jsonify
+import spacy
+from spacy_patterns import *
+from spacy.matcher import Matcher
+from spacy.gold import GoldParse
+
+def ent_list_to_json(ent_list):
+       	return [
+       		{
+       		'start': ent.start_char,
+       		'end': ent.end_char,
+       		'type': ent.label_,
+       		'text': str(ent),
+       		} for ent in ent_list
+		]
+
+def merge_and_add_ents(doc, matches): # This function deals with the fact some patterns are sub-patterns of other patterns,
+	overlap = False               # so it is possible to get multiple matches on portions of an overall entity.
+	merged_list = []              # This code looks for overlapping spans of tokens and merges them into one long span
+
+	new_matches = []                                        # This code translates the Spacy v1.9 "matches" format into v2.0 format
+	for match in matches:                                   #
+		if match[0] == URL_ID and '@' in doc[match[2]:match[3]].text: # works around the '@' bug in the LIKE_URL matcher
+			continue				#
+		new_matches += [(match[0], match[2], match[3])] # In Spacy v2.0, the "label" column (second from left) is gone
+                                                                #
+	matches = new_matches                                   # Remove this line and the 6 above for Spacy v2.0, if the '@' bug is fixed
+
+	for i in range(0, len(matches)):
+		if overlap: #continue extending span
+			start_idx = min(matches[i][1], start_idx)
+			end_idx = max(matches[i][2], end_idx)
+		else: #start new span
+                        start_idx = matches[i][1]
+                        end_idx = matches[i][2]
+			match_id = matches[i][0] #first item in matches owns the "type" of the merged span. Could result in some addresses classified as phone numbers
+
+	        if (i &lt;= len(matches) - 2):
+			if (matches[i+1][1] &lt; end_idx):
+				overlap = True
+			else:
+				doc.ents += ((matches[i][0], start_idx, end_idx),)
+				overlap = False
+		else:
+			doc.ents += ((matches[i][0], start_idx, end_idx),)
+
+#################################################
+
+nlp = spacy.load('en')
+matcher = Matcher(nlp.vocab)
+
+ENTS_TO_ADD = ['IP', 'PHONE', 'ADDRESS', 'EMAIL', 'URL', 'ACCT']
+
+for label in ENTS_TO_ADD:
+	nlp.entity.add_label(label)
+
+nlp.entity.model.learn_rate = 0.001
+
+for pattern in IP_PATTERN_LIST:
+        matcher.add_pattern('IP', pattern)
+
+for pattern in PHONE_PATTERN_LIST:
+        matcher.add_pattern('PHONE', pattern)
+
+for pattern in ADDRESS_PATTERN_LIST:
+        matcher.add_pattern('ADDRESS', pattern)
+
+matcher.add_pattern('EMAIL', [{'LIKE_EMAIL':True}])
+matcher.add_pattern('URL', [{'LIKE_URL':True}])
+matcher.add_pattern('ACCT', [{'ORTH':'sfdweeipas3412asdf'}]) # placeholder that currently shouldn't match on anything
+
+IP_ID = nlp.vocab.strings['IP']
+PHONE_ID = nlp.vocab.strings['PHONE']
+ADDRESS_ID = nlp.vocab.strings['ADDRESS']
+EMAIL_ID = nlp.vocab.strings['EMAIL']
+URL_ID = nlp.vocab.strings['URL']
+ACCT_ID = nlp.vocab.strings['ACCT']
+
+ENT_LIST = ['PERSON', 'NORP', 'ORG', 'GPE', 'PRODUCT', 'FAC', 'MONEY', 'LANGUAGE', 'DATE', 'TIME', 'EMAIL', 'URL', 'IP', 'ACCT', 'PHONE', 'ADDRESS']
+
+app = Flask(__name__)
+
+#################################################
+
+@app.route('/')
+def index():
+	return render_template('index.html')
+
+@app.route('/api/tag', methods=['GET', 'POST'])
+def tagger():
+	q = request.values.get('text')
+
+	doc = nlp(q)
+	matches = matcher(doc)
+
+	merge_and_add_ents(doc, matches)
+
+	filtered_ents = [ent for ent in list(doc.ents) if ent.label_ in ENT_LIST and not str(ent).isspace()]
+
+	return jsonify(ent_list_to_json(filtered_ents))
+
+@app.route('/api/train', methods=['GET', 'POST'])
+def train():
+	train_data = request.json
+
+	for raw_text, entity_offsets in train_data:
+		doc = nlp.make_doc(raw_text)
+		tuple_list = [(ent[0], ent[1], ent[2]) for ent in entity_offsets.get('entities')] #convert jsonized offsets back to tuples
+		gold = GoldParse(doc, entities=tuple_list)
+		nlp.tagger(doc)
+		nlp.entity.update(doc, gold, drop=0.9)
+
+	return app.response_class(response='Example(s) processed', status=200, mimetype='text/string')
+
+if __name__ == '__main__':
+	app.run(host='0.0.0.0')
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h2&gt;Your Environment&lt;/denchmark-h&gt;
+
+
+Operating System: Ubuntu
+Python Version Used:  2.7
+spaCy Version Used: 1.9/2.0
+Environment Information:
+
+	</description>
+	<comments>
+		<comment id='1' author='Bri-Will' date='2018-12-08T11:29:25Z'>
+		This is now fixed in spacy-nightly, as we no longer use numpy for matrix multiplications. Thanks for your patience on this! It was a very long road to get this resolved...
+		</comment>
+		<comment id='2' author='Bri-Will' date='2019-01-07T12:28:44Z'>
+		This thread has been automatically locked since there has not been any recent activity after it was closed. Please open a new issue for related bugs.
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,193 @@
+<bug id='1103' author='robertnishihara' open_date='2017-10-11T04:40:43Z' closed_time='2017-10-14T03:52:49Z'>
+	<summary>The ActorReconstruction.testManyLocalSchedulersDying test in actor_test.py sometimes hangs.</summary>
+	<description>
+If you run the following in a loop (on one of our Jenkins workers), one of the runs will eventually hang. This happens in Travis a lot as well.
+&lt;denchmark-code&gt;python test/actor_test.py ActorReconstruction.testManyLocalSchedulersDying
+&lt;/denchmark-code&gt;
+
+Connecting another driver to one of the hanging instances, I see the following. Running
+import ray
+ray.init(redis_address="127.0.0.1:27196")
+tt = ray.global_state.task_table()
+states = [v['State'] for k, v in tt.items()]
+[(s, states.count(s)) for s in set(states)]
+the last line prints
+&lt;denchmark-code&gt;[(16, 694), (32, 143), (4, 20), (8, 2)]
+&lt;/denchmark-code&gt;
+
+so a number of tasks are in the QUEUED state. I checked and they seem to be queued at the live local scheduler (not a dead one). The number 4 corresponds to QUEUED. See
+
+
+
+ray/src/common/task.h
+
+
+        Lines 336 to 352
+      in
+      b1660c4
+
+
+
+
+
+
+ typedef enum { 
+
+
+
+ /** The task is waiting to be scheduled. */ 
+
+
+
+   TASK_STATUS_WAITING = 1, 
+
+
+
+ /** The task has been scheduled to a node, but has not been queued yet. */ 
+
+
+
+   TASK_STATUS_SCHEDULED = 2, 
+
+
+
+ /** The task has been queued on a node, where it will wait for its 
+
+
+
+    *  dependencies to become ready and a worker to become available. */ 
+
+
+
+   TASK_STATUS_QUEUED = 4, 
+
+
+
+ /** The task is running on a worker. */ 
+
+
+
+   TASK_STATUS_RUNNING = 8, 
+
+
+
+ /** The task is done executing. */ 
+
+
+
+   TASK_STATUS_DONE = 16, 
+
+
+
+ /** The task was not able to finish. */ 
+
+
+
+   TASK_STATUS_LOST = 32, 
+
+
+
+ /** The task will be submitted for reexecution. */ 
+
+
+
+   TASK_STATUS_RECONSTRUCTING = 64 
+
+
+
+ } scheduling_state; 
+
+
+
+
+
+I tried adding a commit to dispatch all tasks on a timer &lt;denchmark-link:https://github.com/ray-project/ray/compare/master...robertnishihara:dispatchontimer&gt;master...robertnishihara:dispatchontimer&lt;/denchmark-link&gt;
+, but that didn't change the behavior, tasks are still queued. I'm not totally sure what the problem is, but maybe the task dependencies or something are preventing some tasks from getting executed.
+cc &lt;denchmark-link:https://github.com/stephanie-wang&gt;@stephanie-wang&lt;/denchmark-link&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='robertnishihara' date='2017-10-13T23:24:19Z'>
+		Ok, I've determined that the queued tasks are not getting dispatched because the call to dispatch_actor_task is returning in this if statement (note that this is a little behind the current master).
+
+
+
+ray/src/local_scheduler/local_scheduler_algorithm.cc
+
+
+        Lines 315 to 320
+      in
+      b585001
+
+
+
+
+
+
+ if (next_task_counter != entry.task_counter) { 
+
+
+
+ /* We cannot execute the next task on this actor without violating the 
+
+
+
+      * in-order execution guarantee for actor tasks. */ 
+
+
+
+ CHECK(next_task_counter &gt; entry.task_counter); 
+
+
+
+ return false; 
+
+
+
+   } 
+
+
+
+
+
+		</comment>
+		<comment id='2' author='robertnishihara' date='2017-10-14T01:00:52Z'>
+		It'd be helpful to see the following information, if you can get it:
+
+where the tasks with status 8 are scheduled.
+whether the tasks with status 8 ever finish.
+the values of next_task_counter and entry.task_counter at line 319.
+
+Thanks!
+		</comment>
+		<comment id='3' author='robertnishihara' date='2017-10-14T01:39:37Z'>
+		The tasks with status 8 are just dummy tasks for drivers.
+In the case I am debugging right now, entry.task_counter is 0 (meaning we haven't executed any actor tasks yet), and next_task_counter is 1 (meaning that the first queued task is task 1). I printed out the queued tasks, and they have actor counters 1, 2, 3, ..., 80, but we are waiting for task 0.
+Note that I have also seen situations where the queued tasks are more like 20, 21, 22, ..., 80, but we are waiting for task 0.
+Task 0 is in state 32 (reconstructing). I've checked, and it looks like we are never calling RAY.TASK_TABLE_TEST_AND_UPDATE on task 0. We are repeatedly calling RAY.TASK_TABLE_TEST_AND_UPDATE on task 1, but it is getting suppressed because task 1 is QUEUED.
+The object table entry for the dummy object created by the task 0 is
+&lt;denchmark-code&gt;{'DataSize': -1, 'ManagerIDs': None, 'Hash': '', 'IsPut': False, 'TaskID': '5136c561853b848592e5d13d9e2b174a7c5b5e99'}
+&lt;/denchmark-code&gt;
+
+The only interesting part is that it seems like it was never created a first time (because of the data size and the hash).
+		</comment>
+		<comment id='4' author='robertnishihara' date='2017-10-14T02:26:33Z'>
+		So part of the issue is that we currently aren't calling  on actor tasks (which should be fixed by &lt;denchmark-link:https://github.com/ray-project/ray/pull/1118&gt;#1118&lt;/denchmark-link&gt;
+).
+However, I'm still a little surprised that we aren't attempting to reconstruct it when we recursively go through and reconstruct all of the missing dependencies for the object we are getting. Reconstruction must be getting suppressed. I could see this happening if the monitor has marked some actor tasks lost and simply hasn't gotten to the others yet, although that seems slightly uncommon but maybe not.
+		</comment>
+		<comment id='5' author='robertnishihara' date='2017-10-14T03:03:34Z'>
+		Ok, we do attempt to reconstruct task 0 once, but it is suppressed because it's task status at that point is 2 (TASK_STATUS_SCHEDULED).
+My current favorite explanation is the following:
+Basically, reconstruction for all of the actor methods is initially suppressed because they are all in state SCHEDULED. Once the relevant local scheduler is killed, the monitor will slowly crawl over the task table and switch the statuses to LOST.
+Now, because the local scheduler currently does not add the object dependencies of actor methods to the list of objects to fetch, normally reconstruction would not be reinitiated for these methods. However, the test is calling ray.get on all of the objects, so that is enough to reinitiate reconstruction for all the methods once the monitor has marked them as LOST.
+HOWEVER, task 0 is the constructor task, which doesn't return an object ID to the user, so we are not calling ray.get on it, which means that we never reinitiate reconstruction for it.
+Therefore, I think this problem should be completely solved by &lt;denchmark-link:https://github.com/ray-project/ray/pull/1118&gt;#1118&lt;/denchmark-link&gt;
+.
+		</comment>
+		<comment id='6' author='robertnishihara' date='2017-10-14T03:52:49Z'>
+		Closing because this should have been fixed by &lt;denchmark-link:https://github.com/ray-project/ray/pull/1118&gt;#1118&lt;/denchmark-link&gt;
+.
+		</comment>
+	</comments>
+</bug>

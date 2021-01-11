@@ -1,0 +1,229 @@
+<bug id='981' author='ArnoVel' open_date='2019-12-02T03:22:12Z' closed_time='2019-12-08T23:01:35Z'>
+	<summary>[Bug]  in version 0.3.6 , the kissGP example cannot be put on CUDA</summary>
+	<description>
+&lt;denchmark-h:h1&gt;🐛 Bug&lt;/denchmark-h&gt;
+
+Hi,
+I directly installed gpytorch alpha version (compatible with my pytorch version, see below), and started with &lt;denchmark-link:https://github.com/cornellius-gp/gpytorch/blob/master/examples/04_Scalable_GP_Regression_1D/KISSGP_Regression_1D.ipynb&gt;this tutorial for kissGP&lt;/denchmark-link&gt;
+
+However upon running the code on GPU (w/ only 1 gpu, i'm on a laptop) one encounters this
+&lt;denchmark-h:h2&gt;To reproduce&lt;/denchmark-h&gt;
+
+Code snippet to reproduce
+ll = gpt.likelihoods.GaussianLikelihood().to('cuda:0')
+m = GPRegressionModel(x_tr, y_tr, ll)
+m = m.to('cuda:0')
+
+# Find optimal model hyperparameters
+m.train()
+ll.train()
+
+# Use the adam optimizer
+opt = th.optim.Adam(
+                        [{'params': m.parameters()},],
+                        lr=0.1)
+# Includes GaussianLikelihood parameters
+# "Loss" for GPs - the marginal log likelihood
+mll = gpt.mlls.ExactMarginalLogLikelihood(ll, m)
+
+training_iterations = 30
+for i in range(training_iterations):
+    opt.zero_grad()
+    output = m(x_tr)
+    print(x_tr.device, output, y_tr.device)
+    loss = -mll(output, y_tr)
+    loss.backward()
+    print('Iter %d/%d - Loss: %.3f' % (i + 1, training_iterations, loss.item()))
+    opt.step()
+Stack trace/error message
+&lt;denchmark-code&gt;~/SJTU/research_code/TCEP/GP_scoring/gpytorch_local/gpytorch/kernels/rbf_kernel.py in forward(self, x1, x2, diag, **params)
+     80             x2,
+     81             self.lengthscale,
+---&gt; 82             lambda x1, x2: self.covar_dist(
+     83                 x1, x2, square_dist=True, diag=False, dist_postprocess_func=postprocess_rbf, postprocess=False, **params
+     84             ),
+
+~/SJTU/research_code/TCEP/GP_scoring/gpytorch_local/gpytorch/functions/rbf_covariance.py in forward(ctx, x1, x2, lengthscale, sq_dist_func)
+     10             raise ValueError("RBFCovariance cannot handle multiple lengthscales")
+     11         needs_grad = any(ctx.needs_input_grad)
+---&gt; 12         x1_ = x1.div(lengthscale)
+     13         x2_ = x2.div(lengthscale)
+     14         unitless_sq_dist = sq_dist_func(x1_, x2_)
+
+RuntimeError: expected device cpu and dtype Float but got device cuda:0 and dtype Float
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h2&gt;Expected Behavior&lt;/denchmark-h&gt;
+
+I expected all the model parameters to be on GPU, however the basic model you give is
+class GPRegressionModel(gpt.models.ExactGP):
+    def __init__(self, train_x, train_y, likelihood):
+        super(GPRegressionModel, self).__init__(train_x, train_y, likelihood)
+        
+        # SKI requires a grid size hyperparameter.
+        #This util can help with that. Here we are using a grid
+        #that has the same number of points as the training data
+        #(a ratio of 1.0).
+        #Performance can be sensitive to this parameter,
+        #so you may want to adjust it for your own problem
+        #on a validation set.
+        grid_size = gpt.utils.grid.choose_grid_size(train_x,1.0)
+        
+        self.mean_module = gpt.means.ConstantMean()
+        self.covar_module = gpt.kernels.GridInterpolationKernel(
+            gpt.kernels.ScaleKernel(gpt.kernels.RBFKernel()),
+            grid_size=grid_size, num_dims=1,
+        )
+
+    def forward(self, x):
+        mean_x = self.mean_module(x)
+        covar_x = self.covar_module(x)
+        return gpt.distributions.MultivariateNormal(mean_x, covar_x)
+which returns a  gpt.distributions.MultivariateNormal which cannot be put on GPU. This is solved when I clone the code and modify as follows
+class RBFCovariance(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x1, x2, lengthscale, sq_dist_func):
+        if any(ctx.needs_input_grad[:2]):
+            raise RuntimeError("RBFCovariance cannot compute gradients with " "respect to x1 and x2")
+        if lengthscale.size(-1) &gt; 1:
+            raise ValueError("RBFCovariance cannot handle multiple lengthscales")
+        needs_grad = any(ctx.needs_input_grad)
+        x1_ = x1.to('cuda:0').div(lengthscale)
+        x2_ = x2.to('cuda:0').div(lengthscale)
+        unitless_sq_dist = sq_dist_func(x1_, x2_)
+        # clone because inplace operations will mess with what's saved for backward
+        unitless_sq_dist_ = unitless_sq_dist.clone() if needs_grad else unitless_sq_dist
+        covar_mat = unitless_sq_dist_.div_(-2.0).exp_()
+        if needs_grad:
+            d_output_d_input = unitless_sq_dist.mul_(covar_mat).div_(lengthscale)
+            ctx.save_for_backward(d_output_d_input)
+        return covar_mat
+BUT then the interpolate method is not put on GPU either
+&lt;denchmark-code&gt;~/SJTU/research_code/TCEP/GP_scoring/gpytorch_local/gpytorch/utils/interpolation.py in interpolate(self, x_grid, x_target, interp_points, eps)
+    112 
+    113             # get the interp. coeff. based on distances to interpolating points
+--&gt; 114             scaled_dist = lower_pt_rel_dists.unsqueeze(-1) + interp_points_flip.unsqueeze(-2)
+    115             dim_interp_values = self._cubic_interpolation_kernel(scaled_dist)
+    116 
+
+RuntimeError: expected device cuda:0 and dtype Float but got device cpu and dtype Float
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h2&gt;System information&lt;/denchmark-h&gt;
+
+Please complete the following information:
+
+
+ 0.3.6
+
+
+ 1.2.0
+
+
+ Ubuntu 18.04
+
+
+&lt;denchmark-h:h2&gt;Additional context&lt;/denchmark-h&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='ArnoVel' date='2019-12-02T03:27:43Z'>
+		0.3.6 is the latest release, not the alpha version.
+Everything should be GPU compatible out of the box. Based on your error, it seems like x_tr is not on the GPU? Can you change the line model(x_tr) to be model(x_tr.cuda())?
+		</comment>
+		<comment id='2' author='ArnoVel' date='2019-12-02T03:41:28Z'>
+		Hi,
+About the alpha, I concluded it was alpha since it's described as being pytorch &lt;= 1.2 friendly.
+For some proof that x_tr is where it should be,
+x_tr,y_tr = th.from_numpy(pair[0]).float().to('cuda:0'), th.from_numpy(pair[1]).to('cuda:0').float()
+is how I get my data, where pair is essentially a numpy array obtained from a pandas dataframe !
+Thanks for the quick reply
+		</comment>
+		<comment id='3' author='ArnoVel' date='2019-12-02T03:44:30Z'>
+		Also,
+By cloning everything and forcing whatever my gpytorch was complaining about on GPU,
+namely
+def interpolate(self, x_grid: List[torch.Tensor], x_target: torch.Tensor, interp_points=range(-2, 2), eps=1e-10):
+        if torch.is_tensor(x_grid):
+            x_grid = convert_legacy_grid(x_grid)
+        num_target_points = x_target.size(0)
+        num_dim = x_target.size(-1)
+        assert num_dim == len(x_grid)
+        # put all to cuda:0
+        x_grid = [xg.to('cuda:0') for xg in x_grid]
+
+        grid_sizes = [len(x_grid[i]) for i in range(num_dim)]
+        # Do some boundary checking, # min/max along each dimension
+        x_target_max = x_target.max(0)[0]
+        x_target_min = x_target.min(0)[0]
+        grid_mins = torch.stack([x_grid[i].min() for i in range(num_dim)], dim=0).to(x_target_min)
+        grid_maxs = torch.stack([x_grid[i].max() for i in range(num_dim)], dim=0).to(x_target_max)
+as well as the RBF as above
+class RBFCovariance(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x1, x2, lengthscale, sq_dist_func):
+        if any(ctx.needs_input_grad[:2]):
+            raise RuntimeError("RBFCovariance cannot compute gradients with " "respect to x1 and x2")
+        if lengthscale.size(-1) &gt; 1:
+            raise ValueError("RBFCovariance cannot handle multiple lengthscales")
+        needs_grad = any(ctx.needs_input_grad)
+        x1_ = x1.to('cuda:0').div(lengthscale)
+        x2_ = x2.to('cuda:0').div(lengthscale)
+It now works and iterates the correct number of epochs.
+No idea if my tinkering altered anything though.
+		</comment>
+		<comment id='4' author='ArnoVel' date='2019-12-02T03:49:20Z'>
+		I tried as you suggested,
+for i in range(training_iterations):
+    opt.zero_grad()
+    output = m(x_tr.cuda())
+    #print(x_tr.device, output, y_tr.device)
+    loss = -mll(output, y_tr)
+    loss.backward()
+    print('Iter %d/%d - Loss: %.3f' % (i + 1, training_iterations, loss.item()))
+    opt.step()
+which gives
+as before,
+&lt;denchmark-code&gt;~/.local/lib/python3.6/site-packages/gpytorch/functions/rbf_covariance.py in forward(ctx, x1, x2, lengthscale, sq_dist_func)
+     11             raise ValueError("RBFCovariance cannot handle multiple lengthscales")
+     12         needs_grad = any(ctx.needs_input_grad)
+---&gt; 13         x1_ = x1.div(lengthscale)
+     14         x2_ = x2.div(lengthscale)
+     15         unitless_sq_dist = sq_dist_func(x1_, x2_)
+
+RuntimeError: expected device cpu and dtype Float but got device cuda:0 and dtype Float
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='5' author='ArnoVel' date='2019-12-02T04:08:42Z'>
+		This model has been well tested on GPU before. You shouldn't need to tinker with anything inside GPyTorch. Can you upload a notebook/script that reproduces the error?
+		</comment>
+		<comment id='6' author='ArnoVel' date='2019-12-02T04:40:48Z'>
+		I can, however you'll need some small library called &lt;denchmark-link:https://github.com/Diviyan-Kalainathan/CausalDiscoveryToolbox&gt;CDT&lt;/denchmark-link&gt;
+ to get the exact same dataset.
+The notebook is &lt;denchmark-link:https://github.com/ArnoVel/gpytorch_example&gt;here&lt;/denchmark-link&gt;
+
+EDIT: It is possible that the problem comes from CDT, as it calls GPUtil to detect GPUs under the hood and might conflict with anything trying to use the same GPUs.
+I've had this problem before, but never within the same notebook/thread...
+This shouldn't be the cause, but I have no certainty.
+		</comment>
+		<comment id='7' author='ArnoVel' date='2019-12-02T05:42:41Z'>
+		Actually, I've seen a similar bug myself as well. It might have been from when I redid the GridKernel and GridInterpolationKernel. I'll look into this
+		</comment>
+		<comment id='8' author='ArnoVel' date='2019-12-02T05:44:50Z'>
+		Also &lt;denchmark-link:https://github.com/cornellius-gp/gpytorch/issues/953&gt;#953&lt;/denchmark-link&gt;
+ has the same issue
+		</comment>
+		<comment id='9' author='ArnoVel' date='2019-12-05T04:39:30Z'>
+		I have encountered a similar issue. No tinkering, just fresh installation of pyTorch and GPytorch and then cloning the examples and running &lt;denchmark-link:https://github.com/cornellius-gp/gpytorch/blob/master/examples/04_Scalable_GP_Regression_1D/KISSGP_Regression_1D_CUDA.ipynb&gt;this (KISSGP-CUDA)&lt;/denchmark-link&gt;
+ notebook. I get the following error for last 2 cells.
+ RuntimeError: expected device cpu but got device cuda:0
+My notebook can be found &lt;denchmark-link:https://drive.google.com/file/d/15SRRgWjwsqSIH8duzpRT862oNlfJJxcS/view?usp=sharing&gt;here&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='10' author='ArnoVel' date='2019-12-05T05:20:45Z'>
+		Use this branch &lt;denchmark-link:https://github.com/cornellius-gp/gpytorch/pull/983&gt;#983&lt;/denchmark-link&gt;
+ for now which fixes the issue. It'll be merged in soon
+		</comment>
+	</comments>
+</bug>

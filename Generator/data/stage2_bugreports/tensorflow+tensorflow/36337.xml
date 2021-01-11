@@ -1,0 +1,285 @@
+<bug id='36337' author='yxchng' open_date='2020-01-30T15:07:24Z' closed_time='2020-03-19T00:34:02Z'>
+	<summary>SSD300 on TF 2.0 is unable to train with batch size 32 on GPU with 8GB memory when it should be able to?</summary>
+	<description>
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): No
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Ubuntu 16.04
+Mobile device (e.g. iPhone 8, Pixel 2, Samsung Galaxy) if the issue happens on mobile device: N.A.
+TensorFlow installed from (source or binary): docker pull tensorflow/tensorflow:2.1.0-gpu-py3
+TensorFlow version (use command below): 2.1.0
+Python version: 3.6.9
+Bazel version (if compiling from source): N.A.
+GCC/Compiler version (if compiling from source): N.A.
+CUDA/cuDNN version: 10.1/7.6
+GPU model and memory: GTX 1070 Ti, 8GB
+
+Describe the current behavior
+It runs out of memory when the code is run.
+
+This (&lt;denchmark-link:https://github.com/lufficc/SSD&gt;https://github.com/lufficc/SSD&lt;/denchmark-link&gt;
+) is an alternative code which is written in PyTorch and it is able to run on my 8GB GPU, consuming only 6.8GB with batch size 32. I have ported the code to TF 2.0 and have provided a minimal runnable code below. The code consumes much more memory than 6.8 GB and causes out of memory error. Since TF does not provide any good way to profile GPU memory usage, I am unable to pinpoint the problem. However, I do not see any part of the code that should cause the code to consume much more memory than the PyTorch's version. Is it an inherent TF problem/bug or is there a way to make it consume less memory?
+Code to reproduce the issue
+&lt;denchmark-code&gt;
+import tensorflow as tf
+from tensorflow.keras.layers import Layer, Conv2D, BatchNormalization, ReLU, MaxPool2D, ZeroPadding2D
+from tensorflow.keras import Model, Sequential
+
+
+feature_extractor_config = {
+    '300': [64, 64, 'M', 128, 128, 'M', 256, 256, 256, 'C', 512, 512, 512, 'M',
+            512, 512, 512],
+    '512': [64, 64, 'M', 128, 128, 'M', 256, 256, 256, 'C', 512, 512, 512, 'M',
+            512, 512, 512],
+}
+
+feature_pyramid_config = {
+    '300': [256, 'S', 512, 128, 'S', 256, 128, 256, 128, 256],
+    '512': [256, 'S', 512, 128, 'S', 256, 128, 'S', 256, 128, 'S', 256],
+}
+
+head_config = {
+    '300': [4,6,6,6,4,4]
+}
+
+
+def create_feature_extractor(cfg, batch_norm=False):
+    layers = []
+    in_channels = 3
+    for v in cfg:
+        if v == 'M':
+            layers += [MaxPool2D(pool_size=2, strides=2)]
+        elif v == 'C':
+            layers += [ZeroPadding2D(padding=((0,1), (0,1))), MaxPool2D(pool_size=2, strides=2)]
+        else:
+            pad = ZeroPadding2D(1)
+            conv2d = Conv2D(v, kernel_size=3)
+            if batch_norm:
+                layers += [pad, conv2d, BatchNormalization(v), ReLU()]
+            else:
+                layers += [pad, conv2d, ReLU()]
+            in_channels = v
+    pad5 = ZeroPadding2D(padding=1)
+    pool5 = MaxPool2D(pool_size=3, strides=1)
+    pad6 = ZeroPadding2D(padding=6)
+    conv6 = Conv2D(1024, kernel_size=3, dilation_rate=6)
+    conv7 = Conv2D(1024, kernel_size=1)
+    layers += [pad5, pool5, pad6, conv6,
+               ReLU(), conv7, ReLU()]
+    return layers
+
+def create_feature_pyramid(cfg, size=300):
+    layers = []
+    # in_channels = i
+    flag = False
+    for k, v in enumerate(cfg):
+        if k==0 or in_channels != 'S':
+            if v == 'S':
+                layers += [ZeroPadding2D(padding=1), Conv2D(cfg[k + 1], kernel_size=(1, 3)[flag], strides=2)]
+            else:
+                layers += [Conv2D(v, kernel_size=(1, 3)[flag])]
+            flag = not flag
+        in_channels = v
+    if size == 512:
+        layers.append(Conv2D(128, kernel_size=1, strides=1))
+        layers.append(ZeroPadding2D(padding=1))
+        layers.append(Conv2D(256, kernel_size=4, strides=1))
+    return layers
+
+def create_head(cfg, num_classes):
+    reg_layers  = []
+    cls_layers = []
+    for num_bboxes in cfg:
+        cls_layers.append(Sequential([ZeroPadding2D(padding=1), Conv2D(num_bboxes * num_classes, kernel_size=3)]))
+        reg_layers.append(Sequential([ZeroPadding2D(padding=1), Conv2D(num_bboxes * 4, kernel_size=3)]))
+    head = {'reg': reg_layers, 'cls': cls_layers}
+
+    return head
+
+class L2Norm(Layer):
+    def __init__(self, in_channels, scale):
+        super(L2Norm, self).__init__()
+        self.in_channels = in_channels
+        self.gamma = scale or None
+        self.eps = 1e-10
+        self.w = self.add_weight(
+            name='w',
+            shape=(self.in_channels,),
+            initializer=tf.constant_initializer(20),
+            trainable=True,
+            dtype=self.dtype
+        )
+
+    def call(self, x):
+        norm = tf.sqrt(tf.reduce_sum(tf.pow(x, 2), axis=3, keepdims=True)) + self.eps
+        x = tf.truediv(x, norm)
+        out = self.w * x
+
+        return out
+
+class VGG(Model):
+    def __init__(self):
+        super(VGG, self).__init__()
+        self.feature_extractor = create_feature_extractor(feature_extractor_config['300'])
+        self.l2_norm = L2Norm(512, scale=20)
+        self.feature_pyramid = create_feature_pyramid(feature_pyramid_config['300'], size=300)
+        self.num_classes = 21
+
+        self.head = create_head(head_config['300'], self.num_classes)
+
+
+    def call(self, x):
+        n, h, w, c = x.shape
+        features = []
+        for i in range(34):
+            x = self.feature_extractor[i](x)
+        s = self.l2_norm(x)
+
+        features.append(s)
+
+        for i in range(34, len(self.feature_extractor)):
+            x = self.feature_extractor[i](x)
+        features.append(x)
+
+        for k, v in enumerate(self.feature_pyramid):
+            x = tf.nn.relu(v(x))
+            if k in [2,5,7,9]:
+                features.append(x)
+
+        regressions = []
+        classifications = []
+
+        for k, v in enumerate(features):
+            regressions.append(tf.reshape(self.head['reg'][k](v), [32, -1, 4]))
+            classifications.append(tf.reshape(self.head['cls'][k](v), [32, -1, self.num_classes]))
+
+        regressions = tf.concat(regressions, axis=1)
+        classifications = tf.concat(classifications, axis=1)
+
+        return [regressions, classifications]
+model = VGG()
+
+optimizer = tf.keras.optimizers.Adam()
+
+
+smooth_l1_loss = tf.keras.losses.Huber(
+    delta=1.0, reduction=tf.keras.losses.Reduction.NONE
+)
+
+ce_loss = tf.keras.losses.CategoricalCrossentropy(
+    from_logits=True, label_smoothing=0, reduction=tf.keras.losses.Reduction.NONE
+)
+
+@tf.function
+def train_step(input_imgs, target_bboxes, target_labels):
+    outputs = model(input_imgs)
+
+    regressions = outputs[0]
+    classifications = outputs[1]
+
+    pos_mask = target_labels &gt; 0
+    neg_mask = target_labels == 0
+    num_pos = tf.reduce_sum(tf.cast(pos_mask, tf.float32))
+
+    predicted_bboxes = regressions[pos_mask]
+    target_bboxes = target_bboxes[pos_mask]
+
+    bbox_loss = tf.reduce_sum(smooth_l1_loss(target_bboxes, predicted_bboxes))
+
+    cls_loss = ce_loss(tf.one_hot(tf.cast(target_labels, tf.int32), classifications.shape[2]), classifications)
+
+    pos_cls_loss = cls_loss[pos_mask]
+    neg_cls_loss = cls_loss[neg_mask]
+    neg_cls_loss = tf.sort(neg_cls_loss, direction="DESCENDING")
+    neg_cls_loss = neg_cls_loss[: 3 * tf.cast(num_pos, tf.int32)]
+
+    cls_loss = tf.reduce_sum(
+        tf.reduce_sum(pos_cls_loss) + tf.reduce_sum(neg_cls_loss)
+    )
+    loss = bbox_loss + cls_loss
+    loss = loss / num_pos
+
+    gradients = tf.gradients(loss, model.trainable_variables)
+    optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+
+while True:
+    imgs = tf.random.uniform((32, 300, 300, 3), minval=0, maxval=255)
+    img_bboxes = tf.random.uniform((32, 8732, 4), minval=0, maxval=1)
+    img_labels = tf.random.uniform((32, 8732), minval=0, maxval=21, dtype=tf.int32)
+    train_step(imgs, img_bboxes, img_labels)
+
+&lt;/denchmark-code&gt;
+
+Other info / logs
+&lt;denchmark-code&gt;2020-01-30 14:48:46.435271: I tensorflow/core/common_runtime/bfc_allocator.cc:962] Sum Total of in-use chunks: 6.86GiB
+2020-01-30 14:48:46.435308: I tensorflow/core/common_runtime/bfc_allocator.cc:964] total_region_allocated_bytes_: 7510566400 memory_limit_: 7510566502 available bytes: 102 curr_region_allocation_bytes_: 15021133312
+2020-01-30 14:48:46.435336: I tensorflow/core/common_runtime/bfc_allocator.cc:970] Stats:
+Limit:                  7510566502
+InUse:                  7367076608
+MaxInUse:               7509992704
+NumAllocs:                    2794
+MaxAllocSize:           3335127040
+
+2020-01-30 14:48:46.435424: W tensorflow/core/common_runtime/bfc_allocator.cc:429] ****************************************************************************************************
+2020-01-30 14:48:46.435484: W tensorflow/core/framework/op_kernel.cc:1655] OP_REQUIRES failed at slice_op.cc:154 : Resource exhausted: OOM when allocating tensor with shape[32,512,38,38] and type float on /job:localhost/replica:0/task:0/device:GPU:0 by allocator GPU_0_bfc
+2020-01-30 14:48:46.435548: W tensorflow/core/common_runtime/base_collective_executor.cc:217] BaseCollectiveExecutor::StartAbort Resource exhausted: OOM when allocating tensor with shape[32,512,38,38] and type float on /job:localhost/replica:0/task:0/device:GPU:0 by allocator GPU_0_bfc
+         [[{{node gradients/vgg/sequential/zero_padding2d_18/Pad_grad/Slice_1}}]]
+Hint: If you want to see a list of allocated tensors when OOM happens, add report_tensor_allocations_upon_oom to RunOptions for current allocation info.
+
+Traceback (most recent call last):
+  File "mve.py", line 327, in &lt;module&gt;
+    train_step(imgs, img_bboxes, img_labels)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow_core/python/eager/def_function.py", line 568, in __call__
+    result = self._call(*args, **kwds)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow_core/python/eager/def_function.py", line 599, in _call
+    return self._stateless_fn(*args, **kwds)  # pylint: disable=not-callable
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow_core/python/eager/function.py", line 2363, in __call__
+    return graph_function._filtered_call(args, kwargs)  # pylint: disable=protected-access
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow_core/python/eager/function.py", line 1611, in _filtered_call
+    self.captured_inputs)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow_core/python/eager/function.py", line 1692, in _call_flat
+    ctx, args, cancellation_manager=cancellation_manager))
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow_core/python/eager/function.py", line 545, in call
+    ctx=ctx)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow_core/python/eager/execute.py", line 67, in quick_execute
+    six.raise_from(core._status_to_exception(e.code, message), None)
+  File "&lt;string&gt;", line 3, in raise_from
+tensorflow.python.framework.errors_impl.ResourceExhaustedError:  OOM when allocating tensor with shape[32,512,38,38] and type float on /job:localhost/replica:0/task:0/device:GPU:0 by allocator GPU_0_bfc
+         [[node gradients/vgg/sequential/zero_padding2d_18/Pad_grad/Slice_1 (defined at mve.py:304) ]]
+Hint: If you want to see a list of allocated tensors when OOM happens, add report_tensor_allocations_upon_oom to RunOptions for current allocation info.
+ [Op:__inference_train_step_5034]
+
+Function call stack:
+train_step
+
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='yxchng' date='2020-02-01T05:29:04Z'>
+		&lt;denchmark-link:https://github.com/ymodak&gt;@ymodak&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/gadagashwini&gt;@gadagashwini&lt;/denchmark-link&gt;
+ I realized that manually padding with ZeroPadding2D layer makes the model consumes more memory than when using the implicit  in  or , i.e. Conv2D(..., padding='same'). This should be a bug! There is no reason why manually padding should consume more memory.
+Manually padding is required in many situations because TF does not support symmetric padding, the one used by PyTorch and Caffe.
+		</comment>
+		<comment id='2' author='yxchng' date='2020-02-03T21:42:38Z'>
+		If you can visualize the performance by using TensorBoard's Profile Plugin and share results that will be great.
+See&lt;denchmark-link:https://www.tensorflow.org/tensorboard/tensorboard_profiling_keras&gt; Profiling Tool.&lt;/denchmark-link&gt;
+
+Thanks!
+		</comment>
+		<comment id='3' author='yxchng' date='2020-03-09T00:35:44Z'>
+		It has been 33 days with no activity and the awaiting response label was assigned. Is this still an issue?
+		</comment>
+		<comment id='4' author='yxchng' date='2020-03-19T00:34:02Z'>
+		Automatically closing due to lack of recent activity. Please update the issue when new information becomes available, and we will reopen the issue. Thanks!
+		</comment>
+		<comment id='5' author='yxchng' date='2020-03-19T00:34:04Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/36337&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/36337&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

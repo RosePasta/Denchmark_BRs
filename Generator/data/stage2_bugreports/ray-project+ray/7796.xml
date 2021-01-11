@@ -1,0 +1,632 @@
+<bug id='7796' author='janblumenkamp' open_date='2020-03-29T10:07:29Z' closed_time='2020-11-26T04:57:49Z'>
+	<summary>[rllib] Episodes per iteration changes periodically</summary>
+	<description>
+&lt;denchmark-h:h3&gt;What is your question?&lt;/denchmark-h&gt;
+
+I am running PPO training with the following parameters:
+
+num_envs_per_worker: 16
+num_sgd_iter: 10
+num_workers: 9
+sample_batch_size: 100
+sgd_minibatch_size: 500
+train_batch_size: 5000
+
+Which results in the following section of progress.csv:
+
+
+
+episode_reward_mean
+episode_len_mean
+episodes_this_iter
+timesteps_this_iter
+episodes_total
+time_this_iter_s
+
+
+
+
+0.502040816326583
+69.9591836734694
+98
+16200
+98
+25.9767467975616
+
+
+0.502040816326583
+69.9591836734694
+0
+16200
+98
+11.2316811084747
+
+
+0.651515151515205
+70.2626262626263
+1
+16200
+99
+9.89791893959045
+
+
+0.651515151515205
+70.2626262626263
+0
+16200
+99
+5.62278604507446
+
+
+1.00700000000005
+70.56
+1
+16200
+100
+6.44563126564026
+
+
+18.9261194029848
+93.2089552238806
+134
+16200
+234
+22.4115529060364
+
+
+19.6709999999997
+93.69
+0
+16200
+234
+11.1312561035156
+
+
+19.6709999999997
+93.69
+0
+16200
+234
+11.2101104259491
+
+
+19.6709999999997
+93.69
+0
+16200
+234
+7.29583120346069
+
+
+19.6709999999997
+93.69
+0
+16200
+234
+4.83812427520752
+
+
+37.1651515151511
+101.931818181818
+132
+16200
+366
+23.3235356807709
+
+
+39.6669999999995
+104.27
+0
+16200
+366
+11.3829348087311
+
+
+39.6669999999995
+104.27
+0
+16200
+366
+11.3153231143951
+
+
+
+Why does the number of episodes per iteration changes so drastically (sometimes even 0 episodes) while the time per episode is always unproportionally large (also the number of timesteps per iteration is always the same)? There are regular intervals of 5 to 6 iterations when the number of episodes per iteration increases a lot and only then a change in reward can be observed.
+Ray version and other system information (Python version, TensorFlow version, OS):
+
+Python 3.6
+Latest Ray wheel (0.9.0.dev0)
+Torch 1.4.0
+5.3.0-40-generic 32~18.04.1-Ubuntu SMP Mon Feb 3 14:05:59 UTC 2020 x86_64 x86_64 x86_64 GNU/Linux
+
+	</description>
+	<comments>
+		<comment id='1' author='janblumenkamp' date='2020-03-30T08:36:50Z'>
+		Hmm, that does indeed look strange, especially comparing the episode_lens with timesteps and num_episodes. If episode_len is large, num_episodes should be smaller. &lt;denchmark-link:https://github.com/ericl&gt;@ericl&lt;/denchmark-link&gt;
+ any idea? If not, I can take a look. Could be a bug.
+		</comment>
+		<comment id='2' author='janblumenkamp' date='2020-03-30T19:36:23Z'>
+		Please provide a repro script (see the 'bug' template).
+		</comment>
+		<comment id='3' author='janblumenkamp' date='2020-03-30T23:24:11Z'>
+		Custom environment and custom model, therefore a bit bigger. Tried to throw out as much as possible. I didn't mention that this is a multi-agent setting (if I set n_agents to 1 it looks normal, for 2 the output looks as shown below and for more agents, the distance between iterations with many episodes gets bigger). This environment tries to maximize the global coverage. The observation for each agents contains the individual observations for all agents as well as an index to identify the current agent.
+&lt;denchmark-code&gt;import numpy as np
+import gym
+import ray
+
+from gym import spaces
+from gym.utils import seeding, EzPickle
+from ray import tune
+from ray.tune.registry import register_env
+from ray.rllib.utils import try_import_torch
+from ray.rllib.models import ModelCatalog
+from ray.rllib.env.multi_agent_env import MultiAgentEnv
+from ray.rllib.models.tf.tf_modelv2 import TFModelV2
+from ray.rllib.utils import try_import_tf
+from ray.rllib.models.tf.misc import normc_initializer
+
+from enum import Enum
+
+tf = try_import_tf()
+
+X = 1
+Y = 0
+
+class Action(Enum):
+    NOP         = 0
+    MOVE_RIGHT  = 1
+    MOVE_LEFT   = 2
+    MOVE_UP     = 3
+    MOVE_DOWN   = 4
+
+class Agent():
+    def __init__(self, world, state_shape):
+        self.world = world
+        self.state_shape = state_shape
+        self.reset()
+
+    def reset(self):
+        self.pose = np.array([0,0])
+        self.state = None
+        self.no_new_coverage_steps = 0
+
+    def step(self, action):
+        delta_pose = {
+            Action.MOVE_RIGHT:  [ 0,  1],
+            Action.MOVE_LEFT:   [ 0, -1],
+            Action.MOVE_UP:     [-1,  0],
+            Action.MOVE_DOWN:   [ 1,  0],
+            Action.NOP:         [ 0,  0]
+        }[Action(action)]
+
+        new_pos = self.pose + delta_pose
+        if all([new_pos[c] &gt;= 0 and new_pos[c] &lt; self.world.shape[c] for c in [X, Y]]):
+            self.pose = new_pos
+        
+        self.reward = 1 if self.world.coverage[self.pose[Y], self.pose[X]] == False else 0
+        self.world.coverage[self.pose[Y], self.pose[X]] = 1
+
+        self.no_new_coverage_steps += 1 if self.reward == 0 else 0
+
+        half_state_shape = (np.array(self.state_shape)/2).astype(int)
+        padded_coverage = np.pad(self.world.coverage,([half_state_shape[Y]]*2,[half_state_shape[X]]*2), mode='constant', constant_values=0)
+        self.state = padded_coverage[self.pose[Y]:self.pose[Y] + self.state_shape[Y], self.pose[X]:self.pose[X] + self.state_shape[X]].astype(np.uint8)[...,np.newaxis]
+        
+        done = self.world.get_coverage_fraction() == 1.0 or self.no_new_coverage_steps == 50
+        
+        return self.state, self.reward, done, {}
+
+class World(MultiAgentEnv, EzPickle):
+    def __init__(self, env_config):
+        EzPickle.__init__(self)
+        self.seed()
+        self.cfg = env_config
+        self.observation_space = spaces.Dict({
+            'id': spaces.Box(0, self.cfg['n_agents'], shape=(1,), dtype=np.int),
+            'states': spaces.Dict({
+                i: spaces.Box(0, 2, shape=(self.cfg['state_shape'][Y], self.cfg['state_shape'][X], 1))
+                    for i in range(self.cfg['n_agents'])
+            })
+        })
+        self.action_space = spaces.Discrete(5)
+
+        self.shape = self.cfg['world_shape']
+        self.agents = {
+            i: Agent(
+                self,
+                self.cfg['state_shape']
+            ) for i in range(self.cfg['n_agents'])
+        }
+
+        self.reset()
+    
+    def get_coverage_fraction(self):
+        return np.sum(self.coverage)/np.sum(np.ones(self.shape))
+
+    def seed(self, seed=None):
+        self.np_random, seed = seeding.np_random(seed)
+        return [seed]
+
+    def reset(self):
+        self.dones = {key: False for key in self.agents.keys()}
+        self.coverage = np.zeros(self.shape, dtype=np.bool)
+        [r.reset() for r in self.agents.values()]
+        return self.step({key: 0 for key in self.agents.keys()})[0]
+
+    def step(self, actions):
+        states, rewards = {}, {}
+        for key, action in actions.items():
+            state, reward, done, _ = self.agents[key].step(action)
+            states[key] = state
+            rewards[key] = reward
+            if done:
+                self.dones[key] = True
+        self.dones['__all__'] = any(self.dones.values())
+
+        all_states = {key: agent.state for key, agent in self.agents.items()}
+        final_states = {key: {'id': np.array([key]), 'states': all_states} for key in actions.keys()}
+        return final_states, rewards, self.dones, {}
+
+class AdaptedVisionNetwork(TFModelV2):
+    """Custom model for policy gradient algorithms."""
+
+    def __init__(self, obs_space, action_space, num_outputs, model_config,
+                 name):
+        super(AdaptedVisionNetwork, self).__init__(obs_space, action_space,
+                                           num_outputs, model_config, name)
+
+        self.cfg = model_config['custom_options']
+
+        cnn_input = tf.keras.layers.Input(shape=(3,3,1), name="observations")
+        cnn_0 = tf.keras.layers.Conv2D(
+                filters=64,
+                kernel_size=3,
+                strides=1,
+                padding="same",
+                activation="relu",
+                kernel_initializer=normc_initializer(1.0))(cnn_input)
+        cnn_1 = tf.keras.layers.Conv2D(
+                filters=64,
+                kernel_size=3,
+                strides=1,
+                padding="valid",
+                activation="relu",
+                kernel_initializer=normc_initializer(1.0))(cnn_0)
+        cnn_f = tf.keras.layers.Flatten()(cnn_1)
+        cnn_output = tf.keras.layers.Dense(64, activation="relu", kernel_initializer=normc_initializer(1.0))(cnn_f)
+        self.cnn_model = tf.keras.Model(cnn_input, cnn_output)
+        self.cnn_model.summary()
+
+        logit_input = tf.keras.layers.Input(shape=cnn_output.shape)
+        logit_output = tf.keras.layers.Dense(
+            num_outputs,
+            name="my_out",
+            activation=None,
+            kernel_initializer=normc_initializer(0.01))(logit_input)
+        self.logit_model = tf.keras.Model(logit_input, logit_output)
+        self.logit_model.summary()
+
+        value_input = tf.keras.layers.Input(shape=cnn_output.shape)
+        value_output = tf.keras.layers.Dense(
+            1,
+            name="value_out",
+            activation=None,
+            kernel_initializer=normc_initializer(0.01))(value_input)
+        self.value_model = tf.keras.Model(value_input, value_output)
+
+        self.register_variables(self.cnn_model.variables + self.logit_model.variables + self.value_model.variables)
+
+    def forward(self, input_dict, state, seq_lens):
+        states = input_dict["obs"]['states']
+        batch_size = states[0].shape[0]
+        n_agents = len(states)
+
+        outputs = [None]*len(states)
+        for id_agent, s in states.items():
+            outputs[id_agent] = self.cnn_model(s)
+        all_agents_features = tf.keras.backend.stack(outputs, axis=-1)
+
+        indexes = tf.cast(input_dict["obs"]['id'], dtype=tf.int32)
+        expanded_indexes = tf.expand_dims(tf.repeat(indexes, 64, axis=1), axis=-1)
+        this_entity = tf.gather_nd(all_agents_features, expanded_indexes, batch_dims=2)
+
+        model_out = self.logit_model(this_entity)
+        self._value_out = self.value_model(this_entity)
+        return model_out, state
+
+    def value_function(self):
+        return tf.reshape(self._value_out, [-1])
+
+if __name__ == '__main__':
+    ray.init()
+    register_env("world", lambda config: World(config))
+    ModelCatalog.register_custom_model("vis_tf_mult", AdaptedVisionNetwork)
+    tune.run(
+        "PPO",
+        checkpoint_freq=10,
+        config={
+            "env": "world",
+            "lambda": 0.95,
+            "kl_coeff": 0.5,
+            "clip_rewards": True,
+            "clip_param": 0.3,
+            "vf_clip_param": 10.0,
+            "vf_share_layers": True,
+            "vf_loss_coeff": 1e-2,
+            "entropy_coeff": 0.01,
+            "train_batch_size": 5000,
+            "sample_batch_size": 100,
+            "sgd_minibatch_size": 500,
+            "num_sgd_iter": 10,
+            "num_workers": 15,
+            "num_envs_per_worker": 16,
+            "lr": 0.0001,
+            "gamma": 0.95,
+            "batch_mode": "truncate_episodes",
+            "observation_filter": "NoFilter",
+            "num_gpus": 1,
+            "model": {"custom_model": "vis_tf_mult"},
+            "env_config": {
+                'world_shape': (32, 32),
+                'state_shape': (3, 3),
+                'n_agents': 2
+            }})
+&lt;/denchmark-code&gt;
+
+progress.csv for n_agents=2:
+
+
+
+episode_reward_mean
+episode_len_mean
+episodes_this_iter
+timesteps_this_iter
+episodes_total
+time_this_iter_s
+
+
+
+
+33.6708333333333
+61.6916666666667
+240
+24000
+240
+30.1475417613983
+
+
+33.32
+61.28
+0
+24000
+240
+5.45926451683044
+
+
+45.955223880597
+66.8716417910448
+335
+24000
+575
+6.04910087585449
+
+
+47.62
+67.55
+0
+24000
+575
+5.48669099807739
+
+
+86.4775510204082
+86.8163265306123
+245
+24000
+820
+6.2853627204895
+
+
+87.65
+87.73
+1
+24000
+821
+5.2295081615448
+
+
+135.452631578947
+112.131578947368
+190
+24000
+1011
+6.422847032547
+
+
+135.61
+111.96
+0
+24000
+1011
+4.82979130744934
+
+
+165.798969072165
+128.309278350515
+194
+24000
+1205
+6.51057195663452
+
+
+166.56
+128.69
+1
+24000
+1206
+5.11566877365112
+
+
+171.122448979592
+131.045918367347
+196
+24000
+1402
+6.55353450775147
+
+
+
+and for n_agents=8:
+
+
+
+episode_reward_mean
+episode_len_mean
+episodes_this_iter
+timesteps_this_iter
+episodes_total
+time_this_iter_s
+
+
+
+
+49.0427553444181
+49.4228028503563
+421
+24000
+421
+38.0848498344421
+
+
+48.38
+49.51
+1
+24000
+422
+10.3711409568787
+
+
+48.64
+49.52
+8
+24000
+430
+8.50353837013245
+
+
+49.13
+49.53
+5
+24000
+435
+8.01086711883545
+
+
+49.6
+49.56
+6
+24000
+441
+8.12602949142456
+
+
+49.71
+49.59
+3
+24000
+444
+8.83112263679504
+
+
+49.7
+49.62
+7
+24000
+451
+10.2521905899048
+
+
+49.62
+49.66
+6
+24000
+457
+10.3926463127136
+
+
+87.5323383084577
+50.0721393034826
+402
+24000
+859
+14.1486210823059
+
+
+88.42
+49.99
+7
+24000
+866
+10.2082169055939
+
+
+88.87
+49.98
+5
+24000
+871
+10.2512586116791
+
+
+88.54
+50
+6
+24000
+877
+10.3910822868347
+
+
+
+		</comment>
+		<comment id='4' author='janblumenkamp' date='2020-04-01T15:35:55Z'>
+		Hey &lt;denchmark-link:https://github.com/janblumenkamp&gt;@janblumenkamp&lt;/denchmark-link&gt;
+ Just out of curiosity, are you on our ray slack channel?
+		</comment>
+		<comment id='5' author='janblumenkamp' date='2020-04-01T15:52:16Z'>
+		Wasn't aware that there is a slack channel, I just filled out the form to join!
+		</comment>
+		<comment id='6' author='janblumenkamp' date='2020-04-03T14:48:33Z'>
+		Just wondering, if this is in fact a bug, I assume it should not affect the performance in a multi-agent setting and is more a cosmetic bug?
+		</comment>
+		<comment id='7' author='janblumenkamp' date='2020-05-04T13:21:11Z'>
+		&lt;denchmark-link:https://github.com/janblumenkamp&gt;@janblumenkamp&lt;/denchmark-link&gt;
+ Taking a look today. ... Sorry for the delay.
+		</comment>
+		<comment id='8' author='janblumenkamp' date='2020-05-04T13:24:04Z'>
+		Yeah, could just be something cosmetic, but we do want our metrics to be correct. :)
+		</comment>
+		<comment id='9' author='janblumenkamp' date='2020-06-05T14:49:06Z'>
+		I am using the appo algorithm for my custom environment. And, I get different values of timesteps_this_iter in every iteration (trainer.train() function)? Is this normal? I would like to fix the number of time steps in one iteration. Is this possible for the appo algorithm? Thank you.
+		</comment>
+		<comment id='10' author='janblumenkamp' date='2020-11-12T04:49:41Z'>
+		Hi, I'm a bot from the Ray team :)
+To help human contributors to focus on more relevant issues, I will automatically add the stale label to issues that have had no activity for more than 4 months.
+If there is no further activity in the 14 days, the issue will be closed!
+
+If you'd like to keep the issue open, just leave any comment, and the stale label will be removed!
+If you'd like to get more attention to the issue, please tag one of Ray's contributors.
+
+You can always ask for help on our &lt;denchmark-link:https://discuss.ray.io/&gt;discussion forum&lt;/denchmark-link&gt;
+ or &lt;denchmark-link:https://github.com/ray-project/ray#getting-involved&gt;Ray's public slack channel&lt;/denchmark-link&gt;
+.
+		</comment>
+		<comment id='11' author='janblumenkamp' date='2020-11-26T04:57:44Z'>
+		Hi again! The issue will be closed because there has been no more activity in the 14 days since the last message.
+Please feel free to reopen or open a new issue if you'd still like it to be addressed.
+Again, you can always ask for help on our &lt;denchmark-link:https://discuss.ray.io&gt;discussion forum&lt;/denchmark-link&gt;
+ or &lt;denchmark-link:https://github.com/ray-project/ray#getting-involved&gt;Ray's public slack channel&lt;/denchmark-link&gt;
+.
+Thanks again for opening the issue!
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,315 @@
+<bug id='33651' author='netw0rkf10w' open_date='2019-10-23T21:31:08Z' closed_time='2019-10-26T12:48:38Z'>
+	<summary>An issue with the code in the  Custom training with tf.distribute.Strategy tutorial</summary>
+	<description>
+&lt;denchmark-h:h2&gt;URL(s) with the issue:&lt;/denchmark-h&gt;
+
+&lt;denchmark-link:https://www.tensorflow.org/tutorials/distribute/custom_training&gt;https://www.tensorflow.org/tutorials/distribute/custom_training&lt;/denchmark-link&gt;
+
+&lt;denchmark-h:h2&gt;Description of issue (what needs changing):&lt;/denchmark-h&gt;
+
+I am not sure if this is a bug or an issue with the tutorial, but when I apply the &lt;denchmark-link:https://www.tensorflow.org/tutorials/distribute/custom_training&gt;Custom training with tf.distribute.Strategy&lt;/denchmark-link&gt;
+ tutorial to the &lt;denchmark-link:https://www.tensorflow.org/tutorials/images/segmentation&gt;Image segmentation&lt;/denchmark-link&gt;
+ (I just copy-pasted the code of the two tutorials), the scale of the training loss is not good:
+&lt;denchmark-code&gt;Epoch 1, Loss: 35478.49609375, Accuracy: 48.560935974121094, Test Loss: 0.8764073252677917, Test Accuracy: 57.97665023803711
+Epoch 2, Loss: 20161.634765625, Accuracy: 74.82583618164062, Test Loss: 0.6519305109977722, Test Accuracy: 77.33595275878906
+Epoch 3, Loss: 15657.2880859375, Accuracy: 81.60499572753906, Test Loss: 0.5801540017127991, Test Accuracy: 79.94847106933594
+Epoch 4, Loss: 13322.1689453125, Accuracy: 84.52685546875, Test Loss: 0.5113006830215454, Test Accuracy: 82.27192687988281
+Epoch 5, Loss: 11845.38671875, Accuracy: 85.9767837524414, Test Loss: 0.4614977538585663, Test Accuracy: 83.19354248046875
+Epoch 6, Loss: 10827.380859375, Accuracy: 86.9468002319336, Test Loss: 0.43975135684013367, Test Accuracy: 83.65667724609375
+Epoch 7, Loss: 10006.4892578125, Accuracy: 87.75154113769531, Test Loss: 0.4181833863258362, Test Accuracy: 83.8880386352539
+Epoch 8, Loss: 9534.9345703125, Accuracy: 88.15916442871094, Test Loss: 0.40620285272598267, Test Accuracy: 84.22107696533203
+Epoch 9, Loss: 8993.767578125, Accuracy: 88.73575592041016, Test Loss: 0.3957768976688385, Test Accuracy: 84.42972564697266
+Epoch 10, Loss: 8425.7080078125, Accuracy: 89.38662719726562, Test Loss: 0.37987643480300903, Test Accuracy: 84.94923400878906
+&lt;/denchmark-code&gt;
+
+The full code to reproduce is appended below. It looks like the training loss is scaled by image_height*image_width.
+Code:
+&lt;denchmark-code&gt;import sys, os
+import tensorflow as tf
+from tensorflow_examples.models.pix2pix import pix2pix
+
+import tensorflow_datasets as tfds
+
+import time
+
+
+def normalize(input_image, input_mask):
+  input_image = tf.cast(input_image, tf.float32) / 255.0
+  input_mask -= 1
+  return input_image, input_mask
+
+@tf.function
+def load_image_train(datapoint):
+  input_image = tf.image.resize(datapoint['image'], (128, 128))
+  input_mask = tf.image.resize(datapoint['segmentation_mask'], (128, 128))
+
+  if tf.random.uniform(()) &gt; 0.5:
+    input_image = tf.image.flip_left_right(input_image)
+    input_mask = tf.image.flip_left_right(input_mask)
+
+  input_image, input_mask = normalize(input_image, input_mask)
+
+  return input_image, input_mask
+
+def load_image_test(datapoint):
+  input_image = tf.image.resize(datapoint['image'], (128, 128))
+  input_mask = tf.image.resize(datapoint['segmentation_mask'], (128, 128))
+
+  input_image, input_mask = normalize(input_image, input_mask)
+
+  return input_image, input_mask
+
+
+def main():
+    dataset, info = tfds.load('oxford_iiit_pet:3.0.0', with_info=True)
+    TRAIN_LENGTH = info.splits['train'].num_examples
+    BATCH_SIZE = 192
+    BUFFER_SIZE = 1000
+    STEPS_PER_EPOCH = TRAIN_LENGTH // BATCH_SIZE
+    train = dataset['train'].map(load_image_train, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+    test = dataset['test'].map(load_image_test)
+    train_dataset = train.cache().shuffle(BUFFER_SIZE).batch(BATCH_SIZE).repeat()
+    train_dataset = train_dataset.prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
+    test_dataset = test.batch(BATCH_SIZE)
+
+
+
+    OUTPUT_CHANNELS = 3
+
+    strategy = tf.distribute.MirroredStrategy()
+
+    with strategy.scope():
+
+        base_model = tf.keras.applications.MobileNetV2(input_shape=[128, 128, 3], include_top=False)
+
+        # Use the activations of these layers
+        layer_names = [
+            'block_1_expand_relu',   # 64x64
+            'block_3_expand_relu',   # 32x32
+            'block_6_expand_relu',   # 16x16
+            'block_13_expand_relu',  # 8x8
+            'block_16_project',      # 4x4
+        ]
+        layers = [base_model.get_layer(name).output for name in layer_names]
+
+        # Create the feature extraction model
+        down_stack = tf.keras.Model(inputs=base_model.input, outputs=layers)
+
+        down_stack.trainable = False
+
+        up_stack = [
+            pix2pix.upsample(512, 3),  # 4x4 -&gt; 8x8
+            pix2pix.upsample(256, 3),  # 8x8 -&gt; 16x16
+            pix2pix.upsample(128, 3),  # 16x16 -&gt; 32x32
+            pix2pix.upsample(64, 3),   # 32x32 -&gt; 64x64
+        ]
+        def unet_model(output_channels):
+
+            # This is the last layer of the model
+            last = tf.keras.layers.Conv2DTranspose(
+                output_channels, 3, strides=2,
+                padding='same', activation='softmax')  #64x64 -&gt; 128x128
+
+            inputs = tf.keras.layers.Input(shape=[128, 128, 3])
+            x = inputs
+
+            # Downsampling through the model
+            skips = down_stack(x)
+            x = skips[-1]
+            skips = reversed(skips[:-1])
+
+            # Upsampling and establishing the skip connections
+            for up, skip in zip(up_stack, skips):
+                x = up(x)
+                concat = tf.keras.layers.Concatenate()
+                x = concat([x, skip])
+
+            x = last(x)
+
+            return tf.keras.Model(inputs=inputs, outputs=x)
+
+    
+        model = unet_model(OUTPUT_CHANNELS)
+        # model.compile(optimizer='adam', loss='sparse_categorical_crossentropy',
+        #             metrics=['accuracy'])
+
+        # model.compile(optimizer=tf.keras.optimizers.Adam(3e-4),
+        #             loss=tf.keras.losses.SparseCategoricalCrossentropy(tf.keras.losses.Reduction.NONE),
+        #             metrics=['sparse_categorical_accuracy'])
+
+        optimizer=tf.keras.optimizers.Adam(3e-4)
+        metrics = [tf.keras.metrics.MeanIoU(num_classes=3)]
+
+    EPOCHS = 2
+    VALIDATION_STEPS = info.splits['test'].num_examples//BATCH_SIZE
+
+    print('Start training')
+    start = time.time()
+
+    epochs = EPOCHS; steps = STEPS_PER_EPOCH; GLOBAL_BATCH_SIZE = BATCH_SIZE
+
+    # Distribute the datasets
+
+    train_dist_dataset = strategy.experimental_distribute_dataset(train_dataset)
+    test_dist_dataset = strategy.experimental_distribute_dataset(test_dataset)
+
+    with strategy.scope():
+        # Set reduction to `none` so we can do the reduction afterwards and divide by
+        # global batch size.
+        loss_object = tf.keras.losses.SparseCategoricalCrossentropy(
+            reduction=tf.keras.losses.Reduction.NONE)
+        # or loss_fn = tf.keras.losses.sparse_categorical_crossentropy
+        def compute_loss(labels, predictions):
+            per_example_loss = loss_object(labels, predictions)
+            return tf.nn.compute_average_loss(per_example_loss, global_batch_size=GLOBAL_BATCH_SIZE)
+
+    with strategy.scope():
+        test_loss = tf.keras.metrics.Mean(name='test_loss')
+
+        train_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(
+            name='train_accuracy')
+        test_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(
+            name='test_accuracy')
+
+
+    with strategy.scope():
+        def train_step(inputs):
+            images, labels = inputs
+
+            with tf.GradientTape() as tape:
+                predictions = model(images, training=True)
+                loss = compute_loss(labels, predictions)
+
+            gradients = tape.gradient(loss, model.trainable_variables)
+            optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+
+            train_accuracy.update_state(labels, predictions)
+            return loss 
+
+        def test_step(inputs):
+            images, labels = inputs
+
+            predictions = model(images, training=False)
+            t_loss = loss_object(labels, predictions)
+
+            test_loss.update_state(t_loss)
+            test_accuracy.update_state(labels, predictions)
+
+    with strategy.scope():
+        # `experimental_run_v2` replicates the provided computation and runs it
+        # with the distributed input.
+        @tf.function
+        def distributed_train_step(dataset_inputs):
+            per_replica_losses = strategy.experimental_run_v2(train_step,
+                                                            args=(dataset_inputs,))
+            return strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses,
+                                axis=None)
+        
+        @tf.function
+        def distributed_test_step(dataset_inputs):
+            return strategy.experimental_run_v2(test_step, args=(dataset_inputs,))
+
+        train_iter = iter(train_dataset)
+        for epoch in range(EPOCHS):
+            # TRAIN LOOP
+            total_loss = 0.0
+            num_batches = 0
+            while True:
+                x = next(train_iter)
+                total_loss += distributed_train_step(x)
+                num_batches += 1
+                if num_batches &gt;= steps:
+                    break
+            train_loss = total_loss / num_batches
+
+            # TEST LOOP
+            for x in test_dist_dataset:
+                distributed_test_step(x)
+
+            # if epoch % 2 == 0:
+            #     checkpoint.save(checkpoint_prefix)
+
+            template = ("Epoch {}, Loss: {}, Accuracy: {}, Test Loss: {}, "
+                        "Test Accuracy: {}")
+            print (template.format(epoch+1, train_loss,
+                                train_accuracy.result()*100, test_loss.result(),
+                                test_accuracy.result()*100))
+
+            test_loss.reset_states()
+            train_accuracy.reset_states()
+            test_accuracy.reset_states()
+
+if __name__ == "__main__":
+    main()
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='netw0rkf10w' date='2019-10-24T08:37:28Z'>
+		I have tried on colab with TF version 2.0 and was able to reproduce the issue.Please, find the gist &lt;denchmark-link:https://colab.sandbox.google.com/gist/ravikyram/3bd5f3e75ac2cd79dec74d3bc9619062/untitled295.ipynb&gt;here&lt;/denchmark-link&gt;
+.Thanks!
+		</comment>
+		<comment id='2' author='netw0rkf10w' date='2019-10-25T23:36:04Z'>
+		To fix it, there are 2 steps:
+
+Iter over train_dist_dataset instead of train_dataset.
+Reduce over batch_size instead of the entire prediction tensor because we need to predict an entire image/mask here.
+
+The code changes are:
+&lt;denchmark-code&gt;def compute_loss(labels, predictions):
+  per_example_loss = loss_object(labels, predictions)
+  # Reduce over batch_size
+  return tf.reduce_sum(per_example_loss, 0) / GLOBAL_BATCH_SIZE
+&lt;/denchmark-code&gt;
+
+and then the changing the training loop to reduce_mean over the train_loss fixes the issue.
+&lt;denchmark-code&gt;train_iter = iter(train_dist_dataset)
+for epoch in range(EPOCHS):
+  # TRAIN LOOP
+  total_loss = 0.0
+  num_batches = 0
+  while True:
+    x = next(train_iter)
+    # total_loss will contain the loss reduced over all the replica losses.
+    total_loss += distributed_train_step(x)
+    num_batches += 1
+    if num_batches &gt;= steps:
+      break
+  # Divide the total_loss by the number of batches since we want to report the loss over the entire epoch.
+  # train_loss.shape == (128, 128)
+  train_loss = total_loss / num_batches
+ 
+  # Reduce over the entire array to get the loss that is report able.
+  train_loss = tf.reduce_mean(train_loss)
+&lt;/denchmark-code&gt;
+
+The output I get after this is
+&lt;denchmark-code&gt;Epoch 1, Loss: 1.0484683513641357, Accuracy: 50.26182556152344, Test Loss: 0.9157692790031433, Test Accuracy: 58.35002136230469
+Epoch 2, Loss: 0.692024827003479, Accuracy: 71.80204010009766, Test Loss: 0.7471278309822083, Test Accuracy: 73.24569702148438
+Epoch 3, Loss: 0.5559802055358887, Accuracy: 78.87828063964844, Test Loss: 0.6854224801063538, Test Accuracy: 75.4207992553711
+Epoch 4, Loss: 0.46647387742996216, Accuracy: 82.48332214355469, Test Loss: 0.6156165599822998, Test Accuracy: 77.92351531982422
+Epoch 5, Loss: 0.41117799282073975, Accuracy: 84.09635162353516, Test Loss: 0.5281449556350708, Test Accuracy: 81.19449615478516
+Epoch 6, Loss: 0.368894100189209, Accuracy: 85.38777160644531, Test Loss: 0.47796040773391724, Test Accuracy: 82.69153594970703
+Epoch 7, Loss: 0.34240323305130005, Accuracy: 86.14852142333984, Test Loss: 0.4544333815574646, Test Accuracy: 83.27204895019531
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='3' author='netw0rkf10w' date='2019-10-26T11:39:35Z'>
+		&lt;denchmark-link:https://github.com/yashk2810&gt;@yashk2810&lt;/denchmark-link&gt;
+ Looks good. Thanks a lot!
+		</comment>
+		<comment id='4' author='netw0rkf10w' date='2019-10-26T12:48:39Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/33651&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/33651&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='5' author='netw0rkf10w' date='2019-10-28T19:40:02Z'>
+		&lt;denchmark-link:https://github.com/yashk2810&gt;@yashk2810&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/ravikyram&gt;@ravikyram&lt;/denchmark-link&gt;
+ It seems that this issue is related to &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/32099&gt;this bug&lt;/denchmark-link&gt;
+, which has not been fixed yet.
+		</comment>
+	</comments>
+</bug>

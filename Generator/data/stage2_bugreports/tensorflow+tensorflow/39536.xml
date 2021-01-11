@@ -1,0 +1,231 @@
+<bug id='39536' author='iobtl' open_date='2020-05-14T10:39:27Z' closed_time='2020-05-15T04:02:18Z'>
+	<summary>Failed to pass tf.data.Dataset object to multi-input tf.keras model</summary>
+	<description>
+Please make sure that this is a bug. As per our
+GitHub Policy,
+we only address code/doc bugs, performance issues, feature requests and
+build/installation issues on GitHub. tag:bug_template
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow):
+Yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04):
+Linux Ubuntu 18.04
+Mobile device (e.g. iPhone 8, Pixel 2, Samsung Galaxy) if the issue happens on mobile device:
+NIL
+TensorFlow installed from (source or binary):
+Binary
+TensorFlow version (use command below):
+2.1.0
+Python version:
+3.6
+Bazel version (if compiling from source):
+GCC/Compiler version (if compiling from source):
+CUDA/cuDNN version:
+10.1 / 7.6.4
+GPU model and memory:
+RTX 2070 Super, 8GB RAM
+
+You can collect some of this information using our environment capture
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/tree/master/tools/tf_env_collect.sh&gt;script&lt;/denchmark-link&gt;
+
+You can also obtain the TensorFlow version with:
+
+TF 1.0: python -c "import tensorflow as tf; print(tf.GIT_VERSION, tf.VERSION)"
+TF 2.0: python -c "import tensorflow as tf; print(tf.version.GIT_VERSION, tf.version.VERSION)"
+
+Describe the current behavior
+&lt;denchmark-code&gt;ValueError: Failed to find data adapter that can handle input: (&lt;class 'dict'&gt; containing {"&lt;class 'str'&gt;"} keys and {"&lt;class 'tensorflow.python.data.ops.dataset_ops.ZipDataset'&gt;"} values), &lt;class 'NoneType'&gt;
+&lt;/denchmark-code&gt;
+
+An error is encountered when trying to pass multiple tf.data.Dataset objects to my multi-input Keras model. This is done by passing a dictionary with the keys corresponding to the name of each of my input layers and values corresponding to each tf.data.Dataset object.
+I had no issue passing the same dataset object to a model taking in a single input, but when I tried to combine multiple Model instances into a single Model (for an ensemble CNN), this error is encountered.
+My network and ensemble code:
+def Net(inputs):
+    base_model = DenseNet121(include_top=False, weights='imagenet', input_tensor=inputs)
+    output = base_model.get_layer("pool3_conv").output
+    x = Conv2D(128, 3, activation='relu', padding='same')(output)
+    x = BatchNormalization()(x)
+    x = Conv2D(64, 3, activation='relu', padding='same')(x)
+    x = BatchNormalization()(x)
+    x = Flatten()(x)
+    x = Dense(2, activation='softmax', name='clf_output')(x)
+
+    model = tf.keras.models.Model(inputs=[base_model.input], outputs=[x])
+
+    return model
+
+def create_ensemble(models):
+    for i in range(len(models)):
+        # Each model is a Net object
+        model = models[i]
+        for layer in model.layers[1:]:
+            layer.trainable = False
+            layer._name = 'ensemble_' + str(i+1) + '_' + layer._name
+
+    stack_inputs = [model.input for model in models]
+    stack_outputs = [model.output for model in models]
+    merge = Concatenate()(stack_outputs) 
+    x = Dense(16, activation='relu')(merge)
+    x = Dense(2, activation='softmax')(x)
+
+    model = tf.keras.models.Model(inputs=stack_inputs, outputs=x, name='ensemble')
+
+    return model
+My training process is summarized as follows:
+
+Train 5 instances of DenseNet121 models, in sequence
+Create a new ensemble, combining the outputs of the previously trained DenseNet121 models
+Train the ensembled model (error occurs on model.fit)
+
+My training code:
+    IMAGE_DIR = os.path.join(DATA_DIR, "images")
+    DEPTH_DIR = os.path.join(DATA_DIR, "labels")
+    VAL_SPLIT = int(np.floor(0.1 * len(list(paths.list_images(IMAGE_DIR)))))
+    print(f"Validation split is: {VAL_SPLIT} images")
+
+    imagePaths = sorted(list(paths.list_images(IMAGE_DIR)))
+    depthPaths = sorted(list(paths.list_images(DEPTH_DIR)))
+    labels = generate_labels(depthPaths)
+
+    image_ds = tf.data.Dataset.from_tensor_slices(imagePaths)
+    image_ds = create_image_dataset(
+        image_ds, batch_size=BS, seed=42, training=True)
+
+    labels_ds = tf.data.Dataset.from_tensor_slices(labels)
+    labels_ds = create_labels_dataset(labels_ds, batch_size=BS, seed=42)
+
+    # Splitting into training and validation dataset
+    image_train, labels_train = image_ds.skip(VAL_SPLIT), labels_ds.skip(VAL_SPLIT)
+    image_val, labels_val = image_ds.take(VAL_SPLIT), labels_ds.take(VAL_SPLIT)
+
+    train_ds = tf.data.Dataset.zip((image_train, labels_train))
+    val_ds = tf.data.Dataset.zip((image_val, labels_val))
+
+    # Building the model
+    models = []
+    for i in range(1, N_MODELS+1):
+        inputs = tf.keras.layers.Input(shape=[224, 224, 3], name=f'input_{i}')
+        model = Net(inputs)
+        models.append(model)
+
+    print("Checking model architecture: ")
+    print(model.summary())
+
+    opt = Lookahead(RAdam(lr=INIT_LR))
+    opt = tf.train.experimental.enable_mixed_precision_graph_rewrite(opt)
+
+    # Creating callbacks
+    #earlystop = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=3, verbose=1, mode='auto', restore_best_weights=True)
+
+    reducelr = tf.keras.callbacks.LearningRateScheduler(reduce_lr)
+
+    # Training the model
+    print("Training")
+    if args.pretrained == 0:
+        for i in range(N_MODELS):
+            model = models[i]
+            model.compile(loss="categorical_crossentropy", 
+                          optimizer=opt, 
+                          metrics=["accuracy"])
+
+            checkpoint = tf.keras.callbacks.ModelCheckpoint(f"net_{i}_backup_weights.h5", 
+                                                            monitor='val_loss', 
+                                                            verbose=1, 
+                                                            save_weights_only=True, 
+                                                            save_best_only=True)
+            
+            history = model.fit(train_ds, 
+                                epochs=EPOCHS, 
+                                verbose=1,
+                                steps_per_epoch=(len(imagePaths)-VAL_SPLIT) // BS, 
+                                validation_data=(val_ds), 
+                                validation_steps=VAL_SPLIT // BS, 
+                                callbacks=[checkpoint, reducelr]) 
+
+            # Saving the model
+            print(f"Saving model {i}")
+            model.save(f"net_{i}.h5", include_optimizer=False)
+            model.save_weights(f"net_{i}_weights.h5")
+
+    else:
+        print("Loading pretrained weights")
+        for i in range(args.pretrained):
+            models[i].load_weights(f"net_{i}_weights.h5")
+
+    # Creating Ensemble
+    print("Creating Ensemble")
+    ensemble = create_ensemble(models)
+    print("Ensemble architecture: ")
+    print(ensemble.summary())
+
+    keras.utils.plot_model(model, "ensemble.png", show_shapes=True)
+    ensemble.save("ensemble.h5")
+
+    ensemble_train = {}
+    ensemble_val = {}
+    for i in range(1, args.pretrained+1):
+        ensemble_train[f'input_{i}'] = train_ds
+        ensemble_val[f'input_{i}'] = val_ds
+
+    assert len(ensemble_train) == int(args.pretrained)
+    assert len(ensemble_val) == int(args.pretrained)
+
+    ensemble.compile(loss="categorical_crossentropy", 
+                     optimizer=opt, 
+                     metrics=["accuracy"])
+
+    ensemble_checkpoint = tf.keras.callbacks.ModelCheckpoint("ensemble_backup_weights.h5", 
+                                                             monitor='val_loss', 
+                                                             verbose=1, 
+                                                             save_weights_only=True, 
+                                                             save_best_only=True)
+
+    history = ensemble.fit(ensemble_train, 
+                           epochs=EPOCHS, 
+                           verbose=1,
+                           steps_per_epoch=(len(imagePaths)-VAL_SPLIT) // BS, 
+                           validation_data=(ensemble_val), 
+                           validation_steps = VAL_SPLIT // BS, 
+                           callbacks=[ensemble_checkpoint, reducelr])
+   print("Saving Ensemble")
+      ensemble.save("ensemble.h5", include_optimizer=False)
+      ensemble.save_weights("ensemble_weights.h5")
+
+if __name__ == '__main__':
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--pretrained', default=0, type=int, help='number of pretrained models to use')
+    main(ap.parse_args())
+    sess.close()
+Output of print(train_ds): (batch_size=16, no. of classes=2)
+&lt;ZipDataset shapes: ((16, 224, 224, 3), (16, 2)), types: (tf.float32, tf.float32)&gt;
+&lt;ZipDataset shapes: ((16, 224, 224, 3), (16, 2)), types: (tf.float32, tf.float32)&gt;
+&lt;ZipDataset shapes: ((16, 224, 224, 3), (16, 2)), types: (tf.float32, tf.float32)&gt;
+&lt;ZipDataset shapes: ((16, 224, 224, 3), (16, 2)), types: (tf.float32, tf.float32)&gt;
+&lt;ZipDataset shapes: ((16, 224, 224, 3), (16, 2)), types: (tf.float32, tf.float32)&gt;
+Describe the expected behavior
+The tf.data.Dataset object should not require a 'y' value to be passed to model.fit explicitly, since I have combined the images and labels through tf.data.Dataset.zip.
+Standalone code to reproduce the issue
+Provide a reproducible test case that is the bare minimum necessary to generate
+the problem. If possible, please share a link to Colab/Jupyter/any notebook.
+Other info / logs Include any logs or source code that would be helpful to
+diagnose the problem. If including tracebacks, please include the full
+traceback. Large logs and files should be attached.
+	</description>
+	<comments>
+		<comment id='1' author='iobtl' date='2020-05-15T04:02:18Z'>
+		Issue resolved by changing code in the network from
+stack_inputs = [model.input for model in models]
+stack_outputs = [model.output for model in models[
+to:
+stack_outputs = [model(inputs) for model in models]
+		</comment>
+		<comment id='2' author='iobtl' date='2020-05-15T04:02:20Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/39536&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/39536&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

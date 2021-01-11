@@ -1,0 +1,138 @@
+<bug id='8558' author='yncxcw' open_date='2020-05-22T18:27:46Z' closed_time='2020-06-02T18:48:04Z'>
+	<summary>GC delays when lru_evict=True</summary>
+	<description>
+&lt;denchmark-h:h3&gt;What is the problem?&lt;/denchmark-h&gt;
+
+Even I del the reference to the object, I still see a lot of logs like:
+&lt;denchmark-code&gt;(pid=13522) E0522 12:20:54.414994 13522 plasma_store_provider.cc:108] Failed to put object 913f2e206aa9fb79ef0a6c22010000c801000000 in object store because it is full. Object size is 419430650 bytes.
+(pid=13522) Waiting 1000ms for space to free up...
+(pid=13528) E0522 12:20:54.414867 13528 plasma_store_provider.cc:108] Failed to put object 584460675c5d6a2745b95b1c010000c801000000 in object store because it is full. Object size is 419430650 bytes.
+(pid=13528) Waiting 1000ms for space to free up...
+(pid=13527) E0522 12:20:54.415024 13527 plasma_store_provider.cc:108] Failed to put object 2a92729c51279b7cf66d17ba010000c801000000 in object store because it is full. Object size is 419430650 bytes.
+(pid=13527) Waiting 1000ms for space to free up...
+(pid=13525) E0522 12:20:54.415205 13525 plasma_store_provider.cc:108] Failed to put object 30cb521dff02c13d7e0a4dfc010000c801000000 in object store because it is full. Object size is 419430650 bytes.
+(pid=13525) Waiting 1000ms for space to free up...
+(pid=13524) E0522 12:20:54.415153 13524 plasma_store_provider.cc:108] Failed to put object 10b737bf974c4e4044ee453c010000c801000000 in object store because it is full. Object size is 419430650 bytes.
+(pid=13524) Waiting 1000ms for space to free up...
+&lt;/denchmark-code&gt;
+
+Apparently, the NumPy objects returned from actors/tasks are still in the object store and are not removed when I call del or when the objects are out of their scope. As a result, the object store gets full and the GC kicks in.
+Ray version and other system information (Python version, TensorFlow version, OS):
+Ray: 0.9.0-dev0
+Python: python3.7
+Numpy:  1.18.2
+&lt;denchmark-h:h3&gt;Reproduction (REQUIRED)&lt;/denchmark-h&gt;
+
+Please provide a script that can be run to reproduce the issue. The script should have no external library dependencies (i.e., use fake or mock data / environments):
+import ray
+import numpy as np
+ray.init(lru_evict=True, redis_port=1234, webui_host="0.0.0.0")
+
+@ray.remote
+class Counter(object):
+    def __init__(self, idx):
+        self.idx= idx
+        self.value = 0
+
+    def increment(self):
+        self.value = self.value + 1
+        return np.zeros([1024, 1024, 100], np.float32)
+
+@ray.remote
+def get_numpy():
+    return np.zeros([1024, 1024, 100], np.float32)
+
+def actor_test():
+    counters = [Counter.remote(i) for i in range(5)]
+    for idx in range(1000):
+        print("iter ", idx)
+        futures = [c.increment.remote() for c in counters]
+        for i in range(len(futures)):
+            result = ray.get(futures[i])
+            del result
+        del futures
+
+
+def task_test():
+    for idx in range(1000):
+        print("iter ", idx)
+        futures = [get_numpy.remote() for _ in range(5)]
+        results = ray.get(futures)
+        del futures
+        del results
+
+actor_test()
+# task_test()
+Test with both actor and task runs into the same issue.
+If we cannot run your script, we cannot fix your issue.
+
+ I have verified my script runs in a clean environment and reproduces the issue.
+[] I have verified the issue also occurs with the latest wheels.
+
+	</description>
+	<comments>
+		<comment id='1' author='yncxcw' date='2020-05-22T18:29:46Z'>
+		cc &lt;denchmark-link:https://github.com/stephanie-wang&gt;@stephanie-wang&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/edoakes&gt;@edoakes&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='2' author='yncxcw' date='2020-05-22T18:48:08Z'>
+		Does ray memory show a leak? Also, how much memory does the node have?
+		</comment>
+		<comment id='3' author='yncxcw' date='2020-05-22T18:50:49Z'>
+		No, I did not see memory leakage. The node has 251GB memory. I can see constant memory usage at about 83GB.
+It might be the case that the memory is actually removed, but the Garbage collector is not aware of that ?
+		</comment>
+		<comment id='4' author='yncxcw' date='2020-05-22T18:52:50Z'>
+		Also, see this from dashboard:
+&lt;denchmark-code&gt;object_store_memory: 0 GiB / 51.51 GiB, GPU: 0 / 4, memory: 0 GiB / 164.89 GiB, CPU: 0 / 40, node:10.28.xxx.xxx: 0 / 1
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='5' author='yncxcw' date='2020-05-22T19:02:22Z'>
+		I believe there's a bug with the lru_evict option that is causing the GC delays. Can you try without the lru_evict=True flag? I tried this on my laptop and that seemed to work OK.
+By the way, you should only use lru_evict=True if there are object refs that you expect to keep around for a long time but the values should not actually be pinned. In most cases, we recommend using the default option, which will automatically evict objects by LRU, but only out of the objects that are no longer in reference.
+		</comment>
+		<comment id='6' author='yncxcw' date='2020-05-22T19:14:02Z'>
+		&lt;denchmark-link:https://github.com/stephanie-wang&gt;@stephanie-wang&lt;/denchmark-link&gt;
+ Thanks for the quick response. Yeah removing  fixes my issue. I still have a few questions regarding this feature:
+
+but the values should not actually be pinned
+
+What do you mean by this? My understanding is that the objects (like numpy) cached by the object store is actually pinned to object store ?
+
+which will automatically evict objects by LRU but only out of the objects that are no longer in reference.
+
+What if the object store is full but the driver still holds  references to all the objects ?
+		</comment>
+		<comment id='7' author='yncxcw' date='2020-05-22T19:24:26Z'>
+		
+@stephanie-wang Thanks for the quick response. Yeah removing lru_evict=True fixes my issue. I still have a few questions regarding this feature:
+
+Great, I'll open a PR soon to fix the issue, but again, would recommend just using the default option if that's working for you.
+
+
+but the values should not actually be pinned
+
+What do you mean by this? My understanding is that the objects (like numpy) cached by the object store is actually pinned to object store ?
+
+Actually, the objects are only pinned with the default option. With lru_evict, objects that are in reference are not pinned, so they may get evicted in LRU order.
+
+
+which will automatically evict objects by LRU but only out of the objects that are no longer in reference.
+
+What if the object store is full but the driver still holds references to all the objects ?
+
+With the default option, the system will attempt a GC round in all worker processes and give the application some time to delete refs. If the object store is still full and all objects are still in reference, you will get an OutOfMemory error the next time you call ray.get.
+With lru_evict=True, you will not get an OutOfMemory error. Instead, the system will evict an object that is still in reference based on LRU.
+		</comment>
+		<comment id='8' author='yncxcw' date='2020-05-22T19:27:39Z'>
+		Got it, thanks, please let me know when your PR gets merged.
+		</comment>
+		<comment id='9' author='yncxcw' date='2020-06-02T18:50:47Z'>
+		&lt;denchmark-link:https://github.com/yncxcw&gt;@yncxcw&lt;/denchmark-link&gt;
+, we've merged the PR, but FYI, we cannot fully fix the issue in your script. The problem is that when LRU eviction is enabled for all objects, it is not safe to evict as soon as the system hits capacity. Instead, we trigger garbage collection on all Python workers and give the system some time to evict objects that have already gone out of scope. So it may still possible to see GC-related delays when using .
+If you tell us more about our use case, perhaps we can recommend something better.
+		</comment>
+	</comments>
+</bug>

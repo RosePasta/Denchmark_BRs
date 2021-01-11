@@ -1,0 +1,292 @@
+<bug id='42111' author='MinasTyuru' open_date='2020-08-07T00:57:36Z' closed_time='2020-10-18T15:12:31Z'>
+	<summary>TensorFlow hangs forever in multinode training with NCCL and certain model (with SyncBatchNorm layers)</summary>
+	<description>
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): Yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Linux Ubuntu 14.04 running in Docker container (host is 18.04)
+TensorFlow installed from (source or binary): source
+TensorFlow version (use command below): 2.2.0
+Python version: 3.6.8
+Bazel version (if compiling from source): 0.29.1-1.0
+GCC/Compiler version (if compiling from source): 4.8.5
+CUDA/cuDNN version: 10.0
+GPU model and memory: Various, e.g. Nvidia RTX 2080 Ti
+
+Describe the current behavior
+In certain circumstances, TensorFlow appears to hang forever before starting training:
+
+Multinode training using MultiWorkerMirroredStrategy (the bug does not appear when using one worker with multiple GPUs, or with one GPU).
+NCCL communication (not 100% sure on this)
+A specific model, which seems to require SyncBatchNorm layers interleaved with Conv2D layers
+
+This seems to happen both on the Estimator and Keras frameworks - the output is slightly different but my guess is that it's the same bug.
+I've tried to test with tf-nightly, but unfortunately I've had difficulty getting the correct CUDA libraries for our particular setup and haven't been able to verify whether it is reproducible on tf-nightly. However, if you e.g. are unable to reproduce and would like me to take another look, please let me know.
+Describe the expected behavior
+TensorFlow should not hang forever. This toy model in particular finishes training in seconds, but when the bug is triggered, hangs for hours with no output.
+Standalone code to reproduce the issue
+Please note that this code must be run with multiple workers to reproduce the issue, and the TF_CONFIG environment variable should be set correspondingly according to your specific setup.
+As far as I can see, on Colab it is possible to have multiple GPUs on one worker, but I'm not sure how to set it up with multiple workers (with one GPU per worker). So I'm not sure if this problem can be reproduced on Colab. But if there is a way to use multiple workers, please point me at a guide and I can try to reproduce on Colab.
+Estimator code:
+&lt;denchmark-code&gt;import logging
+import os
+import shutil
+import sys
+
+import numpy as np
+import tensorflow as tf
+
+def setup_multi_node_training():
+    # IMPORTANT: SET UP TF_CONFIG FOR MULTINODE TRAINING HERE
+    os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
+    tf.config.set_soft_device_placement(True)
+    mirrored_strategy = tf.distribute.experimental.MultiWorkerMirroredStrategy(tf.distribute.experimental.CollectiveCommunication.NCCL)
+    # Constructs the configuration
+    run_config = tf.estimator.RunConfig(
+        train_distribute=mirrored_strategy,
+    )
+    return run_config
+
+def input_fn():
+    dataset = tf.data.Dataset.from_tensors([tf.random.normal(shape=[496, 496, 64])] * 3)
+    dataset = dataset.repeat()
+    return dataset
+
+def batch_norm(x, is_training):
+    layer = tf.keras.layers.experimental.SyncBatchNormalization(axis=-1)
+    x_norm = layer(x, is_training)
+    with tf.control_dependencies(layer.get_updates_for(x)):
+        x_norm = tf.identity(x_norm)
+    return x_norm
+
+def inference(features, is_training):
+    conv1 = tf.keras.layers.Conv2D(32, 3, padding="SAME")(features)
+    conv1bn = batch_norm(conv1, is_training)
+    deconv1bn = batch_norm(conv1bn, is_training)
+    conv2 = tf.keras.layers.Conv2D(32, 3, padding="SAME")(conv1bn)
+    conv2bn = batch_norm(conv2, is_training)
+    return tf.keras.layers.Concatenate()([conv1bn, deconv1bn, conv2bn])
+
+def compute_loss(predictions, labels, is_training):
+    return tf.reduce_mean(predictions)
+
+def model_fn(features, labels, mode):
+    global_step = tf.compat.v1.train.get_global_step()
+    is_training = mode == tf.estimator.ModeKeys.TRAIN
+
+    predictions = inference(features, is_training)
+    loss = compute_loss(predictions, labels, is_training)
+
+    optimizer = tf.compat.v1.train.GradientDescentOptimizer(1e-5)
+    train_op = optimizer.minimize(loss, global_step=global_step)
+
+    return tf.estimator.EstimatorSpec(mode, loss=loss, train_op=train_op)
+
+def main():
+    model_dir = "/tmp/output"
+    run_config_params = {
+        "save_checkpoints_steps": 100,
+        "save_summary_steps": 100,
+        "log_step_count_steps": 100,
+        "tf_random_seed": 0,
+        "keep_checkpoint_max": 1,
+        "model_dir": model_dir,
+    }
+    run_config = setup_multi_node_training().replace(**run_config_params)
+    estimator = tf.estimator.Estimator(model_fn=model_fn, config=run_config)
+
+    train_spec = tf.estimator.TrainSpec(input_fn=input_fn, max_steps=1000)
+
+    eval_spec = tf.estimator.EvalSpec(
+        input_fn=input_fn, steps=100, throttle_secs=0, start_delay_secs=0
+    )
+
+    print("Training and evaluating model...")
+    tf.estimator.train_and_evaluate(estimator, train_spec, eval_spec)
+
+if __name__ == "__main__":
+    main()
+&lt;/denchmark-code&gt;
+
+Keras code:
+&lt;denchmark-code&gt;import os
+
+import tensorflow as tf
+from tensorflow import keras
+
+class MyModel(keras.Model):
+    def __init__(self, **kwargs):
+        super().__init__(name="my_model", **kwargs)
+        self.conv1 = keras.layers.Conv2D(16, 3, padding="SAME")
+        self.sbn1 = keras.layers.experimental.SyncBatchNormalization()
+        self.sbn2 = keras.layers.experimental.SyncBatchNormalization()
+        self.conv2 = keras.layers.Conv2D(32, 3, padding="SAME")
+        self.sbn3 = keras.layers.experimental.SyncBatchNormalization()
+        self.concat = keras.layers.Concatenate()
+
+    def call(self, inputs, training=False):
+        conv1 = self.conv1(inputs)
+        conv1bn = self.sbn1(conv1, training)
+        conv1bn2 = self.sbn2(conv1bn, training)
+        conv2 = self.conv2(conv1bn)
+        conv2bn = self.sbn3(conv2, training)
+        return self.concat([conv1bn, conv1bn2, conv2bn])
+
+def get_dataset():
+    dataset = tf.data.Dataset.from_tensors(
+        [tf.random.normal(shape=[496, 496, 64])] * 3
+    )
+    dataset = dataset.repeat()
+    dataset = tf.data.Dataset.zip((dataset, dataset))
+    return dataset
+
+def main():
+    model_dir = "/tmp/keras_example"
+
+    # IMPORTANT: SET UP TF_CONFIG FOR MULTINODE TRAINING HERE
+    os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
+    tf.config.set_soft_device_placement(True)
+    mirrored_strategy = tf.distribute.experimental.MultiWorkerMirroredStrategy(tf.distribute.experimental.CollectiveCommunication.NCCL)
+
+    # Create dataset
+    train_dataset = get_dataset()
+
+    with strategy.scope():
+        model = MyModel()
+
+        model.compile(
+            optimizer=keras.optimizers.Adam(),
+            loss=keras.losses.MeanSquaredError(),
+        )
+
+    model.fit(x=train_dataset, steps_per_epoch=100, epochs=1)
+
+if __name__ == "__main__":
+    main()
+&lt;/denchmark-code&gt;
+
+
+There are three log files: &lt;denchmark-link:https://github.com/tensorflow/tensorflow/files/5038681/estimator_log_1.txt&gt;Estimator log&lt;/denchmark-link&gt;
+, &lt;denchmark-link:https://drive.google.com/file/d/1-4abJDs1QWlHgFkFzbW6PGjZ4hXoLbpf/view?usp=sharing&gt;Estimator log with more debug output&lt;/denchmark-link&gt;
+ ( and ) (note this is a Google Drive link as the file is &gt;20 MB), &lt;denchmark-link:https://github.com/tensorflow/tensorflow/files/5038696/keras_log_1.txt&gt;Keras log&lt;/denchmark-link&gt;
+. I had trouble getting the Keras log with debug output so I haven't included that but will update if I can get it.
+Note that the second Estimator log is gigantic, but most of the log is output in about a minute, and then the last hundred lines or so seem to be of the job actually hanging until it is killed after about 15 minutes, with this output repeated:
+&lt;denchmark-code&gt;0: 2020-08-06 00:22:30.510236: I external/org_tensorflow/tensorflow/core/framework/model.cc:892] Starting optimization of tunable parameters with HillClimb
+0: 2020-08-06 00:22:30.510355: I external/org_tensorflow/tensorflow/core/framework/model.cc:943] Number of tunable parameters: 0
+0: 2020-08-06 00:22:30.510377: I external/org_tensorflow/tensorflow/core/kernels/data/model_dataset_op.cc:191] Waiting for 60000 ms.
+&lt;/denchmark-code&gt;
+
+It seems somewhat bizarre that if there are 0 parameters to tune, TensorFlow should still try to repeatedly optimize the nonexistent tunable parameters. I wonder if there's some issue with the model.cc code not properly signaling that it has finished, if there are no tunable parameters? I see that in line 1485-1487 of core/framework/model.cc, there is some code that seems to be doing something with the mutex and notifying, but this block would be entirely skipped if there are no tunable parameters, and that might contribute to the infinite loop here.
+Thanks so much!
+	</description>
+	<comments>
+		<comment id='1' author='MinasTyuru' date='2020-08-07T08:17:42Z'>
+		I have same problem with you
+		</comment>
+		<comment id='2' author='MinasTyuru' date='2020-08-08T19:34:50Z'>
+		Hi &lt;denchmark-link:https://github.com/MinasTyuru&gt;@MinasTyuru&lt;/denchmark-link&gt;
+, confirming that I was able to reproduce this behavior with the Keras example in TF2.2. I ran some other experiments to sanity check, and the following completed training successfully:
+MWMS, one machine,.
+MWMS, one machine,
+MWMS, two machines,
+I tried in nightly as well, and the training started and it seemed promising. But then froze at 3 steps.
+		</comment>
+		<comment id='3' author='MinasTyuru' date='2020-08-13T23:00:49Z'>
+		Thanks Nikita! One minor note, I was never able to get the logs for the Keras version to work. For some reason turning on verbose logging causes it to segfault. I didn't submit a separate issue as I thought maybe it was related to this issue. But the Estimator version should work if the Keras version doesn't.
+		</comment>
+		<comment id='4' author='MinasTyuru' date='2020-08-21T21:15:35Z'>
+		&lt;denchmark-link:https://github.com/nikitamaia&gt;@nikitamaia&lt;/denchmark-link&gt;
+ Hi Nikita, just wanted to check if there's been any movement on this and if there's anything I can do to help? This would unblock substantial performance improvements for us.
+Also wanted to say thank you again for all your work on the various issues I've submitted - they would have been very difficult to resolve by ourselves and it unblocked a lot of work. We really appreciate it.
+		</comment>
+		<comment id='5' author='MinasTyuru' date='2020-08-25T14:55:12Z'>
+		Absolutely! Very happy to help. And thank you for always submitting issues with reproducible code, logs, and other important info : )
+Thanks for the reminder, this issue is currently being investigated and the sync batch norm layers do seem to be the culprit. I will update this thread with some more information shortly.
+		</comment>
+		<comment id='6' author='MinasTyuru' date='2020-09-04T21:15:51Z'>
+		&lt;denchmark-link:https://github.com/nikitamaia&gt;@nikitamaia&lt;/denchmark-link&gt;
+ Were you able to get any more information on this? We may be able to do some investigation on our end if we have an idea of e.g. which part of the code is hanging.
+		</comment>
+		<comment id='7' author='MinasTyuru' date='2020-09-12T00:22:20Z'>
+		Hi &lt;denchmark-link:https://github.com/MinasTyuru&gt;@MinasTyuru&lt;/denchmark-link&gt;
+, we were able to identify the root cause as the SyncBatchNorm layers that don't have control dependencies. The SyncBatchNorm layer launches NCCLAllRecduce in every step, so it is possible the two layers launch NCCLAllReduce on different machines in different order, leading to the program hanging. So far it seems like adding in the control deps is the best option but we're still considering the effects that might have on other use cases.
+		</comment>
+		<comment id='8' author='MinasTyuru' date='2020-09-12T00:27:16Z'>
+		&lt;denchmark-link:https://github.com/nikitamaia&gt;@nikitamaia&lt;/denchmark-link&gt;
+ Oh, fantastic! For the time being, I think adding control dependencies is a totally fine workaround for us.
+Just to be clear, the issue here is that there are three SyncBatchNorm operations, whose outputs are then concatenated into a big tensor, but they can be executed in any order, is that correct? So therefore to resolve this, we would force an ordering something like this:
+&lt;denchmark-code&gt;def inference(features, is_training):
+    conv1 = tf.keras.layers.Conv2D(32, 3, padding="SAME")(features)
+    conv1bn = batch_norm(conv1, is_training)
+    with tf.control_dependencies([conv1bn]):
+        deconv1bn = batch_norm(conv1bn, is_training)
+    conv2 = tf.keras.layers.Conv2D(32, 3, padding="SAME")(conv1bn)
+    with tf.control_dependencies([deconv1bn]):
+        conv2bn = batch_norm(conv2, is_training)
+    return tf.keras.layers.Concatenate()([conv1bn, deconv1bn, conv2bn]) # must execute in this order
+&lt;/denchmark-code&gt;
+
+Is that right?
+		</comment>
+		<comment id='9' author='MinasTyuru' date='2020-09-14T16:13:37Z'>
+		&lt;denchmark-link:https://github.com/MinasTyuru&gt;@MinasTyuru&lt;/denchmark-link&gt;
+ unfortunately I think that was the first thing we tried, but it still didn't solve the problem. It seems that only adds the control deps on the forward pass, and then out of order NCCL launches happen on the backward pass and the program hangs. Let me know if you see otherwise, but this is why we were looking into a more longterm fix.
+		</comment>
+		<comment id='10' author='MinasTyuru' date='2020-09-16T17:56:11Z'>
+		I'm currently trying to reproduce on our end - I had a few issues so might take a little longer than expected. I did see jobs that seem to start training but have NaN loss, but I think that might be expected since the input is all-ones - I'll try changing it to random.
+I was thinking that something like this might work for the dependencies. Assuming Grappler doesn't just prune this operation out, it should theoretically force an ordering on both the forward and backward pass, because x actually depends on y numerically and therefore the gradient of y should wait for the gradient of x to be calculated.
+&lt;denchmark-code&gt;def dependency(x, y):
+    """Returns an instance of x that nominally depends on y (but in reality
+    is identical to x).
+    """
+    return x + 0 * tf.reduce_mean(y)
+
+def inference(features, is_training):
+    conv1 = tf.keras.layers.Conv2D(32, 3, padding="SAME")(features)
+    conv1bn = batch_norm(conv1, is_training)
+    deconv1bn = batch_norm(conv1bn, is_training)
+    # Create fake dependency on deconv1bn to enforce ordering
+    conv1bn = dependency(conv1bn, deconv1bn)
+    conv2 = tf.keras.layers.Conv2D(32, 3, padding="SAME")(conv1bn)
+    conv2bn = batch_norm(conv2, is_training)
+    return tf.keras.layers.Concatenate()([conv1bn, deconv1bn, conv2bn])
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='11' author='MinasTyuru' date='2020-09-21T20:19:46Z'>
+		&lt;denchmark-link:https://github.com/nikitamaia&gt;@nikitamaia&lt;/denchmark-link&gt;
+ The workaround you suggested, i.e.:
+&lt;denchmark-code&gt;def inference(features, is_training):
+    conv1 = tf.keras.layers.Conv2D(32, 3, padding="SAME")(features)
+    conv1bn = batch_norm(conv1, is_training)
+    deconv1bn = batch_norm(conv1bn, is_training)
+    with tf.control_dependencies([deconv1bn]):
+        conv2 = tf.keras.layers.Conv2D(32, 3, padding="SAME")(conv1bn)
+    conv2bn = batch_norm(conv2, is_training)
+    return tf.keras.layers.Concatenate()([conv1bn, deconv1bn, conv2bn])
+&lt;/denchmark-code&gt;
+
+seems to work on my end - training completes without any issues. And the one in the comment above also works. I also verified that without the workaround, training still hangs. Thanks!
+		</comment>
+		<comment id='12' author='MinasTyuru' date='2020-09-23T20:10:00Z'>
+		We're also working on a workaround in SyncBatchNorm layer, which should be included in 2.4. Meanwhile, a complete fix is on track too.
+		</comment>
+		<comment id='13' author='MinasTyuru' date='2020-10-09T22:20:43Z'>
+		A workaround is submitted and will be included in 2.4.
+		</comment>
+		<comment id='14' author='MinasTyuru' date='2020-10-10T00:15:22Z'>
+		&lt;denchmark-link:https://github.com/crccw&gt;@crccw&lt;/denchmark-link&gt;
+ Thanks so much, Ran!
+		</comment>
+		<comment id='15' author='MinasTyuru' date='2020-10-18T15:12:30Z'>
+		@ MinasTyuru  Closing the issue since it is working with workaround mentioned above. Thanks!
+		</comment>
+		<comment id='16' author='MinasTyuru' date='2020-10-18T15:12:32Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/42111&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/42111&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

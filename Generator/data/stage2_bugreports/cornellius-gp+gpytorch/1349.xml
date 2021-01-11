@@ -1,0 +1,227 @@
+<bug id='1349' author='monabf' open_date='2020-11-14T11:57:15Z' closed_time='2020-11-28T20:14:47Z'>
+	<summary>[Question] Sparse GPs for Batch Independent MultiOutputs slow prediction?</summary>
+	<description>
+&lt;denchmark-h:h1&gt;Question&lt;/denchmark-h&gt;
+
+Thanks for this great package!
+Not really a bug, rather a question. I need to train a GP with 20,000x7 training inputs, 20,000x5 training outputs, and 40,000x7 test inputs. My first call was to look into the implementation of sparse GPs, because that's what I usually use with GPy. I implemented a sparse + batch independent multioutput GP model class as in issue &lt;denchmark-link:https://github.com/cornellius-gp/gpytorch/issues/1043&gt;#1043&lt;/denchmark-link&gt;
+ and tested it with the UCI elevators dataset from the &lt;denchmark-link:https://docs.gpytorch.ai/en/v1.1.1/examples/02_Scalable_Exact_GPs/SGPR_Regression_CUDA.html&gt;SGPR tutorial&lt;/denchmark-link&gt;
+.
+However, I noticed that while training runs as expected, prediction is unreasonably slow. Attached is a small example comparing training and prediction time with GPyTorch and GPy. The difference gets much larger as the number of output dimensions, training samples or inducing points grows.
+So here are my questions:
+
+How come prediction takes so long with the sparse + multioutput GP model from #1043? Is there a bug somewhere, or is this actually expected?
+Is it just a bad call to try using SGPR with multioutputs? I don't care which method I am using, I just need to be able to train large, multioutput GPs efficiently. This will mostly be done on GPU, but I would still like it to run reasonably on CPU so I can do some tests locally. With sparse GPs from GPy my use case ran in around 2h, which I would consider reasonable on CPU for tests, but with my current GPyTorch implementation prediction alone takes about 20h... I am open to suggestions!
+
+Thanks a lot for your help.
+&lt;denchmark-h:h2&gt;To reproduce&lt;/denchmark-h&gt;
+
+import time
+import urllib.request
+from math import floor
+
+import GPy
+import gpytorch
+import torch
+from gpytorch.distributions import MultivariateNormal
+from gpytorch.kernels import ScaleKernel, RBFKernel, InducingPointKernel
+from gpytorch.means import ConstantMean
+from scipy.io import loadmat
+
+if __name__ == '__main__':
+    # Run GPyTorch SGPR + independent multioutputs example
+    # https://docs.gpytorch.ai/en/v1.2.1/examples/02_Scalable_Exact_GPs/SGPR_Regression_CUDA.html
+    # https://github.com/cornellius-gp/gpytorch/issues/1043
+    print('Downloading \'elevators\' UCI dataset...')
+    urllib.request.urlretrieve(
+        'https://drive.google.com/uc?export=download&amp;id=1jhWL3YUHvXIaftia4qeAyDwVxo6j1alk',
+        '../elevators.mat')
+    output_size = 2
+    data = torch.Tensor(loadmat('../elevators.mat')['data'])
+    X = data[:, :-1]
+    X = X - X.min(0)[0]
+    X = 2 * (X / X.max(0)[0]) - 1
+    y = data[:, -1]
+    # MAKE MULTIOUTPUT DATA
+    y = y.reshape(-1, 1)
+    y = y.repeat(1, output_size)
+    print(X.shape, y.shape)
+    train_n = int(floor(0.8 * len(X)))
+    train_x = X[:train_n, :].contiguous()
+    train_y = y[:train_n].contiguous()
+    test_x = X[train_n:, :].contiguous()
+    test_y = y[train_n:].contiguous()
+    if torch.cuda.is_available():
+        train_x, train_y, test_x, test_y = train_x.cuda(), train_y.cuda(), test_x.cuda(), test_y.cuda()
+    # CONVERT TO BATCH GP
+    train_x = train_x.repeat(output_size, 1, 1)
+    train_y = train_y.transpose(-2, -1)
+    test_x = test_x.repeat(output_size, 1, 1)
+    test_y = test_y.transpose(-2, -1)
+    print(train_x.shape, train_y.shape, test_x.shape)
+
+
+    class GPRegressionModel(gpytorch.models.ExactGP):
+        def __init__(self, train_x, train_y, likelihood):
+            super(GPRegressionModel, self).__init__(train_x, train_y,
+                                                    likelihood)
+            self.mean_module = ConstantMean(
+                batch_shape=torch.Size([output_size]))
+            self.base_covar_module = ScaleKernel(RBFKernel(
+                batch_shape=torch.Size([output_size])),
+                batch_shape=torch.Size([output_size]))
+            self.covar_module = InducingPointKernel(
+                self.base_covar_module,
+                inducing_points=train_x[:, :500, :],
+                likelihood=likelihood)
+
+        def forward(self, x):
+            mean_x = self.mean_module(x)
+            covar_x = self.covar_module(x)
+            return MultivariateNormal(mean_x, covar_x)
+
+
+    likelihood = gpytorch.likelihoods.GaussianLikelihood(
+        batch_shape=torch.Size([output_size]))
+    model = GPRegressionModel(train_x, train_y, likelihood)
+    if torch.cuda.is_available():
+        model = model.cuda()
+        likelihood = likelihood.cuda()
+    # Train
+    training_iterations = 50
+    model.train()
+    likelihood.train()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
+    start_whole = time.time()
+    for i in range(training_iterations):
+        start = time.time()
+        # Zero backprop gradients
+        optimizer.zero_grad()
+        # Get output from model
+        output = model(train_x)
+        # Calc loss and backprop derivatives
+        loss = -mll(output, train_y).sum()
+        loss.backward()
+        end = time.time()
+        print('Iter %d/%d - Loss: %.3f' % (
+            i + 1, training_iterations, loss.item()), 'in', str(end - start))
+        optimizer.step()
+        torch.cuda.empty_cache()
+    end_whole = time.time()
+    print('GPyTorch training time', str(end_whole - start_whole))
+    model.eval()
+    likelihood.eval()
+    start = time.time()
+    with gpytorch.settings.max_preconditioner_size(10), torch.no_grad():
+        with gpytorch.settings.max_root_decomposition_size(
+                30), gpytorch.settings.fast_pred_var():
+            preds = model(test_x)
+    end = time.time()
+    print('predict', str(test_x.shape[1]), 'in', str(end - start))
+    print('Test MAE: {}'.format(torch.mean(torch.abs(preds.mean - test_y))))
+
+    # Compare GPy
+    train_x = X[:train_n, :].contiguous()
+    train_y = y[:train_n].contiguous()
+    test_x = X[train_n:, :].contiguous()
+    test_y = y[train_n:].contiguous()
+    gpykernel = GPy.kern.RBF(input_dim=train_x.numpy().shape[1], ARD=True)
+    gpymodel = GPy.core.SparseGP(train_x.numpy(),
+                                 train_y.numpy(),
+                                 train_x.numpy()[:500, :],
+                                 kernel=gpykernel,
+                                 likelihood=GPy.likelihoods.Gaussian(),
+                                 inference_method=GPy.inference.latent_function_inference.VarDTC())
+    start = time.time()
+    gpymodel.optimize(messages=True, max_iters=50)
+    end = time.time()
+    print('GPy training time', str(end - start))
+    start = time.time()
+    gpymean, gpyvar = gpymodel.predict(test_x.numpy())
+    end = time.time()
+    print('predict', str(len(test_x)), 'in', str(end - start))
+    print('Test MAE: {}'.format(torch.mean(torch.abs(torch.tensor(gpymean) -
+                                                     test_y))))
+** On my laptop's CPU **
+&lt;denchmark-code&gt;GPyTorch training time 182.81384825706482
+predict 3320 in 6.573011159896851
+Test MAE: 0.07266882807016373
+
+GPy training time 220.74766993522644
+predict 3320 in 0.06382608413696289
+Test MAE: 0.06792577020335429
+&lt;/denchmark-code&gt;
+
+** On GPU with Google Colab **
+&lt;denchmark-code&gt;GPyTorch training time 12.468220949172974
+predict 3320 in 0.2444145679473877
+Test MAE: 0.07270058244466782
+
+GPy training time 340.8614845275879
+predict 3320 in 0.11290717124938965
+Test MAE: 0.06792590803210088
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h2&gt;Expected Behavior&lt;/denchmark-h&gt;
+
+I would expect training and prediction time for both GPyTorch and GPy to be of the same order of magnitude on CPU, GPyTorch an order of magnitude faster on GPU. For training this is approximately the case, but not for prediction...
+&lt;denchmark-h:h2&gt;System information&lt;/denchmark-h&gt;
+
+Please complete the following information:
+
+GPyTorch version 1.2.0
+PyTorch version 1.6.0
+Mac OS Catalina
+
+	</description>
+	<comments>
+		<comment id='1' author='monabf' date='2020-11-16T13:29:48Z'>
+		I think the long prediction time is an artifact of inefficiently performing the K_XZ K_ZZ^{-1} K_ZX + \sigma^2 I solves using the Nystrom approximation. If we explicitly re-arranged the terms using Woodbury, we could perform inverses and log determinants using a single matrix solve.
+&lt;denchmark-link:https://github.com/jacobrgardner&gt;@jacobrgardner&lt;/denchmark-link&gt;
+ it might make sense to implement a NystromLazyTensor (to become NystromLinearOperator) that would explicitly perform Woodbury? Thoughts?
+		</comment>
+		<comment id='2' author='monabf' date='2020-11-16T15:42:43Z'>
+		&lt;denchmark-link:https://github.com/gpleiss&gt;@gpleiss&lt;/denchmark-link&gt;
+ while we're at it, we could generalize all  linear operators and use the matrix inversion lemma and matrix determinant lemma. This is probably a good idea for LinearKernel too. ?
+Probably any time we can do a direct solve in the same asymptotic complexity as CG we should prefer the direct solve.
+Since you've been taking on the torch function stuff, I can get to work on this.
+		</comment>
+		<comment id='3' author='monabf' date='2020-11-17T08:38:26Z'>
+		Thanks for looking into this! I must admit that I don't understand much of what you are saying. But it looks like you should be able to fix this, so please keep me up to date! And if ever you think it would be better to use another one of your methods for my use case, feel free to let me know.
+		</comment>
+		<comment id='4' author='monabf' date='2020-11-28T20:14:47Z'>
+		Should be fixed by &lt;denchmark-link:https://github.com/cornellius-gp/gpytorch/pull/1356&gt;#1356&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='5' author='monabf' date='2020-11-30T09:43:23Z'>
+		After updating to the latest version of GPyTorch, running the exact same code above raises an error in the forward function. &lt;denchmark-link:https://github.com/gpleiss&gt;@gpleiss&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/jacobrgardner&gt;@jacobrgardner&lt;/denchmark-link&gt;
+ could something have gone wrong with this fix?
+Thanks for your help!
+Output of the example code after updating GPyTorch:
+&lt;denchmark-code&gt;Traceback (most recent call last):
+  File "issue.py", line 87, in &lt;module&gt;
+    loss = -mll(output, train_y).sum()
+  File "/Users/mona/PhD_code/observer_add_GPyTorch/venv/lib/python3.8/site-packages/gpytorch/module.py", line 28, in __call__
+    outputs = self.forward(*inputs, **kwargs)
+  File "/Users/mona/PhD_code/observer_add_GPyTorch/venv/lib/python3.8/site-packages/gpytorch/mlls/exact_marginal_log_likelihood.py", line 62, in forward
+    res = output.log_prob(target)
+  File "/Users/mona/PhD_code/observer_add_GPyTorch/venv/lib/python3.8/site-packages/gpytorch/distributions/multivariate_normal.py", line 141, in log_prob
+    inv_quad, logdet = covar.inv_quad_logdet(inv_quad_rhs=diff.unsqueeze(-1), logdet=True)
+  File "/Users/mona/PhD_code/observer_add_GPyTorch/venv/lib/python3.8/site-packages/gpytorch/lazy/low_rank_root_added_diag_lazy_tensor.py", line 98, in inv_quad_logdet
+    self_inv_rhs = self._solve(inv_quad_rhs)
+  File "/Users/mona/PhD_code/observer_add_GPyTorch/venv/lib/python3.8/site-packages/gpytorch/lazy/low_rank_root_added_diag_lazy_tensor.py", line 42, in _solve
+    chol_cap_mat = self.chol_cap_mat
+  File "/Users/mona/PhD_code/observer_add_GPyTorch/venv/lib/python3.8/site-packages/gpytorch/utils/memoize.py", line 59, in g
+    return _add_to_cache(self, cache_name, method(self, *args, **kwargs), *args, kwargs_pkl=kwargs_pkl)
+  File "/Users/mona/PhD_code/observer_add_GPyTorch/venv/lib/python3.8/site-packages/gpytorch/lazy/low_rank_root_added_diag_lazy_tensor.py", line 31, in chol_cap_mat
+    C = ConstantDiagLazyTensor(torch.ones(V.batch_shape, device=V.device, dtype=V.dtype), V.shape[-2])
+  File "/Users/mona/PhD_code/observer_add_GPyTorch/venv/lib/python3.8/site-packages/gpytorch/lazy/diag_lazy_tensor.py", line 221, in __init__
+    self._diag = diag_values.expand(*diag_values.shape[:-1], diag_shape)
+RuntimeError: The expanded size of the tensor (500) must match the existing size (2) at non-singleton dimension 0.  Target sizes: [500].  Tensor sizes: [2]
+&lt;/denchmark-code&gt;
+
+		</comment>
+	</comments>
+</bug>

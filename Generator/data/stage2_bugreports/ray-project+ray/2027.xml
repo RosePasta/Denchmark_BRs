@@ -1,0 +1,131 @@
+<bug id='2027' author='pschafhalter' open_date='2018-05-10T01:45:24Z' closed_time='2018-05-18T19:23:33Z'>
+	<summary>[DataFrame] calling __delitem__ on the last column errors</summary>
+	<description>
+This bug affects calling __setitem__ on the last column as well.
+Code that causes the bug:
+df = rdf.DataFrame({"col1": lrange(3), "col2": lrange(3)})
+del df["col2"]
+Output:
+&lt;denchmark-code&gt;Remote function ray.dataframe.utils._deploy_func failed with:
+
+Traceback (most recent call last):
+  File "/home/peter/workspace/ray/python/ray/dataframe/utils.py", line 132, in _deploy_func
+    return func(dataframe, *args)
+  File "/home/peter/workspace/ray/python/ray/dataframe/dataframe.py", line 4728, in del_helper
+    cols = df.columns[to_delete]  # either int or an array of ints
+  File "/home/peter/workspace/ray_env/lib/python3.6/site-packages/pandas/core/indexes/range.py", line 544, in __getitem__
+    return super_getitem(key)
+  File "/home/peter/workspace/ray_env/lib/python3.6/site-packages/pandas/core/indexes/base.py", line 1754, in __getitem__
+    result = getitem(key)
+IndexError: index 0 is out of bounds for axis 1 with size 0
+
+
+  You can inspect errors by running
+
+      ray.error_info()
+
+  If this driver is hanging, start a new one with
+
+      ray.init(redis_address="192.168.0.114:49682")
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='pschafhalter' date='2018-05-15T21:05:59Z'>
+		&lt;denchmark-h:h2&gt;Issue&lt;/denchmark-h&gt;
+
+The issue is we had redundancy in calls, inside `delitem, we called:
+        self._row_partitions = _map_partitions(
+            del_helper, self._row_partitions, to_delete)
+and then we called:
+            self._col_partitions[i] = _deploy_func.remote(
+                del_helper, self._col_partitions[i], to_delete_in_partition)
+because we already deleted the data, the column deletion won't succeed.
+The implementation note in docstring states:
+&lt;denchmark-code&gt;Notes: This operation happen on row and column partition
+                  simultaneously. No rebuild.
+&lt;/denchmark-code&gt;
+
+but setting row_partitions and col_partitions automatically "rebuild" the block paritions via _create_block_partitions.
+&lt;denchmark-h:h2&gt;Fix&lt;/denchmark-h&gt;
+
+The fix is simply
+
+Just perform the __delitem__ in one of the row/col partition scheme
+Leave the col_metadata reset computation as-is.
+
+&lt;denchmark-h:h2&gt;Question&lt;/denchmark-h&gt;
+
+I would go with fixing it by removing the row_parititions schemes because:
+
+col_paritions should be generally faster and memory efficient than row_parititions because
+- row_partitions create intermediate "copy" of each row
+- col_partitions, with some tweaks, need only touch the part of columns that need to be deleted without memory overhead
+
+&lt;denchmark-link:https://github.com/devin-petersohn&gt;@devin-petersohn&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/pschafhalter&gt;@pschafhalter&lt;/denchmark-link&gt;
+ comments?
+		</comment>
+		<comment id='2' author='pschafhalter' date='2018-05-15T23:02:58Z'>
+		&lt;denchmark-link:https://github.com/simon-mo&gt;@simon-mo&lt;/denchmark-link&gt;
+ Using  makes sense to me in terms of correctness. I think we might be able to improve performance even more if   modifies  directly, using  to find the blocks that we need to modify.
+		</comment>
+		<comment id='3' author='pschafhalter' date='2018-05-16T07:52:26Z'>
+		&lt;denchmark-link:https://github.com/pschafhalter&gt;@pschafhalter&lt;/denchmark-link&gt;
+ Good point. I'll go head and refactor  to use block partitions.
+		</comment>
+		<comment id='4' author='pschafhalter' date='2018-05-16T19:40:50Z'>
+		Thanks for looking into this &lt;denchmark-link:https://github.com/simon-mo&gt;@simon-mo&lt;/denchmark-link&gt;
+! Modifying  is the most efficient. Additionally, is it possible to remove empty ? It may not be worth it considering we don't expose the partitioning to the user, and managing everything ourselves we can get away without some of this cleanup.
+		</comment>
+		<comment id='5' author='pschafhalter' date='2018-05-16T21:11:52Z'>
+		&lt;denchmark-link:https://github.com/devin-petersohn&gt;@devin-petersohn&lt;/denchmark-link&gt;
+
+Yes we can do that. The logic will simply be: if removing this column will create empty block, just pop this column in the  array, and modify .
+One caveat is that I might need to make a copy of our block partition ObjectID array, given that delete the item in original won't affect "view":
+&lt;denchmark-code&gt;In [4]: df_view = df.iloc[1:,:]
+
+In [5]: df
+Out[5]:
+   a  b
+0  1  2
+1  1  2
+2  1  2
+3  1  2
+
+In [6]: del df['b']
+
+In [7]: df_view
+Out[7]:
+   a  b
+1  1  2
+2  1  2
+3  1  2
+
+In [8]: df
+Out[8]:
+   a
+0  1
+1  1
+2  1
+3  1
+&lt;/denchmark-code&gt;
+
+basically, I need to think about how to decouple the view and the original in this situation. But it's doable.
+		</comment>
+		<comment id='6' author='pschafhalter' date='2018-05-16T21:24:55Z'>
+		For this pass, let's just focus on fixing the bug. There are other methods that will be affected by this, and we should probably do this with all of them at the same time.
+		</comment>
+		<comment id='7' author='pschafhalter' date='2018-05-18T19:23:33Z'>
+		Resolved with &lt;denchmark-link:https://github.com/ray-project/ray/pull/2080&gt;#2080&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='8' author='pschafhalter' date='2018-05-19T07:56:01Z'>
+		I'm encountering the same issue on __getitem__
+		</comment>
+		<comment id='9' author='pschafhalter' date='2018-05-19T08:08:02Z'>
+		&lt;denchmark-link:https://github.com/kunalgosar&gt;@kunalgosar&lt;/denchmark-link&gt;
+ can you post a code snippet that can reproduce your issue? I can't reproduce it right now
+		</comment>
+	</comments>
+</bug>

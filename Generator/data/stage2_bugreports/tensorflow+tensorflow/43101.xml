@@ -1,0 +1,203 @@
+<bug id='43101' author='pandrey-fr' open_date='2020-09-10T09:40:50Z' closed_time='2020-09-10T11:34:59Z'>
+	<summary>Graph mode failure with mask-fed RNN layers within a train_step loop on GPU.</summary>
+	<description>
+System information
+
+Have I written custom code: yes
+OS Platform and Distribution: Linux Mint 19.1 &amp; CentOS 8
+TensorFlow installed from: binary (pip)
+TensorFlow version: 2.2.0 (v2.2.0-rc4-8-g2b96f3662b)
+Python version: 3.6.9
+CUDA/cuDNN version: 10.1 / 7
+GPU model and memory: Quadro P1000 (4GB) &amp; RTX 6000 (24GB)
+
+Describe the current behavior
+Model training fails in graph mode when the custom tf.keras.Model.train_step involves both:
+
+a loop (except if iterating over an int and not a tensor)
+a tf.keras.layers.RNN inheriting layer
+the passing of a mask to said layer (whether implicitly based on previous layer's compute_mask output or manually passing a deterministic mask, even an whole-true one)
+
+The error raised has the following format:
+&lt;denchmark-code&gt;InvalidArgumentError: 2 root error(s) found.
+  (0) Invalid argument:  InstantiateOptions.input_devices must have the same length as the number of arguments: input_devices length = 49 number of arguments = 50
+	 [[{{node while/body/_1/StatefulPartitionedCall}}]]
+	 [[while/exit/_59/_46]]
+  (1) Invalid argument:  InstantiateOptions.input_devices must have the same length as the number of arguments: input_devices length = 49 number of arguments = 50
+	 [[{{node while/body/_1/StatefulPartitionedCall}}]]
+0 successful operations.
+0 derived errors ignored. [Op:__inference_train_function_&lt;some_id_number&gt;]
+
+Function call stack:
+train_function -&gt; train_function
+&lt;/denchmark-code&gt;
+
+It appears to be raised on the second call to self._get_gradients, i.e. when entering the loop within the custom train_step and passing inputs to the model for the second time.
+Unresolved, automatically-closed issue &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/39827&gt;#39827&lt;/denchmark-link&gt;
+ appears to be similar to mine.
+I hereby provide a minimal example to reproduce this issue, which is arguably an edge-case but has caused me quite some trouble. In this example, I implement some gradient stacking as part of the custom training step, in a non-general way for the sake of simplicity. Note that in this example, since the number of substeps is fixed, the loop could be rewrote as a Python for loop over an int; then, the issue does not arise. In real life though, I am using a generalized gradient stacking implementation that requires iterating over tensors (hence my providing here a tf.while_loop based example).
+Describe the expected behavior
+I would expect all four tested cases to run without triggering an exception (as they do in 2.3 or on CPU), so that proper masking may be used with RNNs within gradient stacking training loops in graph mode, which is the most desirable setting in terms of both model correctness and code optimization.
+Standalone code to reproduce the issue
+The following script will raise the issue if run on GPU with TF2.2.
+Using a GRU layer and/or a Bidirectional wrapper does not alter the issue.
+Note that is will not raise the issue if run on CPU or with TF2.3.
+# coding: utf-8
+
+"""Minimal example script for an RNN issue within custom train loops."""
+
+import numpy as np
+import tensorflow as tf
+
+
+class StackedModel(tf.keras.Model):
+    """Minimal gradient stacking example Model subclass."""
+
+    def train_step(self, data):
+        # NOTE: here we assume data is a single (x, y) tuple
+        #       in order to provide with a minimal example
+        inputs, y_true = data
+        size = tf.shape(inputs)[0] // 4
+        # Compute gradients on the batch's first quarter.
+        gradients = self._get_gradients(inputs[:size], y_true[:size])
+        # Define a process to compute and stack gradients.
+        def process_quarter(idx, gradients):
+            """Compute gradients on a data sub-batch and stack them."""
+            grads_loc = self._get_gradients(
+                inputs[idx * size:(idx + 1) * size],
+                y_true[idx * size:(idx + 1) * size]
+            )
+            gradients = [
+                self._add_gradients(a, b) for a, b in zip(gradients, grads_loc)
+            ]
+            return tf.add(idx, 1), gradients
+        # Iteratively process the remaining data quarters using the former.
+        _, gradients = tf.while_loop(
+            cond=lambda idx, _: tf.math.less(idx, 4),
+            body=process_quarter,
+            loop_vars=[tf.constant(1), gradients],
+            parallel_iterations=1
+        )
+        # Apply the aggregated gradients.
+        grads_and_vars = zip(gradients, self.trainable_variables)
+        self.optimizer.apply_gradients(grads_and_vars)
+        # Return the current values of the loss and metrics.
+        return {m.name: m.result() for m in self.metrics}
+
+    def _get_gradients(self, inputs, y_true):
+        """Compute gradients for given (x, y) data."""
+        with tf.GradientTape() as tape:
+            y_pred = self(inputs, training=True)
+            loss = self.compiled_loss(y_true, y_pred)
+        return tape.gradient(loss, self.trainable_variables)
+
+    @staticmethod
+    def _add_gradients(grad_a, grad_b):
+        """Return the sum of two gradient objects (Tensor of IndexedSlices)."""
+        if not isinstance(grad_b, type(grad_a)):
+            raise TypeError("Trying to add objects of distinct types.")
+        if isinstance(grad_a, tf.Tensor):
+            return tf.add(grad_a, grad_b)
+        if isinstance(grad_a, tf.IndexedSlices):
+            values = tf.concat([grad_a.values, grad_b.values], axis=0)
+            indices = tf.concat([grad_a.indices, grad_b.indices], axis=0)
+            return tf.IndexedSlices(values, indices, grad_a.dense_shape)
+
+
+def build_example_model(run_eagerly, avoid_mask):
+    """Return a keras Model for binary classification of tokens sequences.
+
+    This model expects an input batch of tokens, with zero values
+    being treated as padding, and thus masked. An embedding layer
+    encodes the tokens into vectors in R^{128}, then a LSTM layer
+    produces sequence-wise vectors in R^{128}, which are finally
+    transformed into binary probabilities by a dense layer.
+    """
+    inputs = tf.keras.Input((None,), dtype=tf.int32)
+    emb = tf.keras.layers.Embedding(
+        input_dim=200,
+        output_dim=128,
+        mask_zero=True
+    )
+    rnn = tf.keras.layers.LSTM(128)
+    out = tf.keras.layers.Dense(2, 'softmax')
+    embedding = emb(inputs)
+    if avoid_mask:
+        embedding = rnn(embedding, mask=None)
+    else:
+        embedding = rnn(embedding)  # mask is passed implicitly
+    model = StackedModel(inputs, out(embedding))
+    model.compile(loss='binary_crossentropy', run_eagerly=run_eagerly)
+    return model
+
+
+def build_example_dataset():
+    """Return a tf.data.Dataset of batched right-padded tokens sequences."""
+    # Define a random tokens sequences generator.
+    def generator():
+        """Yield sequences of 8 to 32 random ints in (1, 200(, plus a label."""
+        sizes = 8 + np.random.choice(24, size=640, replace=True)
+        for i in range(640):
+            seq = 1 + np.random.choice(199, size=sizes[i], replace=True)
+            lab = tf.one_hot(np.random.choice(2), depth=2)
+            yield (seq, lab)
+    # Set up and return a Dataset made of batches of 32 padded sequences.
+    dst = tf.data.Dataset.from_generator(
+        generator,
+        output_shapes=((None,), (2,)),
+        output_types=(tf.int32, tf.float32)
+    )
+    return dst.padded_batch(32, padded_shapes=((None,), (2,)))
+
+
+def main():
+    """Minimal demonstration script."""
+    dst = build_example_dataset().repeat()
+    print('Running eagerly without masking at LSTM.')
+    model = build_example_model(run_eagerly=True, avoid_mask=True)
+    model.fit(dst, steps_per_epoch=20, epochs=3)
+    print('Running eagerly with masking at LSTM.')
+    model = build_example_model(run_eagerly=True, avoid_mask=False)
+    model.fit(dst, steps_per_epoch=20, epochs=3)
+    print('Running in graph mode without masking at LSTM.')
+    model = build_example_model(run_eagerly=False, avoid_mask=True)
+    model.fit(dst, steps_per_epoch=20, epochs=3)
+    print('Running in graph mode with masking at LSTM -- prepare for failure.')
+    model = build_example_model(run_eagerly=False, avoid_mask=False)
+    model.fit(dst, steps_per_epoch=20, epochs=3)
+
+
+if __name__ == '__main__':
+    main()
+Other info
+The issue I raise here appears to have been fixed in TensorFlow 2.3.0; since I realized that after having spent a few hours tracking down the bug, revising my code and eventually implementing this test case, I still thought that it would be worth reporting. I would like to have someone confirm whether this has properly been fixed in 2.3, and if possible I would be interested in some insight as to the issue's initial cause and solving. I am also wondering whether the fix would be worth backporting to TF 2.2 (e.g. as a version 2.2.1) as updating custom code from 2.2 to 2.3 can require a limited yet non-anecdotal effort.
+	</description>
+	<comments>
+		<comment id='1' author='pandrey-fr' date='2020-09-10T10:05:18Z'>
+		&lt;denchmark-link:https://github.com/pandrey-fr&gt;@pandrey-fr&lt;/denchmark-link&gt;
+
+I ran the code shared on tf-nightly GPU "2.4.0-dev20200909" [also tf 2.3] and do not face any errors, please find &lt;denchmark-link:https://colab.research.google.com/gist/Saduf2019/6410bbf7dab4158a3dc3253d89520596/untitled410.ipynb&gt;gist here&lt;/denchmark-link&gt;
+, please confirm if the code shared is the code that creates the error reported. if possible please share a colab gist with the error reported.
+		</comment>
+		<comment id='2' author='pandrey-fr' date='2020-09-10T10:09:19Z'>
+		&lt;denchmark-link:https://github.com/Saduf2019&gt;@Saduf2019&lt;/denchmark-link&gt;
+ As I wrote in my issue report, the bug arises in 2.2, and not in later releases - and your attempt confirms it. It thus seems to have been fixed, but I would actually be curious to get a sense of why it used to occur.
+		</comment>
+		<comment id='3' author='pandrey-fr' date='2020-09-10T11:11:18Z'>
+		&lt;denchmark-link:https://github.com/pandrey-fr&gt;@pandrey-fr&lt;/denchmark-link&gt;
+
+Yes the issue is fixed in tf 2.3 and nightly, its hard to pin point, many bugs get addressed and performance is worked upon on newer versions.
+Please feel free to move the issue to closed status as its resolved in later version. Thanks!
+		</comment>
+		<comment id='4' author='pandrey-fr' date='2020-09-10T11:34:58Z'>
+		This is a very disappointing, uninformative answer; I would have hoped for better, but fine.
+		</comment>
+		<comment id='5' author='pandrey-fr' date='2020-09-10T11:35:00Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/43101&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/43101&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

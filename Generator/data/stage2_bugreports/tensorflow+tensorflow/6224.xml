@@ -1,0 +1,111 @@
+<bug id='6224' author='ZhengBitFusion' open_date='2016-12-09T20:55:32Z' closed_time='2017-05-08T17:43:39Z'>
+	<summary>Extremely inefficient cuda event polling</summary>
+	<description>
+I am running tensorflow with this application: &lt;denchmark-link:https://github.com/openai/pixel-cnn&gt;https://github.com/openai/pixel-cnn&lt;/denchmark-link&gt;
+. I am running on 4 NVIDIA K80 cards and CUDA 7.5. For my experiment, I modified the code to only do 100 training iterations.
+During the 100 iterations, tensorflow destroys 2662 cuda events. But how many times it polls event status? 40669120 times. This means on average it polls ~15,000 times for 1 destroy. Isn't it extremely inefficient?
+Per my understanding of tensorflow source code, it uses one dedicated thread to poll event status and destroy an event once it's complete. That's the only place where the event status is polled.
+	</description>
+	<comments>
+		<comment id='1' author='ZhengBitFusion' date='2016-12-09T23:21:50Z'>
+		&lt;denchmark-link:https://github.com/zheng-xq&gt;@zheng-xq&lt;/denchmark-link&gt;
+ do you want to comment?
+		</comment>
+		<comment id='2' author='ZhengBitFusion' date='2016-12-09T23:27:31Z'>
+		Adding poxvoculi@
+In general, TensorFlow polls the event to make sure the kernel actually finishes. It effectively synchronizes between host and device while respecting the execution model. I'll leave it up to poxvoculi@ to answer whether 15,000:1 is the right ballpark between polling and event count.
+		</comment>
+		<comment id='3' author='ZhengBitFusion' date='2016-12-12T18:20:00Z'>
+		&lt;denchmark-link:https://github.com/ZhengBitFusion&gt;@ZhengBitFusion&lt;/denchmark-link&gt;
+: I don't think your implied measure of efficiency is most useful in this case.
+If your measure is to poll the minimum number of times per queued event, then the optimal strategy would be to poll at an extremely long interval, say once per second or slower.  However, that would result in extremely slow overall program execution.
+The kind of efficiency most people care more about is getting the program to execute as quickly as possible, which is most easily accomplished by polling much more frequently, so that any potential computation waiting on completion of an event can begin as soon as possible.
+More generally, there is some conflict between increased polling frequency and overall computation speed, but only to the extent that use of one thread for polling blocks other necessary work that might otherwise use that thread.  And the extra gain provided by the part of that one thread not used for polling must be greater than the loss from polling less frequently.  If your TF program is mostly executing on GPUs, and you're using a modern CPU with many cores and hyperthreading, this seems unlikely.
+If you look at the polling logic source code in
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/master/tensorflow/core/common_runtime/gpu/gpu_event_mgr.cc#L123&gt;https://github.com/tensorflow/tensorflow/blob/master/tensorflow/core/common_runtime/gpu/gpu_event_mgr.cc#L123&lt;/denchmark-link&gt;
+
+you can see the tradeoff explained, and that we try to achieve a good balance by polling at two different frequencies, depending on whether the last poll found the event queue empty.
+At the slower polling frequency,  it should poll about 1000/sec, which should consume only a small fraction of one core.  At the higher frequency it should poll about 100k/sec, which still probably doesn't consume a full core on a good processor.  You didn't say how long your 100 iterations takes, but it sounds like your program always had events queued, and hence always polled at full speed.
+We arrived at this polling strategy by experimentation with some test programs.  It's possible that a different strategy would result in slightly faster execution for your program.  Somewhat more likely, it's possible that a different strategy could yield equivalent performance but poll a little less often, if that matters to you.
+In any case, if you devise an alternative polling strategy that consistently yields better performance in practice, that would make a nice contribution.
+		</comment>
+		<comment id='4' author='ZhengBitFusion' date='2016-12-12T20:37:36Z'>
+		Can you please briefly explain why the lower polling frequency could potentially slow down the overall program execution? &lt;denchmark-link:https://github.com/poxvoculi&gt;@poxvoculi&lt;/denchmark-link&gt;
+
+From your reply, looks like it may affect any computation that is waiting on completion of event. But looks to me the polling would only lead to the destroy of events once these events are completed.
+If in any case the computation would wait on polling of events to proceed, then the execution model is not efficient. Events should automatically unblock computation with CUDA API like cuStreamWaitEvent, which I believe is in fact used by tensorflow in this regard.
+So it only makes sense to me that polling of events is used to release event resources once the events are complete. Then polling frequency is a matter that you want to have as lower frequency as possible but still make sure the GPUs are not out of resources for event allocation.
+		</comment>
+		<comment id='5' author='ZhengBitFusion' date='2016-12-12T20:50:41Z'>
+		The events are used to queue the freeing of memory that must stay live
+until completion.  If memory is not freed promptly it can cause the max
+memory in use to exceed that available.  In that circumstance either the
+program fails or it slows down to wait for memory to be freed.
+
+You could try varying the polling to see what happens.
+&lt;denchmark-link:#&gt;…&lt;/denchmark-link&gt;
+
+
+On Mon, Dec 12, 2016 at 12:38 PM, Zheng ***@***.***&gt; wrote:
+ Can you please briefly explain why the lower polling frequency would slow
+ down the overall program execution?
+
+ From your reply, looks like it may affect any computation that is waiting
+ on completion of event. But looks to me the polling would only lead to the
+ destroy of events once these events are completed.
+
+ If in any case the computation would wait on polling of events to proceed,
+ then the execution model is not efficient. Events should automatically
+ unblock computation with CUDA API like cuStreamWaitEvent, which I believe
+ is in fact used by tensorflow in this regard.
+
+ So it only makes sense to me that polling of events is used to release
+ event resources once the events are complete. Then polling frequency is a
+ matter that you want to have as lower frequency as possible but still make
+ sure the GPUs are not out of resources for event allocation.
+
+ —
+ You are receiving this because you were assigned.
+ Reply to this email directly, view it on GitHub
+ &lt;#6224 (comment)&gt;,
+ or mute the thread
+ &lt;https://github.com/notifications/unsubscribe-auth/AO818Rgi848mm3NfnyIDsWR70ivzpyJtks5rHbDFgaJpZM4LJWUJ&gt;
+ .
+
+
+
+		</comment>
+		<comment id='6' author='ZhengBitFusion' date='2016-12-12T21:12:35Z'>
+		Another common use of the events is to enable operations across device boundaries. For example,  after a GPU-to-CPU memcpy, enable CPU operations that depend on the copied results.
+		</comment>
+		<comment id='7' author='ZhengBitFusion' date='2016-12-12T21:47:43Z'>
+		&lt;denchmark-link:https://github.com/zheng-xq&gt;@zheng-xq&lt;/denchmark-link&gt;
+ I assume you want to use event polling to enable the CPU operations? That's not the correct way of using events here. Correct thing to use in this scenario is callback.
+		</comment>
+		<comment id='8' author='ZhengBitFusion' date='2016-12-12T22:22:10Z'>
+		I don't think there is incorrectness here, unorthodox maybe. Cuda intentionally encourages different use patterns in this area. At the time when this code was written, active polling was more efficient than Cuda callback, since it betters matches the remaining TF threading model.
+After a few generations of Cuda drivers, this might have changed. Anyone is welcome to give a try and see whether there is improvement. The concern is to really performance in complicated models.
+		</comment>
+		<comment id='9' author='ZhengBitFusion' date='2016-12-14T04:49:50Z'>
+		&lt;denchmark-link:https://github.com/poxvoculi&gt;@poxvoculi&lt;/denchmark-link&gt;
+ I tested with 1/1000 query frequency using this application &lt;denchmark-link:https://github.com/openai/pixel-cnn&gt;https://github.com/openai/pixel-cnn&lt;/denchmark-link&gt;
+. It's actually 1% faster on native CUDA driver, and 10% faster on a remote CUDA service, meaning that the CUDA APIs are forwarded to a remote system.
+Since it is to protect against out-of-resource, why to use so many resources in the first place? Could the events be reused? Or, can the events be self-destroyed? A naive approach would be that once the event is recorded, insert a callback immediately after to destroy it, if you only want to record the event for the last time. Or, can the query frequency be adjustable at runtime?
+		</comment>
+		<comment id='10' author='ZhengBitFusion' date='2016-12-16T18:29:56Z'>
+		&lt;denchmark-link:https://github.com/ZhengBitFusion&gt;@ZhengBitFusion&lt;/denchmark-link&gt;
+ It's interesting that you're seeing a 10% speedup with a remote CUDA service.  That's not a configuration that we tried or considered during development.  This part of TensorFlow was developed and tuned some time ago, before we fully settled some other details, and not reconsidered since.  And of course the GPU environment has continued to evolve.  It would be nice to drive a reexamination of the EventMgr design with a benchmark suite that could be tested on multiple system configurations.  Unfortunately I don't know of anything especially suited to this purpose.  My recollection is that we tuned using a data-parallel version of inception.
+In the short term I think it would be good to replace the timing constants kPollingDelayUsecs and kPollingSuspendMsecs with values that can be user-set in GPUOptions
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/master/tensorflow/core/protobuf/config.proto#L14&gt;https://github.com/tensorflow/tensorflow/blob/master/tensorflow/core/protobuf/config.proto#L14&lt;/denchmark-link&gt;
+
+This will allow you to immediately improve your remote CUDA case.
+In the longer term, we should gather or develop an approprate benchmark suite and try using the cuda callback mechanism.
+		</comment>
+		<comment id='11' author='ZhengBitFusion' date='2016-12-16T20:11:05Z'>
+		Sounds good. Thanks.
+		</comment>
+		<comment id='12' author='ZhengBitFusion' date='2017-01-17T20:10:25Z'>
+		FYI. From our experiments (on CUDA 7.5 at least), callback is not as efficient. Inserting callbacks into compute streams hurts the performance dramatically. So scratch my idea of using callbacks to signal event completion instead of polling.
+		</comment>
+	</comments>
+</bug>

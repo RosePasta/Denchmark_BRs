@@ -1,0 +1,266 @@
+<bug id='2648' author='alexatknit' open_date='2016-06-03T22:15:02Z' closed_time='2016-07-21T17:39:59Z'>
+	<summary>Saver.restore() causes segfault in distributed mode</summary>
+	<description>
+I use a custom saver object in distributed mode that operates over a subset of the parameters in my model so that I can perform transfer learning between my models. I'm running into a situation where loading weights for one of my models causes a segfault, and I can't seem to figure out why. I'm running this code:
+...
+supervisor = tf.train.Supervisor(is_chief=(task_index == 0),
+                                 logdir=log_dir,
+                                 init_op=init_op,
+                                 saver=None,
+                                 summary_op=training_summary_op,
+                                 global_step=global_step,
+                                 summary_writer=summary_writer)
+
+if task_index != 0:
+    logger.info('waiting for session.')
+else:
+    logger.info('starting session.')
+with supervisor.prepare_or_wait_for_session(
+        server.target, config=tf.ConfigProto(allow_soft_placement=True)) as sesh:
+    if task_index != 0:
+        while True:
+            if supervisor.should_stop():
+                logger.info('training completed')
+                return
+            if ready.eval(sesh):
+                break
+            sleep(0.01)
+    logger.info('session started.')
+
+    if task_index == 0:
+        if isfile(save_file):
+            logger.info('loading from save file: %s' % save_file.split('/')[-1])
+            saver.restore(sesh, save_file)
+        elif transfer_file is not None and isfile(transfer_file):
+            logger.info('transfering weights from file: %s' % transfer_file.split('/')[-1])
+            loader.restore(sesh, transfer_file)
+            logger.info('executing post transfer ops')
+            sesh.run(post_transfer_ops)
+        sesh.run(is_ready)
+...
+The transfer file exists on both the parameter servers and the chief worker and running the code results in this output:
+&lt;denchmark-code&gt;INFO: starting session.
+INFO: session started.
+INFO: transfering weights from file: test_train5.0.ckpt
+Segmentation fault (core dumped)
+&lt;/denchmark-code&gt;
+
+The graph I'm using is identical to one that I can deploy on a single machine without error, I can even load the weights into the local version, but even if an issue with parameter names were the issue I would still hope that it would give me an error instead of a segfault. Note that this issue does not appear for every model, though it is deterministic.
+	</description>
+	<comments>
+		<comment id='1' author='alexatknit' date='2016-06-03T22:33:15Z'>
+		This is unexpected, and definitely a bug. When you run it in the single-machine mode, are you using the tf.train.Supervisor?
+Also, which process segfaults? Is it the Python client that calls saver.restore() or the parameter server that runs the restore op?
+		</comment>
+		<comment id='2' author='alexatknit' date='2016-06-03T22:36:20Z'>
+		On a single machine I use a simple session. The segfault is in the chief worker process, which initiates the call to Saver.restore(). I don't know what the parameter server does as my current setup forwards all logging to the chief worker process.
+		</comment>
+		<comment id='3' author='alexatknit' date='2016-06-03T22:46:37Z'>
+		Can you try running the chief worker under gdb and reporting the stack trace for the failure? Also, are you running the 0.8 release or a nightly/from-source build of TensorFlow?
+		</comment>
+		<comment id='4' author='alexatknit' date='2016-06-03T22:50:35Z'>
+		its a from source build from a few days ago, I'll try gdb and be back in a sec
+		</comment>
+		<comment id='5' author='alexatknit' date='2016-06-03T23:34:14Z'>
+		&lt;denchmark-code&gt;Program received signal SIGSEGV, Segmentation fault.
+[Switching to Thread 0x7f4c577fe700 (LWP 8517)]
+0x00007f4f5aee4ff6 in google::protobuf::MessageLite::ParseFromCodedStream(google::protobuf::io::CodedInputStream*) () from /usr/local/lib/python3.4/dist-packages/tensorflow/python/_pywrap_tensorflow.so
+(gdb) backtrace
+#0  0x00007f4f5aee4ff6 in google::protobuf::MessageLite::ParseFromCodedStream(google::protobuf::io::CodedInputStream*) ()
+   from /usr/local/lib/python3.4/dist-packages/tensorflow/python/_pywrap_tensorflow.so
+#1  0x00007f4f5aac8dfb in grpc::DeserializeProto(grpc_byte_buffer*, google::protobuf::Message*, int) () from /usr/local/lib/python3.4/dist-packages/tensorflow/python/_pywrap_tensorflow.so
+#2  0x00007f4f5aa820e6 in grpc::CallOpSet&lt;grpc::CallOpRecvInitialMetadata, grpc::CallOpRecvMessage&lt;tensorflow::RunGraphResponse&gt;, grpc::CallOpClientRecvStatus, grpc::CallNoOp&lt;4&gt;, grpc::CallNoOp&lt;5&gt;, grpc::CallNoOp&lt;6&gt; &gt;::FinalizeResult(void**, bool*) () from /usr/local/lib/python3.4/dist-packages/tensorflow/python/_pywrap_tensorflow.so
+#3  0x00007f4f5aac82e2 in grpc::CompletionQueue::AsyncNextInternal(void**, bool*, gpr_timespec) () from /usr/local/lib/python3.4/dist-packages/tensorflow/python/_pywrap_tensorflow.so
+#4  0x00007f4f5aa53dba in std::_Function_handler&lt;void (), tensorflow::GrpcWorkerCache::GrpcWorkerCache(tensorflow::GrpcChannelCache*)::{lambda()#1}&gt;::_M_invoke(std::_Any_data const&amp;) ()
+   from /usr/local/lib/python3.4/dist-packages/tensorflow/python/_pywrap_tensorflow.so
+#5  0x00007f4f58ebea60 in std::(anonymous namespace)::execute_native_thread_routine (__p=&lt;optimized out&gt;) at ../../../../../src/libstdc++-v3/src/c++11/thread.cc:84
+#6  0x00007f4f63e60184 in start_thread (arg=0x7f4c577fe700) at pthread_create.c:312
+#7  0x00007f4f63b8d37d in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:111
+(gdb) print buf
+$1 = 0x159f4c0 "Unknown error 58"
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='6' author='alexatknit' date='2016-06-03T23:38:40Z'>
+		I'm going to gdb my parameter server to see if I can get anything else
+		</comment>
+		<comment id='7' author='alexatknit' date='2016-06-03T23:43:23Z'>
+		Thanks, it looks like it is failing to deserialize a large proto. We just fixed a related bug, which will be part of &lt;denchmark-link:https://github.com/tensorflow/tensorflow/pull/2649&gt;#2649&lt;/denchmark-link&gt;
+, so if you could try out your code against the PR, that would be great.
+There's a higher level issue, which is that running the saver shouldn't be causing large amounts of data to be transferred across the network. Try passing  to the &lt;denchmark-link:https://www.tensorflow.org/versions/r0.8/api_docs/python/state_ops.html#Saver.__init__&gt;tf.train.Saver constructor&lt;/denchmark-link&gt;
+ and that might also solve the problem without rebuilding.
+		</comment>
+		<comment id='8' author='alexatknit' date='2016-06-03T23:44:23Z'>
+		Thanks! I'll let you know if it works.
+		</comment>
+		<comment id='9' author='alexatknit' date='2016-06-04T00:12:01Z'>
+		It looks like nonsharded savers save to the chief worker (if called from that process) and the sharded saver saves to the parameter server, weird
+		</comment>
+		<comment id='10' author='alexatknit' date='2016-06-04T02:33:46Z'>
+		It looks like I'm still getting a segfault, and now I also need to manage sharded files, I'll see if I can get the gdb backtrace later
+		</comment>
+		<comment id='11' author='alexatknit' date='2016-06-06T17:24:06Z'>
+		Looks like the exact same trace:
+&lt;denchmark-code&gt;Program received signal SIGSEGV, Segmentation fault.
+[Switching to Thread 0x7f15c7c32700 (LWP 67911)]
+0x00007f18888f6ff6 in google::protobuf::MessageLite::ParseFromCodedStream(google::protobuf::io::CodedInputStream*) () from /usr/local/lib/python3.4/dist-packages/tensorflow/python/_pywrap_tensorflow.so
+(gdb) backtrace
+#0  0x00007f18888f6ff6 in google::protobuf::MessageLite::ParseFromCodedStream(google::protobuf::io::CodedInputStream*) () from /usr/local/lib/python3.4/dist-packages/tensorflow/python/_pywrap_tensorflow.so
+#1  0x00007f18884dadfb in grpc::DeserializeProto(grpc_byte_buffer*, google::protobuf::Message*, int) () from /usr/local/lib/python3.4/dist-packages/tensorflow/python/_pywrap_tensorflow.so
+#2  0x00007f18884940e6 in grpc::CallOpSet&lt;grpc::CallOpRecvInitialMetadata, grpc::CallOpRecvMessage&lt;tensorflow::RunGraphResponse&gt;, grpc::CallOpClientRecvStatus, grpc::CallNoOp&lt;4&gt;, grpc::CallNoOp&lt;5&gt;, grpc::CallNoOp&lt;6&gt; &gt;::FinalizeResult(void**, bool*) ()
+   from /usr/local/lib/python3.4/dist-packages/tensorflow/python/_pywrap_tensorflow.so
+#3  0x00007f18884da2e2 in grpc::CompletionQueue::AsyncNextInternal(void**, bool*, gpr_timespec) () from /usr/local/lib/python3.4/dist-packages/tensorflow/python/_pywrap_tensorflow.so
+#4  0x00007f1888465dba in std::_Function_handler&lt;void (), tensorflow::GrpcWorkerCache::GrpcWorkerCache(tensorflow::GrpcChannelCache*)::{lambda()#1}&gt;::_M_invoke(std::_Any_data const&amp;) ()
+   from /usr/local/lib/python3.4/dist-packages/tensorflow/python/_pywrap_tensorflow.so
+#5  0x00007f18868d0a60 in std::(anonymous namespace)::execute_native_thread_routine (__p=&lt;optimized out&gt;) at ../../../../../src/libstdc++-v3/src/c++11/thread.cc:84
+#6  0x00007f1891872184 in start_thread (arg=0x7f15c7c32700) at pthread_create.c:312
+#7  0x00007f189159f37d in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:111
+(gdb) print buf
+$1 = 0x13c9510 "Unknown error 58"
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='12' author='alexatknit' date='2016-06-06T17:38:25Z'>
+		That's strange, because I think grpc::DeserializeProto() (#1 on the stack trace) no longer exists in the 0.14 release of gRPC, which we're now using.
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/pull/2649&gt;#2649&lt;/denchmark-link&gt;
+ is now merged, so can you try this again with either the latest nightly or the 0.9 release candidate?
+		</comment>
+		<comment id='13' author='alexatknit' date='2016-06-06T19:24:35Z'>
+		I'll update the cluster to r0.9 and try again
+		</comment>
+		<comment id='14' author='alexatknit' date='2016-06-06T19:59:33Z'>
+		&lt;denchmark-code&gt;Program received signal SIGSEGV, Segmentation fault.
+[Switching to Thread 0x7fbc20ff9700 (LWP 59920)]
+0x00007fbe0a54fd16 in google::protobuf::MessageLite::ParseFromCodedStream(google::protobuf::io::CodedInputStream*) () from /usr/local/lib/python3.4/dist-packages/tensorflow/python/_pywrap_tensorflow.so
+(gdb) backtrace
+#0  0x00007fbe0a54fd16 in google::protobuf::MessageLite::ParseFromCodedStream(google::protobuf::io::CodedInputStream*) () from /usr/local/lib/python3.4/dist-packages/tensorflow/python/_pywrap_tensorflow.so
+#1  0x00007fbe0a0c2b30 in grpc::UnlimitedSizeProtoSerializationTraits&lt;tensorflow::RunGraphResponse&gt;::Deserialize(grpc_byte_buffer*, tensorflow::RunGraphResponse*, int) ()
+   from /usr/local/lib/python3.4/dist-packages/tensorflow/python/_pywrap_tensorflow.so
+#2  0x00007fbe0a0c2f89 in grpc::CallOpSet&lt;grpc::CallOpRecvInitialMetadata, grpc::CallOpRecvMessage&lt;tensorflow::RunGraphResponse&gt;, grpc::CallOpClientRecvStatus, grpc::CallNoOp&lt;4&gt;, grpc::CallNoOp&lt;5&gt;, grpc::CallNoOp&lt;6&gt; &gt;::FinalizeResult(void**, bool*) () from /usr/local/lib/python3.4/dist-packages/tensorflow/python/_pywrap_tensorflow.so
+#3  0x00007fbe0a10eac2 in grpc::CompletionQueue::AsyncNextInternal(void**, bool*, gpr_timespec) () from /usr/local/lib/python3.4/dist-packages/tensorflow/python/_pywrap_tensorflow.so
+#4  0x00007fbe0a09ade8 in std::_Function_handler&lt;void (), tensorflow::GrpcWorkerCache::GrpcWorkerCache(tensorflow::GrpcChannelCache*)::{lambda()#1}&gt;::_M_invoke(std::_Any_data const&amp;) ()
+   from /usr/local/lib/python3.4/dist-packages/tensorflow/python/_pywrap_tensorflow.so
+#5  0x00007fbe085bda60 in std::(anonymous namespace)::execute_native_thread_routine (__p=&lt;optimized out&gt;) at ../../../../../src/libstdc++-v3/src/c++11/thread.cc:84
+#6  0x00007fbe13a36184 in start_thread (arg=0x7fbc20ff9700) at pthread_create.c:312
+#7  0x00007fbe1376337d in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:111
+(gdb) print buf
+$1 = 0x26de4b0 "Unknown error 58"
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='15' author='alexatknit' date='2016-06-07T16:41:17Z'>
+		Thanks for persisting with this. I've been trying to reproduce this, but haven't managed to get the exact same failure.
+One potential issue is that protobuf doesn't handle messages larger than 2GB. We haven't optimized this because we haven't seen any realistic models where it is necessary to transfer this much in a single step, but it obviously shouldn't crash like this. If I set up two servers, and try to transfer a tensor larger than 2GB from one to the other, it fails with SIGABRT on the sending side. However, I haven't managed to get it to "successfully" send a tensor that the other side fails to retrieve.
+Are there any very large (&gt; ~2GB) variables in your model that could be brushing up against the protobuf limit?
+		</comment>
+		<comment id='16' author='alexatknit' date='2016-06-07T17:59:28Z'>
+		The weird thing is that the model is only about 10M on disk
+&lt;denchmark-code&gt;$ ls -lh
+...
+-rw-r--r--    1 alexatknit  staff    10M Jun  3 12:09 test_train5.0.ckpt
+...
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='17' author='alexatknit' date='2016-06-07T18:15:34Z'>
+		Also, like I said before, it doesn't happen for all of my models, but it is deterministic.
+If the weights are loaded on the parameter server, why would the segfault happen on the chief worker? Wouldn't the worker receive the loaded parameters in the same way that it updates its parameters during async sgd?
+		</comment>
+		<comment id='18' author='alexatknit' date='2016-06-08T16:16:06Z'>
+		Ah, if the model is only 10M, then my hypothesis about protobuf overflow is almost certainly wrong. (There were certainly segfault- and SIGTERM-causing bugs in that path, which should be fixed now, or at least in the next push from the internal branch.)
+I see two potential options for fixing this, but I'm afraid I'm going to need your help.
+
+Can you package up a minimum failing example, which I'll try and run locally to track down the failure?
+Can you try building from source with bazel build -c dbg, and report a stack trace with line numbers, so that we can see exactly where it's failing?
+
+If you're already familiar with building from source, I suspect option 2 might be easier.
+		</comment>
+		<comment id='19' author='alexatknit' date='2016-06-08T17:01:50Z'>
+		1 is going to be a problem, but I can do 2
+		</comment>
+		<comment id='20' author='alexatknit' date='2016-06-08T17:05:54Z'>
+		Does the whole cluster need to be in debug, or just the master worker? (I've temporarily repurposed those machines)
+		</comment>
+		<comment id='21' author='alexatknit' date='2016-06-08T17:07:49Z'>
+		Thanks! Only the process that you expect to crash needs to be in debug - it should be able to communicate with other workers that are running release binaries.
+		</comment>
+		<comment id='22' author='alexatknit' date='2016-06-08T18:22:42Z'>
+		I don't see any obvious debug logging, where can I expect to find the stack trace?
+		</comment>
+		<comment id='23' author='alexatknit' date='2016-06-08T20:27:22Z'>
+		The easiest way to get it is probably to run under gdb (otherwise you could turn on core file recording and load one of those in gdb).
+		</comment>
+		<comment id='24' author='alexatknit' date='2016-06-08T21:30:11Z'>
+		&lt;denchmark-code&gt;(gdb) bt no-filters full
+#0  0x00007f63b97ac264 in InlineParseFromCodedStream (message=0x7f6111bba7a0, input=0x7f61ba7fbc30) at external/protobuf/src/google/protobuf/message_lite.cc:128
+No locals.
+#1  google::protobuf::MessageLite::ParseFromCodedStream (this=0x7f6111bba7a0, input=0x7f61ba7fbc30) at external/protobuf/src/google/protobuf/message_lite.cc:168
+No locals.
+#2  0x00007f63b8ea53c6 in grpc::UnlimitedSizeProtoSerializationTraits&lt;tensorflow::RunGraphResponse&gt;::Deserialize (buffer=0x7f61a801c520, msg=0x7f6111bba7a0, max_message_size=0)
+    at ./tensorflow/core/distributed_runtime/rpc/grpc_serialization_traits.h:187
+        reader = {&lt;google::protobuf::io::ZeroCopyInputStream&gt; = {_vptr.ZeroCopyInputStream = 0x7f63c331a630 &lt;vtable for grpc::tensorflow_helper::GrpcBufferReader+16&gt;}, byte_count_ = 0, backup_count_ = 0, 
+          reader_ = {buffer_in = 0x7f61a801c520, buffer_out = 0x7f61a801c520, current = {index = 0}}, slice_ = {refcount = 0x7f61ba7fbd50, data = {refcounted = {bytes = 0x0, length = 140057717488880}, 
+              inlined = {length = 0 '\000', bytes = "\000\000\000\000\000\000\000\360\274\177\272a\177\000"}}}}
+        decoder = {buffer_ = 0x0, buffer_end_ = 0x0, input_ = 0x7f61ba7fbc80, total_bytes_read_ = 0, overflow_bytes_ = 0, last_tag_ = 0, legitimate_message_end_ = false, aliasing_enabled_ = false, 
+          current_limit_ = 2147483647, buffer_size_after_limit_ = 0, total_bytes_limit_ = 2147483647, total_bytes_warning_threshold_ = 2147483647, recursion_budget_ = 100, recursion_limit_ = 100, 
+          extension_pool_ = 0x0, extension_factory_ = 0x0, static kDefaultTotalBytesLimit = 67108864, static kDefaultTotalBytesWarningThreshold = 33554432, static default_recursion_limit_ = 100}
+        result = {static OK = @0x7f63c42c3390, static CANCELLED = @0x7f63c42c33a0, code_ = grpc::OK, details_ = ""}
+#3  0x00007f63b8ea399e in grpc::CallOpRecvMessage&lt;tensorflow::RunGraphResponse&gt;::FinishOp (this=0x7f60e4002868, status=0x7f61ba7fbe1f, max_message_size=0) at external/grpc/include/grpc++/impl/codegen/call.h:284
+No locals.
+#4  0x00007f63b8ea2928 in grpc::CallOpSet&lt;grpc::CallOpRecvInitialMetadata, grpc::CallOpRecvMessage&lt;tensorflow::RunGraphResponse&gt;, grpc::CallOpClientRecvStatus, grpc::CallNoOp&lt;4&gt;, grpc::CallNoOp&lt;5&gt;, grpc::CallNoOp&lt;6&gt; &gt;::FinalizeResult (this=0x7f60e4002828, tag=0x7f61ba7fbe20, status=0x7f61ba7fbe1f) at external/grpc/include/grpc++/impl/codegen/call.h:576
+No locals.
+#5  0x00007f63b8f1c681 in grpc::CompletionQueue::AsyncNextInternal (this=0xd50afa8, tag=0x7f61ba7fbe20, ok=0x7f61ba7fbe1f, deadline=...) at external/grpc/src/cpp/common/completion_queue.cc:66
+        cq_tag = 0x7f60e4002828
+        ev = {type = GRPC_OP_COMPLETE, success = 1, tag = 0x7f60e4002828}
+#6  0x00007f63b8e577f7 in grpc::CompletionQueue::Next (this=0xd50afa8, tag=0x7f61ba7fbe20, ok=0x7f61ba7fbe1f) at external/grpc/include/grpc++/impl/codegen/completion_queue.h:137
+No locals.
+#7  0x00007f63b8e71f21 in tensorflow::GrpcWorkerCache::GrpcWorkerCache(tensorflow::GrpcChannelCache*)::{lambda()#1}::operator()() const () at tensorflow/core/distributed_runtime/rpc/grpc_worker_cache.cc:38
+        std::__ioinit = {static _S_refcount = 585, static _S_synced_with_stdio = true}
+#8  0x00007f63b8e72a07 in std::_Function_handler&lt;void (), tensorflow::GrpcWorkerCache::GrpcWorkerCache(tensorflow::GrpcChannelCache*)::{lambda()#1}&gt;::_M_invoke(std::_Any_data const&amp;) (__functor=...)
+    at /usr/include/c++/4.8/functional:2071
+No locals.
+#9  0x00007f63b6adc598 in std::function&lt;void ()&gt;::operator()() const (this=0x9c52170) at /usr/include/c++/4.8/functional:2471
+No locals.
+#10 0x00007f63b9463572 in std::_Bind_simple&lt;std::function&lt;void ()&gt; ()&gt;::_M_invoke&lt;&gt;(std::_Index_tuple&lt;&gt;) (this=0x9c52170) at /usr/include/c++/4.8/functional:1732
+No locals.
+#11 0x00007f63b94634c9 in std::_Bind_simple&lt;std::function&lt;void ()&gt; ()&gt;::operator()() (this=0x9c52170) at /usr/include/c++/4.8/functional:1720
+No locals.
+#12 0x00007f63b9463462 in std::thread::_Impl&lt;std::_Bind_simple&lt;std::function&lt;void ()&gt; ()&gt; &gt;::_M_run() (this=0x9c52158) at /usr/include/c++/4.8/thread:115
+No locals.
+#13 0x00007f63b538ca60 in std::(anonymous namespace)::execute_native_thread_routine (__p=&lt;optimized out&gt;) at ../../../../../src/libstdc++-v3/src/c++11/thread.cc:84
+---Type &lt;return&gt; to continue, or q &lt;return&gt; to quit---
+        __t = &lt;optimized out&gt;
+        __local = warning: RTTI symbol not found for class 'std::_Sp_counted_ptr_inplace&lt;std::thread::_Impl&lt;std::_Bind_simple&lt;std::function&lt;void ()&gt; ()&gt; &gt;, std::allocator&lt;std::thread::_Impl&lt;std::_Bind_simple&lt;std::function&lt;void ()&gt; ()&gt; &gt; &gt;, (__gnu_cxx::_Lock_policy)2&gt;'
+warning: RTTI symbol not found for class 'std::_Sp_counted_ptr_inplace&lt;std::thread::_Impl&lt;std::_Bind_simple&lt;std::function&lt;void ()&gt; ()&gt; &gt;, std::allocator&lt;std::thread::_Impl&lt;std::_Bind_simple&lt;std::function&lt;void ()&gt; ()&gt; &gt; &gt;, (__gnu_cxx::_Lock_policy)2&gt;'
+std::shared_ptr (count 1, weak 0) 0x0
+#14 0x00007f63ca318184 in start_thread (arg=0x7f61ba7fc700) at pthread_create.c:312
+        __res = &lt;optimized out&gt;
+        pd = 0x7f61ba7fc700
+        now = &lt;optimized out&gt;
+        unwind_buf = {cancel_jmp_buf = {{jmp_buf = {140057717491456, -6954491474313246661, 1, 0, 140057717492160, 140057717491456, 7043588202167502907, 7042287016126023739}, mask_was_saved = 0}}, priv = {
+            pad = {0x0, 0x0, 0x0, 0x0}, data = {prev = 0x0, cleanup = 0x0, canceltype = 0}}}
+        not_first_call = &lt;optimized out&gt;
+        pagesize_m1 = &lt;optimized out&gt;
+        sp = &lt;optimized out&gt;
+        freesize = &lt;optimized out&gt;
+        __PRETTY_FUNCTION__ = "start_thread"
+#15 0x00007f63ca04537d in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:111
+No locals.
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='25' author='alexatknit' date='2016-06-14T18:46:03Z'>
+		I figured out a workaround. As long as I match the directory structure used by the session manager object, and sync it completely from the master worker to the parameter servers and there are no exception during loading, theres no segfault. The saver also has unexpected behavior when saving sharded models, as the sharded model is saved on the parameter servers rather than the master worker like the nonsharded model. The saver seems to be very fragile in distributed mode, it could use some polish.
+		</comment>
+		<comment id='26' author='alexatknit' date='2016-06-14T20:04:18Z'>
+		Thanks for following up. Unfortunately, we still haven't been able to reproduce the failure you are seeing, but it does sound like there's a bug.
+Just to clarify: does the failure only occur when there is a mismatch in the directory structure on the master worker and the parameter servers?
+		</comment>
+		<comment id='27' author='alexatknit' date='2016-06-14T20:28:05Z'>
+		The important thing seemed to be that the checkpoint file wasn't overwritten by a save with a different name and that it existed on the parameter server. I also had an issue with collections occurring because I was transitioning to a frozen graph implementation. The resulting exception caused a segfault for some reason.
+		</comment>
+		<comment id='28' author='alexatknit' date='2016-07-18T18:13:59Z'>
+		Since there has been no activity and we have not been able to reproduce, I am closing for now.
+		</comment>
+	</comments>
+</bug>

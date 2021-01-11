@@ -1,0 +1,326 @@
+<bug id='38731' author='sephiroce' open_date='2020-04-21T02:42:59Z' closed_time='2020-04-23T05:52:34Z'>
+	<summary>TF 1.15 GPU version is not working as intended.</summary>
+	<description>
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): yes, I wrote a custom code.
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Linux Ubuntu 18.04
+Mobile device (e.g. iPhone 8, Pixel 2, Samsung Galaxy) if the issue happens on mobile device: running on servers
+TensorFlow installed from (source or binary): pip
+TensorFlow version (use command below): 1.15
+Python version: Python 3.6.9
+Bazel version (if compiling from source): None
+GCC/Compiler version (if compiling from source): None
+CUDA/cuDNN version: 10.0/7
+GPU model and memory: GTX1060, 6GB
+
+
+I'm trying to build up Capsule Network using TF 1.15 by referring tutorial.
+The source code seemed to work well with CPU.
+But if GPU is used, the model did not seem to be trained.
+I turned on/off GPU by modifying LD_LIBRARY_PATH.
+&lt;denchmark-link:https://user-images.githubusercontent.com/661463/79819478-0a21ba80-83c5-11ea-8166-459df2d4615f.png&gt;&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://user-images.githubusercontent.com/661463/79819492-0e4dd800-83c5-11ea-85b8-f1ed923569c5.png&gt;&lt;/denchmark-link&gt;
+
+Describe the expected behavior
+CPU and GPU version of the models need to be trained.
+Standalone code to reproduce the issue
+&lt;denchmark-code&gt;import numpy as np
+import tensorflow as tf
+
+caps1_n = 32
+caps1_dim = 8
+caps2_n = 10
+caps2_dim = 16
+exp_caps1_n = caps1_n * 6 * 6  # 1152 primary capsules
+
+m_plus = 0.9
+m_minus = 0.1
+lambda_ = 0.5
+
+conv1_params = {
+    "filters": 256,
+    "kernel_size": 9,
+    "strides": 1,
+    "padding": "valid",
+    "activation": tf.nn.relu,
+}
+
+conv2_params = {
+    "filters": caps1_n * caps1_dim, # 256 convolutional filters
+    "kernel_size": 9,
+    "strides": 2,
+    "padding": "valid",
+    "activation": tf.nn.relu
+}
+
+def squash(s, axis=-1, epsilon=1e-7):
+    squared_norm = tf.reduce_sum(tf.square(s), axis=axis, keep_dims=True)
+    safe_norm = tf.sqrt(squared_norm + epsilon)
+    squash_factor = squared_norm / (1. + squared_norm)
+    unit_vector = s / safe_norm
+    return squash_factor * unit_vector
+
+def safe_norm(s, axis=-1, epsilon=1e-7, keep_dims=False):
+    squared_norm = tf.reduce_sum(tf.square(s), axis=axis, keep_dims=keep_dims)
+    return tf.sqrt(squared_norm + epsilon)
+
+from tensorflow.examples.tutorials.mnist import input_data
+
+mnist = input_data.read_data_sets("data/")
+
+tf.reset_default_graph()
+np.random.seed(42)
+tf.set_random_seed(42)
+
+# Placeholders
+X = tf.placeholder(shape=[None, 28, 28, 1], dtype=tf.float32)
+Y = tf.placeholder(shape=[None], dtype=tf.int64)
+batch_size = tf.shape(X)[0]
+
+# CapsuleizationLayer
+conv1 = tf.layers.conv2d(X, **conv1_params)
+conv2 = tf.layers.conv2d(conv1, **conv2_params)
+caps1_raw = tf.reshape(conv2, [-1, exp_caps1_n, caps1_dim])
+caps1_output = squash(caps1_raw)
+
+init_sigma = 0.1
+W = tf.Variable(tf.random_normal(shape=(1, exp_caps1_n, caps2_n, caps2_dim, caps1_dim),
+                                 stddev=init_sigma, dtype=tf.float32))
+W_tiled = tf.tile(W, [batch_size, 1, 1, 1, 1])
+
+caps1_output_expanded = tf.expand_dims(caps1_output, -1)
+caps1_output_tile = tf.expand_dims(caps1_output_expanded, 2)
+caps1_output_tiled = tf.tile(caps1_output_tile, [1, 1, caps2_n, 1, 1])
+u_hat = tf.matmul(W_tiled, caps1_output_tiled)
+
+#===============================================================
+# Dynamic Routing
+#===============================================================
+raw_weights = tf.zeros([batch_size, exp_caps1_n, caps2_n, 1, 1], dtype=np.float32)
+
+# Round1, Line 4
+routing_weights = tf.nn.softmax(raw_weights, dim=2)
+# Round1, Line 5
+weighted_predictions = tf.multiply(routing_weights, u_hat)
+weighted_sum = tf.reduce_sum(weighted_predictions, axis=1, keep_dims=True)
+# Round1, Line 6
+caps2_output_round_1 = squash(weighted_sum, axis=-2)
+# Round1, Line 7
+caps2_output_round_1_tiled = tf.tile(caps2_output_round_1, [1, exp_caps1_n, 1, 1, 1])
+raw_weights2 = raw_weights + tf.matmul(u_hat, caps2_output_round_1_tiled, transpose_a=True)
+
+# Round2, Line 4
+routing_weights_round_2 = tf.nn.softmax(raw_weights2, dim=2)
+# Round2, Line 5
+weighted_predictions_round_2 = tf.multiply(routing_weights_round_2, u_hat)
+weighted_sum_round_2 = tf.reduce_sum(weighted_predictions_round_2, axis=1, keep_dims=True)
+# Round2, Line 6
+caps2_output = squash(weighted_sum_round_2, axis=-2)
+#===============================================================
+
+y_proba = safe_norm(caps2_output, axis=-2)
+y_proba_argmax = tf.argmax(y_proba, axis=2)
+y_pred = tf.squeeze(y_proba_argmax, axis=[1, 2])
+
+# Loss: Margin loss
+T = tf.one_hot(Y, depth=caps2_n)
+caps2_output_norm = safe_norm(caps2_output, axis=-2, keep_dims=True)
+present_error_raw = tf.square(tf.maximum(0., m_plus - caps2_output_norm))
+present_error = tf.reshape(present_error_raw, shape=(-1, 10))
+absent_error_raw = tf.square(tf.maximum(0., caps2_output_norm - m_minus))
+absent_error = tf.reshape(absent_error_raw, shape=(-1, 10))
+L = tf.add(T * present_error, lambda_ * (1.0 - T) * absent_error)
+loss = margin_loss = tf.reduce_mean(tf.reduce_sum(L, axis=1))
+
+# Loss: Reconstruction loss
+correct = tf.equal(Y, y_pred)
+accuracy = tf.reduce_mean(tf.cast(correct, tf.float32))
+
+#default option for Adam
+optimizer = tf.train.AdamOptimizer()
+training_op = optimizer.minimize(loss)
+
+init = tf.global_variables_initializer()
+saver = tf.train.Saver()
+
+batch_size = 50
+n_iterations_per_epoch = mnist.train.num_examples // batch_size
+n_iterations_validation = mnist.validation.num_examples // batch_size
+
+with tf.Session() as sess:
+    init.run()
+
+    for epoch in range(10):
+        for iteration in range(1, n_iterations_per_epoch + 1):
+            X_batch, Y_batch = mnist.train.next_batch(batch_size)
+            # Run the training operation and measure the loss:
+            _, loss_train, acc_train = sess.run(
+                [training_op, loss, accuracy],
+                feed_dict={X: X_batch.reshape([-1, 28, 28, 1]),
+                           Y: Y_batch})
+            print("Iteration: {}/{} ({:.1f}%)  Loss: {:.5f}, Acc: {:.5f}".format(
+                      iteration, n_iterations_per_epoch,
+                      iteration * 100 / n_iterations_per_epoch,
+                      loss_train, acc_train * 100)
+                  )
+&lt;/denchmark-code&gt;
+
+Other info / logs Include any logs or source code that would be helpful to
+diagnose the problem. If including tracebacks, please include the full
+traceback. Large logs and files should be attached.
+GPU version log
+&lt;denchmark-code&gt;Iteration: 1/1100 (0.1%)  Loss: 0.30913, Acc: 6.00000
+Iteration: 2/1100 (0.2%)  Loss: 0.47852, Acc: 16.00000
+Iteration: 3/1100 (0.3%)  Loss: 0.00000, Acc: 8.00000
+Iteration: 4/1100 (0.4%)  Loss: 0.33996, Acc: 4.00000
+Iteration: 5/1100 (0.5%)  Loss: 0.00000, Acc: 10.00000
+Iteration: 6/1100 (0.5%)  Loss: 0.21045, Acc: 12.00000
+Iteration: 7/1100 (0.6%)  Loss: 0.33996, Acc: 8.00000
+Iteration: 8/1100 (0.7%)  Loss: 0.00000, Acc: 12.00000
+Iteration: 9/1100 (0.8%)  Loss: 0.00000, Acc: 10.00000
+Iteration: 10/1100 (0.9%)  Loss: 0.00000, Acc: 8.00000
+Iteration: 11/1100 (1.0%)  Loss: 0.21045, Acc: 16.00000
+Iteration: 12/1100 (1.1%)  Loss: 0.21045, Acc: 12.00000
+Iteration: 13/1100 (1.2%)  Loss: 0.40472, Acc: 6.00000
+Iteration: 14/1100 (1.3%)  Loss: 0.00000, Acc: 8.00000
+Iteration: 15/1100 (1.4%)  Loss: 0.61517, Acc: 14.00000
+Iteration: 16/1100 (1.5%)  Loss: 0.33996, Acc: 10.00000
+Iteration: 17/1100 (1.5%)  Loss: 0.00000, Acc: 14.00000
+Iteration: 18/1100 (1.6%)  Loss: 0.33996, Acc: 12.00000
+Iteration: 19/1100 (1.7%)  Loss: 0.00000, Acc: 8.00000
+Iteration: 20/1100 (1.8%)  Loss: 0.21045, Acc: 12.00000
+Iteration: 21/1100 (1.9%)  Loss: 0.33996, Acc: 18.00000
+Iteration: 22/1100 (2.0%)  Loss: 0.00000, Acc: 4.00000
+Iteration: 23/1100 (2.1%)  Loss: 0.21045, Acc: 8.00000
+Iteration: 24/1100 (2.2%)  Loss: 0.33996, Acc: 12.00000
+Iteration: 25/1100 (2.3%)  Loss: 0.00000, Acc: 10.00000
+Iteration: 26/1100 (2.4%)  Loss: 0.21045, Acc: 16.00000
+Iteration: 27/1100 (2.5%)  Loss: 0.61517, Acc: 8.00000
+Iteration: 28/1100 (2.5%)  Loss: 0.33996, Acc: 8.00000
+Iteration: 29/1100 (2.6%)  Loss: 0.00000, Acc: 16.00000
+Iteration: 30/1100 (2.7%)  Loss: 0.21045, Acc: 6.00000
+Iteration: 31/1100 (2.8%)  Loss: 0.00000, Acc: 6.00000
+Iteration: 32/1100 (2.9%)  Loss: 0.21045, Acc: 10.00000
+Iteration: 33/1100 (3.0%)  Loss: 0.61517, Acc: 14.00000
+Iteration: 34/1100 (3.1%)  Loss: 0.21045, Acc: 10.00000
+Iteration: 35/1100 (3.2%)  Loss: 0.21045, Acc: 4.00000
+Iteration: 36/1100 (3.3%)  Loss: 0.21045, Acc: 12.00000
+Iteration: 37/1100 (3.4%)  Loss: 0.61517, Acc: 10.00000
+Iteration: 38/1100 (3.5%)  Loss: 0.21045, Acc: 12.00000
+Iteration: 39/1100 (3.5%)  Loss: 0.21045, Acc: 6.00000
+Iteration: 40/1100 (3.6%)  Loss: 0.00000, Acc: 12.00000
+Iteration: 41/1100 (3.7%)  Loss: 0.00000, Acc: 14.00000
+Iteration: 42/1100 (3.8%)  Loss: 0.21045, Acc: 16.00000
+Iteration: 43/1100 (3.9%)  Loss: 0.21045, Acc: 16.00000
+Iteration: 44/1100 (4.0%)  Loss: 0.33996, Acc: 12.00000
+Iteration: 45/1100 (4.1%)  Loss: 0.00000, Acc: 6.00000
+Iteration: 46/1100 (4.2%)  Loss: 0.00000, Acc: 4.00000
+Iteration: 47/1100 (4.3%)  Loss: 0.21045, Acc: 10.00000
+Iteration: 48/1100 (4.4%)  Loss: 0.33996, Acc: 12.00000
+Iteration: 49/1100 (4.5%)  Loss: 0.00000, Acc: 14.00000
+Iteration: 50/1100 (4.5%)  Loss: 0.21045, Acc: 10.00000
+&lt;/denchmark-code&gt;
+
+CPU Version log
+&lt;denchmark-code&gt;Iteration: 1/1100 (0.1%)  Loss:  0.80942, Acc: 8.00000
+Iteration: 2/1100 (0.2%)  Loss:  0.63684, Acc: 10.00000
+Iteration: 3/1100 (0.3%)  Loss:  1.88716, Acc: 8.00000
+Iteration: 4/1100 (0.4%)  Loss:  0.80636, Acc: 4.00000
+Iteration: 5/1100 (0.5%)  Loss:  0.60099, Acc: 10.00000
+Iteration: 6/1100 (0.5%)  Loss:  0.54984, Acc: 12.00000
+Iteration: 7/1100 (0.6%)  Loss:  0.52977, Acc: 28.00000
+Iteration: 8/1100 (0.7%)  Loss:  0.52300, Acc: 12.00000
+Iteration: 9/1100 (0.8%)  Loss:  0.54408, Acc: 8.00000
+Iteration: 10/1100 (0.9%)  Loss: 0.49441, Acc: 16.00000
+Iteration: 11/1100 (1.0%)  Loss: 0.48491, Acc: 20.00000
+Iteration: 12/1100 (1.1%)  Loss: 0.49179, Acc: 36.00000
+Iteration: 13/1100 (1.2%)  Loss: 0.46365, Acc: 50.00000
+Iteration: 14/1100 (1.3%)  Loss: 0.45733, Acc: 54.00000
+Iteration: 15/1100 (1.4%)  Loss: 0.41508, Acc: 64.00000
+Iteration: 16/1100 (1.5%)  Loss: 0.40333, Acc: 64.00000
+Iteration: 17/1100 (1.5%)  Loss: 0.37526, Acc: 58.00000
+Iteration: 18/1100 (1.6%)  Loss: 0.37363, Acc: 58.00000
+Iteration: 19/1100 (1.7%)  Loss: 0.37349, Acc: 50.00000
+Iteration: 20/1100 (1.8%)  Loss: 0.37024, Acc: 52.00000
+Iteration: 21/1100 (1.9%)  Loss: 0.31172, Acc: 64.00000
+Iteration: 22/1100 (2.0%)  Loss: 0.29889, Acc: 64.00000
+Iteration: 23/1100 (2.1%)  Loss: 0.32116, Acc: 66.00000
+Iteration: 24/1100 (2.2%)  Loss: 0.31103, Acc: 74.00000
+Iteration: 25/1100 (2.3%)  Loss: 0.28157, Acc: 76.00000
+Iteration: 26/1100 (2.4%)  Loss: 0.22721, Acc: 82.00000
+Iteration: 27/1100 (2.5%)  Loss: 0.24645, Acc: 80.00000
+Iteration: 28/1100 (2.5%)  Loss: 0.28085, Acc: 76.00000
+Iteration: 29/1100 (2.6%)  Loss: 0.21644, Acc: 82.00000
+Iteration: 30/1100 (2.7%)  Loss: 0.22552, Acc: 82.00000
+Iteration: 31/1100 (2.8%)  Loss: 0.19832, Acc: 84.00000
+Iteration: 32/1100 (2.9%)  Loss: 0.18913, Acc: 86.00000
+Iteration: 33/1100 (3.0%)  Loss: 0.18527, Acc: 86.00000
+Iteration: 34/1100 (3.1%)  Loss: 0.19863, Acc: 84.00000
+Iteration: 35/1100 (3.2%)  Loss: 0.16656, Acc: 90.00000
+Iteration: 36/1100 (3.3%)  Loss: 0.17566, Acc: 80.00000
+Iteration: 37/1100 (3.4%)  Loss: 0.16723, Acc: 82.00000
+Iteration: 38/1100 (3.5%)  Loss: 0.13901, Acc: 94.00000
+Iteration: 39/1100 (3.5%)  Loss: 0.14630, Acc: 88.00000
+Iteration: 40/1100 (3.6%)  Loss: 0.16909, Acc: 84.00000
+Iteration: 41/1100 (3.7%)  Loss: 0.13749, Acc: 90.00000
+Iteration: 42/1100 (3.8%)  Loss: 0.16060, Acc: 84.00000
+Iteration: 43/1100 (3.9%)  Loss: 0.12409, Acc: 92.00000
+Iteration: 44/1100 (4.0%)  Loss: 0.16228, Acc: 82.00000
+Iteration: 45/1100 (4.1%)  Loss: 0.14838, Acc: 86.00000
+Iteration: 46/1100 (4.2%)  Loss: 0.13091, Acc: 90.00000
+Iteration: 47/1100 (4.3%)  Loss: 0.13386, Acc: 92.00000
+Iteration: 48/1100 (4.4%)  Loss: 0.15651, Acc: 84.00000
+Iteration: 49/1100 (4.5%)  Loss: 0.15982, Acc: 84.00000
+Iteration: 50/1100 (4.5%)  Loss: 0.12564, Acc: 90.00000
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='sephiroce' date='2020-04-21T12:35:58Z'>
+		&lt;denchmark-link:https://github.com/sephiroce&gt;@sephiroce&lt;/denchmark-link&gt;
+,
+I tried to reproduce the issue, but did not observe much difference in the results on &lt;denchmark-link:https://colab.research.google.com/gist/amahendrakar/de66d100ff9842499d394fa69fd5188e/38731.ipynb&gt;CPU&lt;/denchmark-link&gt;
+ and &lt;denchmark-link:https://colab.research.google.com/gist/amahendrakar/419557fea3ade5839494a1ef19922354/38731-gpu.ipynb&gt;GPU&lt;/denchmark-link&gt;
+. Please find the attached gist.
+Could you please try upgrading to TF v1.15.2 and check if you are facing the same issue? Thanks!
+		</comment>
+		<comment id='2' author='sephiroce' date='2020-04-21T14:43:47Z'>
+		@amahendrar, Thank you!
+I upgraded TF to 1.15.2 but I'm still facing the same issue T.T..
+Especially margin losses went wrong I guess.
+&lt;denchmark-code&gt;Iteration: 1/50 (2.0%)  Loss: 0.30925, Acc: 6.00000margin loss: 0.000000, reconstruction loss: 0.232661
+Iteration: 2/50 (4.0%)  Loss: 0.00012, Acc: 14.00000margin loss: 0.000000, reconstruction loss: 0.232515
+Iteration: 3/50 (6.0%)  Loss: 0.00012, Acc: 8.00000margin loss: 0.210452, reconstruction loss: 0.231619
+Iteration: 4/50 (8.0%)  Loss: 0.21057, Acc: 4.00000margin loss: 0.210452, reconstruction loss: 0.231232
+Iteration: 5/50 (10.0%)  Loss: 0.21057, Acc: 10.00000margin loss: 0.000000, reconstruction loss: 0.229791
+Iteration: 6/50 (12.0%)  Loss: 0.00011, Acc: 12.00000margin loss: 0.000000, reconstruction loss: 0.231024
+Iteration: 7/50 (14.0%)  Loss: 0.00012, Acc: 8.00000margin loss: 0.000000, reconstruction loss: 0.230170
+Iteration: 8/50 (16.0%)  Loss: 0.00012, Acc: 12.00000margin loss: 0.000000, reconstruction loss: 0.231490
+Iteration: 9/50 (18.0%)  Loss: 0.00012, Acc: 10.00000margin loss: 0.000000, reconstruction loss: 0.231016
+Iteration: 10/50 (20.0%)  Loss: 0.00012, Acc: 8.00000margin loss: 0.000000, reconstruction loss: 0.230513
+Iteration: 11/50 (22.0%)  Loss: 0.00012, Acc: 16.00000margin loss: 0.000000, reconstruction loss: 0.231000
+&lt;/denchmark-code&gt;
+
+I have another question. In the attached gists, the same pip commands are used.
+How did you turn on/off GPU usage?
+		</comment>
+		<comment id='3' author='sephiroce' date='2020-04-21T15:32:08Z'>
+		&lt;denchmark-link:https://github.com/sephiroce&gt;@sephiroce&lt;/denchmark-link&gt;
+,
+There's an option to choose GPU as a hardware accelerator under 'Runtime' -&gt; 'Change runtime type'.
+		</comment>
+		<comment id='4' author='sephiroce' date='2020-04-23T05:52:34Z'>
+		I converted my source code to TF2.1 and the issues have gone.
+I'll close this issue. Thanks!
+		</comment>
+		<comment id='5' author='sephiroce' date='2020-04-23T05:52:35Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/38731&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/38731&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

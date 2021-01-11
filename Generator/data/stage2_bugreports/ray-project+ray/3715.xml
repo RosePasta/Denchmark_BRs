@@ -1,0 +1,573 @@
+<bug id='3715' author='pschafhalter' open_date='2019-01-08T08:07:54Z' closed_time='2019-07-23T18:55:29Z'>
+	<summary>ray.wait() doesn't return methods completed by dead actors as ready</summary>
+	<description>
+&lt;denchmark-h:h3&gt;System information&lt;/denchmark-h&gt;
+
+
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Ubuntu 18.04
+Ray installed from (source or binary): source
+Ray version: 0.6.1
+Python version: 3.6.6
+
+&lt;denchmark-h:h3&gt;Describe the problem&lt;/denchmark-h&gt;
+
+
+launch an actor on another node
+x = actor.ping.remote()
+kill the node containing the actor
+ray.wait([x], timeout=0). x will never become ready, even if called much later
+
+Expected behavior is that x will become ready and store an exception.
+This is an issue when adding heartbeats for actors on multiple node using ray.wait(), such as for distributed SGD.
+&lt;denchmark-h:h3&gt;Source code / logs&lt;/denchmark-h&gt;
+
+import time
+
+import ray 
+from ray.test.cluster_utils import Cluster
+
+cluster = Cluster(True, True, head_node_args={"num_cpus": 0})
+node = cluster.add_node()
+
+@ray.remote(num_cpus=1)
+class Foo:
+    def ping(self):
+        pass
+
+f = Foo.remote()
+
+print("pinging")
+ray.get(f.ping.remote())
+
+x = f.ping.remote()
+
+print("removing node")
+cluster.remove_node(node)
+print("done removing node")
+
+for i in range(100):
+    print(i, ray.wait([x], timeout=1))
+    time.sleep(1)
+CC &lt;denchmark-link:https://github.com/stephanie-wang&gt;@stephanie-wang&lt;/denchmark-link&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='pschafhalter' date='2019-01-08T22:07:44Z'>
+		Interesting, ray.wait initially returns the object ID as "ready". And then after the monitor marks the node as dead it returns the object ID as "not ready". See the below screenshot.
+&lt;denchmark-link:https://user-images.githubusercontent.com/249517/50860955-2e7e9280-134c-11e9-9a64-011e6647a484.png&gt;&lt;/denchmark-link&gt;
+
+Checking ray.global_state.object_table()[x] you can see that it is still in the object table.
+I suspect it's getting cleaned up from some object manager state, though I'm not 100% sure where.
+		</comment>
+		<comment id='2' author='pschafhalter' date='2019-01-08T22:15:31Z'>
+		This is only if you use the timeout though, right? It seems to return fine if otherwise.
+		</comment>
+		<comment id='3' author='pschafhalter' date='2019-01-08T23:53:33Z'>
+		Yes, this only happens with the timeout which is non-blocking. If ray.wait blocks on the ObjectID, then the behavior is as expected.
+		</comment>
+		<comment id='4' author='pschafhalter' date='2019-01-09T20:57:47Z'>
+		Normally, we would fail the task by resubmitting it, then upon seeing that its actor has died, by storing an exception in the return value. It looks like this is happening because we normally wait for some time (at least &lt;denchmark-link:https://github.com/ray-project/ray/blob/master/src/ray/ray_config.h#L198&gt;this much&lt;/denchmark-link&gt;
+) before resubmitting a task, to make sure that we don't duplicate a task that hasn't actually failed. Unfortunately, before we can resubmit the task, the  timeout expires and the request for the task is canceled.
+I think there are two ways we can fix this. First, since the actor has already been marked as dead, we can pass this information to the reconstruction policy so that it can decide to resubmit any tasks meant for that actor without waiting for the timeout. The downside to that approach is that we will have to retrieve the task spec in order to figure out which actor the task was meant for, which means a possibly unnecessary round-trip to the GCS. I'm not sure if the extra complexity/performance cost is worth it.
+The second way is to introduce an (experimental) API that changes the semantics of ray.wait() into more of a subscription service. It would allow the client to subscribe to a set of object IDs that it needs to be local eventually. The client could still call ray.wait()/ray.get() on these objects, but the request to get all the objects would stay open until the client signals that it has all the objects it needs. We could implement this API with a ray.wait()-like call alone, or with additional calls to start/finish a subscription request.
+		</comment>
+		<comment id='5' author='pschafhalter' date='2019-01-09T20:58:28Z'>
+		By the way, I think that a hack for the API proposal above is already used in RLlib. &lt;denchmark-link:https://github.com/ericl&gt;@ericl&lt;/denchmark-link&gt;
+ or &lt;denchmark-link:https://github.com/richardliaw&gt;@richardliaw&lt;/denchmark-link&gt;
+?
+		</comment>
+		<comment id='6' author='pschafhalter' date='2019-01-09T21:59:20Z'>
+		
+The downside to that approach is that we will have to retrieve the task spec in order to figure out which actor the task was meant for, which means a possibly unnecessary round-trip to the GCS. I'm not sure if the extra complexity/performance cost is worth it.
+
+If the round trip would only be for the failure case, then it seems worth it to avoid the reconstruction wait this way.
+
+It would allow the client to subscribe to a set of object IDs that it needs to be local eventually.
+
+Hm we currently use fetch(), I guess that probably doesn't handle failures very nicely (it would probably hang forever on a node removal).
+		</comment>
+		<comment id='7' author='pschafhalter' date='2019-01-10T19:02:04Z'>
+		
+
+The downside to that approach is that we will have to retrieve the task spec in order to figure out which actor the task was meant for, which means a possibly unnecessary round-trip to the GCS. I'm not sure if the extra complexity/performance cost is worth it.
+
+If the round trip would only be for the failure case, then it seems worth it to avoid the reconstruction wait this way.
+
+Unfortunately, it would also be in the non-failure case, since you'd have to look up the task spec while trying to decide whether the task had failed.
+
+
+It would allow the client to subscribe to a set of object IDs that it needs to be local eventually.
+
+Hm we currently use fetch(), I guess that probably doesn't handle failures very nicely (it would probably hang forever on a node removal).
+
+Yeah, ideally we would just standardize fetch() to be used as an experimental API.
+		</comment>
+		<comment id='8' author='pschafhalter' date='2019-01-15T03:36:28Z'>
+		Another situation where this seems to be showing up is in Tune fault tolerance tests.
+The basic event loop that Tune implements is:
+remaining = [actor.step() for actor in actor_list]
+
+while True:
+   ready, remaining = ray.wait(remaining)
+   process_event(ready)
+   remaining.add(actor[ready.actor_id].step()])
+If any actor is on a killed node, they will be deprioritized significantly. Setting the max task lease to 200ms also does not resolve this issue. This is a very important use case for Tune because people often launch a bulk of actors, one per spot instance, and the duration of the Tune session becomes 3 or 4x longer than expected.
+&lt;denchmark-h:h3&gt;Logs:&lt;/denchmark-h&gt;
+
+To read the below logs: essentially each output is a step of the event loop with an actor result returning. Notice that ip-172-31-0-144 trials do not progress after node death.
+ray start --head --redis-port=6379 --num-cpus=4 --internal-config='{"max_task_lease_timeout_ms": 200}
+&lt;denchmark-code&gt;== Status ==
+Using FIFO scheduling algorithm.
+Resources requested: 12/12 CPUs, 0/0 GPUs
+Unknown memory usage. Please run `pip install psutil` (or ray[debug]) to resolve)
+Result logdir: /home/ubuntu/ray_results/asynchyperband_test
+PENDING trials:
+ - MyTrainableClass_6_height=91,width=51:	PENDING
+ - MyTrainableClass_7_height=51,width=45:	PENDING
+ - MyTrainableClass_8_height=11,width=73:	PENDING
+ - MyTrainableClass_9_height=53,width=32:	PENDING
+ - MyTrainableClass_10_height=64,width=78:	PENDING
+ - MyTrainableClass_11_height=72,width=23:	PENDING
+RUNNING trials:
+ - MyTrainableClass_0_height=16,width=31:	RUNNING [pid=6513], 34 s, 34 iter, 12.8 rew
+ - MyTrainableClass_1_height=95,width=10:	RUNNING [ip-172-31-0-144 pid=9637], 7 s, 7 iter, 57.4 rew
+ - MyTrainableClass_2_height=61,width=31:	RUNNING [ip-172-31-0-144 pid=9636], 7 s, 7 iter, 13.5 rew
+ - MyTrainableClass_3_height=46,width=29:	RUNNING [ip-172-31-0-144 pid=9635], 6 s, 6 iter, 9.38 rew
+ - MyTrainableClass_4_height=41,width=27:	RUNNING [ip-172-31-0-144 pid=9638], 7 s, 7 iter, 10.4 rew
+ - MyTrainableClass_5_height=26,width=20:	RUNNING [pid=6918], 33 s, 33 iter, 24.2 rew
+&lt;/denchmark-code&gt;
+
+Node death here ...
+&lt;denchmark-code&gt;The node with client ID 4989fdc506c5cfcd308140d9d80ed87d5960bb99 has been marked dead because the monitor has missed too many heartbeats from it.
+== Status ==
+Using FIFO scheduling algorithm.
+Resources requested: 12/12 CPUs, 0/0 GPUs
+Unknown memory usage. Please run `pip install psutil` (or ray[debug]) to resolve)
+Result logdir: /home/ubuntu/ray_results/asynchyperband_test
+PENDING trials:
+ - MyTrainableClass_6_height=91,width=51:	PENDING
+ - MyTrainableClass_7_height=51,width=45:	PENDING
+ - MyTrainableClass_8_height=11,width=73:	PENDING
+ - MyTrainableClass_9_height=53,width=32:	PENDING
+ - MyTrainableClass_10_height=64,width=78:	PENDING
+ - MyTrainableClass_11_height=72,width=23:	PENDING
+RUNNING trials:
+ - MyTrainableClass_0_height=16,width=31:	RUNNING [pid=6513], 39 s, 39 iter, 13.6 rew
+ - MyTrainableClass_1_height=95,width=10:	RUNNING [ip-172-31-0-144 pid=9637], 7 s, 7 iter, 57.4 rew
+ - MyTrainableClass_2_height=61,width=31:	RUNNING [ip-172-31-0-144 pid=9636], 7 s, 7 iter, 13.5 rew
+ - MyTrainableClass_3_height=46,width=29:	RUNNING [ip-172-31-0-144 pid=9635], 6 s, 6 iter, 9.38 rew
+ - MyTrainableClass_4_height=41,width=27:	RUNNING [ip-172-31-0-144 pid=9638], 7 s, 7 iter, 10.4 rew
+ - MyTrainableClass_5_height=26,width=20:	RUNNING [pid=6918], 38 s, 38 iter, 24.9 rew
+
+== Status ==
+Using FIFO scheduling algorithm.
+Resources requested: 12/4 CPUs, 0/0 GPUs
+Unknown memory usage. Please run `pip install psutil` (or ray[debug]) to resolve)
+Result logdir: /home/ubuntu/ray_results/asynchyperband_test
+PENDING trials:
+ - MyTrainableClass_6_height=91,width=51:	PENDING
+ - MyTrainableClass_7_height=51,width=45:	PENDING
+ - MyTrainableClass_8_height=11,width=73:	PENDING
+ - MyTrainableClass_9_height=53,width=32:	PENDING
+ - MyTrainableClass_10_height=64,width=78:	PENDING
+ - MyTrainableClass_11_height=72,width=23:	PENDING
+RUNNING trials:
+ - MyTrainableClass_0_height=16,width=31:	RUNNING [pid=6513], 44 s, 44 iter, 14.2 rew
+ - MyTrainableClass_1_height=95,width=10:	RUNNING [ip-172-31-0-144 pid=9637], 7 s, 7 iter, 57.4 rew
+ - MyTrainableClass_2_height=61,width=31:	RUNNING [ip-172-31-0-144 pid=9636], 7 s, 7 iter, 13.5 rew
+ - MyTrainableClass_3_height=46,width=29:	RUNNING [ip-172-31-0-144 pid=9635], 6 s, 6 iter, 9.38 rew
+ - MyTrainableClass_4_height=41,width=27:	RUNNING [ip-172-31-0-144 pid=9638], 7 s, 7 iter, 10.4 rew
+ - MyTrainableClass_5_height=26,width=20:	RUNNING [pid=6918], 43 s, 43 iter, 25.3 rew
+
+== Status ==
+Using FIFO scheduling algorithm.
+Resources requested: 12/4 CPUs, 0/0 GPUs
+Unknown memory usage. Please run `pip install psutil` (or ray[debug]) to resolve)
+Result logdir: /home/ubuntu/ray_results/asynchyperband_test
+PENDING trials:
+ - MyTrainableClass_6_height=91,width=51:	PENDING
+ - MyTrainableClass_7_height=51,width=45:	PENDING
+ - MyTrainableClass_8_height=11,width=73:	PENDING
+ - MyTrainableClass_9_height=53,width=32:	PENDING
+ - MyTrainableClass_10_height=64,width=78:	PENDING
+ - MyTrainableClass_11_height=72,width=23:	PENDING
+RUNNING trials:
+ - MyTrainableClass_0_height=16,width=31:	RUNNING [pid=6513], 49 s, 49 iter, 14.7 rew
+ - MyTrainableClass_1_height=95,width=10:	RUNNING [ip-172-31-0-144 pid=9637], 7 s, 7 iter, 57.4 rew
+ - MyTrainableClass_2_height=61,width=31:	RUNNING [ip-172-31-0-144 pid=9636], 7 s, 7 iter, 13.5 rew
+ - MyTrainableClass_3_height=46,width=29:	RUNNING [ip-172-31-0-144 pid=9635], 6 s, 6 iter, 9.38 rew
+ - MyTrainableClass_4_height=41,width=27:	RUNNING [ip-172-31-0-144 pid=9638], 7 s, 7 iter, 10.4 rew
+ - MyTrainableClass_5_height=26,width=20:	RUNNING [pid=6918], 48 s, 48 iter, 25.6 rew
+
+== Status ==
+Using FIFO scheduling algorithm.
+Resources requested: 12/4 CPUs, 0/0 GPUs
+Unknown memory usage. Please run `pip install psutil` (or ray[debug]) to resolve)
+Result logdir: /home/ubuntu/ray_results/asynchyperband_test
+PENDING trials:
+ - MyTrainableClass_6_height=91,width=51:	PENDING
+ - MyTrainableClass_7_height=51,width=45:	PENDING
+ - MyTrainableClass_8_height=11,width=73:	PENDING
+ - MyTrainableClass_9_height=53,width=32:	PENDING
+ - MyTrainableClass_10_height=64,width=78:	PENDING
+ - MyTrainableClass_11_height=72,width=23:	PENDING
+RUNNING trials:
+ - MyTrainableClass_0_height=16,width=31:	RUNNING [pid=6513], 54 s, 54 iter, 15 rew
+ - MyTrainableClass_1_height=95,width=10:	RUNNING [ip-172-31-0-144 pid=9637], 7 s, 7 iter, 57.4 rew
+ - MyTrainableClass_2_height=61,width=31:	RUNNING [ip-172-31-0-144 pid=9636], 7 s, 7 iter, 13.5 rew
+ - MyTrainableClass_3_height=46,width=29:	RUNNING [ip-172-31-0-144 pid=9635], 6 s, 6 iter, 9.38 rew
+ - MyTrainableClass_4_height=41,width=27:	RUNNING [ip-172-31-0-144 pid=9638], 7 s, 7 iter, 10.4 rew
+ - MyTrainableClass_5_height=26,width=20:	RUNNING [pid=6918], 53 s, 53 iter, 25.7 rew
+
+== Status ==
+Using FIFO scheduling algorithm.
+Resources requested: 12/4 CPUs, 0/0 GPUs
+Unknown memory usage. Please run `pip install psutil` (or ray[debug]) to resolve)
+Result logdir: /home/ubuntu/ray_results/asynchyperband_test
+PENDING trials:
+ - MyTrainableClass_6_height=91,width=51:	PENDING
+ - MyTrainableClass_7_height=51,width=45:	PENDING
+ - MyTrainableClass_8_height=11,width=73:	PENDING
+ - MyTrainableClass_9_height=53,width=32:	PENDING
+ - MyTrainableClass_10_height=64,width=78:	PENDING
+ - MyTrainableClass_11_height=72,width=23:	PENDING
+RUNNING trials:
+ - MyTrainableClass_0_height=16,width=31:	RUNNING [pid=6513], 59 s, 59 iter, 15.3 rew
+ - MyTrainableClass_1_height=95,width=10:	RUNNING [ip-172-31-0-144 pid=9637], 7 s, 7 iter, 57.4 rew
+ - MyTrainableClass_2_height=61,width=31:	RUNNING [ip-172-31-0-144 pid=9636], 7 s, 7 iter, 13.5 rew
+ - MyTrainableClass_3_height=46,width=29:	RUNNING [ip-172-31-0-144 pid=9635], 6 s, 6 iter, 9.38 rew
+ - MyTrainableClass_4_height=41,width=27:	RUNNING [ip-172-31-0-144 pid=9638], 7 s, 7 iter, 10.4 rew
+ - MyTrainableClass_5_height=26,width=20:	RUNNING [pid=6918], 58 s, 58 iter, 25.8 rew
+
+== Status ==
+Using FIFO scheduling algorithm.
+Resources requested: 12/4 CPUs, 0/0 GPUs
+Unknown memory usage. Please run `pip install psutil` (or ray[debug]) to resolve)
+Result logdir: /home/ubuntu/ray_results/asynchyperband_test
+PENDING trials:
+ - MyTrainableClass_6_height=91,width=51:	PENDING
+ - MyTrainableClass_7_height=51,width=45:	PENDING
+ - MyTrainableClass_8_height=11,width=73:	PENDING
+ - MyTrainableClass_9_height=53,width=32:	PENDING
+ - MyTrainableClass_10_height=64,width=78:	PENDING
+ - MyTrainableClass_11_height=72,width=23:	PENDING
+RUNNING trials:
+ - MyTrainableClass_0_height=16,width=31:	RUNNING [pid=6513], 64 s, 64 iter, 15.5 rew
+ - MyTrainableClass_1_height=95,width=10:	RUNNING [ip-172-31-0-144 pid=9637], 7 s, 7 iter, 57.4 rew
+ - MyTrainableClass_2_height=61,width=31:	RUNNING [ip-172-31-0-144 pid=9636], 7 s, 7 iter, 13.5 rew
+ - MyTrainableClass_3_height=46,width=29:	RUNNING [ip-172-31-0-144 pid=9635], 6 s, 6 iter, 9.38 rew
+ - MyTrainableClass_4_height=41,width=27:	RUNNING [ip-172-31-0-144 pid=9638], 7 s, 7 iter, 10.4 rew
+ - MyTrainableClass_5_height=26,width=20:	RUNNING [pid=6918], 63 s, 63 iter, 25.9 rew
+
+== Status ==
+Using FIFO scheduling algorithm.
+Resources requested: 12/4 CPUs, 0/0 GPUs
+Unknown memory usage. Please run `pip install psutil` (or ray[debug]) to resolve)
+Result logdir: /home/ubuntu/ray_results/asynchyperband_test
+PENDING trials:
+ - MyTrainableClass_6_height=91,width=51:	PENDING
+ - MyTrainableClass_7_height=51,width=45:	PENDING
+ - MyTrainableClass_8_height=11,width=73:	PENDING
+ - MyTrainableClass_9_height=53,width=32:	PENDING
+ - MyTrainableClass_10_height=64,width=78:	PENDING
+ - MyTrainableClass_11_height=72,width=23:	PENDING
+RUNNING trials:
+ - MyTrainableClass_0_height=16,width=31:	RUNNING [pid=6513], 69 s, 69 iter, 15.6 rew
+ - MyTrainableClass_1_height=95,width=10:	RUNNING [ip-172-31-0-144 pid=9637], 7 s, 7 iter, 57.4 rew
+ - MyTrainableClass_2_height=61,width=31:	RUNNING [ip-172-31-0-144 pid=9636], 7 s, 7 iter, 13.5 rew
+ - MyTrainableClass_3_height=46,width=29:	RUNNING [ip-172-31-0-144 pid=9635], 6 s, 6 iter, 9.38 rew
+ - MyTrainableClass_4_height=41,width=27:	RUNNING [ip-172-31-0-144 pid=9638], 7 s, 7 iter, 10.4 rew
+ - MyTrainableClass_5_height=26,width=20:	RUNNING [pid=6918], 68 s, 68 iter, 25.9 rew
+
+== Status ==
+Using FIFO scheduling algorithm.
+Resources requested: 12/4 CPUs, 0/0 GPUs
+Unknown memory usage. Please run `pip install psutil` (or ray[debug]) to resolve)
+Result logdir: /home/ubuntu/ray_results/asynchyperband_test
+PENDING trials:
+ - MyTrainableClass_6_height=91,width=51:	PENDING
+ - MyTrainableClass_7_height=51,width=45:	PENDING
+ - MyTrainableClass_8_height=11,width=73:	PENDING
+ - MyTrainableClass_9_height=53,width=32:	PENDING
+ - MyTrainableClass_10_height=64,width=78:	PENDING
+ - MyTrainableClass_11_height=72,width=23:	PENDING
+RUNNING trials:
+ - MyTrainableClass_0_height=16,width=31:	RUNNING [pid=6513], 74 s, 74 iter, 15.7 rew
+ - MyTrainableClass_1_height=95,width=10:	RUNNING [ip-172-31-0-144 pid=9637], 7 s, 7 iter, 57.4 rew
+ - MyTrainableClass_2_height=61,width=31:	RUNNING [ip-172-31-0-144 pid=9636], 7 s, 7 iter, 13.5 rew
+ - MyTrainableClass_3_height=46,width=29:	RUNNING [ip-172-31-0-144 pid=9635], 6 s, 6 iter, 9.38 rew
+ - MyTrainableClass_4_height=41,width=27:	RUNNING [ip-172-31-0-144 pid=9638], 7 s, 7 iter, 10.4 rew
+ - MyTrainableClass_5_height=26,width=20:	RUNNING [pid=6918], 73 s, 73 iter, 26 rew
+
+== Status ==
+Using FIFO scheduling algorithm.
+Resources requested: 12/4 CPUs, 0/0 GPUs
+Unknown memory usage. Please run `pip install psutil` (or ray[debug]) to resolve)
+Result logdir: /home/ubuntu/ray_results/asynchyperband_test
+PENDING trials:
+ - MyTrainableClass_6_height=91,width=51:	PENDING
+ - MyTrainableClass_7_height=51,width=45:	PENDING
+ - MyTrainableClass_8_height=11,width=73:	PENDING
+ - MyTrainableClass_9_height=53,width=32:	PENDING
+ - MyTrainableClass_10_height=64,width=78:	PENDING
+ - MyTrainableClass_11_height=72,width=23:	PENDING
+RUNNING trials:
+ - MyTrainableClass_0_height=16,width=31:	RUNNING [pid=6513], 79 s, 79 iter, 15.8 rew
+ - MyTrainableClass_1_height=95,width=10:	RUNNING [ip-172-31-0-144 pid=9637], 7 s, 7 iter, 57.4 rew
+ - MyTrainableClass_2_height=61,width=31:	RUNNING [ip-172-31-0-144 pid=9636], 7 s, 7 iter, 13.5 rew
+ - MyTrainableClass_3_height=46,width=29:	RUNNING [ip-172-31-0-144 pid=9635], 6 s, 6 iter, 9.38 rew
+ - MyTrainableClass_4_height=41,width=27:	RUNNING [ip-172-31-0-144 pid=9638], 7 s, 7 iter, 10.4 rew
+ - MyTrainableClass_5_height=26,width=20:	RUNNING [pid=6918], 78 s, 78 iter, 26 rew
+
+== Status ==
+Using FIFO scheduling algorithm.
+Resources requested: 12/4 CPUs, 0/0 GPUs
+Unknown memory usage. Please run `pip install psutil` (or ray[debug]) to resolve)
+Result logdir: /home/ubuntu/ray_results/asynchyperband_test
+PENDING trials:
+ - MyTrainableClass_6_height=91,width=51:	PENDING
+ - MyTrainableClass_7_height=51,width=45:	PENDING
+ - MyTrainableClass_8_height=11,width=73:	PENDING
+ - MyTrainableClass_9_height=53,width=32:	PENDING
+ - MyTrainableClass_10_height=64,width=78:	PENDING
+ - MyTrainableClass_11_height=72,width=23:	PENDING
+RUNNING trials:
+ - MyTrainableClass_0_height=16,width=31:	RUNNING [pid=6513], 84 s, 84 iter, 15.9 rew
+ - MyTrainableClass_1_height=95,width=10:	RUNNING [ip-172-31-0-144 pid=9637], 7 s, 7 iter, 57.4 rew
+ - MyTrainableClass_2_height=61,width=31:	RUNNING [ip-172-31-0-144 pid=9636], 7 s, 7 iter, 13.5 rew
+ - MyTrainableClass_3_height=46,width=29:	RUNNING [ip-172-31-0-144 pid=9635], 6 s, 6 iter, 9.38 rew
+ - MyTrainableClass_4_height=41,width=27:	RUNNING [ip-172-31-0-144 pid=9638], 7 s, 7 iter, 10.4 rew
+ - MyTrainableClass_5_height=26,width=20:	RUNNING [pid=6918], 83 s, 83 iter, 26 rew
+
+== Status ==
+Using FIFO scheduling algorithm.
+Resources requested: 12/4 CPUs, 0/0 GPUs
+Unknown memory usage. Please run `pip install psutil` (or ray[debug]) to resolve)
+Result logdir: /home/ubuntu/ray_results/asynchyperband_test
+PENDING trials:
+ - MyTrainableClass_6_height=91,width=51:	PENDING
+ - MyTrainableClass_7_height=51,width=45:	PENDING
+ - MyTrainableClass_8_height=11,width=73:	PENDING
+ - MyTrainableClass_9_height=53,width=32:	PENDING
+ - MyTrainableClass_10_height=64,width=78:	PENDING
+ - MyTrainableClass_11_height=72,width=23:	PENDING
+RUNNING trials:
+ - MyTrainableClass_0_height=16,width=31:	RUNNING [pid=6513], 89 s, 89 iter, 15.9 rew
+ - MyTrainableClass_1_height=95,width=10:	RUNNING [ip-172-31-0-144 pid=9637], 7 s, 7 iter, 57.4 rew
+ - MyTrainableClass_2_height=61,width=31:	RUNNING [ip-172-31-0-144 pid=9636], 7 s, 7 iter, 13.5 rew
+ - MyTrainableClass_3_height=46,width=29:	RUNNING [ip-172-31-0-144 pid=9635], 6 s, 6 iter, 9.38 rew
+ - MyTrainableClass_4_height=41,width=27:	RUNNING [ip-172-31-0-144 pid=9638], 7 s, 7 iter, 10.4 rew
+ - MyTrainableClass_5_height=26,width=20:	RUNNING [pid=6918], 88 s, 88 iter, 26 rew
+
+== Status ==
+Using FIFO scheduling algorithm.
+Resources requested: 12/4 CPUs, 0/0 GPUs
+Unknown memory usage. Please run `pip install psutil` (or ray[debug]) to resolve)
+Result logdir: /home/ubuntu/ray_results/asynchyperband_test
+PENDING trials:
+ - MyTrainableClass_6_height=91,width=51:	PENDING
+ - MyTrainableClass_7_height=51,width=45:	PENDING
+ - MyTrainableClass_8_height=11,width=73:	PENDING
+ - MyTrainableClass_9_height=53,width=32:	PENDING
+ - MyTrainableClass_10_height=64,width=78:	PENDING
+ - MyTrainableClass_11_height=72,width=23:	PENDING
+RUNNING trials:
+ - MyTrainableClass_0_height=16,width=31:	RUNNING [pid=6513], 94 s, 94 iter, 15.9 rew
+ - MyTrainableClass_1_height=95,width=10:	RUNNING [ip-172-31-0-144 pid=9637], 7 s, 7 iter, 57.4 rew
+ - MyTrainableClass_2_height=61,width=31:	RUNNING [ip-172-31-0-144 pid=9636], 7 s, 7 iter, 13.5 rew
+ - MyTrainableClass_3_height=46,width=29:	RUNNING [ip-172-31-0-144 pid=9635], 6 s, 6 iter, 9.38 rew
+ - MyTrainableClass_4_height=41,width=27:	RUNNING [ip-172-31-0-144 pid=9638], 7 s, 7 iter, 10.4 rew
+ - MyTrainableClass_5_height=26,width=20:	RUNNING [pid=6918], 93 s, 93 iter, 26 rew
+
+== Status ==
+Using FIFO scheduling algorithm.
+Resources requested: 12/4 CPUs, 0/0 GPUs
+Unknown memory usage. Please run `pip install psutil` (or ray[debug]) to resolve)
+Result logdir: /home/ubuntu/ray_results/asynchyperband_test
+PENDING trials:
+ - MyTrainableClass_6_height=91,width=51:	PENDING
+ - MyTrainableClass_7_height=51,width=45:	PENDING
+ - MyTrainableClass_8_height=11,width=73:	PENDING
+ - MyTrainableClass_9_height=53,width=32:	PENDING
+ - MyTrainableClass_10_height=64,width=78:	PENDING
+ - MyTrainableClass_11_height=72,width=23:	PENDING
+RUNNING trials:
+ - MyTrainableClass_0_height=16,width=31:	RUNNING [pid=6513], 99 s, 99 iter, 15.9 rew
+ - MyTrainableClass_1_height=95,width=10:	RUNNING [ip-172-31-0-144 pid=9637], 7 s, 7 iter, 57.4 rew
+ - MyTrainableClass_2_height=61,width=31:	RUNNING [ip-172-31-0-144 pid=9636], 7 s, 7 iter, 13.5 rew
+ - MyTrainableClass_3_height=46,width=29:	RUNNING [ip-172-31-0-144 pid=9635], 6 s, 6 iter, 9.38 rew
+ - MyTrainableClass_4_height=41,width=27:	RUNNING [ip-172-31-0-144 pid=9638], 7 s, 7 iter, 10.4 rew
+ - MyTrainableClass_5_height=26,width=20:	RUNNING [pid=6918], 98 s, 98 iter, 26 rew
+
+2019-01-15 01:27:01,881	ERROR trial_runner.py:387 -- Error processing event.
+Traceback (most recent call last):
+  File "/home/ubuntu/anaconda3/envs/tensorflow_p36/lib/python3.6/site-packages/ray/tune/trial_runner.py", line 353, in _process_events
+    result = self.trial_executor.fetch_result(trial)
+  File "/home/ubuntu/anaconda3/envs/tensorflow_p36/lib/python3.6/site-packages/ray/tune/ray_trial_executor.py", line 222, in fetch_result
+    result = ray.get(trial_future[0])
+  File "/home/ubuntu/anaconda3/envs/tensorflow_p36/lib/python3.6/site-packages/ray/worker.py", line 2211, in get
+    raise value
+ray.worker.RayTaskError: Invalid return value: likely worker died or was killed while executing the task; check previous logs or dmesg for errors.
+== Status ==
+Using FIFO scheduling algorithm.
+Resources requested: 6/4 CPUs, 0/0 GPUs
+Unknown memory usage. Please run `pip install psutil` (or ray[debug]) to resolve)
+Result logdir: /home/ubuntu/ray_results/asynchyperband_test
+PENDING trials:
+ - MyTrainableClass_3_height=46,width=29:	PENDING, 1 failures: /home/ubuntu/ray_results/asynchyperband_test/MyTrainableClass_3_height=46,width=29_2019-01-15_01-25-098csg_ra1/error_2019-01-15_01-27-02.txt [ip-172-31-0-144 pid=9635], 6 s, 6 iter, 9.38 rew
+ - MyTrainableClass_6_height=91,width=51:	PENDING
+ - MyTrainableClass_7_height=51,width=45:	PENDING
+ - MyTrainableClass_8_height=11,width=73:	PENDING
+ - MyTrainableClass_9_height=53,width=32:	PENDING
+ - MyTrainableClass_10_height=64,width=78:	PENDING
+ - MyTrainableClass_11_height=72,width=23:	PENDING
+RUNNING trials:
+ - MyTrainableClass_1_height=95,width=10:	RUNNING [ip-172-31-0-144 pid=9637], 7 s, 7 iter, 57.4 rew
+ - MyTrainableClass_2_height=61,width=31:	RUNNING [ip-172-31-0-144 pid=9636], 7 s, 7 iter, 13.5 rew
+ - MyTrainableClass_4_height=41,width=27:	RUNNING [ip-172-31-0-144 pid=9638], 7 s, 7 iter, 10.4 rew
+TERMINATED trials:
+ - MyTrainableClass_0_height=16,width=31:	TERMINATED [pid=6513], 100 s, 100 iter, 15.9 rew
+ - MyTrainableClass_5_height=26,width=20:	TERMINATED [pid=6918], 100 s, 100 iter, 26 rew
+
+2019-01-15 01:27:02,366	ERROR trial_runner.py:387 -- Error processing event.
+Traceback (most recent call last):
+  File "/home/ubuntu/anaconda3/envs/tensorflow_p36/lib/python3.6/site-packages/ray/tune/trial_runner.py", line 353, in _process_events
+    result = self.trial_executor.fetch_result(trial)
+  File "/home/ubuntu/anaconda3/envs/tensorflow_p36/lib/python3.6/site-packages/ray/tune/ray_trial_executor.py", line 222, in fetch_result
+    result = ray.get(trial_future[0])
+  File "/home/ubuntu/anaconda3/envs/tensorflow_p36/lib/python3.6/site-packages/ray/worker.py", line 2211, in get
+    raise value
+ray.worker.RayTaskError: Invalid return value: likely worker died or was killed while executing the task; check previous logs or dmesg for errors.
+2019-01-15 01:27:02,890	ERROR trial_runner.py:387 -- Error processing event.
+Traceback (most recent call last):
+  File "/home/ubuntu/anaconda3/envs/tensorflow_p36/lib/python3.6/site-packages/ray/tune/trial_runner.py", line 353, in _process_events
+    result = self.trial_executor.fetch_result(trial)
+  File "/home/ubuntu/anaconda3/envs/tensorflow_p36/lib/python3.6/site-packages/ray/tune/ray_trial_executor.py", line 222, in fetch_result
+    result = ray.get(trial_future[0])
+  File "/home/ubuntu/anaconda3/envs/tensorflow_p36/lib/python3.6/site-packages/ray/worker.py", line 2211, in get
+    raise value
+ray.worker.RayTaskError: Invalid return value: likely worker died or was killed while executing the task; check previous logs or dmesg for errors.
+2019-01-15 01:27:03,338	INFO trial_runner.py:424 -- Attempting to recover trial state from last checkpoint.
+2019-01-15 01:27:04,369	ERROR trial_runner.py:387 -- Error processing event.
+Traceback (most recent call last):
+  File "/home/ubuntu/anaconda3/envs/tensorflow_p36/lib/python3.6/site-packages/ray/tune/trial_runner.py", line 353, in _process_events
+    result = self.trial_executor.fetch_result(trial)
+  File "/home/ubuntu/anaconda3/envs/tensorflow_p36/lib/python3.6/site-packages/ray/tune/ray_trial_executor.py", line 222, in fetch_result
+    result = ray.get(trial_future[0])
+  File "/home/ubuntu/anaconda3/envs/tensorflow_p36/lib/python3.6/site-packages/ray/worker.py", line 2211, in get
+    raise value
+ray.worker.RayTaskError: Invalid return value: likely worker died or was killed while executing the task; check previous logs or dmesg for errors.
+2019-01-15 01:27:04,778	INFO trial_runner.py:424 -- Attempting to recover trial state from last checkpoint.
+== Status ==
+Using FIFO scheduling algorithm.
+Resources requested: 4/4 CPUs, 0/0 GPUs
+Unknown memory usage. Please run `pip install psutil` (or ray[debug]) to resolve)
+Result logdir: /home/ubuntu/ray_results/asynchyperband_test
+PENDING trials:
+ - MyTrainableClass_1_height=95,width=10:	PENDING, 1 failures: /home/ubuntu/ray_results/asynchyperband_test/MyTrainableClass_1_height=95,width=10_2019-01-15_01-25-09vtcsd3y4/error_2019-01-15_01-27-02.txt [ip-172-31-0-144 pid=9637], 7 s, 7 iter, 57.4 rew
+ - MyTrainableClass_3_height=46,width=29:	PENDING, 1 failures: /home/ubuntu/ray_results/asynchyperband_test/MyTrainableClass_3_height=46,width=29_2019-01-15_01-25-098csg_ra1/error_2019-01-15_01-27-02.txt [ip-172-31-0-144 pid=9635], 6 s, 6 iter, 9.38 rew
+ - MyTrainableClass_6_height=91,width=51:	PENDING
+ - MyTrainableClass_7_height=51,width=45:	PENDING
+ - MyTrainableClass_8_height=11,width=73:	PENDING
+ - MyTrainableClass_9_height=53,width=32:	PENDING
+ - MyTrainableClass_10_height=64,width=78:	PENDING
+ - MyTrainableClass_11_height=72,width=23:	PENDING
+RUNNING trials:
+ - MyTrainableClass_2_height=61,width=31:	RUNNING, 1 failures: /home/ubuntu/ray_results/asynchyperband_test/MyTrainableClass_2_height=61,width=31_2019-01-15_01-25-097htnb74g/error_2019-01-15_01-27-03.txt [pid=6954], 8 s, 8 iter, 15.4 rew
+ - MyTrainableClass_4_height=41,width=27:	RUNNING, 1 failures: /home/ubuntu/ray_results/asynchyperband_test/MyTrainableClass_4_height=41,width=27_2019-01-15_01-25-09mpjsocfn/error_2019-01-15_01-27-04.txt [pid=6943], 8 s, 8 iter, 11.8 rew
+TERMINATED trials:
+ - MyTrainableClass_0_height=16,width=31:	TERMINATED [pid=6513], 100 s, 100 iter, 15.9 rew
+ - MyTrainableClass_5_height=26,width=20:	TERMINATED [pid=6918], 100 s, 100 iter, 26 rew
+
+== Status ==
+Using FIFO scheduling algorithm.
+Resources requested: 4/4 CPUs, 0/0 GPUs
+Unknown memory usage. Please run `pip install psutil` (or ray[debug]) to resolve)
+Result logdir: /home/ubuntu/ray_results/asynchyperband_test
+PENDING trials:
+ - MyTrainableClass_1_height=95,width=10:	PENDING, 1 failures: /home/ubuntu/ray_results/asynchyperband_test/MyTrainableClass_1_height=95,width=10_2019-01-15_01-25-09vtcsd3y4/error_2019-01-15_01-27-02.txt [ip-172-31-0-144 pid=9637], 7 s, 7 iter, 57.4 rew
+ - MyTrainableClass_3_height=46,width=29:	PENDING, 1 failures: /home/ubuntu/ray_results/asynchyperband_test/MyTrainableClass_3_height=46,width=29_2019-01-15_01-25-098csg_ra1/error_2019-01-15_01-27-02.txt [ip-172-31-0-144 pid=9635], 6 s, 6 iter, 9.38 rew
+ - MyTrainableClass_6_height=91,width=51:	PENDING
+ - MyTrainableClass_7_height=51,width=45:	PENDING
+ - MyTrainableClass_8_height=11,width=73:	PENDING
+ - MyTrainableClass_9_height=53,width=32:	PENDING
+ - MyTrainableClass_10_height=64,width=78:	PENDING
+ - MyTrainableClass_11_height=72,width=23:	PENDING
+RUNNING trials:
+ - MyTrainableClass_2_height=61,width=31:	RUNNING, 1 failures: /home/ubuntu/ray_results/asynchyperband_test/MyTrainableClass_2_height=61,width=31_2019-01-15_01-25-097htnb74g/error_2019-01-15_01-27-03.txt [pid=6954], 13 s, 13 iter, 24.2 rew
+ - MyTrainableClass_4_height=41,width=27:	RUNNING, 1 failures: /home/ubuntu/ray_results/asynchyperband_test/MyTrainableClass_4_height=41,width=27_2019-01-15_01-25-09mpjsocfn/error_2019-01-15_01-27-04.txt [pid=6943], 13 s, 13 iter, 18.3 rew
+TERMINATED trials:
+ - MyTrainableClass_0_height=16,width=31:	TERMINATED [pid=6513], 100 s, 100 iter, 15.9 rew
+ - MyTrainableClass_5_height=26,width=20:	TERMINATED [pid=6918], 100 s, 100 iter, 26 rew
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='9' author='pschafhalter' date='2019-01-15T05:23:52Z'>
+		&lt;denchmark-link:https://github.com/richardliaw&gt;@richardliaw&lt;/denchmark-link&gt;
+, I tried to create a minimal testing script but cannot reproduce the error. My script creates 10 nodes, several actors per node, then pings each actor. It does the same  loop as your example and then counts the number of tasks per node that have become ready so far. As expected, after a node failure, the actors on the dead node never become ready because of this issue. However, when I set the , the actors become ready after the node has been marked as dead. Here is &lt;denchmark-link:https://gist.github.com/stephanie-wang/8e75464368c0347a3f38436410162ff2#file-logs-L634&gt;the script and the logs&lt;/denchmark-link&gt;
+ for the correct behavior. The logs print the number of ready tasks per node during every round of .
+I think we had better open a separate issue for tune fault tolerance, since so far I cannot determine if it's the same issue as this one.
+		</comment>
+		<comment id='10' author='pschafhalter' date='2019-01-15T08:41:41Z'>
+		Oh I see; I was configuring with max_task_lease_timeout_ms  rather than initial_reconstruction_timeout_milliseconds. It works fine now; thanks!
+		</comment>
+		<comment id='11' author='pschafhalter' date='2019-03-22T19:55:55Z'>
+		I was going to file another issue, but I think another case where this comes up is evicted objects:
+The following script will hang forever "waiting for original". Note that without the timeout, ray.wait() will raise the right exception. I think this is the cause of some weird RLlib hangs when allocating lots of memory.
+&lt;denchmark-code&gt;import numpy as np
+import ray
+
+@ray.remote
+class A():
+    def f(self):
+       return np.zeros((1024, 1024, 10))
+
+ray.init(object_store_memory=100000000)
+a = A.remote()
+
+original = a.f.remote()
+for i in range(100):
+    ray.get(a.f.remote())
+    print(i)
+
+done = None
+while not done:
+    print("waiting for original...")
+    done, _ = ray.wait([original], timeout=1.0)
+
+ray.get(done)
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='12' author='pschafhalter' date='2019-03-23T16:39:52Z'>
+		I'm curious if I am also seeing the kind of hang, does something show up in a log indicating this is happening?
+		</comment>
+		<comment id='13' author='pschafhalter' date='2019-04-03T18:46:03Z'>
+		Any update on this?
+		</comment>
+		<comment id='14' author='pschafhalter' date='2019-04-03T18:46:53Z'>
+		&lt;denchmark-link:https://github.com/vladfi1&gt;@vladfi1&lt;/denchmark-link&gt;
+ I think you probably ran into some variant of this issue for the hanging (i.e., some object got evicted and there wasn't an error message raised for that).
+		</comment>
+		<comment id='15' author='pschafhalter' date='2019-07-23T19:12:21Z'>
+		Nice!
+&lt;denchmark-link:#&gt;…&lt;/denchmark-link&gt;
+
+
+On Tue, Jul 23, 2019, 11:55 AM Stephanie Wang ***@***.***&gt; wrote:
+ Closed #3715 &lt;#3715&gt; via #5234
+ &lt;#5234&gt;.
+
+ —
+ You are receiving this because you were mentioned.
+ Reply to this email directly, view it on GitHub
+ &lt;#3715?email_source=notifications&amp;email_token=AAADUSRW7GZPF4PGGXLASLDQA5H3XA5CNFSM4GOT2IUKYY3PNVWWK3TUL52HS4DFWZEXG43VMVCXMZLOORHG65DJMZUWGYLUNFXW5KTDN5WW2ZLOORPWSZGOSVAVJUI#event-2504086737&gt;,
+ or mute the thread
+ &lt;https://github.com/notifications/unsubscribe-auth/AAADUSU2URS5ZT675HEALP3QA5H3XANCNFSM4GOT2IUA&gt;
+ .
+
+
+
+		</comment>
+	</comments>
+</bug>

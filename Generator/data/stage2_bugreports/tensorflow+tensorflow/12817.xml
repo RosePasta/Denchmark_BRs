@@ -1,0 +1,203 @@
+<bug id='12817' author='Enigma-li' open_date='2017-09-05T10:49:40Z' closed_time='2018-10-24T20:51:43Z'>
+	<summary>LMDB reader Error in Reading Data of multi-thread, queue based input pipeline</summary>
+	<description>
+Hi,
+I am now using LMDB reader to read and decode my custom data into tensorflow training pipeline, based on the example:
+&lt;denchmark-code&gt;def read_my_file_format(filename_queue):
+  reader = tf.SomeReader()
+  key, record_string = reader.read(filename_queue)
+  example, label = tf.some_decoder(record_string)
+  processed_example = some_processing(example)
+  return processed_example, label
+
+def input_pipeline(filenames, batch_size, num_epochs=None):
+  filename_queue = tf.train.string_input_producer(
+      filenames, num_epochs=num_epochs, shuffle=True)
+  example, label = read_my_file_format(filename_queue)
+  min_after_dequeue = 10000
+  capacity = min_after_dequeue + 3 * batch_size
+  example_batch, label_batch = tf.train.shuffle_batch(
+      [example, label], batch_size=batch_size, capacity=capacity,
+      min_after_dequeue=min_after_dequeue)
+  return example_batch, label_batch
+&lt;/denchmark-code&gt;
+
+Here, I designed my own decoder and used LMDB reader here. But the problem is that, when the num_epochs is not 1, there will be ERROR:
+&lt;denchmark-code&gt;Process finished with exit code 139 (interrupted by signal 11: SIGSEGV)
+&lt;/denchmark-code&gt;
+
+Could you help check this?
+Thanks
+	</description>
+	<comments>
+		<comment id='1' author='Enigma-li' date='2017-09-05T11:02:25Z'>
+		The detailed code is like:
+&lt;denchmark-code&gt;# set data directory
+CURRENT = os.path.abspath(os.path.dirname(__file__))
+DATA_DIR = os.path.join(CURRENT, 'gt')
+DB_DIR = os.path.join(DATA_DIR, 'toy_db', 'data.mdb')
+OUT_DIR = os.path.join(DATA_DIR, 'out')
+
+def tf_lmdb_reader():
+    test_queue = tf.train.string_input_producer([DB_DIR], num_epochs=2)
+    reader = io_ops.LMDBReader()
+    key, value = reader.read(test_queue)
+    npr_line, mask, train_input, depth, normal = decode_block(value, [380, 380, 12])
+
+    queue_buf = 1000
+    cap_shuffle = queue_buf + 3 * 1
+
+    batch_data = tf.train.shuffle_batch(tensors=[npr_line, mask, train_input, depth, normal],
+                                        batch_size=9,
+                                        num_threads=5,
+                                        capacity=cap_shuffle,
+                                        min_after_dequeue=queue_buf)
+
+    with tf.Session() as sess:
+
+        init_op = tf.group(tf.global_variables_initializer(),
+                           tf.local_variables_initializer())
+        sess.run(init_op)
+        coord = tf.train.Coordinator()
+        threads = tf.train.start_queue_runners(sess=sess, coord=coord)
+
+        try:
+            step = 0
+            while not coord.should_stop():
+                cur_batch = sess.run([batch_data])
+                step += 1
+                print(step)
+        except tf.errors.OutOfRangeError:
+            print('Done')
+        finally:
+            coord.request_stop()
+
+        coord.request_stop()
+        coord.join(threads)
+
+if __name__ == '__main__':
+    tf_lmdb_reader()
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='2' author='Enigma-li' date='2017-09-05T17:47:12Z'>
+		There should never be a SEGV.  I'm guessing the problem is on the LMDB reader. Do you have a stack trace?
+		</comment>
+		<comment id='3' author='Enigma-li' date='2017-09-06T02:06:20Z'>
+		I guess the reason is that there is lock file when we open the LMDB database, this will prevent us to read it again when one epoch is finished. I got some explanation from other questions, like:
+When opening a database file, LMDB creates a lock file lock.mdb in the same folder to prevent that database being opened more than once. This unfortunately prevents us to enqueue the database file multiple times.
+But how can solve this? I mean how to use LMDB reader to read database file more than one epoch in the above pipeline?
+		</comment>
+		<comment id='4' author='Enigma-li' date='2017-09-06T04:58:35Z'>
+		Have you considered whether using DataFlow from tensorpack (though independent of tensorpack dependency-wise) would address this?
+There's &lt;denchmark-link:http://tensorpack.readthedocs.io/en/latest/tutorial/efficient-dataflow.html#sequential-read&gt;an LMDB example here&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='5' author='Enigma-li' date='2017-09-06T12:21:51Z'>
+		&lt;denchmark-link:https://github.com/quaeler&gt;@quaeler&lt;/denchmark-link&gt;
+ sorry, I did not try. I already convert my data to TFRecords, which is bug free and can use the pipeline I used for LMDB. And I am waiting bug fixation for LMDB.
+Thanks
+		</comment>
+		<comment id='6' author='Enigma-li' date='2017-09-06T16:56:08Z'>
+		You mean the LMDB reader lacks a close?
+		</comment>
+		<comment id='7' author='Enigma-li' date='2017-09-06T20:50:33Z'>
+		I don't know what's causing the problem, but just want to mention that lmdb database can be opened without a lock when the transaction is read-only.
+		</comment>
+		<comment id='8' author='Enigma-li' date='2017-09-06T21:13:22Z'>
+		We &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/master/tensorflow/core/kernels/lmdb_reader_op.cc#L39&gt;do currently open it in read-only mode&lt;/denchmark-link&gt;
+, but &lt;denchmark-link:http://www.lmdb.tech/doc/group__mdb.html#ga32a193c6bf4d7d5c5d579e71f22e9340&gt;the documentation for the LMDB API&lt;/denchmark-link&gt;
+ states WRT read-only mode:
+&lt;denchmark-code&gt;MDB_RDONLY Open the environment in read-only mode. No write operations
+will be allowed. LMDB will still modify the lock file - except on
+read-only filesystems, where LMDB does not use locks.
+&lt;/denchmark-code&gt;
+
+If we also specified the  flag on the open (&lt;denchmark-link:https://github.com/drpngx&gt;@drpngx&lt;/denchmark-link&gt;
+,) perhaps this problem would go away; i'm unaware of other ramifications of not locking on the read-only read.
+		</comment>
+		<comment id='9' author='Enigma-li' date='2017-09-30T00:21:34Z'>
+		Thanks for reporting the bug. I just saw this issue today. This PR &lt;denchmark-link:https://github.com/tensorflow/tensorflow/pull/13396&gt;#13396&lt;/denchmark-link&gt;
+ should fix it. Sorry for the bug.
+		</comment>
+		<comment id='10' author='Enigma-li' date='2017-10-12T09:13:36Z'>
+		Hi all,
+I was looking use my data which is present in LMDB form but i am unable to find any sample code or more usage documentation on using LMDB dataset in Tensorflow.
+If someone has tried LMDB could share the usage experience .it would be very helpful.
+A simple example to read a LMDB file and print the key value pair would be helpful.
+Thanks
+		</comment>
+		<comment id='11' author='Enigma-li' date='2017-10-12T21:56:57Z'>
+		&lt;denchmark-link:https://github.com/vishalghor&gt;@vishalghor&lt;/denchmark-link&gt;
+ It's pretty much the same as other readers like TFRecordReader.
+For sample code, you may take a look at the test case.
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/master/tensorflow/python/kernel_tests/reader_ops_test.py#L998&gt;https://github.com/tensorflow/tensorflow/blob/master/tensorflow/python/kernel_tests/reader_ops_test.py#L998&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='12' author='Enigma-li' date='2017-10-24T06:27:06Z'>
+		&lt;denchmark-link:https://github.com/bowang&gt;@bowang&lt;/denchmark-link&gt;
+ thank you for fast reply.I was able to read an LMDB file and print the values by assigning the tensor key and value to normal variables.
+However, Is there any sample implementation of LMDB dataset for any opensource models such as inception v3 or an implementation of LMDB dataset for the retraining inception v3 tutorial by tensorflow.
+It would be very helpful if a sample of usage in training a models is provided.
+Thanks and Regards
+		</comment>
+		<comment id='13' author='Enigma-li' date='2017-10-25T04:56:05Z'>
+		Hi all,
+I was able to read LMDB database using the following code:
+&lt;denchmark-code&gt;from __future__ import print_function
+import os
+import tensorflow as tf
+from tensorflow.python.framework import dtypes
+from tensorflow.python.ops import data_flow_ops
+from tensorflow.python.ops import io_ops
+from tensorflow.python.ops import variables
+
+prefix_path = "tensorflow"
+
+def read_lmdb():
+    with tf.Session() as sess:
+        path = os.path.join(prefix_path, "testLMDB", "data.mdb")
+        #print(path)
+        reader=io_ops.LMDBReader()
+        queue = data_flow_ops.FIFOQueue(200, [dtypes.string], shapes=())
+        key, value = reader.read(queue)
+        queue.enqueue([path]).run()
+        queue.close().run()
+       for i in range(1,no_of_key_value_pair)
+            k,v = sess.run([key,value])
+            print(k)
+
+if __name__ == '__main__':
+    read_lmdb()
+&lt;/denchmark-code&gt;
+
+But while researching more on LMDBReader,i found tf.LMDBReader also.
+So what is the difference between io_ps.LMDBReader() and tf.LMDBReader().
+The Tensorflow documentation speaks very minimal about various other forms of dataset format such as LMDB,HDF5 compared to TFRecord.
+How such datasets be included in existing code?
+Please help me in clearing the doubt due to lack of adequate documentation.
+Thanks and Regards
+		</comment>
+		<comment id='14' author='Enigma-li' date='2017-10-25T18:32:53Z'>
+		&lt;denchmark-link:https://github.com/vishalghor&gt;@vishalghor&lt;/denchmark-link&gt;
+ io_ps.LMDBReader() and tf.LMDBReader() are the same. But the former is for internal use only. Thus I'd recommend to use tf.LMDBReader.
+LMDBReader shares the same interface as TFRecordsReader. So you may follow the documentation of the latter. Once you get both key, value out of LMDB, it's up to you (and the LMDB you are using) to determine how to decode it. For example, if it's an image, you can pass the value to tf.image.decode_jpeg()
+		</comment>
+		<comment id='15' author='Enigma-li' date='2017-10-26T15:57:37Z'>
+		&lt;denchmark-link:https://github.com/bowang&gt;@bowang&lt;/denchmark-link&gt;
+ So you fixed the error of loading LMDB multi-epoch Segment Error?
+		</comment>
+		<comment id='16' author='Enigma-li' date='2017-10-26T17:14:20Z'>
+		&lt;denchmark-link:https://github.com/Enigma-li&gt;@Enigma-li&lt;/denchmark-link&gt;
+ Yes. But it hasn't been merged yet. It'd be great if you can bring it to the notice of TensorFlow maintainers by commenting on it. &lt;denchmark-link:https://github.com/tensorflow/tensorflow/pull/13396&gt;#13396&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='17' author='Enigma-li' date='2017-10-28T07:18:42Z'>
+		&lt;denchmark-link:https://github.com/bowang&gt;@bowang&lt;/denchmark-link&gt;
+ Sure, already commented
+		</comment>
+		<comment id='18' author='Enigma-li' date='2018-10-24T20:51:43Z'>
+		Closing as the PR is merged.
+		</comment>
+	</comments>
+</bug>

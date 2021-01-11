@@ -1,0 +1,128 @@
+<bug id='8687' author='pdames' open_date='2020-05-31T05:23:20Z' closed_time='2020-06-09T02:25:26Z'>
+	<summary>[ray] Consistent Crashes w/ Actor-Handle-Based Implementation of Parquet File Compactor</summary>
+	<description>
+&lt;denchmark-h:h3&gt;What is the problem?&lt;/denchmark-h&gt;
+
+I’ve been running a task-based compactor against production Parquet datasets successfully and stably for the last few days, but just had my first crash with an actor-handle-based compactor running against a relatively small ~7GB parquet input dataset (divided into 20MB chunks).
+The original pure-task-based compactor launches one distributed task per input delta in a table’s stream, takes a hash of the primary key modulo a desired number of buckets to group “like” primary keys together, saves each parallel task’s bucket groupings into distinct S3 files, and then "compacts" (i.e. sorts by sort key columns and dedupes by primary keys) these like-groupings by creating one parallel compaction task per hash bucket index.
+The actor-based compactor I was just testing tries to reduce the number of small hash bucket grouping files by passing a list of hash bucket actor handles into the task - in this case 75 for 75 hash buckets. Basically this:
+@ray.remote
+class HashBucket:
+    def __init__(self, ):
+        self.dataframes = list()
+    def append(self, dataframe):
+        self.dataframes.append(dataframe)
+    def write(self, file_path):
+        output = next(iter(self.dataframes)) if len(self.dataframes) == 1 \
+            else pd.concat(self.dataframes, axis=0, copy=False)
+        output.to_parquet(file_path)
+So, whereas each parallel task would previously just write multiple small dataframe parquet file to S3 for the same bucket, they now call hashBucket.append.remote(dataframe).
+This step went just fine.
+Once all appends have completed, I iterate through the completed hash buckets to produce 1 output file in S3 per bucket, like so:
+ write_tasks_pending = []
+    for hash_bucket_index in all_hash_bucket_indices:
+        file_path = #[...]
+        write_task_promise = hb_actors[hash_bucket_index].write.remote(file_path)
+        write_tasks_pending.append(write_task_promise)
+    while len(write_tasks_pending):
+        write_task_complete, write_tasks_pending = ray.wait(write_tasks_pending)
+The failure occurred here - it wrote several outputs successfully, then crashed with the following stack trace (while calling hb_actors[hash_bucket_index].write.remote(file_path)):
+&lt;denchmark-link:https://github.com/ray-project/ray/files/4707110/simple_compactor_actor_stack_trace.txt&gt;simple_compactor_actor_stack_trace.txt&lt;/denchmark-link&gt;
+
+Subsequent ray exec attempts then fail to connect to the cluster:
+&lt;denchmark-code&gt;2020-05-27 23:24:06,509	INFO updater.py:201 -- NodeUpdater: i-09bf37eaf088eef3d: Waiting for IP...
+2020-05-27 23:24:06,510	INFO log_timer.py:17 -- NodeUpdater: i-09bf37eaf088eef3d: Got IP [LogTimer=571ms]
+2020-05-27 23:24:06,510	INFO updater.py:257 -- NodeUpdater: i-09bf37eaf088eef3d: Running python ./simple_compactor_actors.py “compactor” “compactor” “testTableStreamId” ‘[“customer_id”,“session_id”]’ ‘[“dw_insert_date”]’ 1_000_000 75 on 54.84.223.16...
+E0528 06:24:29.959751 24475 24475 raylet_client.cc:69] Retrying to connect to socket for pathname /tmp/ray/session_2020-05-27_14-47-54_876303_4354/sockets/raylet (num_attempts = 1, num_retries = 5)
+E0528 06:24:30.459939 24475 24475 raylet_client.cc:69] Retrying to connect to socket for pathname /tmp/ray/session_2020-05-27_14-47-54_876303_4354/sockets/raylet (num_attempts = 2, num_retries = 5)
+E0528 06:24:30.960027 24475 24475 raylet_client.cc:69] Retrying to connect to socket for pathname /tmp/ray/session_2020-05-27_14-47-54_876303_4354/sockets/raylet (num_attempts = 3, num_retries = 5)
+E0528 06:24:31.460111 24475 24475 raylet_client.cc:69] Retrying to connect to socket for pathname /tmp/ray/session_2020-05-27_14-47-54_876303_4354/sockets/raylet (num_attempts = 4, num_retries = 5)
+F0528 06:24:31.960207 24475 24475 raylet_client.cc:78] Could not connect to socket /tmp/ray/session_2020-05-27_14-47-54_876303_4354/sockets/raylet
+*** Check failure stack trace: ***
+  @   0x7f2cd19a6afd google::LogMessage::Fail()
+  @   0x7f2cd19a7f6c google::LogMessage::SendToLog()
+  @   0x7f2cd19a67d9 google::LogMessage::Flush()
+  @   0x7f2cd19a69f1 google::LogMessage::~LogMessage()
+  @   0x7f2cd1726439 ray::RayLog::~RayLog()
+  @   0x7f2cd15010cd ray::raylet::RayletConnection::RayletConnection()
+  @   0x7f2cd1501a5c ray::raylet::RayletClient::RayletClient()
+  @   0x7f2cd149dc37 ray::CoreWorker::CoreWorker()
+  @   0x7f2cd14a1ac4 ray::CoreWorkerProcess::CreateWorker()
+  @   0x7f2cd14a204f ray::CoreWorkerProcess::CoreWorkerProcess()
+  @   0x7f2cd14a269b ray::CoreWorkerProcess::Initialize()
+  @   0x7f2cd140d064 __pyx_pw_3ray_7_raylet_10CoreWorker_1__cinit__()
+  @   0x7f2cd140e145 __pyx_tp_new_3ray_7_raylet_CoreWorker()
+  @   0x55eb57a1a725 type_call
+  @   0x55eb5799338b _PyObject_FastCallDict
+  @   0x55eb57a1a58e call_function
+  @   0x55eb57a3ea1a _PyEval_EvalFrameDefault
+  @   0x55eb57a13b3e _PyEval_EvalCodeWithName
+  @   0x55eb57a146b1 fast_function
+  @   0x55eb57a1a515 call_function
+  @   0x55eb57a3f734 _PyEval_EvalFrameDefault
+  @   0x55eb57a13814 _PyEval_EvalCodeWithName
+  @   0x55eb57a146b1 fast_function
+  @   0x55eb57a1a515 call_function
+  @   0x55eb57a3f734 _PyEval_EvalFrameDefault
+  @   0x55eb57a151c9 PyEval_EvalCodeEx
+  @   0x55eb57a15f5c PyEval_EvalCode
+  @   0x55eb57a985e4 run_mod
+  @   0x55eb57a989e1 PyRun_FileExFlags
+  @   0x55eb57a98be4 PyRun_SimpleFileExFlags
+  @   0x55eb57a9c6c4 Py_Main
+  @   0x55eb5796452e main
+Shared connection to 54.84.223.16 closed.
+Error: Command failed:
+&lt;/denchmark-code&gt;
+
+
+Python 3.6
+&lt;denchmark-link:https://github.com/ray-project/ray/commit/99cc2e28b3f1f11b51c857c0fdffc7c9f64444cf&gt;99cc2e2&lt;/denchmark-link&gt;
+
+4 r5n-8xlarge instances in us-east-1 w/ ami-0dbb717f493016a1a (Deep Learning AMI, Ubuntu 18.04, Version 27.0)
+&lt;denchmark-h:h3&gt;Reproduction (REQUIRED)&lt;/denchmark-h&gt;
+
+Reproduction relies on the files available at &lt;denchmark-link:https://github.com/ray-project/ray/pull/8707&gt;#8707&lt;/denchmark-link&gt;
+.
+
+Create an S3 bucket like "compactor-8687"
+Create an "input" S3 folder within this bucket, and place 7GB+ of Parquet file input files (w/ 20MB per file to reproduce the original scenario). Ensure that each input file follows the naming convention: {tableStreamId}-{eventTimeInt}.[parq|parquet]. For example, testTableStreamId-0.parq" is a valid input file name for table steam ID "testTableStreamId" and event time "0".
+Stand up a new Ray cluster from https://github.com/ray-project/ray/blob/2d167062ccd64fc8c65a2a1be75cbe6a675fb978/doc/examples/compactor/compactor.yaml, sync https://github.com/ray-project/ray/blob/2d167062ccd64fc8c65a2a1be75cbe6a675fb978/doc/examples/compactor/compactor_actors_example.py, and run it with a command of the following form:
+
+&lt;denchmark-code&gt;ray exec ./compactor.yaml 'python ./compactor_actors_example.py "compactor-8687" "compactor-8687" "testTableStreamId" --primary-keys "primary_key_column_1" "primary_key_column_2" --sort-keys "sort_key_column_1" --records-per-output-file 1_000_000 --hash-bucket-count 75'
+&lt;/denchmark-code&gt;
+
+
+Verify that the above failure occurs while attempting to write Parquet output files with the HashBucket actor.
+
+
+ I have verified my script runs in a clean environment and reproduces the issue.
+ I have verified the issue also occurs with the latest wheels.
+
+	</description>
+	<comments>
+		<comment id='1' author='pdames' date='2020-05-31T06:45:04Z'>
+		Is it possible to create a simplified reproduction script you can share?
+		</comment>
+		<comment id='2' author='pdames' date='2020-06-01T18:02:35Z'>
+		Full reproduction script available at:
+&lt;denchmark-link:https://github.com/ray-project/ray/blob/2d167062ccd64fc8c65a2a1be75cbe6a675fb978/doc/examples/compactor/compactor_actors_example.py&gt;https://github.com/ray-project/ray/blob/2d167062ccd64fc8c65a2a1be75cbe6a675fb978/doc/examples/compactor/compactor_actors_example.py&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='3' author='pdames' date='2020-06-01T18:20:27Z'>
+		Can you mock out the data/etc dependencies so the file can be run without any additional setup?
+		</comment>
+		<comment id='4' author='pdames' date='2020-06-06T02:56:29Z'>
+		&lt;denchmark-link:https://github.com/pdames&gt;@pdames&lt;/denchmark-link&gt;
+ we merged a possible fix. Is it possible for you to try again with the latest master?
+		</comment>
+		<comment id='5' author='pdames' date='2020-06-09T02:25:26Z'>
+		&lt;denchmark-link:https://github.com/rkooo567&gt;@rkooo567&lt;/denchmark-link&gt;
+ Fix verified on the latest build from master - 10/10 job runs succeeded using the same source dataset and cluster config that consistently crashed before. Thanks!
+		</comment>
+		<comment id='6' author='pdames' date='2020-06-09T06:47:08Z'>
+		&lt;denchmark-link:https://github.com/pdames&gt;@pdames&lt;/denchmark-link&gt;
+ Happy to hear that!!
+		</comment>
+	</comments>
+</bug>

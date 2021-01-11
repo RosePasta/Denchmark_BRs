@@ -1,0 +1,273 @@
+<bug id='43349' author='rickstaa' open_date='2020-09-18T20:37:49Z' closed_time='2020-09-18T21:27:40Z'>
+	<summary>Different gradients in tf2 when eager mode is enabled compared to graph mode</summary>
+	<description>
+&lt;denchmark-h:h3&gt;System information&lt;/denchmark-h&gt;
+
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): Yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Ubuntu 18.04
+TensorFlow installed from (source or binary): Binary
+TensorFlow version (use command below):  v2.3.0
+Python version:  v3.8.5
+CUDA/cuDNN version: CUDA  v11.0/ cuDNN V9.1.85
+GPU model and memory: GPU: NVIDIA Quadro P1000 / Intel UHD Graphics 630 - Memory: 2x Samsung M471A4G43MB1-CTD
+
+You can collect some of this information using our environment capture:
+
+tf_env.txt
+
+&lt;denchmark-h:h3&gt;Describe the current behaviour&lt;/denchmark-h&gt;
+
+I'm currently porting several TensorFlow v1.x legacy repositories over to tf2.3 with eager execution enabled. I used the steps in the &lt;denchmark-link:https://www.tensorflow.org/guide/migrate&gt;documentation&lt;/denchmark-link&gt;
+ to do this. Unfortunately, one of the RL Agents which is based on the &lt;denchmark-link:http://arxiv.org/abs/2004.14288&gt;Lyapunov Actor-Critic &lt;/denchmark-link&gt;
+ architecture of &lt;denchmark-link:http://arxiv.org/abs/2004.14288&gt;Han et al. 2019&lt;/denchmark-link&gt;
+ is not training when eager execution is enabled. I did some debugging, and it looks like there is a problem with computing the gradients of the Squashed Gaussian Actor-network:
+class SquashedGaussianActor(tf.keras.Model):
+    def __init__(
+        self, obs_dim, act_dim, hidden_sizes, name, seeds=None, **kwargs,
+    ):
+        """Squashed Gaussian actor network.
+
+        Args:
+            obs_dim (int): The dimension of the observation space.
+
+            act_dim (int): The dimension of the action space.
+
+            hidden_sizes (list): Array containing the sizes of the hidden layers.
+
+            name (str): The keras module name.
+
+            seeds (list, optional): The random seeds used for the weight initialization
+                and the sampling ([weights_seed, sampling_seed]). Defaults to
+                [None, None]
+        """
+        super().__init__(name=name, **kwargs)
+
+        # Get class parameters
+        self.s_dim = obs_dim
+        self.a_dim = act_dim
+        self._seed = seeds[0]
+        self._initializer = tf.keras.initializers.GlorotUniform(
+            seed=self._seed
+        )  # Seed weights initializer
+        self._tfp_seed = seeds[1]
+
+        # Create fully connected layers
+        self.net = tf.keras.Sequential(
+            [
+                tf.keras.layers.InputLayer(
+                    dtype=tf.float32, input_shape=(self.s_dim), name=name + "/input"
+                )
+            ]
+        )
+        for i, hidden_size_i in enumerate(hidden_sizes):
+            self.net.add(
+                tf.keras.layers.Dense(
+                    hidden_size_i,
+                    activation="relu",
+                    name=name + "/l{}".format(i + 1),
+                    kernel_initializer=self._initializer,
+                )
+            )
+
+        # Create Mu and log sigma output layers
+        self.mu = tf.keras.Sequential(
+            [
+                tf.keras.layers.InputLayer(
+                    dtype=tf.float32, input_shape=hidden_sizes[-1]
+                ),
+                tf.keras.layers.Dense(
+                    act_dim,
+                    activation=None,
+                    name=name + "/mu",
+                    kernel_initializer=self._initializer,
+                ),
+            ]
+        )
+        self.log_sigma = tf.keras.Sequential(
+            [
+                tf.keras.layers.InputLayer(
+                    dtype=tf.float32, input_shape=hidden_sizes[-1]
+                ),
+                tf.keras.layers.Dense(
+                    act_dim,
+                    activation=None,
+                    name=name + "/log_sigma",
+                    kernel_initializer=self._initializer,
+                ),
+            ]
+        )
+
+    @tf.function
+    def call(self, inputs):
+        """Perform forward pass."""
+
+        # Retrieve inputs
+        obs = inputs
+
+        # Perform forward pass through fully connected layers
+        net_out = self.net(obs)
+
+        # Calculate mu and log_sigma
+        mu = self.mu(net_out)
+        log_sigma = self.log_sigma(net_out)
+        log_sigma = tf.clip_by_value(
+            log_sigma, LOG_SIGMA_MIN_MAX[0], LOG_SIGMA_MIN_MAX[1]
+        )
+
+        # Perform re-parameterization trick
+        sigma = tf.exp(log_sigma)
+
+        # Create bijectors (Used in the re-parameterization trick)
+        squash_bijector = SquashBijector()
+        affine_bijector = tfp.bijectors.Shift(mu)(tfp.bijectors.Scale(sigma))
+
+        # Sample from the normal distribution and calculate the action
+        batch_size = tf.shape(input=obs)[0]
+        base_distribution = tfp.distributions.MultivariateNormalDiag(
+            loc=tf.zeros(self.a_dim), scale_diag=tf.ones(self.a_dim)
+        )
+        epsilon = base_distribution.sample(batch_size, seed=self._tfp_seed)
+        raw_action = affine_bijector.forward(epsilon)
+        clipped_a = squash_bijector.forward(raw_action)
+
+        # Transform distribution back to the original policy distribution
+        reparm_trick_bijector = tfp.bijectors.Chain((squash_bijector, affine_bijector))
+        distribution = tfp.distributions.TransformedDistribution(
+            distribution=base_distribution, bijector=reparm_trick_bijector
+        )
+        clipped_mu = squash_bijector.forward(mu)
+
+        # Return network outputs and noise sample
+        return clipped_a, clipped_mu, distribution.log_prob(clipped_a), epsilon
+Although gradients are computed for this network, these are very different in eager mode as compared to when the tf.compat.v1.disable_eager_execution() flag is used. This is strange since the loss functions, random seeds, weights/biases and inputs are equal. Furthermore, also the outputs of a forward pass through the network are identical in both Eager and legacy Graph mode. This problem does not seem to exist for accompanying Lyapunov Critic (a modified version of a deep Q network). I first wanted to post it here before posting on StackOverflow as I am unsure whether this a translation issue or a bug. I tried searching for possible causes, but I did not find a possible solution to my problem.
+&lt;denchmark-h:h3&gt;Describe the expected behaviour&lt;/denchmark-h&gt;
+
+I expected the gradients to be equal in both the script in which Eager mode is enabled and the one in which Eager mode disabled. Instead, although the Actor loss is equal (-1084.2743) the gradients are different:
+Results eager mode:
+grad/l1/weights:
+[[ 13.408794     2.178104   -11.570398   108.1129       0.      46.277092  ]
+ [ 30.369755    -0.23067771 -16.505516    87.53128      0.      22.498222]]
+
+grad/l1/bias:
+[ 47.802944    0.4118477 -26.826544  185.92018     0.         60.14121]
+
+grad/l2/weights:
+[[-12.058103     0.          -0.33448434  14.862488     0.      -1.8673693 ]
+ [ -0.30301327   0.           0.          18.134262     0.      0.        ]
+ [-58.740616     0.          -1.113349   119.78081      0.      -2.120421  ]
+ [-24.779123     0.          -0.4045168   66.25852      0.      -0.24545981]
+ [  0.           0.           0.           0.           0.      0.        ]
+ [ -3.3655543    0.           0.          41.697414     0.      0.]]
+
+grad/l2/bias:
+[-98.14556     0.          1.5422362 206.91672     0.         -4.5077815]
+
+grad/mu/weights:
+[[ 4.81568050e+00 -2.37027216e+00]
+ [ 0.00000000e+00  0.00000000e+00]
+ [-1.84061453e-01  1.09151885e-01]
+ [ 3.29189644e+01 -2.93549042e+01]
+ [ 0.00000000e+00  0.00000000e+00]
+ [-4.64032125e-03  6.64837938e-03]]
+
+grad/mu/bias:
+[110.85972 -87.11501]
+
+grad/log_sigma/weights:
+[[5.8719816e+00 5.4135699e+00]
+ [0.0000000e+00 0.0000000e+00]
+ [2.2099029e-01 3.2953596e-01]
+ [7.5656143e+01 6.9250507e+00]
+ [0.0000000e+00 0.0000000e+00]
+ [6.7091000e-04 9.1812750e-03]]
+
+grad/log_sigma/bias:
+[238.21657   47.906483]
+Results graph mode:
+grad/l1/weights:
+[[  1.1570635   2.2042375 -11.598429   88.867676    0.         48.9553   ]
+ [ 11.854488   -0.2453581 -16.115313   49.29876     0.         24.385675 ]]
+
+grad/l1/bias:
+[ 29.577682     0.16548407 -29.669703   144.31357      0.      64.56108   ]
+
+grad/l2/weights:
+[[ -9.905338     0.           4.7838783    3.8737621    0.      -3.4614413 ]
+ [ -0.30002874   0.           0.          18.411116     0.      0.]
+ [-53.221275     0.           5.242466    79.01278      0.      -3.936808]
+ [-23.196867     0.           0.53559065  51.048943     0.      -0.45809162]
+ [  0.           0.           0.           0.           0.      0. ]
+ [ -4.0506964    0.           0.          42.10633      0.      0.]]
+
+grad/l2/bias:
+[-98.10234    0.        16.95784  155.67645    0.        -8.705088]
+
+grad/mu/weights:
+[[ 1.62482891e+01  1.15455017e+01]
+ [ 0.00000000e+00  0.00000000e+00]
+ [ 2.01459303e-01  6.31435871e-01]
+ [ 1.06661575e+02  4.60808792e+01]
+ [ 0.00000000e+00  0.00000000e+00]
+ [-3.92461056e-03  9.14150383e-03]]
+
+grad/mu/bias:
+[372.89713 178.99115]
+
+grad/log_sigma/weights:
+[[7.4654112e+00 1.1838960e+01]
+ [0.0000000e+00 0.0000000e+00]
+ [3.2749507e-01 6.5140498e-01]
+ [8.7392433e+01 4.8770226e+01]
+ [0.0000000e+00 0.0000000e+00]
+ [1.4014873e-03 9.9075940e-03]]
+
+grad/log_sigma/bias:
+[289.77673 198.32103]
+&lt;denchmark-h:h3&gt;Code to reproduce the problem&lt;/denchmark-h&gt;
+
+I placed two small stand-alone example scripts &lt;denchmark-link:https://github.com/rickstaa/tf2_eager_vs_graph_grad_problem/blob/master/tf2_val_grad.py&gt;tf2_val_grad.py&lt;/denchmark-link&gt;
+ and &lt;denchmark-link:https://github.com/rickstaa/tf2_eager_vs_graph_grad_problem/blob/master/tf2_val_grad_eager.py&gt;tf2_val_grad_eager.py&lt;/denchmark-link&gt;
+ in my repository that can be used to reproduce the problem. &lt;denchmark-link:https://github.com/rickstaa/tf2_eager_vs_graph_grad_problem&gt;The repository&lt;/denchmark-link&gt;
+ also contains a small README.md which explains how to run the code examples.
+&lt;denchmark-h:h3&gt;Other info / logs&lt;/denchmark-h&gt;
+
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/files/5247877/tf2_val_grad_eager_terminal_output.txt&gt;tf2_val_grad_eager_terminal_output.txt&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/files/5247879/tf2_val_grad_terminal_output.txt&gt;tf2_val_grad_terminal_output.txt&lt;/denchmark-link&gt;
+
+&lt;denchmark-h:h3&gt;Possible related issues&lt;/denchmark-h&gt;
+
+
+#27827
+tensorflow/probability#345
+
+&lt;denchmark-h:h3&gt;Further debug steps&lt;/denchmark-h&gt;
+
+
+Trim the call function down to see where the gradients converge.
+
+	</description>
+	<comments>
+		<comment id='1' author='rickstaa' date='2020-09-18T21:27:36Z'>
+		Closing this issue for now as. This might be a StackOverflow question after all. I just found out that when I change the loss function from:
+a_loss = GRAD_SCALE_FACTOR * (
+        labda * l_delta + alpha * tf.reduce_mean(input_tensor=log_pis)
+    ) 
+To:
+a_loss = GRAD_SCALE_FACTOR * (alpha * tf.reduce_mean(input_tensor=log_pis))
+The gradients become equal. Meaning there is a difference in how the gradient is computed when the second actor copy is added.
+		</comment>
+		<comment id='2' author='rickstaa' date='2020-09-18T21:27:43Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/43349&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/43349&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='3' author='rickstaa' date='2020-09-22T07:44:55Z'>
+		For future reference: One of the required gradients was None in the tf2 eager version. This was caused by one of the forward passes that was required to compute these gradients not being taped. I used the &lt;denchmark-link:https://www.tensorflow.org/tensorboard/debugger_v2&gt;tensorboard debugger&lt;/denchmark-link&gt;
+ to find this out.
+		</comment>
+	</comments>
+</bug>

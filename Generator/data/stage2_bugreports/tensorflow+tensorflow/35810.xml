@@ -1,0 +1,234 @@
+<bug id='35810' author='bj1123' open_date='2020-01-13T08:04:19Z' closed_time='2020-01-18T02:54:49Z'>
+	<summary>Autograph transformation warning</summary>
+	<description>
+Please make sure that this is a bug. As per our GitHub Policy, we only address code/doc bugs, performance issues, feature requests and build/installation issues on GitHub. tag:bug_template
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): 18.04
+Mobile device (e.g. iPhone 8, Pixel 2, Samsung Galaxy) if the issue happens on mobile device:
+TensorFlow installed from (source or binary): binary
+TensorFlow version (use command below): 2.1
+Python version: 3.7
+Bazel version (if compiling from source):
+GCC/Compiler version (if compiling from source):
+CUDA/cuDNN version: 7.6
+GPU model and memory: 2080ti
+
+Describe the current behavior
+I'm seeing the message "AutoGraph could not transform and will run it as-is"
+I found no performance issue, because a model shows almost the same losses compared to the exact code implemented with pytorch. I'm using gast version 0.2.2, so I doubt this is caused by gast.
+Code to reproduce the issue
+Provide a reproducible test case that is the bare minimum necessary to generate the problem.
+&lt;denchmark-code&gt;import os
+import tensorflow as tf
+from tensorflow.keras import layers
+import tensorflow.keras as keras
+
+
+os.environ['AUTOGRAPH_VERBOSITY'] = '10'
+
+def shape_list(x):
+    static = x.shape.as_list()
+    dynamic = tf.shape(x)
+    return [dynamic[i] if s is None else s for i, s in enumerate(static)]
+
+
+class TFConv1D(layers.Layer):
+    def __init__(self, input_dim, output_dim, init_std=0.02, use_bias=True, **kwargs):
+        """ TFConv1D layer as defined by Radford et al. for OpenAI GPT (and also used in GPT-2)
+            Basically works like a Linear layer but the weights are transposed
+        """
+        super(TFConv1D, self).__init__(**kwargs)
+        self.nf = output_dim
+        self.nx = input_dim
+        self.initializer_range = init_std
+        self.use_bias = use_bias
+        self.weight = self.add_weight(
+            "{}_weight".format(self.name),
+            shape=[self.nx, self.nf],
+            initializer=keras.initializers.TruncatedNormal(stddev=init_std))
+        if self.use_bias:
+            self.bias = self.add_weight(
+                "{}_bias".format(self.name),
+                shape=[1, self.nf],
+                initializer=tf.zeros_initializer())
+
+    def call(self, x):
+        x = tf.matmul(x, self.weight)
+        if self.use_bias:
+            x += self.bias
+        return x
+
+
+class Adaptive_Softmax(layers.Layer):
+    def __init__(self, vocab_size: int, hidden_dim: int, cutoffs: list, padding_index: int, init_std=0.02):
+        super(Adaptive_Softmax, self).__init__()
+        self.padding_index = padding_index
+        self.vocab_size = vocab_size
+        self.hidden_dim = hidden_dim
+        self.n_clusters = len(cutoffs) + 1
+        self.cutoffs = [0] + cutoffs + [vocab_size]
+        self.cluster_logit = TFConv1D(hidden_dim, self.n_clusters)
+        self.logits = self.add_weight(
+            "{}_weight".format(self.name),
+            shape=[hidden_dim, vocab_size],
+            initializer=keras.initializers.TruncatedNormal(stddev=init_std))
+
+        self.bias = self.add_weight(
+            "{}_bias".format(self.name),
+            shape=[1, vocab_size],
+            initializer=tf.zeros_initializer())
+
+    def call(self, x, y):
+        x = x[:, :-1]
+        b, l, h = shape_list(x)
+        x = tf.reshape(x, [b * l, -1])
+        y = tf.reshape(y, [-1])
+        cl = self.cluster_logit(x)
+        cluster_ll = tf.nn.log_softmax(cl, axis=1)
+        nll = tf.zeros_like(y, dtype=x.dtype)
+        tail_weight = self.logits
+
+        for i in range(self.n_clusters):
+            l, r = self.cutoffs[i], self.cutoffs[i + 1]
+            mask = (y &gt;= l) &amp; (y &lt; r)
+            indices = tf.where(mask)
+            target_i = tf.boolean_mask(y, mask) - l
+            tail_logit = tf.matmul(tf.boolean_mask(x, mask), tail_weight[:, l:r]) + self.bias[:, l:r]
+            tail_logprob_i = tf.nn.log_softmax(tail_logit, axis=1)  # [b,vocab]
+            # word_nll[indices] = -logprob_i
+            cur_ll = tf.gather_nd(cluster_ll, tf.concat([indices, tf.ones_like(indices) * i], 1)) + \
+                     tf.gather_nd(tail_logprob_i,
+                                  tf.stack([tf.range(tf.size(target_i, out_type=target_i.dtype)), target_i], 1))
+            nll = tf.tensor_scatter_nd_update(nll, indices, -cur_ll)
+        return nll
+
+vocab_size = 51
+hidden_dim = 100
+cutoffs = [5,20]
+padding_index = 50
+x = tf.random.normal((800,51,100),dtype=tf.float32)
+y = tf.random.uniform((800,50),maxval=50,dtype=tf.int64)
+
+dataset = tf.data.Dataset.from_tensor_slices((x,y))
+batchfier = dataset.batch(4)
+
+model = Adaptive_Softmax(vocab_size,hidden_dim,cutoffs,padding_index)
+optimizer = keras.optimizers.Adam()
+
+@tf.function
+def update_step(x, y):
+    with tf.GradientTape() as tape:
+        batch_loss = model(x,y)
+    step_grad = tape.gradient(batch_loss, model.trainable_variables)
+    optimizer.apply_gradients(zip(step_grad, model.trainable_variables))
+    return batch_loss
+
+for x,y in batchfier:
+    update_step(x,y)
+
+&lt;/denchmark-code&gt;
+
+Other info / logs
+
+2020-01-13 16:53:44.063623: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamic library libnvinfer.so.6
+2020-01-13 16:53:44.064637: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamic library libnvinfer_plugin.so.6
+2020-01-13 16:53:44.604399: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamic library libcuda.so.1
+2020-01-13 16:53:44.613753: I tensorflow/stream_executor/cuda/cuda_gpu_executor.cc:981] successful NUMA node read from SysFS had negative value (-1), but there must be at least one NUMA node, so returning NUMA node zero
+2020-01-13 16:53:44.614201: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1555] Found device 0 with properties:
+pciBusID: 0000:01:00.0 name: GeForce RTX 2080 Ti computeCapability: 7.5
+coreClock: 1.545GHz coreCount: 68 deviceMemorySize: 10.73GiB deviceMemoryBandwidth: 573.69GiB/s
+2020-01-13 16:53:44.614220: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamic library libcudart.so.10.1
+2020-01-13 16:53:44.614238: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamic library libcublas.so.10
+2020-01-13 16:53:44.615203: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamic library libcufft.so.10
+2020-01-13 16:53:44.615364: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamic library libcurand.so.10
+2020-01-13 16:53:44.616463: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamic library libcusolver.so.10
+2020-01-13 16:53:44.617020: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamic library libcusparse.so.10
+2020-01-13 16:53:44.617041: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamic library libcudnn.so.7
+2020-01-13 16:53:44.617092: I tensorflow/stream_executor/cuda/cuda_gpu_executor.cc:981] successful NUMA node read from SysFS had negative value (-1), but there must be at least one NUMA node, so returning NUMA node zero
+2020-01-13 16:53:44.617634: I tensorflow/stream_executor/cuda/cuda_gpu_executor.cc:981] successful NUMA node read from SysFS had negative value (-1), but there must be at least one NUMA node, so returning NUMA node zero
+2020-01-13 16:53:44.618056: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1697] Adding visible gpu devices: 0
+2020-01-13 16:53:44.618258: I tensorflow/core/platform/cpu_feature_guard.cc:142] Your CPU supports instructions that this TensorFlow binary was not compiled to use: AVX2 FMA
+2020-01-13 16:53:44.641610: I tensorflow/core/platform/profile_utils/cpu_utils.cc:94] CPU Frequency: 3000000000 Hz
+2020-01-13 16:53:44.642154: I tensorflow/compiler/xla/service/service.cc:168] XLA service 0x55ad9a2a6710 initialized for platform Host (this does not guarantee that XLA will be used). Devices:
+2020-01-13 16:53:44.642165: I tensorflow/compiler/xla/service/service.cc:176]   StreamExecutor device (0): Host, Default Version
+2020-01-13 16:53:44.686305: I tensorflow/stream_executor/cuda/cuda_gpu_executor.cc:981] successful NUMA node read from SysFS had negative value (-1), but there must be at least one NUMA node, so returning NUMA node zero
+2020-01-13 16:53:44.686789: I tensorflow/compiler/xla/service/service.cc:168] XLA service 0x55ad9a925960 initialized for platform CUDA (this does not guarantee that XLA will be used). Devices:
+2020-01-13 16:53:44.686818: I tensorflow/compiler/xla/service/service.cc:176]   StreamExecutor device (0): GeForce RTX 2080 Ti, Compute Capability 7.5
+2020-01-13 16:53:44.686923: I tensorflow/stream_executor/cuda/cuda_gpu_executor.cc:981] successful NUMA node read from SysFS had negative value (-1), but there must be at least one NUMA node, so returning NUMA node zero
+2020-01-13 16:53:44.687358: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1555] Found device 0 with properties:
+pciBusID: 0000:01:00.0 name: GeForce RTX 2080 Ti computeCapability: 7.5
+coreClock: 1.545GHz coreCount: 68 deviceMemorySize: 10.73GiB deviceMemoryBandwidth: 573.69GiB/s
+2020-01-13 16:53:44.687376: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamic library libcudart.so.10.1
+2020-01-13 16:53:44.687383: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamic library libcublas.so.10
+2020-01-13 16:53:44.687395: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamic library libcufft.so.10
+2020-01-13 16:53:44.687403: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamic library libcurand.so.10
+2020-01-13 16:53:44.687411: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamic library libcusolver.so.10
+2020-01-13 16:53:44.687419: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamic library libcusparse.so.10
+2020-01-13 16:53:44.687425: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamic library libcudnn.so.7
+2020-01-13 16:53:44.687455: I tensorflow/stream_executor/cuda/cuda_gpu_executor.cc:981] successful NUMA node read from SysFS had negative value (-1), but there must be at least one NUMA node, so returning NUMA node zero
+2020-01-13 16:53:44.687898: I tensorflow/stream_executor/cuda/cuda_gpu_executor.cc:981] successful NUMA node read from SysFS had negative value (-1), but there must be at least one NUMA node, so returning NUMA node zero
+2020-01-13 16:53:44.688316: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1697] Adding visible gpu devices: 0
+2020-01-13 16:53:44.688332: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamic library libcudart.so.10.1
+2020-01-13 16:53:44.910219: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1096] Device interconnect StreamExecutor with strength 1 edge matrix:
+2020-01-13 16:53:44.910242: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1102]      0
+2020-01-13 16:53:44.910247: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1115] 0:   N
+2020-01-13 16:53:44.910389: I tensorflow/stream_executor/cuda/cuda_gpu_executor.cc:981] successful NUMA node read from SysFS had negative value (-1), but there must be at least one NUMA node, so returning NUMA node zero
+2020-01-13 16:53:44.910886: I tensorflow/stream_executor/cuda/cuda_gpu_executor.cc:981] successful NUMA node read from SysFS had negative value (-1), but there must be at least one NUMA node, so returning NUMA node zero
+2020-01-13 16:53:44.911318: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1241] Created TensorFlow device (/job:localhost/replica:0/task:0/device:GPU:0 with 9064 MB memory) -&gt; physical GPU (device: 0, name: GeForce RTX 2080 Ti, pci bus id: 0000:01:00.0, compute capability: 7.5)
+WARNING:tensorflow:AutoGraph could not transform &lt;bound method Adaptive_Softmax.call of &lt;main.Adaptive_Softmax object at 0x7ff7a6a7f320&gt;&gt; and will run it as-is.
+Please report this to the TensorFlow team. When filing the bug, set the verbosity to 10 (on Linux, export AUTOGRAPH_VERBOSITY=10) and attach the full output.
+Cause: expected exactly one node node, found [&lt;gast.gast.FunctionDef object at 0x7ff79c3853c8&gt;, &lt;gast.gast.Return object at 0x7ff79c385c50&gt;]
+WARNING:tensorflow:AutoGraph could not transform &lt;bound method Adaptive_Softmax.call of &lt;main.Adaptive_Softmax object at 0x7ff7a6a7f320&gt;&gt; and will run it as-is.
+Please report this to the TensorFlow team. When filing the bug, set the verbosity to 10 (on Linux, export AUTOGRAPH_VERBOSITY=10) and attach the full output.
+Cause: expected exactly one node node, found [&lt;gast.gast.FunctionDef object at 0x7ff79c212198&gt;, &lt;gast.gast.Return object at 0x7ff79c2121d0&gt;]
+2020-01-13 16:53:45.777560: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamic library libcublas.so.10
+
+Process finished with exit code 0
+Include any logs or source code that would be helpful to diagnose the problem. If including tracebacks, please include the full traceback. Large logs and files should be attached.
+	</description>
+	<comments>
+		<comment id='1' author='bj1123' date='2020-01-14T05:15:40Z'>
+		I have tried on colab with TF version 2.1 .Please, find the gist &lt;denchmark-link:https://colab.sandbox.google.com/gist/ravikyram/3a5e0b854e4a42629569eb214f7706eb/untitled556.ipynb&gt;here&lt;/denchmark-link&gt;
+. Is this the expected behavior?.Thanks!
+		</comment>
+		<comment id='2' author='bj1123' date='2020-01-14T08:55:46Z'>
+		
+I have tried on colab with TF version 2.1 .Please, find the gist here. Is this the expected behavior?.Thanks!
+
+I guess it works as I expected. I manually checked output values and the result was the same as I expected. I guess the warning is caused by tensor_scatter_nd_update method, but I'm not sure
+		</comment>
+		<comment id='3' author='bj1123' date='2020-01-17T21:35:59Z'>
+		This looks like &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/35765&gt;#35765&lt;/denchmark-link&gt;
+. Could you try removing the backslash continuation on this line:
+&lt;denchmark-code&gt;            cur_ll = tf.gather_nd(cluster_ll, tf.concat([indices, tf.ones_like(indices) * i], 1)) + \
+                     tf.gather_nd(tail_logprob_i,
+                                  tf.stack([tf.range(tf.size(target_i, out_type=target_i.dtype)), target_i], 1))
+&lt;/denchmark-code&gt;
+
+Breaking the line using parentheses should work:
+&lt;denchmark-code&gt;            cur_ll = (
+                tf.gather_nd(cluster_ll, tf.concat([indices, tf.ones_like(indices) * i], 1)) +
+                tf.gather_nd(tail_logprob_i,
+                             tf.stack([tf.range(tf.size(target_i, out_type=target_i.dtype)), target_i], 1)))
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='4' author='bj1123' date='2020-01-18T02:45:59Z'>
+		&lt;denchmark-link:https://github.com/mdanatg&gt;@mdanatg&lt;/denchmark-link&gt;
+ removing backslash continuation solves the problem. Thanks
+		</comment>
+		<comment id='5' author='bj1123' date='2020-01-18T02:54:49Z'>
+		Thank you for checking. We'll track fixing this issue in &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/35765&gt;#35765&lt;/denchmark-link&gt;
+.
+		</comment>
+		<comment id='6' author='bj1123' date='2020-01-18T02:54:50Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/35810&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/35810&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

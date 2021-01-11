@@ -1,0 +1,169 @@
+<bug id='523' author='Duane321' open_date='2019-02-20T22:57:56Z' closed_time='2019-02-21T16:20:45Z'>
+	<summary>ScaleKernel causes base kernel to act like a noise kernel.</summary>
+	<description>
+Hi,
+First, thanks for writing this package. I think it's awesome and I hope to contribute after I'm more familiar.
+That said, I'm observing what I suspect is odd behavior. In a nutshell, I believe the ScaleKernel causes a kernel to be used like a noise kernel (only being applied to training data).
+I'll try to demonstrate what I mean:
+&lt;denchmark-code&gt;import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+%matplotlib inline
+
+import gpytorch
+import torch
+
+torch.set_default_tensor_type("torch.DoubleTensor")
+&lt;/denchmark-code&gt;
+
+Now I'll set up some fake training data:
+&lt;denchmark-code&gt;beta = 10
+offset = 2
+sin_amplitutde = 20
+sin_period = 2
+noise_var = 10
+
+y = x*beta + offset + np.sin(x*2*np.pi/sin_period)*sin_amplitutde + np.random.normal(0,np.sqrt(noise_var),len(x))
+
+def clean_ax(ax):
+    ax.grid(True)
+    for which in ['top','right']:
+        ax.spines[which].set_visible(False)
+
+figsize=(10,6)
+fig, ax = plt.subplots(figsize=figsize)
+ax.plot(x,y,'*')
+clean_ax(ax)
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-link:https://user-images.githubusercontent.com/19956442/53130546-7aae1c80-351f-11e9-9fe8-29d9137c825c.png&gt;&lt;/denchmark-link&gt;
+
+My goal will be to observe the left 70% of this and predict to the right.
+I can do this with 2 features. One is the x axis and the other is the x axis mod the period length. We'll set up a GP to model the first feature with a linear kernel and the 2nd with an RBF.
+&lt;denchmark-code&gt;split_point = int(len(x)*.7)
+
+X = np.concatenate([x.reshape(-1,1),np.mod(x,sin_period).reshape(-1,1)],axis=1)
+
+train_x = torch.from_numpy(X[:split_point,:]).to(torch.float64)
+train_y = torch.from_numpy(y[:split_point]).to(torch.float64)
+
+test_x = torch.from_numpy(X[split_point:,:]).to(torch.float64)
+test_y = torch.from_numpy(y[split_point:]).to(torch.float64)
+&lt;/denchmark-code&gt;
+
+Now, this next function will accept a model and produce the predictions in a graph.
+&lt;denchmark-code&gt;def prediction_graph_for_model(model):
+
+    model.train() # What does this do?
+    likelihood.train()
+
+    optimizer = torch.optim.Adam([
+        {'params': model.parameters()},  # Includes GaussianLikelihood parameters
+    ], lr=0.1)
+
+    # "Loss" for GPs - the marginal log likelihood
+    mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
+
+    training_iter = 200
+    for i in range(training_iter):
+        # Zero gradients from previous iteration
+        optimizer.zero_grad()
+        # Output from model
+        output = model(train_x)
+        # Calc loss and backprop gradients
+        loss = -mll(output, train_y)
+        loss.backward()
+        if not i % 20:
+            print('i: {0}, Loss: {1}'.format(i, loss.item()))
+        optimizer.step()
+        
+    # Get into evaluation (predictive posterior) mode
+    model.eval()
+    likelihood.eval()
+
+    # Test points are regularly spaced along [0,1]
+    # Make predictions by feeding model through likelihood
+    with torch.no_grad(), gpytorch.settings.fast_pred_var():
+        y_test_pred = likelihood(model(test_x)).mean.numpy()
+        y_train_pred = likelihood(model(train_x)).mean.numpy()
+
+    y_predicted = np.concatenate([y_train_pred,y_test_pred])
+    
+    figsize = (10, 5)
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+
+    ax.plot(train_x.numpy()[:,0],train_y.numpy(),'*',color='green',alpha=.5,label='training_data')
+    ax.plot(X[:,0],y_predicted,color='blue',alpha=.5,label='predicted')
+
+    ax.plot(test_x.numpy()[:,0],test_y.numpy(),'*',color='red',alpha=.5,label='actual')
+
+    clean_ax(ax)
+    ax.legend()
+    
+    return fig, ax
+&lt;/denchmark-code&gt;
+
+Now we set up the model. The first way will work properly.
+&lt;denchmark-code&gt;class ExactGPModel(gpytorch.models.ExactGP):
+    def __init__(self, train_x, train_y, likelihood):
+        super(ExactGPModel, self).__init__(train_x, train_y, likelihood)
+        self.mean_module = gpytorch.means.ConstantMean()
+        cov1 = gpytorch.kernels.LinearKernel(num_dimensions=1, active_dims=[0])
+        
+        #cov2 is the ONLY THING that will change between this model and the broken one.
+        cov2 = gpytorch.kernels.RBFKernel(active_dims=[1])
+        self.covar_module = cov1 + cov2        
+    
+    def forward(self, x):
+        mean_x = self.mean_module(x)
+        covar_x = self.covar_module(x)
+        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+    
+likelihood = gpytorch.likelihoods.GaussianLikelihood()
+model = ExactGPModel(train_x, train_y, likelihood)
+prediction_graph_for_model(model)
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-link:https://user-images.githubusercontent.com/19956442/53130660-bea12180-351f-11e9-8667-81007f192178.png&gt;&lt;/denchmark-link&gt;
+
+Now let's break it. We'll change just cov2 in the previous.
+&lt;denchmark-code&gt;class ExactGPModel(gpytorch.models.ExactGP):
+    def __init__(self, train_x, train_y, likelihood):
+        super(ExactGPModel, self).__init__(train_x, train_y, likelihood)
+        self.mean_module = gpytorch.means.ConstantMean()
+        cov1 = gpytorch.kernels.LinearKernel(num_dimensions=1, active_dims=[0])
+        
+        #cov2 is now wrapped in a ScaleKernel
+        cov2 = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(active_dims=[1]))
+        self.covar_module = cov1 + cov2        
+    
+    def forward(self, x):
+        mean_x = self.mean_module(x)
+        covar_x = self.covar_module(x)
+        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+    
+    
+likelihood = gpytorch.likelihoods.GaussianLikelihood()
+model = ExactGPModel(train_x, train_y, likelihood)
+prediction_graph_for_model(model)
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-link:https://user-images.githubusercontent.com/19956442/53130719-e3959480-351f-11e9-897c-339a21a83f6b.png&gt;&lt;/denchmark-link&gt;
+
+I've tried a few things to solve this, but I can't get it to work. I'd like ultimately to use the ScaleKernel, but it to extrapolate to the test data as well.
+	</description>
+	<comments>
+		<comment id='1' author='Duane321' date='2019-02-20T23:32:36Z'>
+		&lt;denchmark-link:https://github.com/Duane321&gt;@Duane321&lt;/denchmark-link&gt;
+ This ended up being a subtle bug in ScaleKernel effectively destroying the  argument of its base kernel. The end result was that the RBF kernel ended up acting on the data in non modular arithmetic as well as the second feature, leading to the behavior you saw. I just pushed a fix to master, and now get this with your second model as expected:
+&lt;denchmark-link:https://user-images.githubusercontent.com/4016393/53132466-a1228680-3524-11e9-8d88-ff36a75b1029.png&gt;&lt;/denchmark-link&gt;
+
+Thanks for bringing this to our attention! We don't use the active_dims functionality often enough in house to have caught this :-).
+		</comment>
+		<comment id='2' author='Duane321' date='2019-02-21T16:20:45Z'>
+		Closing because it looks like this was fixed (and tested)
+		</comment>
+	</comments>
+</bug>

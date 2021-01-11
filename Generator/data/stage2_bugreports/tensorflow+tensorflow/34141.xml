@@ -1,0 +1,184 @@
+<bug id='34141' author='chahld' open_date='2019-11-10T16:57:09Z' closed_time='2020-04-20T16:14:02Z'>
+	<summary>input_shape to build method is None when calling compute_output_shape on layer with overridden build method</summary>
+	<description>
+System information
+custom code to reproduce is included below.
+
+
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04):
+Ubuntu 18.04.3
+
+
+TensorFlow installed from (source or binary):
+pip install tensorflow-gpu
+
+
+TensorFlow version (use command below):
+v2.0.0-rc2-26-g64c3d38 2.0.0
+
+
+Python version:
+3.6.8
+
+
+Describe the current behavior
+build method called with input_shape = None
+Describe the expected behavior
+Build method called with correct input shape
+Code to reproduce the issue
+&lt;denchmark-code&gt;import tensorflow as tf
+
+class MyLayer(tf.keras.layers.Layer):
+    def build(self, input_shape):
+
+        if input_shape is None:
+            print('error: input shape is none')
+        else:
+            print('build:', input_shape)
+
+        super().build(input_shape)
+
+    def call(self, inputs):
+        print('call:', inputs.shape)
+
+        return inputs * 2
+
+def main():
+
+    l = MyLayer()
+
+    inp = tf.keras.Input(shape=(5, 5, 1))
+    l.compute_output_shape((None, 5, 5, 1))
+
+    o = l(inp)
+
+    print("input_shape:", l.input_shape)
+    print("count_params:", l.count_params())
+    print('output:', o.shape)
+
+if __name__=='__main__':
+    main()
+&lt;/denchmark-code&gt;
+
+Other info / logs
+When run, program prints this:
+&lt;denchmark-code&gt;error: input shape is none
+call: (None, 5, 5, 1)
+call: (None, 5, 5, 1)
+input_shape: (None, 5, 5, 1)
+count_params: 0
+output: (None, 5, 5, 1)
+&lt;/denchmark-code&gt;
+
+Looking at the code for compute_output_shape, I noticed that it calls self._mabye_build method, but this method expects actual tensors as inputs, not tensor shapes. So it fumbes and passes in a None.
+Suggested code to fix:
+at &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/r2.0/tensorflow/python/keras/engine/base_layer.py#L620&gt;https://github.com/tensorflow/tensorflow/blob/r2.0/tensorflow/python/keras/engine/base_layer.py#L620&lt;/denchmark-link&gt;
+
+replace _maybe_build with _maybe_build_from_shapes:
+(should probably adjust _maybe_build to call this method also)
+&lt;denchmark-code&gt;def _maybe_build_with_shapes(self, inputshapes):
+    # Check input assumptions set before layer building, e.g. input rank.
+    if not self.built:
+
+      # Only call `build` if the user has manually overridden the build method.
+      if not hasattr(self.build, '_is_default'):
+        # Any setup work performed only once should happen in an `init_scope`
+        # to avoid creating symbolic Tensors that will later pollute any eager
+        # operations.
+        with tf_utils.maybe_init_scope(self):
+          self.build(input_shapes)
+      # We must set self.built since user defined build functions are not
+      # constrained to set self.built.
+      self.built = True
+
+&lt;/denchmark-code&gt;
+
+I don't know what the code at the end of maybe_build is doing, so don't know if it belongs in this method or should just stay in _maybe_build:
+&lt;denchmark-code&gt;    # Optionally load weight values specified at layer instantiation.
+    if getattr(self, '_initial_weights', None) is not None:
+      self.set_weights(self._initial_weights)
+      self._initial_weights = None
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='chahld' date='2019-11-10T17:24:59Z'>
+		Alternate bug fix:
+move the _maybe_build call after the placeholders have been created:
+&lt;denchmark-code&gt;    """Computes the output shape of the layer.
+    If the layer has not been built, this method will call `build` on the
+    layer. This assumes that the layer will later be used with inputs that
+    match the input shape provided here.
+    Arguments:
+        input_shape: Shape tuple (tuple of integers)
+            or list of shape tuples (one per output tensor of the layer).
+            Shape tuples can include None for free dimensions,
+            instead of an integer.
+    Returns:
+        An input shape tuple.
+    """
+    if context.executing_eagerly():
+      # In this case we build the model first in order to do shape inference.
+      # This is acceptable because the framework only calls
+      # `compute_output_shape` on shape values that the layer would later be
+      # built for. It would however cause issues in case a user attempts to
+      # use `compute_output_shape` manually with shapes that are incompatible
+      # with the shape the Layer will be called on (these users will have to
+      # implement `compute_output_shape` themselves).
+      with context.graph_mode():
+        graph = func_graph.FuncGraph('graph')
+        with graph.as_default():
+          input_shape = tf_utils.convert_shapes(input_shape, to_tuples=False)
+          inputs = nest.map_structure(
+              base_layer_utils.generate_placeholders_from_shape, input_shape)
+          self._maybe_build(inputs)
+          try:
+            if self._expects_training_arg:
+              outputs = self(inputs, training=False)
+            else:
+              outputs = self(inputs)
+          except TypeError:
+            raise NotImplementedError('We could not automatically infer '
+                                      'the static shape of the layer\'s output.'
+                                      ' Please implement the '
+                                      '`compute_output_shape` method on your '
+                                      'layer (%s).' % self.__class__.__name__)
+      return nest.map_structure(lambda t: t.shape, outputs)
+    raise NotImplementedError
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='2' author='chahld' date='2019-11-11T07:37:44Z'>
+		I have tried on colab with TF version 2.0 ,2.1.0-dev20191110 and was able to reproduce the issue.Please, find the gist &lt;denchmark-link:https://colab.sandbox.google.com/gist/ravikyram/1bc35ad6876cb9944aa1254e27facfbe/untitled347.ipynb&gt;here&lt;/denchmark-link&gt;
+. Thanks!
+		</comment>
+		<comment id='3' author='chahld' date='2019-11-13T22:06:46Z'>
+		I want to modify the PR
+There is an unnecessary file in there.
+		</comment>
+		<comment id='4' author='chahld' date='2019-11-13T22:07:07Z'>
+		There is an unnecessary file in there.
+		</comment>
+		<comment id='5' author='chahld' date='2020-04-14T21:24:20Z'>
+		&lt;denchmark-link:https://github.com/chahld&gt;@chahld&lt;/denchmark-link&gt;
+ Is this still an issue? Can you please check with recent . I tried and am not getting that . Please check the &lt;denchmark-link:https://colab.research.google.com/gist/jvishnuvardhan/a37cdcc0684c5191ae9d1f7a09f740ad/untitled347.ipynb&gt;gist here&lt;/denchmark-link&gt;
+.
+Please verify once and close the issue if this was resolved for you. Thanks!
+		</comment>
+		<comment id='6' author='chahld' date='2020-04-19T17:48:16Z'>
+		&lt;denchmark-link:https://github.com/chahld&gt;@chahld&lt;/denchmark-link&gt;
+ Can you please verify and close if this was resolved for you. Thanks!
+		</comment>
+		<comment id='7' author='chahld' date='2020-04-20T16:14:02Z'>
+		Yes it appears to be fixed in nightly.
+thanks!
+		</comment>
+		<comment id='8' author='chahld' date='2020-04-20T16:14:04Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/34141&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/34141&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,500 @@
+<bug_data>
+<bug id='11725' author='shamoya' open_date='2017-07-24T20:01:58Z' closed_time='2017-08-24T05:21:42Z'>
+ 	<summary>tf_cnn_benchmarks.py stuck when running with multiple GPUs and ImageNet data with protocol grpc+verbs</summary>
+ 	<description>
+ &lt;denchmark-h:h3&gt;System information&lt;/denchmark-h&gt;
+ 
+ 
+ Have I written custom code (as opposed to using a stock example script provided in TensorFlow): No, running tf_cnn_benchmarks.py from benchmarks repo
+ OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Ubuntu 16.04.2 LTS
+ TensorFlow installed from (source or binary): Unmodified source with RDMA Verbs enabled
+ TensorFlow version (use command below): 1.3.0-rc0
+ Python version: 2.7.12
+ Bazel version (if compiling from source): 0.5.1
+ CUDA/cuDNN version: 8.0/6
+ GPU model and memory: NVIDIA Tesla P100 PCIe 16GB (8 per node)
+ Exact command to reproduce:
+ 
+ PS: CUDA_VISIBLE_DEVICES='' python tf_cnn_benchmarks.py --ps_hosts 12.12.12.43:20000 --worker_hosts 12.12.12.44:20000,12.12.12.41:20000 --batch_size=64 --model=inception3 --variable_update=parameter_server --local_parameter_device=cpu --job_name=ps --task_index=0 --server_protocol grpc+verbs
+ Worker0: CUDA_VISIBLE_DEVICES='0,1,2,3,4,5,6,7' python tf_cnn_benchmarks.py --ps_hosts 12.12.12.43:20000 --worker_hosts 12.12.12.44:20000,12.12.12.41:20000 --batch_size=64 --model=inception3 --variable_update=parameter_server --local_parameter_device=cpu --job_name=worker --task_index=0 --num_gpus=8 --data_dir=/data/imagenet_data/ --train_dir=/data/imagenet_train/ --server_protocol grpc+verbs
+ Worker1: CUDA_VISIBLE_DEVICES='0,1,2,3,4,5,6,7' python tf_cnn_benchmarks.py --ps_hosts 12.12.12.43:20000 --worker_hosts 12.12.12.44:20000,12.12.12.41:20000 --batch_size=64 --model=inception3 --variable_update=parameter_server --local_parameter_device=cpu --job_name=worker --task_index=1 --num_gpus=8 --data_dir=/data/imagenet_data/ --train_dir=/data/imagenet_train/ --server_protocol grpc+verbs
+ 
+ RDMA driver version: MLNX_OFED_LINUX-4.1-1.0.2.0
+ 
+ &lt;denchmark-h:h3&gt;Describe the problem&lt;/denchmark-h&gt;
+ 
+ When running the above commands (Inception V3 synchronized data parallelism training with 2 workers and 1 external ps), the tf_cnn_benchmarks application hangs forever after some iterations (usually in warm up).
+ It happens only when real data is involved (ImageNet), and with &gt;4 GPUs. (More GPUs, less iterations before it hangs). Doesn't happen with grpc protocol, or when running with "synthetic" data.
+ The master_service in the workers is stuck &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/master/tensorflow/core/distributed_runtime/master_session.cc#L608&gt;here&lt;/denchmark-link&gt;
+ , which I guess means some operations in the computation have not been completed.
+ The RDMA protocol looks valid and clean, all messages corresponds to the protocol (see below logs).
+ There some tensors requested by the workers which they don't receive, but they are passed by the RDMA Verbs transport to the BaseRendezvoudMgr with RecvLocalAsync in a valid way, and for some reason the higher level worker service doesn't trigger the Send kernel on those tensors.
+ Any help is much appreciated!
+ If there are some debug mechanisms I can use to understand which tensors/operations have not been completed it can greatly help. I was mostly debugging this from the RDMA Verbs layer till now, without much success, and I feel I don't have enough information there to understand what's missing.
+ Also I feel we don't have enough knowledge on how the step_id acts (diving into this in the code now, but there's some higher level documentation it can greatly help).
+ My initial guess was an occurrence of a racy condition when loading the data, since it creates a gap in execution time (worker0 starts the first training step 30-60 seconds after worker1, since it does the preprocessing of the data twice for a reason I couldn't understand yet), but after the first iteration (which usually passes successfully) the time is synchronized between workers.
+ &lt;denchmark-h:h3&gt;Source code / logs&lt;/denchmark-h&gt;
+ 
+ Those are the logs of the runtime after moving the logging in &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/master/tensorflow/contrib/verbs/rdma.cc&gt;rdma.cc&lt;/denchmark-link&gt;
+  to VLOG(0) (also adding Tensor name and step id for all cases, in some cases the step_id doesn't mean anything like BUFFER_REQUEST/RESPONSE for example), and also some VLOG in &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/master/tensorflow/core/distributed_runtime/master_session.cc&gt;master_session.cc&lt;/denchmark-link&gt;
+ 
+ &lt;denchmark-link:https://gist.github.com/shamoya/15a42f421e088473b8f02bf00c16d0fc&gt;worker0&lt;/denchmark-link&gt;
+ 
+ &lt;denchmark-link:https://gist.github.com/shamoya/dd3126c02c73990a6e28b534d9a9ddf6&gt;worker1&lt;/denchmark-link&gt;
+ 
+ &lt;denchmark-link:https://gist.github.com/shamoya/0c856365802ae4d42b38baf988149574&gt;ps&lt;/denchmark-link&gt;
+ 
+ Unfortunately they are fairly large, but it's better then to cut the log files IMO.
+ Example for analysis I did in the verbs layer, comparing the Sent Tensor requests to the actual received tensors writes in both workers:
+ worker 0:
+ 
+ /job:ps/replica:0/task:0/cpu:0;f3c10d28b54074c0;/job:worker/replica:0/task:0/gpu:0;edge_116943_group_deps_2/NoOp_1;0:0 80661058974090965
+ /job:worker/replica:0/task:1/cpu:0;1a50d5c51cd9c5d1;/job:worker/replica:0/task:0/gpu:0;edge_116947_group_deps_3/NoOp_1;0:0 80661058974090965
+ /job:worker/replica:0/task:1/gpu:2;7f00fadabfe781f5;/job:worker/replica:0/task:0/gpu:0;edge_111078_group_deps_1/NoOp_2;0:0 80661058974090965
+ /job:worker/replica:0/task:1/gpu:4;b07185dd19f62088;/job:worker/replica:0/task:0/gpu:0;edge_111080_group_deps_1/NoOp_4;0:0 80661058974090965
+ 
+ worker 1:
+ 
+ /job:ps/replica:0/task:0/cpu:0;f3c10d28b54074c0;/job:worker/replica:0/task:1/cpu:0;edge_155113_AssignAdd;0:0 80661058974090965
+ /job:worker/replica:0/task:0/gpu:0;f3df8abf03739fe8;/job:worker/replica:0/task:1/cpu:0;edge_116948_group_deps_3;0:0 80661058974090965
+ 
+ The tensors requests received well by the other side and passed to RecvLocalAsync, but are not called later.
+ Thanks a lot.
+ 	</description>
+ 	<comments>
+ 		<comment id='1' author='shamoya' date='2017-07-24T23:11:14Z'>
+ 		I was able to reproduce the issue. I also tried 'alexnet', it hung as well. I will take a close look in the coming days. Thanks for reporting.
+ 		</comment>
+ 		<comment id='2' author='shamoya' date='2017-07-25T00:14:15Z'>
+ 		Thank you for looking into this &lt;denchmark-link:https://github.com/junshi15&gt;@junshi15&lt;/denchmark-link&gt;
+ !
+ 		</comment>
+ 		<comment id='3' author='shamoya' date='2017-07-25T11:01:18Z'>
+ 		&lt;denchmark-link:https://github.com/mrry&gt;@mrry&lt;/denchmark-link&gt;
+  &lt;denchmark-link:https://github.com/jhseu&gt;@jhseu&lt;/denchmark-link&gt;
+  &lt;denchmark-link:https://github.com/poxvoculi&gt;@poxvoculi&lt;/denchmark-link&gt;
+  , just a small question.
+ I'm trying to understand why execution hangs in &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/master/tensorflow/core/distributed_runtime/master_session.cc#L608&gt;here&lt;/denchmark-link&gt;
+ .
+ What (I think) I need is to get the Executor(s) which doesn't end in &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/master/tensorflow/core/distributed_runtime/graph_mgr.cc#L541&gt;here&lt;/denchmark-link&gt;
+ .
+ I tried passing tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE) to sess.run but then I get a huge file I can't really understand.  Is this the right way ?
+ 		</comment>
+ 		<comment id='4' author='shamoya' date='2017-07-25T11:51:33Z'>
+ 		I have met stuck problem(I think it may happen in warm up if I'm right.) when all workers finished all steps. I think  should be protected by a lock.I raised &lt;denchmark-link:https://github.com/tensorflow/benchmarks/issues/38&gt;an issue&lt;/denchmark-link&gt;
+ . I'm not sure if tensorflow has some special code for .
+ 		</comment>
+ 		<comment id='5' author='shamoya' date='2017-07-25T16:41:12Z'>
+ 		When I'm trying to debug a hung concurrent program the first step is
+ usually to try to find a small case that exhibits the problem, i.e. try to
+ find the least number of workers and GPUs that still hangs.  It's much
+ easier to debug a small case than a large one.  Then, if it's a really
+ small case you might be able to set the logging level high and read all the
+ log files.  Usually though, I form some hypotheses about where the problem
+ might be (e.g. a missing lock, a race that might result in deadlock, logic
+ error that always deadlocks) and start putting in LOG(INFO) statements
+ around the suspicious points to confirm or refute each hypothesis.
+ &lt;denchmark-link:#&gt;…&lt;/denchmark-link&gt;
+ 
+ 
+ On Tue, Jul 25, 2017 at 4:53 AM, Ziming Dong ***@***.***&gt; wrote:
+  I think global_step should be protected by a lock.I raised an issue
+  &lt;tensorflow/benchmarks#38&gt;. I'm not sure if
+  tensorflow has some special code for global_step.
+ 
+  —
+  You are receiving this because you were mentioned.
+  Reply to this email directly, view it on GitHub
+  &lt;#11725 (comment)&gt;,
+  or mute the thread
+  &lt;https://github.com/notifications/unsubscribe-auth/AO818aHj9Ak6IS6emES-wdAhL-n1M4oUks5sRdcmgaJpZM4OhqyQ&gt;
+  .
+ 
+ 
+ 
+ 		</comment>
+ 		<comment id='6' author='shamoya' date='2017-07-25T17:09:14Z'>
+ 		&lt;denchmark-link:https://github.com/tfboyd&gt;@tfboyd&lt;/denchmark-link&gt;
+  I'm unassigning myself because I know very little about the RPC layer and know nothing about VERBs. I don't think this is a bug with tf_cnn_benchmarks, because &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/11416&gt;#11416&lt;/denchmark-link&gt;
+  also has the same issue with a different model.
+ &lt;denchmark-link:https://github.com/suiyuan2009&gt;@suiyuan2009&lt;/denchmark-link&gt;
+  I don't think &lt;denchmark-link:https://github.com/tensorflow/benchmarks/issues/38&gt;tensorflow/benchmarks#38&lt;/denchmark-link&gt;
+  is the same issue, since this issue only occurs with verbs, and it occurs with another model with verbs. I'll take a look at &lt;denchmark-link:https://github.com/tensorflow/benchmarks/issues/38&gt;tensorflow/benchmarks#38&lt;/denchmark-link&gt;
+  though.
+ 		</comment>
+ 		<comment id='7' author='shamoya' date='2017-07-26T13:26:29Z'>
+ 		Thanks &lt;denchmark-link:https://github.com/poxvoculi&gt;@poxvoculi&lt;/denchmark-link&gt;
+ 
+ Sadly the smallest case which repro the issue is 3 nodes (2 workers 1 ps) with InveptionV3 and ImageNet, with the tf_cnn_benchmark.py (haven't checked others).
+ I had ~15 hypotheses which turn out to be false.
+ Added a lot of prints, but still couldn't understand which tensor is the rebel.
+ I feel the trace_log mechanism (tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)) can help me here, but I have no idea how to parse it. Is there a parsing tool or format for it ?
+ 		</comment>
+ 		<comment id='8' author='shamoya' date='2017-07-26T14:19:07Z'>
+ 		after adding  a lock to global step, I didn't meet stuck problem.
+ but I got error when running vgg benchmark code, maybe my network environment is a little unstable.
+ &lt;denchmark-code&gt;2017-07-26 21:21:26.691844: F tensorflow/contrib/verbs/rdma.cc:683] Check failed: status.ok() RecvLocalAsync was not ok, key/job:worker/replica:0/task:2/gpu:1;b0903effc6e4881e;/job:ps/replica:0/task:0/cpu:0;edge_2493_Mul_1;0:0;138139939197237012 error message: Step 138139939197237012
+ &lt;/denchmark-code&gt;
+ 
+ 		</comment>
+ 		<comment id='9' author='shamoya' date='2017-07-26T15:11:05Z'>
+ 		&lt;denchmark-link:https://github.com/suiyuan2009&gt;@suiyuan2009&lt;/denchmark-link&gt;
+  Your error might be caused by another process (PS or worker) in your job. We have met the same problem and it turns out when one process terminated the connection, its peers will print out such odd error log.
+ 		</comment>
+ 		<comment id='10' author='shamoya' date='2017-07-26T15:13:50Z'>
+ 		&lt;denchmark-link:https://github.com/shamoya&gt;@shamoya&lt;/denchmark-link&gt;
+  For a simpler model, you could try  (the default one) and set your number of batches to a smaller value.
+ Sorry that I am busying working on migrating my own patch and have little time to reproduce this particular bug right now.
+ 		</comment>
+ 		<comment id='11' author='shamoya' date='2017-07-26T15:45:04Z'>
+ 		&lt;denchmark-link:https://github.com/shamoya&gt;@shamoya&lt;/denchmark-link&gt;
+  Can you try what &lt;denchmark-link:https://github.com/suiyuan2009&gt;@suiyuan2009&lt;/denchmark-link&gt;
+  and &lt;denchmark-link:https://github.com/byronyi&gt;@byronyi&lt;/denchmark-link&gt;
+  suggested.
+ 
+ 
+ try the simple model to see if it hangs --model=trivial.
+ 
+ 
+ With inception3, add a lock around global_step. something like
+ 
+ 
+ &lt;denchmark-code&gt;  with self.lock:
+         inc_global_step = global_step.assign_add(1)
+         fetches.append(inc_global_step)
+ &lt;/denchmark-code&gt;
+ 
+ some where in the init function, you define the lock:
+ self.lock = threading.Lock()
+ I was unable to get an infiniband setup yesterday. I will try again today.
+ 		</comment>
+ 		<comment id='12' author='shamoya' date='2017-07-26T16:48:34Z'>
+ 		&lt;denchmark-link:https://github.com/shamoya&gt;@shamoya&lt;/denchmark-link&gt;
+ 
+ The tracing data is available in a pre-parsed (protobuf) format.  See the run_metadata option to Session.run, which returns tracing data in StepStats.
+ 		</comment>
+ 		<comment id='13' author='shamoya' date='2017-07-26T17:39:51Z'>
+ 		&lt;denchmark-link:https://github.com/junshi15&gt;@junshi15&lt;/denchmark-link&gt;
+  &lt;denchmark-link:https://github.com/shamoya&gt;@shamoya&lt;/denchmark-link&gt;
+ 
+ note that  is also a part of computing graph,  op has a  arg.
+ 		</comment>
+ 		<comment id='14' author='shamoya' date='2017-07-26T21:32:04Z'>
+ 		&lt;denchmark-link:https://github.com/byronyi&gt;@byronyi&lt;/denchmark-link&gt;
+  , you're the best ! it's reproduced on trivial case (with ImageNet data).
+ Now it will be much easier to debug, going full VLOG now - let's hope I'll have update soon.
+ &lt;denchmark-link:https://github.com/suiyuan2009&gt;@suiyuan2009&lt;/denchmark-link&gt;
+ , it's not related to the global_step.
+ I changed to have only the chief increment it and it doesn't have any affect.
+ 		</comment>
+ 		<comment id='15' author='shamoya' date='2017-07-27T02:43:39Z'>
+ 		&lt;denchmark-link:https://github.com/byronyi&gt;@byronyi&lt;/denchmark-link&gt;
+ , do your GDR patch have met same problem like stuck or failure?
+ 		</comment>
+ 		<comment id='16' author='shamoya' date='2017-07-27T05:52:22Z'>
+ 		No I have not met such kind of problems, at least not during our internal testing. But my patch uses vastly different design compared to current verbs implementation so there is little I can tell about this particular issue.
+ 		</comment>
+ 		<comment id='17' author='shamoya' date='2017-07-27T06:47:04Z'>
+ 		My observation agrees with &lt;denchmark-link:https://github.com/shamoya&gt;@shamoya&lt;/denchmark-link&gt;
+  's.
+ 
+ the program got stuck with the trivial model, but it needed 8 GPUs per worker. Even 7 GPUs do not result in hang (after running 1000 iterations).
+ the program got stuck either at warm-up or early iterations (&lt; 100).
+ locking global_step does not help.
+ At the very beginning, some tensors changed size as shown below. This may not be an issue, but it will be good to find out why.
+ 
+ &lt;denchmark-code&gt;tensor and buffer size do not agree! buffer_size = 653 requested tensor size = 593 Tensor&lt;type: int64 shape: [0,1] values: &gt; key = /job:ps/replica:0/task:0/cpu:0;ccc0db7aa974ba53;/job:worker/replica:0/task:0/gpu:0;edge_37_report_uninitialized_variables/boolean_mask/Where;0:0
+ 
+ tensor and buffer size do not agree! buffer_size = 649 requested tensor size = 589 Tensor&lt;type: int64 shape: [0] values: &gt; key = /job:worker/replica:0/task:0/gpu:0;62e354fc58da5afa;/job:ps/replica:0/task:0/cpu:0;edge_39_report_uninitialized_variables/boolean_mask/Squeeze;0:0
+ &lt;/denchmark-code&gt;
+ 
+ 		</comment>
+ 		<comment id='18' author='shamoya' date='2017-07-27T14:49:16Z'>
+ 		&lt;denchmark-link:https://github.com/katyakats&gt;@katyakats&lt;/denchmark-link&gt;
+  &lt;denchmark-link:https://github.com/bkovalev&gt;@bkovalev&lt;/denchmark-link&gt;
+ 
+ Ok, after reviewing the full logs, this is what we think is the root cause:
+ A single GPU (in worker1) doesn't complete loading of the model parameters from the CPU.
+ For this GPU we don't see "Async kernel done" for the SEND/RECV operation (CPU:0 -&gt; GPU:x locally).
+ The reason why it happens only with RDMA (and not with gRPC) is not known yet.
+ Thought about possible interrupts issue due to excessive interrupts (8 GPUs + NIC + NVMe drive which holds the ImageNet data, all on the same PCIe bus). however polling mode of Process_CQ (no interrupts from the NIC at all) didn't resolve the issue.
+ &lt;denchmark-link:https://gist.github.com/shamoya/824d452be527d95902f20b59f868b391&gt;This&lt;/denchmark-link&gt;
+  is the problematic GPU relevant logs.
+ This is what I get from grepping one of the model parameters tensors  in the problematic GPU log (as above) VS one of the other valid GPUs:
+ idos@MTR-IDOS $cat gpu2.log | grep "affine1/biases"
+ 2017-07-27 16:04:48.740960: I tensorflow/core/common_runtime/executor.cc:1558] Process node: 8 step 286 v/affine1/biases/read_G109 = _Recv&lt;denchmark-link:&gt;client_terminated=false, recv_device="/job:worker/replica:0/task:1/gpu:2", send_device="/job:worker/replica:0/task:1/cpu:0", send_device_incarnation=-5325932350616196133, tensor_name="edge_609_v/affine1/biases/read", tensor_type=DT_FLOAT, _device="/job:worker/replica:0/task:1/gpu:2"&lt;/denchmark-link&gt;
+  is dead: 0
+ 2017-07-27 16:04:48.748463: I tensorflow/core/common_runtime/executor.cc:1558] Process node: 35506 step 286 v/affine1/biases/read_G108 = _Send&lt;denchmark-link:v/affine1/biases/read&gt;T=DT_FLOAT, client_terminated=false, recv_device="/job:worker/replica:0/task:1/gpu:2", send_device="/job:worker/replica:0/task:1/cpu:0", send_device_incarnation=-5325932350616196133, tensor_name="edge_609_v/affine1/biases/read", _device="/job:worker/replica:0/task:1/cpu:0"&lt;/denchmark-link&gt;
+  is dead: 0
+ idos@MTR-IDOS $cat gpu4.log | grep "affine1/biases"
+ 2017-07-27 16:04:48.740332: I tensorflow/core/common_runtime/executor.cc:1558] Process node: 8 step 286 v/affine1/biases/read_G105 = _Recv&lt;denchmark-link:&gt;client_terminated=false, recv_device="/job:worker/replica:0/task:1/gpu:4", send_device="/job:worker/replica:0/task:1/cpu:0", send_device_incarnation=-5325932350616196133, tensor_name="edge_605_v/affine1/biases/read", tensor_type=DT_FLOAT, _device="/job:worker/replica:0/task:1/gpu:4"&lt;/denchmark-link&gt;
+  is dead: 0
+ 2017-07-27 16:04:48.748482: I tensorflow/core/common_runtime/executor.cc:1558] Process node: 35508 step 286 v/affine1/biases/read_G104 = _Send&lt;denchmark-link:v/affine1/biases/read&gt;T=DT_FLOAT, client_terminated=false, recv_device="/job:worker/replica:0/task:1/gpu:4", send_device="/job:worker/replica:0/task:1/cpu:0", send_device_incarnation=-5325932350616196133, tensor_name="edge_605_v/affine1/biases/read", _device="/job:worker/replica:0/task:1/cpu:0"&lt;/denchmark-link&gt;
+  is dead: 0
+ 2017-07-27 16:04:48.764311: I tensorflow/core/common_runtime/executor.cc:1612] 0x7f1fc4e67ab0 Async kernel done: v/affine1/biases/read_G105 = _Recv&lt;denchmark-link:&gt;client_terminated=false, recv_device="/job:worker/replica:0/task:1/gpu:4", send_device="/job:worker/replica:0/task:1/cpu:0", send_device_incarnation=-5325932350616196133, tensor_name="edge_605_v/affine1/biases/read", tensor_type=DT_FLOAT, _device="/job:worker/replica:0/task:1/gpu:4"&lt;/denchmark-link&gt;
+ 
+ 2017-07-27 16:04:48.765221: I tensorflow/core/common_runtime/executor.cc:1558] Process node: 69 step 286 v_4/tower_4/gradients/v_4/tower_4/L2Loss_3_grad/mul = Mul[T=DT_FLOAT, _device="/job:worker/replica:0/task:1/gpu:4"](v/affine1/biase
+ /read_G105, v_4/tower_4/gradients/v_4/tower_4/mul_1_grad/Reshape_1) is dead: 0
+ 2017-07-27 16:04:48.765199: I tensorflow/core/common_runtime/executor.cc:1558] Process node: 9 step 286 v_4/tower_4/L2Loss_3 = L2Loss&lt;denchmark-link:v/affine1/biases/read_G105&gt;T=DT_FLOAT, _device="/job:worker/replica:0/task:1/gpu:4"&lt;/denchmark-link&gt;
+  is dead: 0
+ 2017-07-27 16:04:48.765338: I tensorflow/core/common_runtime/executor.cc:1558] Process node: 38 step 286 v_4/tower_4/affine1/add = Add[T=DT_FLOAT, _device="/job:worker/replica:0/task:1/gpu:4"](v_4/tower_4/affine1/MatMul, v/affine1/biase
+ /read_G105) is dead: 0
+ 		</comment>
+ 		<comment id='19' author='shamoya' date='2017-07-27T16:33:53Z'>
+ 		Just a wild guess, if the callback passed into the local async recv kernel is an erroneous remote send, would it appear to be stuck at the local recv? What's the downstream operator of that local recv?
+ 		</comment>
+ 		<comment id='20' author='shamoya' date='2017-07-27T20:01:26Z'>
+ 		&lt;denchmark-link:https://github.com/shamoya&gt;@shamoya&lt;/denchmark-link&gt;
+  intriguing discovery. Local tensor transfer is handled by BaseRemoteRendezvous. There is one difference between gRPC and RDMA: tolerate_dup_recv is set to  in &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/r1.3/tensorflow/core/distributed_runtime/rpc/rpc_rendezvous_mgr.cc#L42&gt;the former&lt;/denchmark-link&gt;
+  and  in &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/r1.3/tensorflow/contrib/verbs/rdma_rendezvous_mgr.cc#L34&gt;the latter&lt;/denchmark-link&gt;
+ . The reason: gRPC only receives a tensor once, with verbs we have multiple receive attempts, since the tx/rx buffer may not be ready at early attempts. I ran some experiments by changing that to  in gPRC model, no hang was observed. However &lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/cbfd50ff0f01e1825922230a8bc6e5766da98dd7#diff-b9ae16e68ba80801fe243bb5e19bac51&gt;this patch&lt;/denchmark-link&gt;
+  totally broke the verbs code. I had to raise an issue &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/11825&gt;here&lt;/denchmark-link&gt;
+ . Something to worry about after this debug.
+ A correction to what I said early, I finally saw hang with 7 GPUs per worker, after 2000 steps.
+ 		</comment>
+ 		<comment id='21' author='shamoya' date='2017-07-27T20:48:27Z'>
+ 		Thanks &lt;denchmark-link:https://github.com/junshi15&gt;@junshi15&lt;/denchmark-link&gt;
+  for noticing this commit.
+ Not sure I understand why you say BaseRemoteRendezvous is used in the case of local tensor transfer between GPU and CPU on the same worker.
+ &lt;denchmark-link:https://gist.github.com/shamoya/36beb1d093d4b95a523e27d4deda16ea&gt;This&lt;/denchmark-link&gt;
+  is a more detailed log of the all the occurences of affine1/biases in the last iteration in worker1. We can see the RdmaRemoteRendezvous has completed successfully from the PS.
+ I'm not so sure anymore this issue is even related to the Verbs code.
+ 		</comment>
+ 		<comment id='22' author='shamoya' date='2017-07-27T21:53:37Z'>
+ 		&lt;denchmark-link:https://github.com/shamoya&gt;@shamoya&lt;/denchmark-link&gt;
+  RdmaRemoteRendezvous is a derived class of BaseRemoteRendezvous. The local send/receive functions are defined in the base class. RdmaRemoteRendezvous only overrides RecvFromRemoteAsync().
+ 		</comment>
+ 		<comment id='23' author='shamoya' date='2017-08-07T16:53:00Z'>
+ 		&lt;denchmark-link:https://github.com/katyakats&gt;@katyakats&lt;/denchmark-link&gt;
+  When you reverted commit &lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/626d8d905aa412aaca02d171e5e0b4a1c407656b&gt;626d8d9&lt;/denchmark-link&gt;
+  (Improve RDMA rendezvous speed), where did the code hang? SetProtoFromGPUSync?
+ 		</comment>
+ 		<comment id='24' author='shamoya' date='2017-08-08T07:31:17Z'>
+ 		&lt;denchmark-link:https://github.com/junshi15&gt;@junshi15&lt;/denchmark-link&gt;
+  thank you! we will check this direction!
+ I did not check what method is stuck when I reverted the commit. Will check this as well
+ 		</comment>
+ 		<comment id='25' author='shamoya' date='2017-08-09T13:15:21Z'>
+ 		Hi &lt;denchmark-link:https://github.com/junshi15&gt;@junshi15&lt;/denchmark-link&gt;
+  , following the discussion &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/11825&gt;here&lt;/denchmark-link&gt;
+  and in this bug and after I review the code, I think we have a serious issue with tolerate_dup_recv mechanism (maybe this is why it was removed ? ).
+ I think &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/r1.3/tensorflow/core/framework/rendezvous.cc#L209&gt;this&lt;/denchmark-link&gt;
+  is wrong in case we don't do a duplicate receive (if we have a buffer already in some step), becasue no one will UnRef it, in case the Recv will not be called.
+ Do u think it might be the issue ?
+ 		</comment>
+ 		<comment id='26' author='shamoya' date='2017-08-09T13:34:36Z'>
+ 		&lt;denchmark-link:https://github.com/shamoya&gt;@shamoya&lt;/denchmark-link&gt;
+  UnRef is in &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/r1.3/tensorflow/core/framework/rendezvous.cc#L264&gt;Recv&lt;/denchmark-link&gt;
+ . In what case Recv will not be called? In verbs case, Send only is only called once, but Recv is called multiple times.
+ 		</comment>
+ 		<comment id='27' author='shamoya' date='2017-08-09T13:39:02Z'>
+ 		If Recv was called before the SEND ?
+ It doesn't have to be called multiple times (only first tensor appearance)
+ 		</comment>
+ 		<comment id='28' author='shamoya' date='2017-08-09T14:31:56Z'>
+ 		If the first Recv is called before Send, then the waiting table does not have the tensor yet, Recv will put a callback in the table and return. Now, if a second Recv is called and still before Send, I think there is an issue since we allow multiple Recvs. In this case, &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/r1.3/tensorflow/core/framework/rendezvous.cc#L246&gt;an empty tensor will be received&lt;/denchmark-link&gt;
+ . We will have trouble in the downstream. Is this what you are referring to?
+ 		</comment>
+ 		<comment id='29' author='shamoya' date='2017-08-09T19:48:02Z'>
+ 		No &lt;denchmark-link:https://github.com/junshi15&gt;@junshi15&lt;/denchmark-link&gt;
+ , you didn't follow me, I'll try to be more clear.
+ Let's say RECV is called before SEND, and puts &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/master/tensorflow/contrib/verbs/rdma.cc#L678&gt;this&lt;/denchmark-link&gt;
+  callback in the table as u said. And let's say there's already a buffer for this tensor, meaning this callback will be called once (trigger TENSOR_WRITE).
+ now SEND flow performs &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/r1.3/tensorflow/core/framework/rendezvous.cc#L209&gt;this&lt;/denchmark-link&gt;
+  Ref() before calling the callback, since it assumes the RECV  be duplicated and called again.
+ But in this case it doesn't, and no one will do &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/r1.3/tensorflow/core/framework/rendezvous.cc#L264&gt;this&lt;/denchmark-link&gt;
+  Unref.
+ When we are stuck in the bug, I noticed there's a huge diff between Refs and Unref on the GPU that is "stuck" (hundernds).
+ Now, I do see &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/r1.3/tensorflow/core/framework/rendezvous.cc#L323&gt;this&lt;/denchmark-link&gt;
+  Unref, in the Item destructor, which might do the missing Unref, but I need to check if it happens.
+ 		</comment>
+ 		<comment id='30' author='shamoya' date='2017-08-09T21:51:43Z'>
+ 		&lt;denchmark-link:https://github.com/shamoya&gt;@shamoya&lt;/denchmark-link&gt;
+  Thanks for the explanation. A Recv-Send sequence does increase the reference count by one for send_dev_context. This can be a problem. I tried adding Unref right after &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/r1.3/tensorflow/core/framework/rendezvous.cc#L219&gt;this&lt;/denchmark-link&gt;
+ , it crashed right away.
+ &lt;denchmark-link:https://github.com/katyakats&gt;@katyakats&lt;/denchmark-link&gt;
+  mentioned hang at . I see similar issue. Here is a &lt;denchmark-link:https://gist.github.com/junshi15/af3063e5bd22c911c30fcaafee060fa1&gt;stack trace&lt;/denchmark-link&gt;
+  I captured with gdb when the program hung. It was stuck while trying to lock a mutex. Frame &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/2&gt;#2&lt;/denchmark-link&gt;
+  is  and Frame &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/20&gt;#20&lt;/denchmark-link&gt;
+  is . Note both of them call , which uses the same lock. So a nesting call like this tries to acquire a already obtained lock, a recipe for hang. Not sure what caused this situation.
+ 		</comment>
+ 		<comment id='31' author='shamoya' date='2017-08-10T11:42:11Z'>
+ 		Wowww &lt;denchmark-link:https://github.com/junshi15&gt;@junshi15&lt;/denchmark-link&gt;
+ , looks like this is it !
+ I've ran the test with inter/intra_op_parallelism_threads = 500 and it passed (multiple times).
+ It workaround the problem by reducing the probability to have this scenario (Schedule of the threadpool more likely to choose an idle thread).
+ It also explains why it happens when working with real data (queue readers also use the same threads)!
+ &lt;denchmark-link:https://github.com/poxvoculi&gt;@poxvoculi&lt;/denchmark-link&gt;
+ 
+ Really not clear to me how Schedule is possible on a thread which holds a mutex.
+ Can't understand also where the context switch happens in this thread while it performs ThenExecute.
+ Thanks &lt;denchmark-link:https://github.com/junshi15&gt;@junshi15&lt;/denchmark-link&gt;
+  !
+ 		</comment>
+ 		<comment id='32' author='shamoya' date='2017-08-10T13:29:50Z'>
+ 		By reducing the number of threads to 1 inter_thread I managed to reproduce the bug in a system with 2 GPUs per host and 2 hosts only  (2ps + 2 workers). I believe its the same issue because it occurs only when using verbs and I am getting the same backtrace as &lt;denchmark-link:https://github.com/junshi15&gt;@junshi15&lt;/denchmark-link&gt;
+  did. so I think we are close.
+ But I don't think ThenExecute's lock is the problem.
+ I've added VLOG prints before and after the critical section, And counted them afterward. No one seems to be 'stuck' inside (locks and unlocks were equal).
+ 		</comment>
+ 		<comment id='33' author='shamoya' date='2017-08-10T13:38:46Z'>
+ 		&lt;denchmark-link:https://github.com/shamoya&gt;@shamoya&lt;/denchmark-link&gt;
+  Glad we are making some progress.
+ &lt;denchmark-link:https://github.com/yanivbl6&gt;@yanivbl6&lt;/denchmark-link&gt;
+   Thanks for your help. This &lt;denchmark-link:https://gist.github.com/junshi15/af3063e5bd22c911c30fcaafee060fa1#file-gistfile1-txt-L2&gt;line&lt;/denchmark-link&gt;
+  seems to be waiting for a mutex. We need to identify the mutex inside .
+ 		</comment>
+ 		<comment id='34' author='shamoya' date='2017-08-10T13:50:16Z'>
+ 		This &lt;denchmark-link:https://gist.github.com/junshi15/af3063e5bd22c911c30fcaafee060fa1#file-gistfile1-txt-L37&gt;line&lt;/denchmark-link&gt;
+  is not  itself. It looks like a lambda function (callback?) inside .
+ 		</comment>
+ 		<comment id='35' author='shamoya' date='2017-08-10T13:51:18Z'>
+ 		I think this line relate to the condition variable of "Notification n", which requires a mutex. (for waiting).
+ If I got this right The condition variable is waiting for the callback, that was scheduled after the stream in ThenExecute.
+ 		</comment>
+ 		<comment id='36' author='shamoya' date='2017-08-14T12:18:13Z'>
+ 		I think the problem rises because the Sync deviceToDevice operation blocks the thread, preventing the earlier Async Device to Device operation from finishing- which, for some reason, blocks the later operation.
+ What I did to check this was change the &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/master/tensorflow/contrib/verbs/rdma.cc#L724&gt;call to the wrapper sync function&lt;/denchmark-link&gt;
+  to a call to the async function, and inserted the rest of the code (that which is executed after the sync wrapper) into then lambda callback function ("done"). With this setting, the application no longer hangs (Tested multipile times, few of which in 8 gpus system).
+ &lt;denchmark-link:https://github.com/junshi15&gt;@junshi15&lt;/denchmark-link&gt;
+  , is there an additional motivation for the usage of the sync wrappers, beside the pending operations we execute after the operation is completed?
+ 		</comment>
+ 		<comment id='37' author='shamoya' date='2017-08-14T20:30:58Z'>
+ 		&lt;denchmark-link:https://github.com/yanivbl6&gt;@yanivbl6&lt;/denchmark-link&gt;
+  Thanks for looking into it. There is another sync wrapper function, &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/master/tensorflow/contrib/verbs/rdma.cc#L730&gt;SetProtoFromGPUSync&lt;/denchmark-link&gt;
+ . We should convert that back to async as well.
+ The motivation for using sync wrapper is mainly for simplicity. Otherwise, you end up with chained call-backs, which is actually fairly common in tensorflow code.
+ Please submit a PR if you have a fix.
+ 		</comment>
+ 		<comment id='38' author='shamoya' date='2017-08-15T11:48:05Z'>
+ 		Great job &lt;denchmark-link:https://github.com/yanivbl6&gt;@yanivbl6&lt;/denchmark-link&gt;
+  , looks like this is it.
+ Waiting for the PR with the fix.
+ Looking now in the gRPC code, they are doing this flow aysnc, this is probably why we didn't see it when running with gRPC.
+ 		</comment>
+ 		<comment id='39' author='shamoya' date='2017-08-15T12:49:08Z'>
+ 		Thanks to all to solve it! Great job!  Go to check it !
+ Need to put it in r1.3 and master.
+ 		</comment>
+ 		<comment id='40' author='shamoya' date='2017-08-17T18:01:29Z'>
+ 		&lt;denchmark-link:https://github.com/poxvoculi&gt;@poxvoculi&lt;/denchmark-link&gt;
+  We found some of &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/master/tensorflow/contrib/verbs/verbs_util.cc#L23-L70&gt;the wrapper functions&lt;/denchmark-link&gt;
+  caused hang. Do you know whether we are not supposed to use the sync version of these functions? I know CPU/GPU transfer can be slow,  but I did not expect it to hang. Thanks.
+ 		</comment>
+ 		<comment id='41' author='shamoya' date='2017-08-17T18:11:21Z'>
+ 		I would avoid using any sync version of a function where an async version with callback is available.  The sync versions suspend a thread which could lead to a deadlock if you run out of threads.  It may be that by blocking you've also introduced a deadlock some other way, where the callback is waiting on something whose execution would have been triggered after the async invocation returned.
+ 		</comment>
+ 		<comment id='42' author='shamoya' date='2017-08-17T20:00:04Z'>
+ 		&lt;denchmark-link:https://github.com/poxvoculi&gt;@poxvoculi&lt;/denchmark-link&gt;
+  What we saw matches your description. Hang happens when 4+ GPUs are used. It goes away when we increase the number of threads. &lt;denchmark-link:https://github.com/yanivbl6&gt;@yanivbl6&lt;/denchmark-link&gt;
+  is working on a &lt;denchmark-link:https://github.com/tensorflow/tensorflow/pull/12361&gt;fix&lt;/denchmark-link&gt;
+ .
+ 		</comment>
+ 		<comment id='43' author='shamoya' date='2017-08-24T05:21:42Z'>
+ 		&lt;denchmark-link:https://github.com/tensorflow/tensorflow/pull/12361&gt;#12361&lt;/denchmark-link&gt;
+  merged to master
+ 		</comment>
+ 		<comment id='44' author='shamoya' date='2018-10-19T23:59:26Z'>
+ 		
+ @poxvoculi What we saw matches your description. Hang happens when 4+ GPUs are used. It goes away when we increase the number of threads. @yanivbl6 is working on a fix.
+ 
+ &lt;denchmark-link:https://github.com/junshi15&gt;@junshi15&lt;/denchmark-link&gt;
+   Cool thanks, I hit a very similar problem and got stuck during the warm up. As you suggested, I increased  to work around the problem.
+ before changing the number of threads, I couldn't get this far.
+ 2018-10-20 01:54:02.736996: I tensorflow/stream_executor/dso_loader.cc:151] successfully opened CUDA library libcupti.so.9.2 locally
+ 		</comment>
+ 		<comment id='45' author='shamoya' date='2018-10-20T12:46:14Z'>
+ 		&lt;denchmark-link:https://github.com/nicolefinnie&gt;@nicolefinnie&lt;/denchmark-link&gt;
+  - did you experience an hang with grpc+verbs?
+ This issue was (At least, to my knowledge) fixed already.
+ What TF version are you experiencing this issue with?
+ 		</comment>
+ 		<comment id='46' author='shamoya' date='2018-10-20T18:51:58Z'>
+ 		&lt;denchmark-link:https://github.com/yanivbl6&gt;@yanivbl6&lt;/denchmark-link&gt;
+   Thanks for your response. It's tensorflow  and I didn't specify the server protocol so it's  by default.
+ 		</comment>
+ 		<comment id='47' author='shamoya' date='2018-10-21T02:17:21Z'>
+ 		&lt;denchmark-link:https://github.com/nicolefinnie&gt;@nicolefinnie&lt;/denchmark-link&gt;
+  The thread is about an issue related to grpc+verbs, and it has been fixed by &lt;denchmark-link:https://github.com/yanivbl6&gt;@yanivbl6&lt;/denchmark-link&gt;
+ .
+ I do not know why you are experiencing the issue with grpc only.
+ 		</comment>
+ 		<comment id='48' author='shamoya' date='2018-10-21T04:38:19Z'>
+ 		I experienced an hang with the master branch and vanilla grpc about a week ago, and it was already fixed in master. I would suggest trying to pull the latest commit.
+ 		</comment>
+ 	</comments>
+ </bug>
+<commit id='e650dcfb462a9efc9236e33cae87ac5bbf55d9f7' author='yanivbl6' date='2017-08-23 21:57:07-07:00'>
+ 	<dmm_unit complexity='0.0' interfacing='0.0' size='0.0'></dmm_unit>
+ 	<modification change_type='MODIFY' old_name='tensorflow\contrib\verbs\rdma.cc' new_name='tensorflow\contrib\verbs\rdma.cc'>
+ 		<file_info nloc='713' complexity='103' token_count='5501'></file_info>
+ 		<method name='tensorflow::RdmaTensorBuffer::PostCopyOperations' parameters='can_memcpy,buffer_size,tensor_bytes,key,in,step_id,is_dead,key_with_step_id,copy,proto,copy_buf'>
+ 				<method_info nloc='67' complexity='15' token_count='536' nesting_level='1' start_line='774' end_line='848'></method_info>
+ 			<added_lines>774,775,776,777,778,779,780,781,782,783,784,785,786,787,788,789,790,791,792,793,794,795,796,797,798,799,800,801,802,803,804,805,806,807,808,809,810,811,812,813,814,815,816,817,818,819,820,821,822,823,824,825,826,827,828,829,830,831,832,833,834,835,836,837,838,839,840,841,842,843,844,845,846,847,848</added_lines>
+ 			<deleted_lines>774,775,776,777,778,779,780,781,782,783,784,785,786,787,788,789,790,791,792,793,794,795,796,797,798,799,800,801,802,803,804,805,806,807,808,809,810,811,812,813,814,815,816,817,818,819,820</deleted_lines>
+ 		</method>
+ 		<method name='tensorflow::RdmaTensorBuffer::SendNextItem' parameters=''>
+ 				<method_info nloc='101' complexity='7' token_count='747' nesting_level='1' start_line='659' end_line='772'></method_info>
+ 			<added_lines>723,724,725,726,727,728,729,730,731,732,733,734,735,737,738,739,740,741,742,743,744,745,746,747,748,749,753,756,759,761,762,763,764,768</added_lines>
+ 			<deleted_lines>710,724,725,726,727,729,730,731,732,741,742,743,744,745,748,749,750,751,752,753,754,755,756,757,758,759,760,761,762,763,764,765,766,767,768,769,770,771,772</deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines>849</added_lines>
+ 			<deleted_lines>773</deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='tensorflow\contrib\verbs\rdma.h' new_name='tensorflow\contrib\verbs\rdma.h'>
+ 		<file_info nloc='224' complexity='11' token_count='1221'></file_info>
+ 		<modified_lines>
+ 			<added_lines>31,229,230,231,232,233,234</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='tensorflow\contrib\verbs\rdma_rendezvous_mgr.cc' new_name='tensorflow\contrib\verbs\rdma_rendezvous_mgr.cc'>
+ 		<file_info nloc='157' complexity='16' token_count='1241'></file_info>
+ 		<method name='tensorflow::RdmaRemoteRendezvous::RecvFromRemoteAsync' parameters='parsed,recv_args,done'>
+ 				<method_info nloc='106' complexity='11' token_count='921' nesting_level='1' start_line='54' end_line='164'></method_info>
+ 			<added_lines>122,123,124,125,126,127,128,129,130,131,132,133,152</added_lines>
+ 			<deleted_lines>116,117,118,119,138,139,140,141,142,143,144,145,146,147,148,149</deleted_lines>
+ 		</method>
+ 		<method name='tensorflow::RdmaRemoteRendezvous::RecvPostCopyOps' parameters='key,key_with_step_id,recv_args,done,rm,rc,val,s'>
+ 				<method_info nloc='15' complexity='1' token_count='126' nesting_level='1' start_line='166' end_line='180'></method_info>
+ 			<added_lines>166,167,168,169,170,171,172,173,174,175,176,177,178,179,180</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines>24,37,38,39,40,41,181</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='tensorflow\contrib\verbs\verbs_util.cc' new_name='tensorflow\contrib\verbs\verbs_util.cc'>
+ 		<file_info nloc='18' complexity='2' token_count='129'></file_info>
+ 		<method name='tensorflow::VerbsUtil::CopyCPUTensorToGPUSync' parameters='cpu_tensor,device_context,gpu_device,gpu_tensor'>
+ 				<method_info nloc='15' complexity='1' token_count='78' nesting_level='1' start_line='41' end_line='55'></method_info>
+ 			<added_lines></added_lines>
+ 			<deleted_lines>41,42,43,44,45,46,47,48,49,50,51,52,53,54,55</deleted_lines>
+ 		</method>
+ 		<method name='tensorflow::VerbsUtil::CopyGPUTensorToCPUSync' parameters='gpu_device,device_context,gpu_tensor,cpu_tensor'>
+ 				<method_info nloc='15' complexity='1' token_count='78' nesting_level='1' start_line='24' end_line='38'></method_info>
+ 			<added_lines></added_lines>
+ 			<deleted_lines>24,25,26,27,28,29,30,31,32,33,34,35,36,37,38</deleted_lines>
+ 		</method>
+ 		<method name='tensorflow::VerbsUtil::SetProtoFromGPUSync' parameters='tensor,dev,device_context,proto,is_dead'>
+ 				<method_info nloc='13' complexity='1' token_count='83' nesting_level='1' start_line='58' end_line='70'></method_info>
+ 			<added_lines></added_lines>
+ 			<deleted_lines>58,59,60,61,62,63,64,65,66,67,68,69,70</deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines></added_lines>
+ 			<deleted_lines>23,39,40,56,57,71</deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='tensorflow\contrib\verbs\verbs_util.h' new_name='tensorflow\contrib\verbs\verbs_util.h'>
+ 		<file_info nloc='13' complexity='0' token_count='53'></file_info>
+ 		<modified_lines>
+ 			<added_lines></added_lines>
+ 			<deleted_lines>31,32,33,34,35,36,37,38,39,40,41,42,43,44</deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ </commit>
+</bug_data>

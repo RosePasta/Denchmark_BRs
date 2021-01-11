@@ -1,0 +1,282 @@
+<bug id='4756' author='klimentij' open_date='2020-08-11T18:22:30Z' closed_time='2020-09-16T14:14:00Z'>
+	<summary>Can't make GPT2 working with past state</summary>
+	<description>
+Describe the bug
+GPT2-XL exported to ONNX with past state works when past_sequence_length=0. But when I start generating actual text autoregressively, it doesn't work:
+&lt;denchmark-code&gt;RuntimeError: Error in execution: Non-zero status code returned while running Attention node. Name:'GptAttention_1' Status Message: Inputs 'mask_index' with raw attention mask shall have shape batch_size x (past_sequence_length + sequence_length)
+&lt;/denchmark-code&gt;
+
+Although attention mask has exactly the shape of  batch_size x (past_sequence_length + sequence_length).
+Urgency
+My company's project is blocked because I can't get optimized GPT2 to production.
+System information
+
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Debian 9
+ONNX Runtime installed from (source or binary): Binary
+ONNX Runtime version: 1.4.0
+Python version: 3.7.6
+CUDA/cuDNN version: 10.1
+GPU model and memory: Nvidia T4 16Gb + 51Gb RAM
+Pytorch version: 1.5.0+cu101
+
+To Reproduce
+
+cd to onnxruntime/python/tools/transformers
+Export GPT2-XL to ONNX with past like this (you might also need a fix from here)
+
+&lt;denchmark-code&gt;python benchmark_gpt2.py \
+--model_name "gpt2-xl" \
+--cache_dir "./cache_models" \
+--onnx_dir="./gpt2_xl_onnx_past" \
+--test_times 10 \
+--precision fp16 \
+--optimize_onnx \
+--use_gpu \
+--batch_sizes "1" \
+--past_sequence_lengths 1000 \
+--result_csv gpt2_results.csv
+&lt;/denchmark-code&gt;
+
+
+In the same directory create an inference notebook:
+
+&lt;denchmark-code&gt;from benchmark_helper import Precision
+from transformers import AutoTokenizer, GPT2Config
+import numpy
+import time
+import torch
+import os
+import onnxruntime
+import pandas as pd
+from gpt2_helper import Gpt2Helper 
+
+tokenizer = AutoTokenizer.from_pretrained('gpt2-xl')
+device='cuda'
+
+class ONNX_Generative_Model():
+    
+    def __init__(self, onnx_model_path,
+                 model_class_name,
+                 config,
+                 device='cuda',
+                 is_float16=True, 
+                ):
+        self.onnx_model_path = onnx_model_path
+        self.model_class_name = model_class_name
+        self.config = config
+        self.device = device
+        self.float_type = torch.float16 if is_float16 else torch.float32
+        self.is_float16 = is_float16
+        self.batch_size = 1
+        
+        #shapes for IO binding
+        self.empty_past_sequence_length=0
+        self.empty_past_shape = [2, 1, self.config.num_attention_heads, self.empty_past_sequence_length, 
+                            int(self.config.hidden_size / self.config.num_attention_heads)]
+        self.max_output_shapes = Gpt2Helper.get_output_shapes(1, 1024, 1024, self.config, self.model_class_name)
+        
+        #CUDA session with ONNX model
+        self.sess_options = onnxruntime.SessionOptions()
+        self.session = onnxruntime.InferenceSession(self.onnx_model_path, self.sess_options, 
+                            providers=['CUDAExecutionProvider' if device=='cuda' else 'CPUExecutionProvider'])
+
+        
+    
+    
+    
+    def get_real_inputs(self, 
+                        input_ids,
+                        past,
+                        sequence_length,
+                        past_sequence_length):
+
+        """ Create real inputs for GPT2 model.
+        Returns torch tensors of input_ids, position_ids, 
+        attention_mask and a list of past state tensors.
+        """
+
+        past_sequence_length = past[0].shape[3]
+        total_sequence_length = input_ids.shape[1]
+        
+        print('past_sequence_length', past_sequence_length)
+        print('total_sequence_length', total_sequence_length)
+        
+        attention_mask = torch.ones([self.batch_size, total_sequence_length], 
+                                    dtype=self.float_type, device=self.device)
+
+        # Deduce position_ids from attention mask
+        position_ids = (attention_mask.long().cumsum(-1) - 1)
+        position_ids.masked_fill_(position_ids &lt; 0, 0)
+#        position_ids = position_ids[:, past_sequence_length:]
+        position_ids = position_ids[:, :]
+        
+        print('input_ids.shape', input_ids.shape)
+        print('position_ids.shape', position_ids.shape)
+        print('attention_mask.shape', attention_mask.shape)
+        print('past[0].shape', past[0].shape)
+
+        return input_ids, position_ids, attention_mask, past
+    
+
+    
+    def __call__(self, input_ids, past=None):
+
+        if past:
+            past_sequence_length = past[0].shape[3]
+            print('past_sequence_length', past_sequence_length)
+            print('past_shape', past[0].shape)
+        else:
+            past_sequence_length = self.empty_past_sequence_length
+            past = [torch.empty(self.empty_past_shape, dtype=self.float_type, 
+                                device=self.device) for _ in range(self.config.n_layer)]
+
+        sequence_length = len(input_ids[0])
+
+
+        #put everything together for ONNX input
+        onnx_inputs = self.get_real_inputs(input_ids, past, sequence_length, past_sequence_length)
+        output_shapes = Gpt2Helper.get_output_shapes(1, past_sequence_length, sequence_length, 
+                                                     self.config, self.model_class_name)
+        output_buffers = Gpt2Helper.get_output_buffers(self.max_output_shapes, self.device, Precision.FLOAT16)
+
+
+
+        ort_io_outputs = Gpt2Helper.onnxruntime_inference_with_binded_io(
+                                self.session,
+                                onnx_inputs,
+                                output_buffers,
+                                output_shapes,
+                                total_runs=0,
+                                return_numpy=False,
+                                include_copy_output_latency=True)
+
+        return ort_io_outputs
+        
+
+model = ONNX_Generative_Model('gpt2_xl_onnx_past/_past_fp16.onnx',
+                             model_class_name='GPT2LMHeadModel',
+                             config=GPT2Config.from_pretrained('gpt2-xl'),
+                             device=device,
+                             is_float16=True,)
+&lt;/denchmark-code&gt;
+
+
+Try calling the model without past. It should work:
+
+&lt;denchmark-code&gt;prefix = """Thinking back, when you say that one variable equals another, e.g. variable2 = variable1, the variable on the left-hand side of the equal-sign takes on the value of the variable on the right. With class instances, this happens a little differently - the name on the left becomes the class instance on the right. So in instance2 = instance1, instance2 is 'pointing' to instance1 - there are two names given to the one class instance, and you can access the class instance via either name.
+
+In other languages, you do things like this using pointers, however in python this all happens behind the scenes.
+
+The final thing that we will cover is"""
+input_ids = tokenizer.encode(prefix, add_special_tokens=True, return_tensors='pt').to(device)
+onnx_outputs = model(input_ids, past=None)
+&lt;/denchmark-code&gt;
+
+
+Finally, try generating real (not dummy) text:
+
+&lt;denchmark-code&gt;k=3
+
+input_ids = tokenizer.encode(prefix, add_special_tokens=True, return_tensors='pt').to(device)
+
+outputs = model(input_ids)
+
+cur_len = 1
+max_len = 10
+
+inference_time = 0
+util_time = 0
+
+while cur_len&lt;=max_len:
+    scores = outputs[0][0][-1]
+    past = outputs[1:]
+    
+    top_tokens = torch.topk(scores, k).indices
+    next_token = top_tokens[torch.randperm(k)[0]]
+
+    input_ids = torch.cat([input_ids[0], next_token.unsqueeze(-1)], dim=-1).reshape(1,-1)
+    cur_len = cur_len + 1
+
+    outputs = model(input_ids, past)
+&lt;/denchmark-code&gt;
+
+And it prints out shapes. The first inference without past is okay:
+&lt;denchmark-code&gt;past_sequence_length 0
+total_sequence_length 145
+input_ids.shape torch.Size([1, 145])
+position_ids.shape torch.Size([1, 145])
+attention_mask.shape torch.Size([1, 145])
+past[0].shape torch.Size([2, 1, 25, 0, 64])
+&lt;/denchmark-code&gt;
+
+Then non-zero past comes:
+&lt;denchmark-code&gt;past_sequence_length 145
+past_shape torch.Size([2, 1, 25, 145, 64])
+past_sequence_length 145
+total_sequence_length 146
+input_ids.shape torch.Size([1, 146])
+position_ids.shape torch.Size([1, 146])
+attention_mask.shape torch.Size([1, 146])
+past[0].shape torch.Size([2, 1, 25, 145, 64])
+&lt;/denchmark-code&gt;
+
+It it fails this second inference
+&lt;denchmark-code&gt;/opt/conda/lib/python3.7/site-packages/onnxruntime/capi/session.py in run_with_iobinding(self, iobinding, run_options)
+    140          :param run_options: See :class:`onnxruntime.RunOptions`.
+    141         """
+--&gt; 142         self._sess.run_with_iobinding(iobinding._iobinding, run_options)
+    143 
+    144 
+
+RuntimeError: Error in execution: Non-zero status code returned while running Attention node. Name:'GptAttention_1' Status Message: Inputs 'mask_index' with raw attention mask shall have shape batch_size x (past_sequence_length + sequence_length)
+&lt;/denchmark-code&gt;
+
+In this case batch_size=1, past_sequence_length=145 and sequence_length=1 so the attention mask shape should be [1,146], correct? But for some reason it doesn't like it.
+Expected behavior
+I can generate real text with ONNX GPT2-XL and past state
+	</description>
+	<comments>
+		<comment id='1' author='klimentij' date='2020-08-11T20:59:10Z'>
+		&lt;denchmark-link:https://github.com/tianleiwu&gt;@tianleiwu&lt;/denchmark-link&gt;
+ - can you please take a look ?
+		</comment>
+		<comment id='2' author='klimentij' date='2020-08-25T06:56:53Z'>
+		&lt;denchmark-link:https://github.com/klimentij&gt;@klimentij&lt;/denchmark-link&gt;
+,
+Did you solve the issue?
+I added a &lt;denchmark-link:https://github.com/microsoft/onnxruntime/blob/master/onnxruntime/python/tools/transformers/notebooks/Inference_GPT2_with_OnnxRuntime_on_CPU.ipynb&gt;notebook&lt;/denchmark-link&gt;
+ for GPT-2 with example for generation.
+In this case batch_size=1, past_sequence_length=145 and sequence_length=1. The attention mask shape should be [1,146].
+		</comment>
+		<comment id='3' author='klimentij' date='2020-09-08T07:33:05Z'>
+		&lt;denchmark-link:https://github.com/tianleiwu&gt;@tianleiwu&lt;/denchmark-link&gt;
+ Thanks for the GPT2 example!
+could you provide some beam-search example code with onnx GPT2 please?
+		</comment>
+		<comment id='4' author='klimentij' date='2020-09-16T14:02:01Z'>
+		
+@klimentij,
+Did you solve the issue?
+I added a notebook for GPT-2 with example for generation.
+In this case batch_size=1, past_sequence_length=145 and sequence_length=1. The attention mask shape should be [1,146].
+
+I manged to convert my fine-tuned GPT2-1.5B with benchmark_gpt2.py. Then in this notebook I replaced fp32 with fp16 and put all tensors to cuda — and the model started working on cuda.
+I can observe 4-10x speedups (depending on the batch size) on GPU comparing to Higgingface Pytorch model.
+Thank you! You saved my day.
+		</comment>
+		<comment id='5' author='klimentij' date='2020-09-16T14:08:48Z'>
+		
+@tianleiwu Thanks for the GPT2 example!
+could you provide some beam-search example code with onnx GPT2 please?
+
+I'm about to slightly modify and plug-in generation code from Hugginface, there's also a beam search there: &lt;denchmark-link:https://github.com/huggingface/transformers/blob/master/src/transformers/generation_utils.py&gt;https://github.com/huggingface/transformers/blob/master/src/transformers/generation_utils.py&lt;/denchmark-link&gt;
+
+Might be helpful &lt;denchmark-link:https://github.com/carter54&gt;@carter54&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='6' author='klimentij' date='2020-09-18T01:40:04Z'>
+		&lt;denchmark-link:https://github.com/klimentij&gt;@klimentij&lt;/denchmark-link&gt;
+ Thanks for the reply. I have tried hugginface code, but it includes a lot of matrix operations by torch, I'm trying to replace them by numpy (because torch package is 800Mb+). The greedy search works now, and the numpy version works faster than the torch version. Working on numpy version of beam search now...
+		</comment>
+	</comments>
+</bug>

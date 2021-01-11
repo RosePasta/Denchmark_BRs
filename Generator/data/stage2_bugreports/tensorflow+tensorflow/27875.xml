@@ -1,0 +1,165 @@
+<bug id='27875' author='botev' open_date='2019-04-15T22:26:00Z' closed_time='2020-04-17T11:59:32Z'>
+	<summary>Second Order derivative of sparse_softmax_cross_entropy_with_logits</summary>
+	<description>
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): Non
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Ubuntu 18.04
+Mobile device (e.g. iPhone 8, Pixel 2, Samsung Galaxy) if the issue happens on mobile device: N/A
+TensorFlow installed from (source or binary): PyPI
+TensorFlow version (use command below): 2.0-alpha
+Python version: 3.6
+Bazel version (if compiling from source): N/A
+GCC/Compiler version (if compiling from source): N/A
+CUDA/cuDNN version: N/A
+GPU model and memory: N/A
+
+Describe the current behaviour
+Currently trying to take second order derivatives of sparse_softmax_cross_entropy_with_logits leads to the error:
+&lt;denchmark-code&gt;LookupError: Gradient explicitly disabled. Reason: b"Currently there is no way to take the second derivative of sparse_softmax_cross_entropy_with_logits due to the fused implementation's interaction with tf.gradients()"
+&lt;/denchmark-code&gt;
+
+Describe the expected behavior
+This should work.
+	</description>
+	<comments>
+		<comment id='1' author='botev' date='2019-04-16T14:00:15Z'>
+		Just a quick show for a workaround (and potentially how this might be handled internally)
+&lt;denchmark-code&gt;@tf.custom_gradient
+def sparse_softmax_cross_entropy_with_logits_with_gradients(labels, logits):
+    """ Copied from tf.nn.sparse_softmax_cross_entropy_with_logits_with_gradients """
+    with tf.name_scope("SparseSoftmaxCrossEntropyWithLogits"):
+        labels = tf.convert_to_tensor(labels)
+        logits = tf.convert_to_tensor(logits)
+        precise_logits = tf.cast(logits, tf.float32) if (tf.as_dtype(logits.dtype) == tf.float16) else logits
+
+        # Store label shape for result later.
+        labels_static_shape = labels.get_shape()
+        labels_shape = tf.shape(labels)
+        static_shapes_fully_defined = (
+                labels_static_shape.is_fully_defined() and
+                logits.get_shape()[:-1].is_fully_defined())
+        if logits.get_shape().ndims is not None and logits.get_shape().ndims == 0:
+            raise ValueError(
+                "Logits cannot be scalars - received shape %s." % logits.get_shape())
+        if logits.get_shape().ndims is not None and (
+                labels_static_shape.ndims is not None and
+                labels_static_shape.ndims != logits.get_shape().ndims - 1):
+            raise ValueError("Rank mismatch: Rank of labels (received %s) should "
+                             "equal rank of logits minus 1 (received %s)." %
+                             (labels_static_shape.ndims, logits.get_shape().ndims))
+        if (static_shapes_fully_defined and
+                labels_static_shape != logits.get_shape()[:-1]):
+            raise ValueError("Shape mismatch: The shape of labels (received %s) "
+                             "should equal the shape of logits except for the last "
+                             "dimension (received %s)." % (labels_static_shape,
+                                                           logits.get_shape()))
+        # Check if no reshapes are required.
+        if logits.get_shape().ndims == 2:
+            cost, dcost_dlogits = _tf_sotfmax_with_grads(precise_logits, labels)
+            if logits.dtype == tf.float16:
+                cost = tf.cast(cost, tf.float16)
+                dcost_dlogits = tf.cast(dcost_dlogits, tf.float16)
+
+            def grad(dcost, d2cost_dlogits):
+                return None, grad_of_sparse_softmax_cross_entropy_with_logits(logits, dcost_dlogits, dcost)
+
+            return (cost, dcost_dlogits), grad
+
+        # Perform a check of the dynamic shapes if the static shapes are not fully
+        # defined.
+        shape_checks = []
+        if not static_shapes_fully_defined:
+            shape_checks.append(
+                tf.assert_equal(
+                    tf.shape(labels),
+                    tf.shape(logits)[:-1]))
+        with tf.control_dependencies(shape_checks):
+            # Reshape logits to 2 dim, labels to 1 dim.
+            num_classes = tf.shape(logits)[tf.rank(logits) - 1]
+            precise_logits = tf.reshape(precise_logits, [-1, num_classes])
+            labels = tf.reshape(labels, [-1])
+            # The second output tensor contains the gradients.  We use it in
+            # _CrossEntropyGrad() in nn_grad but not here.
+            cost, dcost_dlogits = _tf_sotfmax_with_grads(precise_logits, labels)
+            cost = tf.reshape(cost, labels_shape)
+            cost.set_shape(labels_static_shape)
+            dcost_dlogits = tf.reshape(dcost_dlogits, logits.shape)
+            dcost_dlogits.set_shape(logits.shape)
+            if logits.dtype == tf.float16:
+                cost = tf.cast(cost, tf.float16)
+                dcost_dlogits = tf.cast(dcost_dlogits, tf.float16)
+
+            def grad(dcost, d2cost_dlogits):
+                return None, grad_of_sparse_softmax_cross_entropy_with_logits(logits, dcost_dlogits, dcost)
+
+            return (cost, dcost_dlogits), grad
+
+
+@tf.custom_gradient
+def grad_of_sparse_softmax_cross_entropy_with_logits(logits, dcost_dlogits, dcost):
+    dcost = tf.expand_dims(dcost, axis=-1)
+
+    def grad(dy):
+        p = tf.nn.softmax(logits)
+        d2logits = p * dy - p * tf.reduce_sum(p * dy, axis=-1, keepdims=True)
+        return d2logits * dcost, None, dcost_dlogits * dy
+    return dcost_dlogits * dcost, grad
+
+
+def sparse_softmax_cross_entropy_with_logits(labels, logits):
+    return sparse_softmax_cross_entropy_with_logits_with_gradients(labels, logits)[0]
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='2' author='botev' date='2019-05-01T21:35:51Z'>
+		Yes, I agree that this is a problem. Are you interested in contributing a version of this as a pull request?
+One issue we had is that because the fused op emits both the cross entropy and the linearization if we naively used RegisterGradient we'd always compute the second derivative, which is expensive, but we can do the same trick we do in 
+
+
+tensorflow/tensorflow/python/ops/nn_grad.py
+
+
+         Line 530
+      in
+      2f3eb7b
+
+
+
+
+
+
+ if grad_grad is not None and not IsZero(grad_grad): 
+
+
+
+
+ to avoid computation if not needed.
+		</comment>
+		<comment id='3' author='botev' date='2019-05-17T01:13:05Z'>
+		Sorry was on holiday. I can try to cook up something. Should I attempt what you have linked of the gradient of the normal Softmax with Logits?
+		</comment>
+		<comment id='4' author='botev' date='2019-05-17T16:19:15Z'>
+		&lt;denchmark-link:https://github.com/botev&gt;@botev&lt;/denchmark-link&gt;
+ I think &lt;denchmark-link:https://github.com/tensorflow/tensorflow/pull/22231&gt;#22231&lt;/denchmark-link&gt;
+ is already doing this
+		</comment>
+		<comment id='5' author='botev' date='2020-04-02T03:34:11Z'>
+		Closing this issue since the associated PR has been merged. Thanks!
+		</comment>
+		<comment id='6' author='botev' date='2020-04-17T01:05:51Z'>
+		It has been 14 days with no activity and the awaiting response label was assigned. Is this still an issue?
+		</comment>
+		<comment id='7' author='botev' date='2020-04-17T11:59:33Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/27875&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/27875&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='8' author='botev' date='2020-09-05T15:34:47Z'>
+		I am getting this error in Python as well, similar to &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/27875#issue-433504286&gt;#27875 (comment)&lt;/denchmark-link&gt;
+. Is there any update on this issue? Is there any short-term workaround for it?
+		</comment>
+	</comments>
+</bug>

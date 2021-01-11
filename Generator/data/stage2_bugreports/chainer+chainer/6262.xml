@@ -1,0 +1,478 @@
+<bug id='6262' author='fiarabbit' open_date='2019-02-17T07:41:10Z' closed_time='2019-03-14T06:56:10Z'>
+	<summary>[bug report] NStepLSTM causes error only when n_layers&amp;gt;1 device&amp;gt;0, dropout!=0, and config.train==True</summary>
+	<description>
+&lt;denchmark-h:h2&gt;Descrition&lt;/denchmark-h&gt;
+
+NStepLSTM raises cudaErrorIllegalAddress when n_layers&gt;1 and device&gt;0 with multi-gpu environment.
+This phenomenon is not observed when n_layers=1 or device=0.
+&lt;denchmark-h:h2&gt;Environment&lt;/denchmark-h&gt;
+
+&gt;&gt;&gt; chainer.print_runtime_info()
+Platform: Linux-4.4.0-135-generic-x86_64-with-debian-stretch-sid
+Chainer: 5.2.0
+NumPy: 1.16.0
+CuPy:
+  CuPy Version          : 5.2.0
+  CUDA Root             : /home/hashimoto/.local/cuda/cuda-9.2
+  CUDA Build Version    : 9020
+  CUDA Driver Version   : 10000
+  CUDA Runtime Version  : 9020
+  cuDNN Build Version   : 7301
+  cuDNN Version         : 7301
+  NCCL Build Version    : 2307
+iDeep: Not Available
+&lt;denchmark-code&gt;$ nvidia-smi
+Sun Feb 17 16:40:55 2019
++-----------------------------------------------------------------------------+
+| NVIDIA-SMI 410.48                 Driver Version: 410.48                    |
+|-------------------------------+----------------------+----------------------+
+| GPU  Name        Persistence-M| Bus-Id        Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp  Perf  Pwr:Usage/Cap|         Memory-Usage | GPU-Util  Compute M. |
+|===============================+======================+======================|
+|   0  GeForce GTX 108...  On   | 00000000:02:00.0  On |                  N/A |
+| 29%   33C    P8    15W / 250W |    218MiB / 11178MiB |     21%      Default |
++-------------------------------+----------------------+----------------------+
+|   1  GeForce GTX 108...  On   | 00000000:81:00.0 Off |                  N/A |
+| 29%   36C    P8     8W / 250W |      2MiB / 11178MiB |      0%      Default |
++-------------------------------+----------------------+----------------------+
+
++-----------------------------------------------------------------------------+
+| Processes:                                                       GPU Memory |
+|  GPU       PID   Type   Process name                             Usage      |
+|=============================================================================|
+|    0      1929      G   /usr/lib/xorg/Xorg                           130MiB |
+|    0     20566      G   compiz                                        86MiB |
++-----------------------------------------------------------------------------+
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h2&gt;Code to reproduce&lt;/denchmark-h&gt;
+
+import numpy as np
+
+import chainer
+from chainer import functions as F, links as L
+from chainer.iterators import SerialIterator
+from chainer.optimizers import Adam
+from chainer.training.updaters import StandardUpdater
+from chainer.training import Trainer
+
+N_LAYERS = 2
+DEVICE = 1
+
+IN_N_UNITS = 1
+OUT_N_UNITS = 1
+
+
+class MyModel(chainer.Chain):
+    def __init__(self):
+        super().__init__()
+        with self.init_scope():
+            self.n_step_lstm = L.NStepLSTM(N_LAYERS, IN_N_UNITS, OUT_N_UNITS, 0.8)
+
+    def __call__(self, xs, ys):
+        _, _, ys_predicted = self.n_step_lstm(None, None, xs)
+        loss = 0
+        for i in range(len(ys)):
+            loss += F.mean_squared_error(ys_predicted[i], ys[i])
+        return loss
+
+
+class MyDataset(chainer.dataset.DatasetMixin):
+    N_SAMPLES = 100
+    NOISE_LEVEL = 0.1
+    DATA_LEN_MAX = 10
+    DATA_LEN_MIN = 5
+
+    def __init__(self):
+        self.data = np.sin(np.arange(self.N_SAMPLES, dtype=np.float32) * 0.1) \
+                    + self.NOISE_LEVEL * np.random.randn(100).astype(np.float32)
+
+    def __len__(self):
+        return self.N_SAMPLES - (self.DATA_LEN_MAX + 1)
+
+    def get_example(self, i):
+        data_len = i % (self.DATA_LEN_MAX - self.DATA_LEN_MIN) + self.DATA_LEN_MIN
+        return np.expand_dims(self.data[i:i + data_len], 1), np.expand_dims(self.data[i + 1:i + data_len + 1], 1)
+
+
+def convert(batch, device):
+    def to_device_batch(batch):
+        if device is None:
+            return batch
+        elif device &lt; 0:
+            return [chainer.dataset.to_device(device, x) for x in batch]
+        else:
+            xp = chainer.cuda.cupy.get_array_module(*batch)
+            concat = xp.concatenate(batch, axis=0)
+            sections = np.cumsum([len(x)
+                                  for x in batch[:-1]], dtype=np.int32)
+            concat_dev = chainer.dataset.to_device(device, concat)
+            batch_dev = chainer.cuda.cupy.split(concat_dev, sections)
+            return batch_dev
+
+    return {'xs': to_device_batch([x for x, _ in batch]),
+            'ys': to_device_batch([y for _, y in batch])}
+
+
+dataset = MyDataset()
+iterator = SerialIterator(dataset, batch_size=16)
+model = MyModel()
+optimizer = Adam()
+optimizer.setup(model)
+
+updater = StandardUpdater(iterator, optimizer, converter=convert, device=DEVICE)
+trainer = Trainer(updater, (10, "iteration"), "result")
+
+trainer.run()
+Exception in main training loop: cudaErrorIllegalAddress: an illegal memory access was encountered
+Traceback (most recent call last):
+  File "/home/hashimoto/python372/lib/python3.7/site-packages/chainer/training/trainer.py", line 315, in run
+    update()
+  File "/home/hashimoto/python372/lib/python3.7/site-packages/chainer/training/updaters/standard_updater.py", line 165, in update
+    self.update_core()
+  File "/home/hashimoto/python372/lib/python3.7/site-packages/chainer/training/updaters/standard_updater.py", line 179, in update_core
+    optimizer.update(loss_func, **in_arrays)
+  File "/home/hashimoto/python372/lib/python3.7/site-packages/chainer/optimizer.py", line 680, in update
+    loss = lossfun(*args, **kwds)
+  File "/tmp/pycharm_project_979/nsteplstm_test.py", line 24, in __call__
+    _, _, ys_predicted = self.n_step_lstm(None, None, xs)
+  File "/home/hashimoto/python372/lib/python3.7/site-packages/chainer/link.py", line 242, in __call__
+    out = forward(*args, **kwargs)
+  File "/home/hashimoto/python372/lib/python3.7/site-packages/chainer/links/connection/n_step_lstm.py", line 70, in forward
+    (hy, cy), ys = self._call([hx, cx], xs, **kwargs)
+  File "/home/hashimoto/python372/lib/python3.7/site-packages/chainer/links/connection/n_step_rnn.py", line 207, in _call
+    for h in result[:-1]]
+  File "/home/hashimoto/python372/lib/python3.7/site-packages/chainer/links/connection/n_step_rnn.py", line 207, in &lt;listcomp&gt;
+    for h in result[:-1]]
+  File "/home/hashimoto/python372/lib/python3.7/site-packages/chainer/functions/array/permutate.py", line 133, in permutate
+    y, = Permutate(indices, axis, inv).apply((x,))
+  File "/home/hashimoto/python372/lib/python3.7/site-packages/chainer/function_node.py", line 263, in apply
+    outputs = self.forward(in_data)
+  File "/home/hashimoto/python372/lib/python3.7/site-packages/chainer/functions/array/permutate.py", line 70, in forward
+    return self._permutate(x, inds, self.inv),
+  File "/home/hashimoto/python372/lib/python3.7/site-packages/chainer/functions/array/permutate.py", line 61, in _permutate
+    return x[((slice(None),) * self.axis) + (indices,)]
+  File "cupy/core/core.pyx", line 1625, in cupy.core.core.ndarray.__getitem__
+  File "cupy/core/core.pyx", line 3134, in cupy.core.core._prepare_slice_list
+  File "cupy/core/core.pyx", line 2397, in cupy.core.core.array
+  File "cupy/core/core.pyx", line 2394, in cupy.core.core.array
+  File "cupy/cuda/pinned_memory.pyx", line 212, in cupy.cuda.pinned_memory.alloc_pinned_memory
+  File "cupy/cuda/pinned_memory.pyx", line 286, in cupy.cuda.pinned_memory.PinnedMemoryPool.malloc
+  File "cupy/cuda/pinned_memory.pyx", line 306, in cupy.cuda.pinned_memory.PinnedMemoryPool.malloc
+  File "cupy/cuda/pinned_memory.pyx", line 303, in cupy.cuda.pinned_memory.PinnedMemoryPool.malloc
+  File "cupy/cuda/pinned_memory.pyx", line 177, in cupy.cuda.pinned_memory._malloc
+  File "cupy/cuda/pinned_memory.pyx", line 178, in cupy.cuda.pinned_memory._malloc
+  File "cupy/cuda/pinned_memory.pyx", line 29, in cupy.cuda.pinned_memory.PinnedMemory.__init__
+  File "cupy/cuda/runtime.pyx", line 231, in cupy.cuda.runtime.hostAlloc
+  File "cupy/cuda/runtime.pyx", line 137, in cupy.cuda.runtime.check_status
+Will finalize trainer extensions and updater before reraising the exception.
+Traceback (most recent call last):
+  File "/tmp/pycharm_project_979/nsteplstm_test.py", line 77, in &lt;module&gt;
+    trainer.run()
+  File "/home/hashimoto/python372/lib/python3.7/site-packages/chainer/training/trainer.py", line 329, in run
+    six.reraise(*sys.exc_info())
+  File "/home/hashimoto/python372/lib/python3.7/site-packages/six.py", line 693, in reraise
+    raise value
+  File "/home/hashimoto/python372/lib/python3.7/site-packages/chainer/training/trainer.py", line 315, in run
+    update()
+  File "/home/hashimoto/python372/lib/python3.7/site-packages/chainer/training/updaters/standard_updater.py", line 165, in update
+    self.update_core()
+  File "/home/hashimoto/python372/lib/python3.7/site-packages/chainer/training/updaters/standard_updater.py", line 179, in update_core
+    optimizer.update(loss_func, **in_arrays)
+  File "/home/hashimoto/python372/lib/python3.7/site-packages/chainer/optimizer.py", line 680, in update
+    loss = lossfun(*args, **kwds)
+  File "/tmp/pycharm_project_979/nsteplstm_test.py", line 24, in __call__
+    _, _, ys_predicted = self.n_step_lstm(None, None, xs)
+  File "/home/hashimoto/python372/lib/python3.7/site-packages/chainer/link.py", line 242, in __call__
+    out = forward(*args, **kwargs)
+  File "/home/hashimoto/python372/lib/python3.7/site-packages/chainer/links/connection/n_step_lstm.py", line 70, in forward
+    (hy, cy), ys = self._call([hx, cx], xs, **kwargs)
+  File "/home/hashimoto/python372/lib/python3.7/site-packages/chainer/links/connection/n_step_rnn.py", line 207, in _call
+    for h in result[:-1]]
+  File "/home/hashimoto/python372/lib/python3.7/site-packages/chainer/links/connection/n_step_rnn.py", line 207, in &lt;listcomp&gt;
+    for h in result[:-1]]
+  File "/home/hashimoto/python372/lib/python3.7/site-packages/chainer/functions/array/permutate.py", line 133, in permutate
+    y, = Permutate(indices, axis, inv).apply((x,))
+  File "/home/hashimoto/python372/lib/python3.7/site-packages/chainer/function_node.py", line 263, in apply
+    outputs = self.forward(in_data)
+  File "/home/hashimoto/python372/lib/python3.7/site-packages/chainer/functions/array/permutate.py", line 70, in forward
+    return self._permutate(x, inds, self.inv),
+  File "/home/hashimoto/python372/lib/python3.7/site-packages/chainer/functions/array/permutate.py", line 61, in _permutate
+    return x[((slice(None),) * self.axis) + (indices,)]
+  File "cupy/core/core.pyx", line 1625, in cupy.core.core.ndarray.__getitem__
+  File "cupy/core/core.pyx", line 3134, in cupy.core.core._prepare_slice_list
+  File "cupy/core/core.pyx", line 2397, in cupy.core.core.array
+  File "cupy/core/core.pyx", line 2394, in cupy.core.core.array
+  File "cupy/cuda/pinned_memory.pyx", line 212, in cupy.cuda.pinned_memory.alloc_pinned_memory
+  File "cupy/cuda/pinned_memory.pyx", line 286, in cupy.cuda.pinned_memory.PinnedMemoryPool.malloc
+  File "cupy/cuda/pinned_memory.pyx", line 306, in cupy.cuda.pinned_memory.PinnedMemoryPool.malloc
+  File "cupy/cuda/pinned_memory.pyx", line 303, in cupy.cuda.pinned_memory.PinnedMemoryPool.malloc
+  File "cupy/cuda/pinned_memory.pyx", line 177, in cupy.cuda.pinned_memory._malloc
+  File "cupy/cuda/pinned_memory.pyx", line 178, in cupy.cuda.pinned_memory._malloc
+  File "cupy/cuda/pinned_memory.pyx", line 29, in cupy.cuda.pinned_memory.PinnedMemory.__init__
+  File "cupy/cuda/runtime.pyx", line 231, in cupy.cuda.runtime.hostAlloc
+  File "cupy/cuda/runtime.pyx", line 137, in cupy.cuda.runtime.check_status
+cupy.cuda.runtime.CUDARuntimeError: cudaErrorIllegalAddress: an illegal memory access was encountered
+Traceback (most recent call last):
+  File "cupy/cuda/driver.pyx", line 192, in cupy.cuda.driver.moduleUnload
+  File "cupy/cuda/driver.pyx", line 81, in cupy.cuda.driver.check_status
+cupy.cuda.driver.CUDADriverError: CUDA_ERROR_ILLEGAL_ADDRESS: an illegal memory access was encountered
+Exception ignored in: 'cupy.cuda.function.Module.__dealloc__'
+Traceback (most recent call last):
+  File "cupy/cuda/driver.pyx", line 192, in cupy.cuda.driver.moduleUnload
+  File "cupy/cuda/driver.pyx", line 81, in cupy.cuda.driver.check_status
+cupy.cuda.driver.CUDADriverError: CUDA_ERROR_ILLEGAL_ADDRESS: an illegal memory access was encountered
+
+Process finished with exit code 1
+&lt;denchmark-h:h2&gt;Note&lt;/denchmark-h&gt;
+
+This issue is originally reported in Chainer Slack (JP). The original error message was cupy.cuda.cudnn.CuDNNError: CUDNN_STATUS_INTERNAL_ERROR, but in my environment it was CUDA_ERROR_ILLEGAL_ADDRESS.
+	</description>
+	<comments>
+		<comment id='1' author='fiarabbit' date='2019-02-17T08:12:33Z'>
+		In  
+
+
+chainer/chainer/functions/connection/n_step_rnn.py
+
+
+        Lines 284 to 286
+      in
+      d7adbfb
+
+
+
+
+
+
+ self.reserve_space, hy, cy, ys = cudnn.rnn_forward_training( 
+
+
+
+ self.states, self.rnn_dir, self.rnn_mode, 
+
+
+
+ hx, cx, w, xs, self.lengths) 
+
+
+
+
+
+invalid cupy.ndarray is returned. This is because self.states is on Device 0, while other input arguments are on Device 1.
+I also confirmed that 
+
+
+chainer/chainer/functions/connection/n_step_lstm.py
+
+
+         Line 421
+      in
+      d7adbfb
+
+
+
+
+
+
+ states = cuda.get_cudnn_dropout_states() 
+
+
+
+
+
+This states is on Device 0.
+This may be an issue of chainer.backends.cuda.get_cudnn_dropout_states that it only returns an object for Device 0.
+		</comment>
+		<comment id='2' author='fiarabbit' date='2019-02-17T09:23:53Z'>
+		I found the reason: this is a little bit complicated, but actually it is a bug.
+In every Function (it does NOT refer a function in Python),
+
+
+
+chainer/chainer/function_node.py
+
+
+         Line 309
+      in
+      d7adbfb
+
+
+
+
+
+
+ with cuda.get_device_from_array(*in_data): 
+
+
+
+
+
+changes the current device (cupy.cuda.runtime.getDevice()).
+However, F.n_step_lstm, which set the DropoutState, is just a function, and it is kicked by L.NStepRNNBase.forward.
+L.NStepRNNBase is a ChainList, which just calls .forward attributes.
+Therefore, F.n_step_lstm does not benefit from the auto-modification of the current device.
+The solution would be rather simple:
+Add with cuda.get_device_from_array to
+
+
+
+chainer/chainer/links/connection/n_step_lstm.py
+
+
+         Line 64
+      in
+      d7adbfb
+
+
+
+
+
+
+ (hy, cy), ys = self._call([hx, cx], xs, **kwargs) 
+
+
+
+
+
+
+
+
+chainer/chainer/links/connection/n_step_rnn.py
+
+
+         Line 153
+      in
+      d7adbfb
+
+
+
+
+
+
+ (hy,), ys = self._call([hx], xs, **kwargs) 
+
+
+
+
+
+would solve this bug.
+		</comment>
+		<comment id='3' author='fiarabbit' date='2019-02-21T06:42:42Z'>
+		I personnaly think the main reason is the lack of chainer.backends.cuda.get_device_from_id(DEVICE).use().
+e.g.
+
+
+
+chainer/examples/mnist/train_mnist.py
+
+
+        Lines 58 to 61
+      in
+      0765bef
+
+
+
+
+
+
+ if args.gpu &gt;= 0: 
+
+
+
+ # Make a specified GPU current 
+
+
+
+ chainer.backends.cuda.get_device_from_id(args.gpu).use() 
+
+
+
+ model.to_gpu()  # Copy the model to the GPU 
+
+
+
+
+
+At least, L.NStepLSTM is tested on multi gpus.
+
+
+
+chainer/tests/chainer_tests/links_tests/connection_tests/test_n_step_lstm.py
+
+
+        Lines 128 to 138
+      in
+      f73b1bf
+
+
+
+
+
+
+ @attr.multi_gpu(2) 
+
+
+
+ def test_forward_nonzero_gpu_test(self): 
+
+
+
+ # Issue #5347 
+
+
+
+ # to_gpu should work without setting the current device 
+
+
+
+ self.rnn.to_gpu(1) 
+
+
+
+ with chainer.using_config('use_cudnn', 'always'), \ 
+
+
+
+ chainer.using_config('train', False): 
+
+
+
+ self.check_forward( 
+
+
+
+ cuda.to_gpu(self.h, 1), 
+
+
+
+ cuda.to_gpu(self.c, 1), 
+
+
+
+             [cuda.to_gpu(x, 1) for x in self.xs]) 
+
+
+
+
+
+		</comment>
+		<comment id='4' author='fiarabbit' date='2019-02-21T07:30:26Z'>
+		&lt;denchmark-link:https://github.com/crcrpar&gt;@crcrpar&lt;/denchmark-link&gt;
+ Thanks for your cooperation. I also mentioned it on Chainer-Slack for the questioner.
+However, ALL links/functions in Chainer should work w/o setting of the current device (as is also written in the code and &lt;denchmark-link:https://github.com/chainer/chainer/issues/5347&gt;#5347&lt;/denchmark-link&gt;
+). It means that &lt;denchmark-link:https://github.com/chainer/chainer/issues/5347&gt;#5347&lt;/denchmark-link&gt;
+ partially fixed this error, but it still remains.
+		</comment>
+		<comment id='5' author='fiarabbit' date='2019-02-21T08:05:30Z'>
+		&lt;denchmark-link:https://github.com/crcrpar&gt;@crcrpar&lt;/denchmark-link&gt;
+ More specifically, the error of this issue is caused by cudnn's training-dropout (testing-dropout differs from it), but all test cases uses   in  in 
+
+I confirmed that if and only if  dropout != 0 and chainer.using_config('train', True) the test on multi-gpu failed.
+		</comment>
+		<comment id='6' author='fiarabbit' date='2019-02-21T09:21:15Z'>
+		I appreciate your clarification.
+It seems that there's a need to test dropout enabled n_step_(rnn  lstm | gru) functions and links 🤔
+		</comment>
+	</comments>
+</bug>

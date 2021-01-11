@@ -1,0 +1,142 @@
+<bug id='4127' author='vladmandic' open_date='2020-10-24T21:16:30Z' closed_time='2020-10-28T18:42:43Z'>
+	<summary>model works in nodejs and fails in browser</summary>
+	<description>
+model works in nodejs and fails in browser
+
+saved_model with tfjs_node in nodejs:
+
+  const model = tf.node.loadSavedModel(modelPath);
+  const result = await model.predict(image);
+pass no issues
+
+graph_model with tfjs_node in nodejs:
+
+  const model = tf.loadGraphModel(modelPath);
+  const result = await model.predict(image);
+fail: error due to dynamic ops
+This execution contains the node 'filtered_detections/map/while/Exit_4', which has the dynamic op 'Exit'
+why? it's the same model, just converted from saved_model to graph_model using tensorflowjs_convert in a simplest possible way
+ok, lets try again with executeAsync
+  const model = tf.loadGraphModel(modelPath);
+  const result = await model.executeAsync(image);
+pass now it works
+
+graph_model with tfjs in browser using webgl backend
+
+  const model = tf.loadGraphModel(modelPath);
+  const result = await model.executeAsync(image);
+fail no matter what, i cannot get this to work in browser
+(same model and code that works in nodejs)
+this is a typical error:
+&lt;denchmark-code&gt;Error: Size(442368) must match the product of shape 65504,4
+  id	@	util.js:281
+  oS	@	Reshape.js:26
+  kernelFunc	@	engine.js:431
+  (anonymous)	@	engine.js:483
+  scopedRun	@	engine.js:324
+  runKernelFunc	@	engine.js:481
+  reshape_	@	reshape.js:58
+  reshape__op	@	operation.js:44
+  executeOp$g	@	transformation_executor.js:34
+  (anonymous)	@	operation_executor.js:78
+  (anonymous)	@	engine.js:314
+  scopedRun	@	engine.js:324
+  tidy	@	engine.js:313
+  tidy	@	globals.js:173
+  (anonymous)	@	operation_executor.js:78
+  executeOp$h	@	operation_executor.js:90
+  processStack	@	graph_executor.js:390
+  executeWithControlFlow	@	graph_executor.js:350
+  _executeAsync	@	graph_executor.js:285
+  executeAsync	@	graph_executor.js:257
+  executeAsync	@	graph_model.js:304
+&lt;/denchmark-code&gt;
+
+environment: tfjs 2.6.0 on ubuntu 20.10
+	</description>
+	<comments>
+		<comment id='1' author='vladmandic' date='2020-10-26T13:04:52Z'>
+		update: what's causing shape mismatch is WEBGL_FORCE_F16_TEXTURES - i wonder why the mismatch happens only on some models (i've seen it on two models so far) and works fine on others.
+however, without WEBGL_FORCE_F16_TEXTURES, i can only process 1-2 images before running into notorious
+Error: Failed to link vertex and fragment shaders. in createFragmentShader()
+which is due to Chrome dropping WebGL context due to OOM.
+i've noticed that i'm getting this error much more frequently lately - what has changed in tfjs to increase memory usage?
+looking at tf.memory() between model runs
+numBytesInGPU and numTensors are not changing after model has loaded, so there are no leaks
+but numBytesInGPUAllocated grows after each model execution until it consumes all available gpu memory and then browser looses webgl context due to out-of-memory error
+which basically means:
+a) tfjs is not de-allocating webgl memory explicitly
+(at least not all since i do see some calls to gl.deleteBuffer() and gl.deleteTexture()),
+but primarily relying on browser's garbage collection instead
+b) browser garbage collection for webgl is BAD:
+webgl conext is garbage collected just as everything else in javascript, but
+browser triggers garbage collection by looking at objects on cpu memory
+however, webgl objects are allocated in gpu memory and only show up as tiny indentifiers in cpu memory
+so browser has no way of knowing if gpu memory is under pressure
+as a workaround, looking at forcing browser garbage collection, you used to be able to start chrome with --js-flags="--expose-gc" to expose gc() method,
+but nowadays that's available only on chrome debug builds, so that's no help.
+btw, if i keep input image size small, numBytesInGPUAllocated still grows but much slower (logical) - and this gives brower gc chance to kick in eventually and oom never happens
+but if input image size is large, numBytesInGPUAllocated grows much faster on each model execution and it causes oom before browser gc ever kicked in.
+seems like backend-webgl needs some work to implement more aggresive memory management itself and rely less on browser garbage collection
+		</comment>
+		<comment id='2' author='vladmandic' date='2020-10-26T18:37:41Z'>
+		&lt;denchmark-link:https://github.com/vladmandic&gt;@vladmandic&lt;/denchmark-link&gt;
+ TensorFlow.js does not dispose GL texture by default, the reason we want to reuse the textures for consecutive runs. If the model is very large and generate a huge amount of intermediate textures, this would cause GL OOM.
+We do have a flag to enable aggressive texture disposal
+
+
+You can set the WEBGL_DELETE_TEXTURE_THRESHOLD in bytes to trigger texture disposal if the total texture size exceed this limit.
+		</comment>
+		<comment id='3' author='vladmandic' date='2020-10-26T19:34:49Z'>
+		&lt;denchmark-link:https://github.com/pyu10055&gt;@pyu10055&lt;/denchmark-link&gt;
+ that works like a charm!
+if you don't mind, few quick questions and then i'll close this issue:
+
+why do some (very few) models run into shape mismatch when WEBGL_FORCE_F16_TEXTURES is set?
+seems like tf.memory().numBytesInGPUAllocated is pretty reliable, but tf.memory().numBytesInGPUFree is definitely not since a) initial value is not correct, b) it increases with each inference run.
+
+init: {numBytesInGPU: 0, numBytesInGPUAllocated: 0, numBytesInGPUFree: 0, numTensors: 0, …}
+loadGraphModel complete: {numBytesInGPU: 0, numBytesInGPUAllocated: 0, numBytesInGPUFree: 0, numTensors: 843, …}
+predict: 0 {numBytesInGPU: 146582848, numBytesInGPUAllocated:  990485844, numBytesInGPUFree:  843902996, numTensors: 843, …}
+predict: 1 {numBytesInGPU: 146582848, numBytesInGPUAllocated: 1683552696, numBytesInGPUFree: 1536969848, numTensors: 843, …}
+predict: 2 {numBytesInGPU: 146582848, numBytesInGPUAllocated: 2178435480, numBytesInGPUFree: 2031852632, numTensors: 843, …}
+predict: 3 {numBytesInGPU: 146582848, numBytesInGPUAllocated: 2362804332, numBytesInGPUFree: 2216221484, numTensors: 843, …}
+predict: 4 {numBytesInGPU: 146582848, numBytesInGPUAllocated: 2363028292, numBytesInGPUFree: 2216445444, numTensors: 843, …}
+predict: 5 {numBytesInGPU: 146582848, numBytesInGPUAllocated: 2623211680, numBytesInGPUFree: 2476628832, numTensors: 843, …}
+predict: 6 {numBytesInGPU: 146582848, numBytesInGPUAllocated: 3382406552, numBytesInGPUFree: 3235823704, numTensors: 843, …}
+predict: 7 {numBytesInGPU: 146582848, numBytesInGPUAllocated: 3789962920, numBytesInGPUFree: 3643380072, numTensors: 843, …}
+predict: 8 {numBytesInGPU: 146582848, numBytesInGPUAllocated: 3992988356, numBytesInGPUFree: 3846405508, numTensors: 843, …}
+predict: 9 {numBytesInGPU: 146582848, numBytesInGPUAllocated: 4863173848, numBytesInGPUFree: 4716591000, numTensors: 843, …}
+if numBytesInGPUFree was reliable then WEBGL_DELETE_TEXTURE_THRESHOLD could be set dynamically.
+for example, store value how much numBytesInGPUAllocated increased during last inference and if that is higher than numBytesInGPUFree, force cleanup.
+(and do you want me to create a new issue for incorrect numBytesInGPUFree?)
+		</comment>
+		<comment id='4' author='vladmandic' date='2020-10-26T20:42:42Z'>
+		Shape mismatch is more likely in float16 mode, since the upper bound of float16 is 65536, if the dimension of a tensor shape is greater than that number, and it is derived from a value of a tensor, it will likely get truncated. As a result, a shape mismatch could happen in the following ops.
+Not sure about the numBytesInGPUFree being not reliable, cc &lt;denchmark-link:https://github.com/annxingyuan&gt;@annxingyuan&lt;/denchmark-link&gt;
+ on this.
+Yes, please create a new issue for the numBytesInGPUFree. BTW thank you for many of these valuable feedbacks, I am curious what is the project you are working on using TFJS?
+		</comment>
+		<comment id='5' author='vladmandic' date='2020-10-26T21:01:32Z'>
+		thanks &lt;denchmark-link:https://github.com/pyu10055&gt;@pyu10055&lt;/denchmark-link&gt;
+
+i'm working on a photo gallery and sharing app that extracts all metadata from uploaded photos, scans them and stores parsed metadata, ml-infered tags, geo tags, thumbnails, etc. in a database - all in natural language searchable format, e.g. 'find all photos with female in 20ies in miami having dinner outdoors at night'.
+docs are not really up-to-date, but main repository is at &lt;denchmark-link:https://github.com/vladmandic/pigallery&gt;https://github.com/vladmandic/pigallery&lt;/denchmark-link&gt;
+
+for that, i'm relying on quite a few different tfjs models (and always tweaking which ones are best) as well as some custom code.
+and in a process of that, i've written several helper modules as well like &lt;denchmark-link:https://github.com/vladmandic/human&gt;https://github.com/vladmandic/human&lt;/denchmark-link&gt;
+.
+and much thanks for your assistance!
+		</comment>
+		<comment id='6' author='vladmandic' date='2020-10-28T18:42:43Z'>
+		closing as resolved
+		</comment>
+		<comment id='7' author='vladmandic' date='2020-10-28T18:42:45Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tfjs/issues/4127&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tfjs/issues/4127&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

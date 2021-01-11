@@ -1,0 +1,184 @@
+<bug id='3603' author='rob-rowe' open_date='2016-08-01T21:14:01Z' closed_time='2016-08-23T16:34:12Z'>
+	<summary>RC 0.10 3X Slower than 0.9 and Error Compiling From Source Under Certain Conditions</summary>
+	<description>
+This issue is a follow-up to &lt;denchmark-link:http://stackoverflow.com/questions/38704095/tensorflow-rc-0-10-3x-slower-than-0-9&gt;this posting&lt;/denchmark-link&gt;
+ on stack overflow. As noted, the 0.10 version is ~3x slower than version 0.9 for a particular training script I am using. The same slow-down is observed when using the pip version with CuDNN4 or with a version compiled from source and CuDNN 5.1.
+I'm not sure what information about the training script would help. It is a fairly complex script that is training a network for object detection using methods similar to YOLO and SSD. It won't be possible to post the entire set of code, but if there is a way to isolate the source of the delay I may be able to modify it and post that portion.
+While trying to get insight into the source of the slow-down I also noted that I wasn't able to compile from source using CuDNN4 as noted in the SO posting. This is a secondary issue, but may also warrant investigation.
+	</description>
+	<comments>
+		<comment id='1' author='rob-rowe' date='2016-08-01T21:55:21Z'>
+		Could you produce a timeline and share that?
+I think this might be the current best how-to on how to produce timelines :) if anyone knows of a better one please share that:
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/1824#issuecomment-225754659&gt;#1824 (comment)&lt;/denchmark-link&gt;
+
+I think that it's going to be hard to help without seeing your code. Would you be able to post your graph protobuf?
+		</comment>
+		<comment id='2' author='rob-rowe' date='2016-08-02T14:05:45Z'>
+		&lt;denchmark-link:https://github.com/rryan&gt;@rryan&lt;/denchmark-link&gt;
+ I've attached the timelines named appropriately. Each was generated with the identical code running under either tf0.9 or tf0.10rc. The elapsed times for 100 training steps were 4:20 and 14:36, respectively.
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/files/397146/timelines.tar.gz&gt;timelines.tar.gz&lt;/denchmark-link&gt;
+
+For some reason, the timing routine gave repeated error messages when running under 0.9 but not for 0.10. The 0.9 message was:
+
+W tensorflow/core/common_runtime/gpu/gpu_tracer.cc:513] Unhandled API Callback for 2 41
+
+I've not used the timing functionality before. Let me know if I've done something incorrectly.
+Also, what's the best way to generate a graph protobuf?
+Thanks
+		</comment>
+		<comment id='3' author='rob-rowe' date='2016-08-02T16:10:25Z'>
+		&lt;denchmark-link:https://github.com/rryan&gt;@rryan&lt;/denchmark-link&gt;
+: Not sure if it matters but I've attached two other timelines taken in loops in which summary operations are not being performed
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/files/397509/timelines2.tar.gz&gt;timelines2.tar.gz&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='4' author='rob-rowe' date='2016-08-02T16:31:04Z'>
+		&lt;denchmark-link:https://github.com/rob-rowe&gt;@rob-rowe&lt;/denchmark-link&gt;
+ -- thanks! The easiest way to get a graph proto is probably to insert some code into your training script to write the graph to a file.
+Once you're done building your graph, right where you would start your session (maybe with a supervisor, etc.) -- you could do this:
+# If you don't already have a handle to your graph:
+g = tf.get_default_graph() 
+
+with open('/tmp/graph.pbtxt', 'w') as f:
+  f.write(str(g.as_graph_def()))
+		</comment>
+		<comment id='5' author='rob-rowe' date='2016-08-02T16:53:57Z'>
+		One thing that sticks out from the traces are these Sum ops associated with your batch norms:
+
+net_cnn/conv1/cbn/moments/moments/mean_ss
+net_cnn/conv1/cbn/moments/moments/var_ss
+net_cnn/conv2/cbn/moments/moments/mean_ss
+net_cnn/conv2/cbn/moments/moments/var_ss
+
+They take a handful of millis in 0.9 but up to 700ms in 0.10. I would potentially chalk that up to a tracing noise (e.g. your Sum ops could waiting on some dependency that isn't ready yet -- hard to know w/o seeing the graph) but in your second trace it looks like every Sum op is taking much longer than normal.
+&lt;denchmark-link:https://github.com/prb12&gt;@prb12&lt;/denchmark-link&gt;
+ I'm not super used to interpreting Chrome tracing timelines -- any gotchas to be aware of when interpreting this?
+&lt;denchmark-link:https://github.com/rmlarsen&gt;@rmlarsen&lt;/denchmark-link&gt;
+ Are you aware of any change to Eigen between 0.9 and 0.10 that could cause Sum (&lt;denchmark-link:https://github.com/rob-rowe&gt;@rob-rowe&lt;/denchmark-link&gt;
+ -- is this float32? float16?) to do this with a Tesla K40c (mentioned in the Stack Overflow post)?
+		</comment>
+		<comment id='6' author='rob-rowe' date='2016-08-02T17:07:00Z'>
+		&lt;denchmark-link:https://github.com/rryan&gt;@rryan&lt;/denchmark-link&gt;
+ --
+graph proto attached.
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/files/397621/graph.pbtxt.tar.gz&gt;graph.pbtxt.tar.gz&lt;/denchmark-link&gt;
+
+The batch norm variables you mention are all default data types (float32)
+		</comment>
+		<comment id='7' author='rob-rowe' date='2016-08-02T17:07:30Z'>
+		&lt;denchmark-link:https://github.com/rryan&gt;@rryan&lt;/denchmark-link&gt;
+ Nop - these traces make it pretty clear that there is a perf regression in the Sum reduction kernel on GPU.  I think it would be useful to compare what CUDA launch parameters are being used for the reduction.  The quickest way to do that is to run the program under nvprof as follows:
+nvprof --print-gpu-trace program args....
+or
+nvprof -o /tmp/nvprof.out program args...  to produce a trace which can be loaded into nvvp
+I think that the Eigen FullReductionKernel was probably changed btw 0.9 and 0.10.
+		</comment>
+		<comment id='8' author='rob-rowe' date='2016-08-02T17:10:42Z'>
+		&lt;denchmark-link:https://github.com/bsteiner&gt;@bsteiner&lt;/denchmark-link&gt;
+ may know more about this.
+		</comment>
+		<comment id='9' author='rob-rowe' date='2016-08-02T18:11:09Z'>
+		&lt;denchmark-link:https://github.com/rryan&gt;@rryan&lt;/denchmark-link&gt;
+, &lt;denchmark-link:https://github.com/prb12&gt;@prb12&lt;/denchmark-link&gt;
+  -- I've attached nvprof.out files for each of the two cases. I ran the profiling for just 5 batches to keep the files from getting too large but they're still too big to upload here. Please let me know if &lt;denchmark-link:https://1drv.ms/u/s!AnX4PArwPRXWg9dmWvZieqWqQqCQbw&gt;this link&lt;/denchmark-link&gt;
+ doesn't work
+		</comment>
+		<comment id='10' author='rob-rowe' date='2016-08-02T18:23:38Z'>
+		Unfortunately both those files seem to be corrupted - it looks like the process didn't exit cleanly.  Did you Ctrl-C ?  (I think that to get a clean nvprof trace you need to exit gracefully)
+		</comment>
+		<comment id='11' author='rob-rowe' date='2016-08-02T18:58:06Z'>
+		Odd, I did let the process end on it's own. I used your nvprof - o method and waited until the cursor returned, which was a multisecond delay after the training finished which I assume was file IO. The raw files here seem to be able to be consumed by nvprof -i I think (see attached). Perhaps compression failed? I uploaded the files uncompressed to google drive at &lt;denchmark-link:https://drive.google.com/open?id=0BwIAwD4S8krbZ1VDU0NtOVRGMjg&gt;this link&lt;/denchmark-link&gt;
+. Please let me know if this doesn't work and if so perhaps an alternative method. Thanks
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/files/397882/nvprof_out_tf9.txt&gt;nvprof_out_tf9.txt&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/files/397883/nvprof_out_tf10.txt&gt;nvprof_out_tf10.txt&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='12' author='rob-rowe' date='2016-08-02T19:08:13Z'>
+		I've also just rerun both cases and confirmed they seem to be ending cleanly:
+
+==28091==Generated result file: /tmp/nvprof_tf0.10.0rc0_v2.out
+
+Both of these 'v2' files are in the same google drive folder as previous
+		</comment>
+		<comment id='13' author='rob-rowe' date='2016-08-02T19:09:50Z'>
+		Sorry -- the tf0.10.0rc0_v2 file is wrong (I didn't switch TF versions) I'll re-upload momentarily
+		</comment>
+		<comment id='14' author='rob-rowe' date='2016-08-02T19:13:47Z'>
+		nvprof_tf0.10.0rc0_v2.out is now correct
+		</comment>
+		<comment id='15' author='rob-rowe' date='2016-08-03T08:14:07Z'>
+		Just chiming in to say that I also experience heavy slowdowns using TF 0.10 RC0. In My case, the slowdown is even more severe: ~10x when using a ResNet-like architecture, on Python 3.5 using cuDNN 4 and CUDA 7.5.
+		</comment>
+		<comment id='16' author='rob-rowe' date='2016-08-03T08:35:28Z'>
+		Same here. 10X slowdown
+		</comment>
+		<comment id='17' author='rob-rowe' date='2016-08-03T12:16:50Z'>
+		I can confirm that the SumOp kernel is much slower in 0.10.0 than it used to be in 0.9.0 on an Nvidia Titan X.
+		</comment>
+		<comment id='18' author='rob-rowe' date='2016-08-03T16:47:46Z'>
+		&lt;denchmark-link:https://github.com/rob-rowe&gt;@rob-rowe&lt;/denchmark-link&gt;
+ Thanks for the nvprof output - it looks like there are two common shapes of Sum reduction ops in your trace and one of them is being evaluated very differently by Eigen in 0.10 resulting in much less GPU parallelism and about a 60x slowdown!  (3.3ms -&gt; 178ms)
+It would help us to make a quick repro if we knew the shapes of the operands to these ops...
+Do you happen to have this information to hand?  If not, we could either get if from the GraphDef or the StepStats proto.
+You can save a graphdef with shape annotations using code like this:
+tf.train.write_graph(g.as_graph_def(add_shapes=True),  '/tmp', 'graphdef.pbtxt')
+(Since you have timelines, you already have the code to capture the stepstats proto - this can be written to a .pbtxt file.  It contains the runtime shapes of all of the Tensors.)
+		</comment>
+		<comment id='19' author='rob-rowe' date='2016-08-03T17:50:41Z'>
+		&lt;denchmark-link:https://github.com/prb12&gt;@prb12&lt;/denchmark-link&gt;
+ the graphdef with shape annotations is attached
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/files/400073/graph_with_shapes.pbtxt.tar.gz&gt;graph_with_shapes.pbtxt.tar.gz&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='20' author='rob-rowe' date='2016-08-03T18:01:19Z'>
+		&lt;denchmark-link:https://github.com/prb12&gt;@prb12&lt;/denchmark-link&gt;
+ here is the runtime metadata jic that is helpful
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/files/400094/metadata.pbtxt.tar.gz&gt;metadata.pbtxt.tar.gz&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='21' author='rob-rowe' date='2016-08-03T18:57:34Z'>
+		I think I found the source of the problem. A fix is on the way. I'll update this thread once the fix is merged.
+		</comment>
+		<comment id='22' author='rob-rowe' date='2016-08-03T20:41:30Z'>
+		&lt;denchmark-link:https://github.com/rob-rowe&gt;@rob-rowe&lt;/denchmark-link&gt;
+ Thanks for the diagnostics.
+For future reference, it looks like the first example of the slow Sum is this one:
+&lt;denchmark-code&gt;node {
+  name: "net_cnn/conv1/cbn/moments/moments/mean_ss"
+  op: "Sum"
+  input: "net_cnn/conv1/Conv2D"
+  input: "net_cnn/conv1/cbn/moments/moments/mean_ss/reduction_indices"
+&lt;/denchmark-code&gt;
+
+Where reduction indices are [0,1,2] and the first input has shape [100, 127, 127, 30]
+		</comment>
+		<comment id='23' author='rob-rowe' date='2016-08-03T21:07:02Z'>
+		&lt;denchmark-link:https://github.com/prb12&gt;@prb12&lt;/denchmark-link&gt;
+ A convolutional batch norm factor in the first layer --- yeah, I can see why that would cause a major slow down if the sum op is slow! I'm looking forward to the fix. Thanks
+		</comment>
+		<comment id='24' author='rob-rowe' date='2016-08-08T20:34:48Z'>
+		&lt;denchmark-link:https://github.com/benoitsteiner&gt;@benoitsteiner&lt;/denchmark-link&gt;
+ any updates on this?
+		</comment>
+		<comment id='25' author='rob-rowe' date='2016-08-09T03:05:38Z'>
+		I have just started one last round of testing. If everything comes back clean this time I'll be able to submit the fix first tomorrow morning.
+		</comment>
+		<comment id='26' author='rob-rowe' date='2016-08-11T22:28:57Z'>
+		The performance regression should have been fixed by &lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/0e12a0b0dbcf17da880402bc01d8511aa4568cda&gt;0e12a0b&lt;/denchmark-link&gt;
+. Please reopen if you still find that RC 0.10 is slower than 0.9 on your GPU.
+		</comment>
+		<comment id='27' author='rob-rowe' date='2016-08-18T11:30:56Z'>
+		&lt;denchmark-link:https://github.com/benoitsteiner&gt;@benoitsteiner&lt;/denchmark-link&gt;
+  is the fix be picked into branch r0.10?
+		</comment>
+		<comment id='28' author='rob-rowe' date='2016-08-19T18:38:55Z'>
+		&lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/r0.10/tensorflow/core/kernels/cwise_ops.h&gt;https://github.com/tensorflow/tensorflow/blob/r0.10/tensorflow/core/kernels/cwise_ops.h&lt;/denchmark-link&gt;
+ the fix doesn't seem to be in 0.10 branch.
+		</comment>
+		<comment id='29' author='rob-rowe' date='2016-08-23T16:34:12Z'>
+		It should be now.
+		</comment>
+	</comments>
+</bug>

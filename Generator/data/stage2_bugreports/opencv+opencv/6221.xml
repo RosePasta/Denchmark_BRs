@@ -1,0 +1,150 @@
+<bug id='6221' author='rovarma' open_date='2016-03-08T22:56:36Z' closed_time='2016-07-08T15:26:16Z'>
+	<summary>OpenCV 3.1 x64 -- Incorrect code is generated when calling cvGetSize from a x64 C library.</summary>
+	<description>
+&lt;denchmark-h:h3&gt;Please state the information for your system&lt;/denchmark-h&gt;
+
+
+OpenCV version: 3.1
+Host OS: Windows 8
+Compiler &amp; CMake: MSVC 2015 x64 &amp; CMake 3.5
+
+&lt;denchmark-h:h3&gt;In which part of the OpenCV library you got the issue?&lt;/denchmark-h&gt;
+
+
+core
+
+&lt;denchmark-h:h3&gt;Description&lt;/denchmark-h&gt;
+
+When using OpenCV 3.1 from a x64 C library, incorrect code is generated when calling cvGetSize. I have only seen this when compiling for x64 (I only have x64 projects), but I don't know whether the bug also appears when building for x86.
+The reason for this bug is the fact that the CvSize struct is defined as follows:
+&lt;denchmark-code&gt;typedef struct CvSize
+{
+    int width;
+    int height;
+
+#ifdef __cplusplus
+    CvSize(int w = 0, int h = 0): width(w), height(h) {}
+    template&lt;typename _Tp&gt;
+    CvSize(const cv::Size_&lt;_Tp&gt;&amp; sz): width(cv::saturate_cast&lt;int&gt;(sz.width)), height(cv::saturate_cast&lt;int&gt;(sz.height)) {}
+    template&lt;typename _Tp&gt;
+    operator cv::Size_&lt;_Tp&gt;() const { return cv::Size_&lt;_Tp&gt;(cv::saturate_cast&lt;_Tp&gt;(width), cv::saturate_cast&lt;_Tp&gt;(height)); }
+#endif
+} CvSize;
+&lt;/denchmark-code&gt;
+
+Since OpenCV itself is compiled as C++ (not as C), this means that CvSize has constructors (#ifdef __cplusplus == true), which makes it a user-defined type. This in turn leads the MSVC compiler to assume that functions returning this struct by value cannot return it in a register, which causes the following code to be generated for cvGetSize (note: this is just the function prologue):
+&lt;denchmark-code&gt;// Returns the size of CvMat or IplImage
+CV_IMPL CvSize
+cvGetSize( const CvArr* arr )
+{
+00007FF763B006F0  mov         qword ptr [rsp+10h],rdx  
+00007FF763B006F5  mov         qword ptr [rsp+8],rcx  
+00007FF763B006FA  push        rdi  
+00007FF763B006FB  sub         rsp,70h  
+&lt;/denchmark-code&gt;
+
+Note that up until this point, everything is still correct. cvGetSize is a function taking two arguments: the address where the return value of cvGetSize should be stored is passed in rcx, the arr argument is passed in rdx.
+However, when you try to call this function from a file compiled as C (not C++), things break down. This is because the constructors in CvSize dissapear (#ifdef __cplusplus == false), which now leads the compiler to assume that the return value for cvGetSize will be returned in a register (rax) since sizeof(CvSize) == 8.
+So, when calling the function, only one parameter is pushed onto the stack (the arr argument), which mismatches with what the generated code for CvSize internally expects. This leads to the following (incorrect) calling code:
+&lt;denchmark-code&gt;    CvSize frame_size = cvGetSize(frame);
+00007FF7637E2BF3  mov         rcx,qword ptr [frame]  
+00007FF7637E2BF7  call        cvGetSize (07FF763353B8Ah)  
+00007FF7637E2BFC  mov         qword ptr [frame_size],rax
+&lt;/denchmark-code&gt;
+
+Note a few things here:
+
+The pointer to frame is stored in rcx, which is where cvGetSize expects to find the address where the return value should be stored.
+The calling code expects the return value from cvGetSize to be stored in rax, which will not be the case
+
+All of this means that cvGetSize will read its argument from the wrong address and either throw an error or crash.
+However, when you instead call this function from a file compiled as C++ (not C), correct code is generated:
+&lt;denchmark-code&gt;    CvSize frame_size = cvGetSize(frame);
+00007FF722682C2B  mov         rdx,qword ptr [frame]  
+00007FF722682C2F  lea         rcx,[frame_size]  
+00007FF722682C33  call        cvGetSize (07FF7221F3B85h)
+&lt;/denchmark-code&gt;
+
+As you can clearly see, 2 arguments are passed to the function; the address where the return value should be stored in rcx and the arr argument to the function in rdx. This matches with the internally generated code for cvGetSize, so everything works as expected.
+I think the current code probably works fine on other compilers (I haven't tried), but that's more of an accident than an intended feature. I believe this is firmly in undefined behaviour territory, so really anything could happen; the code is incorrect.
+To fix this, I think the constructors should be removed from CvSize. There are probably also other structs that may suffer from similar issues (at a glance, CvSize2D32f, CvBox2D all have a similar problem).
+Some links that might be useful:
+&lt;denchmark-link:https://msdn.microsoft.com/en-us/library/1e02627y.aspx&gt;https://msdn.microsoft.com/en-us/library/1e02627y.aspx&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:http://stackoverflow.com/questions/22901697/error-in-c-code-linkage-warning-c4190-type-has-c-linkage-specified-but-retu&gt;http://stackoverflow.com/questions/22901697/error-in-c-code-linkage-warning-c4190-type-has-c-linkage-specified-but-retu&lt;/denchmark-link&gt;
+
+&lt;denchmark-h:h3&gt;Code example to reproduce the issue / Steps to reproduce the issue&lt;/denchmark-h&gt;
+
+
+
+Create (or reuse) a x64 Visual Studio project which is setup to include/link against OpenCV 3 x64
+
+
+Create a main.c file
+
+
+Put the following code in there:
+#include "opencv2/core/core_c.h"
+
+int main(int _argc, char** _argv)
+{
+    IplImage* frame = cvCreateImage(cvSize(640, 480), IPL_DEPTH_32F, 3);
+    CvSize frame_size = cvGetSize(frame); // This line will result in an exception being thrown
+}
+
+
+
+Right-click on main.c in Visual Studio and go to Properties -&gt; C/C++ -&gt; Advanced
+
+
+Set the Compile As field to Compile as C code (/TC)
+
+
+Put a breakpoint on the line calling cvGetSize and run the program
+
+
+Make note of the pointer value of frame
+
+
+Step into cvGetSize
+
+
+Notice that the argument (arr) is not the correct pointer value (ie. it is not pointing to frame).
+
+
+Press F5 to continue running the code and note the error (CV_Error( CV_StsBadArg, "Array should be CvMat or IplImage" );)
+
+
+Now set the Compile As field of main.c to Compile as C++ code (/TP)
+
+
+Run again
+
+
+Notice that the argument to cvGetSize is now correct and no error is thrown
+
+
+	</description>
+	<comments>
+		<comment id='1' author='rovarma' date='2016-03-09T07:07:38Z'>
+		Just realized I forgot to include an important piece of information: I've only seen this happening when building for x64 (which doesn't mean that it works for x86, just that I've only tested x64). I've updated the original issue with this information.
+		</comment>
+		<comment id='2' author='rovarma' date='2016-07-08T15:26:16Z'>
+		C API is not supported anymore and should not be used. Moreover some "C" calls can raise C++ exceptions.
+There is no plan to revive direct C API in OpenCV (you should wait for some FFI C bindings). Use OpenCV from C++ programs only.
+&lt;denchmark-link:https://github.com/opencv/opencv/issues/4705&gt;#4705&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='3' author='rovarma' date='2016-07-08T15:39:31Z'>
+		Lol. That is "a" response, I suppose.
+		</comment>
+		<comment id='4' author='rovarma' date='2019-06-11T13:10:40Z'>
+		
+C API is not supported anymore and should not be used. Moreover some "C" calls can raise C++ exceptions.
+There is no plan to revive direct C API in OpenCV (you should wait for some FFI C bindings). Use OpenCV from C++ programs only.
+#4705
+
+This is terrible.
+		</comment>
+	</comments>
+</bug>

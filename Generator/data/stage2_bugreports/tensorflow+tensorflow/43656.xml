@@ -1,0 +1,309 @@
+<bug id='43656' author='relativeflux' open_date='2020-09-29T21:08:02Z' closed_time='2020-10-16T23:05:00Z'>
+	<summary>TF hangs on HTC Cluster</summary>
+	<description>
+Please make sure that this is a bug. As per our
+GitHub Policy,
+we only address code/doc bugs, performance issues, feature requests and
+build/installation issues on GitHub. tag:bug_template
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): Yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): CentOS, Linux 7
+Mobile device (e.g. iPhone 8, Pixel 2, Samsung Galaxy) if the issue happens on mobile device:
+TensorFlow installed from (source or binary): Pip, under Anaconda
+TensorFlow version (use command below): 2.2.0, 2.3.0
+Python version: 3.7
+Bazel version (if compiling from source):
+GCC/Compiler version (if compiling from source):
+CUDA/cuDNN version: 10.1.243 / 7.6.5__cuda-10.1
+GPU model and memory: Various - K40, K80, P100, V100 (12-64GB)
+
+You can collect some of this information using our environment capture
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/tree/master/tools/tf_env_collect.sh&gt;script&lt;/denchmark-link&gt;
+
+You can also obtain the TensorFlow version with:
+
+TF 1.0: python -c "import tensorflow as tf; print(tf.GIT_VERSION, tf.VERSION)"
+TF 2.0: python -c "import tensorflow as tf; print(tf.version.GIT_VERSION, tf.version.VERSION)"
+
+Describe the current behavior
+I am currently experimenting with running my training jobs on an HTC cluster running the &lt;denchmark-link:https://slurm.schedmd.com/quickstart.html&gt;Slurm&lt;/denchmark-link&gt;
+ job queue manager, however my code just hangs, with no error messages printed. The same code works without issue on my own Ubuntu Deep Learning system, equipped with 2 Titan RTX cards, and also on Google Colab.
+I have a suspicion that this is related to my dataset code, which involves two  transforms. This is shown in the code supplied below, in the  function. The first  runs a function , which yields batches of audio files from disk. The second, running , slices subsequences from the loaded batches, following the &lt;denchmark-link:https://www.tensorflow.org/guide/keras/rnn#cross-batch_statefulness&gt;cross-batch statefulness pattern&lt;/denchmark-link&gt;
+, described in the TensorFlow RNN documentation. So I am feeding subsequences to my RNNs, since there are too many samples to be fed in one go (note that the subsequences retain the batch size).
+If I remove the first from_generator the training does not hang, however. The function get_dataset_NO_HANG shows this - it builds a dataset using a single from_generator, which runs the get_rand_seqs function, which simply yields randomly generated subsequences.
+Describe the expected behavior
+It shouldn't just hang forever, with no info...
+Standalone code to reproduce the issue
+Provide a reproducible test case that is the bare minimum necessary to generate
+the problem. If possible, please share a link to Colab/Jupyter/any notebook.
+&lt;denchmark-code&gt;import os
+import fnmatch
+import random
+import time
+import tensorflow as tf
+import numpy as np
+#import librosa
+
+NUM_EPOCHS = 2
+BATCH_SIZE = 16
+FRAME_SIZE = 64
+NUM_BATCHES = 4
+SEQ_LEN = 1024
+OVERLAP = FRAME_SIZE
+NUM_SAMPS = 128000 + OVERLAP
+
+##################### DATASET #####################
+
+def find_files(directory, pattern='*.wav'):
+    '''Recursively finds all files matching the pattern.'''
+    files = []
+    for root, dirnames, filenames in os.walk(directory):
+        for filename in fnmatch.filter(filenames, pattern):
+            files.append(os.path.join(root, filename))
+    random.shuffle(files)
+    return files
+
+# This can load audio files (preferably of only a few seconds long!), but I have commented out that code
+# and replaced with a line that simply generates some arrays of random 'samples'...
+def load_audio(files, batch_size):
+    #for filename in files:
+    for filename in range(0, 350):
+        #(audio, _) = librosa.load(filename, sr=None, mono=True)
+        audio = np.random.randint(0, 256, size=(batch_size * NUM_SAMPS))
+        audio = audio.reshape(-1, 1)
+        print("Loading corpus entry {}".format(filename))
+        yield audio
+
+def pad_batch(batch, batch_size, seq_len, overlap):
+    num_samps = ( int(np.floor(len(batch[0]) / float(seq_len))) * seq_len )
+    zeros = np.zeros([batch_size, overlap, 1], dtype='float32')
+    return tf.concat([zeros, batch[:, :num_samps, :]], axis=1)
+
+def get_subseqs(dataset, batch_size, seq_len, overlap):
+    for batch in dataset:
+        num_samps = len(batch[0])
+        for i in range(overlap, num_samps, seq_len):
+            x = batch[:, i-overlap : i+seq_len]
+            y = x[:, overlap : overlap+seq_len]
+            yield (x, y)
+
+def get_dataset(files=None, num_epochs=NUM_EPOCHS, batch_size=BATCH_SIZE, overlap=OVERLAP,
+                seq_len=SEQ_LEN, drop_remainder=False):
+    dataset = tf.data.Dataset.from_generator(
+        lambda: load_audio(files, batch_size),
+        output_types=tf.float32,
+        output_shapes=((None, 1))
+    )
+    dataset = dataset.repeat(num_epochs).batch(batch_size, drop_remainder)
+    dataset = dataset.map(lambda batch: tf.py_function(
+        func=pad_batch, inp=[batch, batch_size, seq_len, overlap], Tout=tf.float32
+    ))
+    return tf.data.Dataset.from_generator(
+        lambda: get_subseqs(dataset, batch_size, seq_len, overlap),
+        output_types=(tf.int32, tf.int32),
+        output_shapes=(
+            (batch_size, seq_len + overlap, 1),
+            (batch_size, seq_len, 1)))
+
+# If we use the following there is NO hang...
+
+def get_rand_seqs(num_samps, num_batches=NUM_BATCHES, batch_size=BATCH_SIZE, overlap=OVERLAP, seq_len=SEQ_LEN):
+    time.sleep(0.03)
+    for _ in range(0, num_batches):
+        batch = np.random.randint(0, 256, size=(batch_size * num_samps))
+        batch = batch.reshape((batch_size, num_samps, 1))
+        for i in range(overlap, num_samps, seq_len):
+            x = batch[:, i-overlap : i+seq_len]
+            y = x[:, overlap : overlap+seq_len]
+            yield (x, y)
+
+def get_dataset_NO_HANG(num_epochs=NUM_EPOCHS, batch_size=BATCH_SIZE, overlap=OVERLAP, seq_len=SEQ_LEN):
+    dataset = tf.data.Dataset.from_generator(
+        lambda: get_subseqs(NUM_SAMPS),
+        output_types=(tf.int32, tf.int32),
+        output_shapes=(
+            (batch_size, seq_len + overlap, 1),
+            (batch_size, seq_len, 1)))
+    dataset = dataset.repeat(num_epochs)
+    return dataset
+
+##################### MODEL #####################
+
+# This is just a dummy model, not my real one, although I do make extensive use of RNNs...
+class TestModel(tf.keras.Model):
+
+    def __init__(self, frame_size=FRAME_SIZE, dim=1024):
+        super(TestModel, self).__init__()
+        self.frame_size = frame_size
+        self.q_levels = 256
+        self.dim = dim
+        self.num_lower_tier_frames = 4
+        self.input_expand = tf.keras.layers.Dense(self.dim)
+        self.rnn = tf.keras.layers.GRU(self.dim, return_sequences=True, stateful=True)
+        self.upsample = tf.Variable(
+            tf.initializers.GlorotNormal()(
+                shape=[self.num_lower_tier_frames, self.dim, self.dim]),
+            name="upsample",
+        )
+        self.out = tf.keras.layers.Dense(self.q_levels, activation='relu')
+
+    def train_step(self, data):
+        (x, y) = data
+        with tf.GradientTape() as tape:
+            raw_output = self(x, training=True)
+            prediction = tf.reshape(raw_output, [-1, self.q_levels])
+            target = tf.reshape(y, [-1])
+            loss = self.compiled_loss(
+                target,
+                prediction,
+                regularization_losses=self.losses)
+        grads = tape.gradient(loss, self.trainable_variables)
+        grads, _ = tf.clip_by_global_norm(grads, 5.0)
+        self.optimizer.apply_gradients(zip(grads, self.trainable_variables))
+        self.compiled_metrics.update_state(target, prediction)
+        return {metric.name: metric.result() for metric in self.metrics}
+
+    def call(self, input):
+        batch_size = tf.shape(input)[0]
+        input = tf.cast(input[:, : -self.frame_size, :], tf.float32)
+        frames = tf.reshape(input, [
+            batch_size,
+            tf.shape(input)[1] // self.frame_size,
+            self.frame_size
+        ])
+        num_steps = tf.shape(frames)[1]
+        frames = self.input_expand(frames)
+        hidden = self.rnn(frames)
+        output_shape = [
+            batch_size,
+            num_steps * self.num_lower_tier_frames,
+            self.dim
+        ]
+        outputs = tf.nn.conv1d_transpose(
+            hidden,
+            self.upsample,
+            strides=self.num_lower_tier_frames,
+            output_shape=output_shape,
+        )
+        return self.out(tf.transpose(outputs, perm=(0,2,1)))
+
+##################### TRAINING #####################
+
+#files = find_files('path/to/wavs') # Leave this as is, no audio needs to be loaded
+train_dataset = get_dataset() # This hangs on the HTC, but get_dataset_NO_HANG does not...
+
+model = TestModel()
+
+opt = tf.optimizers.Adam(learning_rate=0.001, epsilon=1e-4)
+compute_loss = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+train_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(name='accuracy')
+model.compile(optimizer=opt, loss=compute_loss, metrics=[train_accuracy])
+
+model.fit(
+    train_dataset,
+    epochs=NUM_EPOCHS,
+    steps_per_epoch=500,
+    shuffle=False
+)
+&lt;/denchmark-code&gt;
+
+Other info / logs Include any logs or source code that would be helpful to
+diagnose the problem. If including tracebacks, please include the full
+traceback. Large logs and files should be attached.
+No error messages are produced.
+I submit a job using sbatch &lt;my_run_script.sh&gt; on the login node, and the system then runs the code on a GPU node. I don't have enough access to the Slurm cluster where I am running my code to investigate what be going on behind the scenes, and I don't have enough knowledge/experience of such systems to be able to hazard a guess (I know that the login node in the cluster runs CentOS... I run my code under Anaconda, with TF 2.2.0, also tried TF 2.3.0 but same issues). So I have no idea what's going on, it's quite baffling. It does seem to be related to the above code, however.
+	</description>
+	<comments>
+		<comment id='1' author='relativeflux' date='2020-09-29T22:18:31Z'>
+		I have fixed some typo errors in the posted code.
+		</comment>
+		<comment id='2' author='relativeflux' date='2020-09-29T23:00:47Z'>
+		Update: Even enumerating the dataset on the HTC hangs:
+&lt;denchmark-code&gt;for (i, (x, y)) in enumerate(train_dataset):
+    print(i)
+    time.sleep(0.2)
+    print(tf.shape(x))
+    print(tf.shape(y))
+&lt;/denchmark-code&gt;
+
+the above produces nothing on that system, but works everywhere else.
+		</comment>
+		<comment id='3' author='relativeflux' date='2020-09-30T13:27:20Z'>
+		As mentioned in the template by &lt;denchmark-link:https://github.com/relativeflux&gt;@relativeflux&lt;/denchmark-link&gt;
+, I was able to run the code without any issues on Google Colab. Please find the gist of it &lt;denchmark-link:https://colab.research.google.com/gist/amahendrakar/df99e89a30ecd5a769d467761f3b82fb/43656.ipynb&gt;here&lt;/denchmark-link&gt;
+. Thanks!
+		</comment>
+		<comment id='4' author='relativeflux' date='2020-10-01T04:03:58Z'>
+		UPDATE: Removing the second from_generator and just returning from the map transform works in the HTC environment. So, if I define get_dataset thus:
+&lt;denchmark-code&gt;def get_dataset(files=None, num_epochs=NUM_EPOCHS, batch_size=BATCH_SIZE, overlap=OVERLAP,
+                seq_len=SEQ_LEN, drop_remainder=False):
+    dataset = tf.data.Dataset.from_generator(
+        lambda: load_audio(files, batch_size),
+        output_types=tf.float32,
+        output_shapes=((None, 1))
+    )
+    dataset = dataset.repeat(num_epochs).batch(batch_size, drop_remainder)
+    return dataset.map(lambda batch: tf.py_function(
+        func=pad_batch, inp=[batch, batch_size, seq_len, overlap], Tout=tf.float32
+    ))
+&lt;/denchmark-code&gt;
+
+and then just
+&lt;denchmark-code&gt;for (i, x) in enumerate(train_dataset):
+    print(i)
+    time.sleep(0.2)
+    print(tf.shape(x))
+&lt;/denchmark-code&gt;
+
+...that works... Evidently something within the context of the HTC environment is interfering with the execution of the second from_generator.
+		</comment>
+		<comment id='5' author='relativeflux' date='2020-10-01T15:13:25Z'>
+		Using a dataset iterator instead of a second from_generator works on the HTC:
+&lt;denchmark-code&gt;def get_dataset(files=None, num_epochs=NUM_EPOCHS, batch_size=BATCH_SIZE, overlap=OVERLAP,
+                  seq_len=SEQ_LEN, drop_remainder=False):
+    dataset = tf.data.Dataset.from_generator(
+        lambda: load_audio(files, batch_size),
+        output_types=tf.float32,
+        output_shapes=((None, 1))
+    )
+    dataset = dataset.repeat(num_epochs).batch(batch_size, drop_remainder)
+    return dataset.map(lambda batch: tf.py_function(
+        func=pad_batch, inp=[batch, batch_size, seq_len, overlap], Tout=tf.float32
+    ))
+
+def ds_iter(dataset, seq_len=SEQ_LEN, overlap=OVERLAP):
+    for batch in dataset:
+        print('ds_iter')
+        num_samps = len(batch[0])
+        for i in range(overlap, num_samps, seq_len):
+            x = batch[:, i-overlap : i+seq_len]
+            y = x[:, overlap : overlap+seq_len]
+            yield (x, y)
+
+dataset = get_dataset(drop_remainder=True)
+gen = ds_iter(dataset)
+for (i, (x, y)) in enumerate(gen):
+    print(i)
+    time.sleep(0.2)
+    print(tf.shape(x))
+    print(tf.shape(y))
+&lt;/denchmark-code&gt;
+
+In fact the above is what I was originally doing, passing the generator to  (as ). I consolidated everything into a dataset because I also use  arg to , and &lt;denchmark-link:https://www.tensorflow.org/api_docs/python/tf/keras/Model#fit&gt;the docs say&lt;/denchmark-link&gt;
+ that 'validation_data does not support all the data types that are supported in x, eg, dict, generator or keras.utils.Sequence'... But is this the case? Because if not I can just revert back to the above pattern. &lt;denchmark-link:https://stackoverflow.com/a/60003165/795131&gt;This&lt;/denchmark-link&gt;
+ StackOverflow answer indicates that a generator  in fact be passed to .
+		</comment>
+		<comment id='6' author='relativeflux' date='2020-10-14T14:59:40Z'>
+		This is now resolved. I have been in touch with the administrators of the cluster, and with their help was able to establish that it was caused by the Slurm --ntasks-per-node setting being too low (it was set to 1). That param just manages the number of CPUs available for a given task on a cluster node, and increasing it to 5 resolved the issue.
+I don't have any info as to whether this might be something arising from the interaction between the Slurm system and TensorFlow, however.
+		</comment>
+		<comment id='7' author='relativeflux' date='2020-10-16T23:05:01Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/43656&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/43656&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

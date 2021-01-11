@@ -1,0 +1,204 @@
+<bug_data>
+<bug id='1105' author='robertnishihara' open_date='2017-10-11T06:21:21Z' closed_time='2017-10-12T07:07:06Z'>
+ 	<summary>In Jenkins tests, test_0.py hangs occasionally.</summary>
+ 	<description>
+ I'm running the following (on our Jenkins workers).
+ &lt;denchmark-code&gt;python test/jenkins_tests/multi_node_docker_test.py --num-nodes=5 --num-redis-shards=10 --test-script=/ray/test/jenkins_tests/multi_node_tests/test_0.py
+ &lt;/denchmark-code&gt;
+ 
+ taken from
+ 
+ 
+ 
+ ray/test/jenkins_tests/run_multi_node_tests.sh
+ 
+ 
+         Lines 14 to 18
+       in
+       b1660c4
+ 
+ 
+ 
+ 
+ 
+ 
+  python $ROOT_DIR/multi_node_docker_test.py \ 
+ 
+ 
+ 
+      --docker-image=$DOCKER_SHA \ 
+ 
+ 
+ 
+      --num-nodes=5 \ 
+ 
+ 
+ 
+      --num-redis-shards=10 \ 
+ 
+ 
+ 
+      --test-script=/ray/test/jenkins_tests/multi_node_tests/test_0.py 
+ 
+ 
+ 
+ 
+ 
+ Occasionally, it will hang, with output
+ &lt;denchmark-code&gt;Starting head node with command:['docker', 'run', '-d', '--shm-size=1G', 'f9636310fd09eed9bce58c174320749526b394816ee15b2f9c674d3c5124aee4', 'ray', 'start', '--head', '--block', '--redis-port=6379', '--num-redis-shards=10', '--num-cpus=10', '--num-gpus=0', '--no-ui']
+ Starting worker node with command:['docker', 'run', '-d', '--shm-size=1G', '--shm-size=1G', 'f9636310fd09eed9bce58c174320749526b394816ee15b2f9c674d3c5124aee4', 'ray', 'start', '--block', '--redis-address=172.17.0.2:6379', '--num-cpus=10', '--num-gpus=0']
+ Starting worker node with command:['docker', 'run', '-d', '--shm-size=1G', '--shm-size=1G', 'f9636310fd09eed9bce58c174320749526b394816ee15b2f9c674d3c5124aee4', 'ray', 'start', '--block', '--redis-address=172.17.0.2:6379', '--num-cpus=10', '--num-gpus=0']
+ Starting worker node with command:['docker', 'run', '-d', '--shm-size=1G', '--shm-size=1G', 'f9636310fd09eed9bce58c174320749526b394816ee15b2f9c674d3c5124aee4', 'ray', 'start', '--block', '--redis-address=172.17.0.2:6379', '--num-cpus=10', '--num-gpus=0']
+ Starting worker node with command:['docker', 'run', '-d', '--shm-size=1G', '--shm-size=1G', 'f9636310fd09eed9bce58c174320749526b394816ee15b2f9c674d3c5124aee4', 'ray', 'start', '--block', '--redis-address=172.17.0.2:6379', '--num-cpus=10', '--num-gpus=0']
+ Starting driver with command /ray/test/jenkins_tests/multi_node_tests/test_0.py.
+ &lt;/denchmark-code&gt;
+ 
+ Doing docker ps shows
+ &lt;denchmark-code&gt;CONTAINER ID        IMAGE               COMMAND                  CREATED             STATUS              PORTS               NAMES
+ b408155b0153        f9636310fd09        "ray start --block..."   21 minutes ago      Up 21 minutes                           cranky_kowalevski
+ f295908861d7        f9636310fd09        "ray start --block..."   21 minutes ago      Up 21 minutes                           elastic_franklin
+ a37bc1714877        f9636310fd09        "ray start --block..."   21 minutes ago      Up 21 minutes                           optimistic_jones
+ a4891cbb597b        f9636310fd09        "ray start --block..."   21 minutes ago      Up 21 minutes                           objective_goodall
+ 43b74949afb7        f9636310fd09        "ray start --head ..."   21 minutes ago      Up 21 minutes                           awesome_lamarr
+ &lt;/denchmark-code&gt;
+ 
+ Attaching to the head node with docker exec -t -i 43b74949afb7 /bin/bash and inspecting /tmp/raylogs, the only interesting thing I see is
+ &lt;denchmark-code&gt;root@43b74949afb7:/tmp/raylogs# cat global_scheduler-0199444623.err
+ [ERROR] (/ray/src/global_scheduler/global_scheduler_algorithm.cc:190: errno: Operation now in progress) Infeasible task. No nodes satisfy hard constraints for task = 108d1007838a4873edc1a4a17868e092d6b0e950
+ [ERROR] (/ray/src/global_scheduler/global_scheduler_algorithm.cc:190: errno: Operation now in progress) Infeasible task. No nodes satisfy hard constraints for task = 81fcdb52b4ba5f6df6567c5fecf91e8a121958e6
+ [ERROR] (/ray/src/global_scheduler/global_scheduler_algorithm.cc:190: errno: Operation now in progress) Infeasible task. No nodes satisfy hard constraints for task = 01eed3d3720a92589b14b7bc9a0abb7d18a88551
+ &lt;/denchmark-code&gt;
+ 
+ That isn't obviously a problem. It just means that we submitted some tasks to the global scheduler before it was aware of any local schedulers with any available workers.
+ Inspecting the task table, I did
+ import ray
+ ray.init(redis_address="172.17.0.2:6379")
+ tt = ray.global_state.task_table()
+ states = [v['State'] for k, v in tt.items()]
+ [(s, states.count(s)) for s in set(states)]
+ The last command printed
+ &lt;denchmark-code&gt;[(16, 980), (1, 20), (8, 2)]
+ &lt;/denchmark-code&gt;
+ 
+ State 8 is RUNNING. The two tasks in those states are probably the two driver tasks (one for the actual test and one for the driver that I just attached). Only 20 tasks are in state 16 which is DONE, and 980 are in state 1, which is WAITING, meaning that they have been pushed to the global scheduler and we are waiting for the global scheduler to assign them to a local scheduler.
+ Printing
+ missed_tasks = [v for k, v in tt.items() if v['State'] == 1]
+ parent_counters = [t['TaskSpec']['ParentCounter'] for t in missed_tasks]
+ parent_counters.sort()
+ print(parent_counters)
+ The last line prints
+ [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+ So this suggests that the first 20 tasks didn't get processed by the global scheduler.
+ The issue I believe is a case that we're not handling, described in this comment
+ 
+ 
+ 
+ ray/src/global_scheduler/global_scheduler.cc
+ 
+ 
+         Lines 419 to 423
+       in
+       1e0ab3d
+ 
+ 
+ 
+ 
+ 
+ 
+  /* Subscribe to notifications about waiting tasks. TODO(rkn): this may need to 
+ 
+ 
+ 
+     * get tasks that were submitted to the database before the subscribe. */ 
+ 
+ 
+ 
+  task_table_subscribe(g_state-&gt;db, NIL_ID, TASK_STATUS_WAITING, 
+ 
+ 
+ 
+                         process_task_waiting, (void *) g_state, NULL, NULL, 
+ 
+ 
+ 
+  NULL); 
+ 
+ 
+ 
+ 
+ 
+ The solution could be to resubmit it to the global scheduler if it is not received the first time (because the global scheduler hadn't started subscribing yet). Still need to verify that this is actually the problem.
+ cc &lt;denchmark-link:https://github.com/shaneknapp&gt;@shaneknapp&lt;/denchmark-link&gt;
+ 
+ 	</description>
+ 	<comments>
+ 		<comment id='1' author='robertnishihara' date='2017-10-11T16:59:32Z'>
+ 		how does this explain what we saw yesterday on this build:
+ &lt;denchmark-link:https://amplab.cs.berkeley.edu/jenkins/job/Ray/1892&gt;https://amplab.cs.berkeley.edu/jenkins/job/Ray/1892&lt;/denchmark-link&gt;
+ 
+ points:
+ 
+ if you look at the console output (https://amplab.cs.berkeley.edu/jenkins/job/Ray/1892/console) you will see that it never actually told us that it had launched the docker containers
+ however, after checking docker ps -a we saw four worker nodes, and no head node.
+ 
+ (this behavior could be explained by STDOUT needing to be flushed)
+ 		</comment>
+ 		<comment id='2' author='robertnishihara' date='2017-10-11T21:40:17Z'>
+ 		So, this doesn't explain why we never saw the console output, and it also doesn't explain why we didn't see the head node.
+ However, I could reproduce the problem (or a similar problem) fairly easily, and whenever I did that I did see the console output as well as the head node container.
+ The problem may be fixed by &lt;denchmark-link:https://github.com/ray-project/ray/pull/1106&gt;#1106&lt;/denchmark-link&gt;
+ , but we shall see :)
+ 		</comment>
+ 		<comment id='3' author='robertnishihara' date='2017-10-12T07:07:06Z'>
+ 		This should be solved by &lt;denchmark-link:https://github.com/ray-project/ray/pull/1106&gt;#1106&lt;/denchmark-link&gt;
+ .
+ There are several PRs in progress that are not rebased on top of &lt;denchmark-link:https://github.com/ray-project/ray/pull/1106&gt;#1106&lt;/denchmark-link&gt;
+ , so we may see the problem a few more times, but for anything rebased on top of this, the problem should be gone. If not, we'll need to open a new issue (or reopen this one).
+ 		</comment>
+ 	</comments>
+ </bug>
+<commit id='b58500188143bbefb2aa358f32c9042885ffec8e' author='Robert Nishihara' date='2017-10-12 00:04:38-07:00'>
+ 	<dmm_unit complexity='1.0' interfacing='0.0' size='0.1'></dmm_unit>
+ 	<modification change_type='MODIFY' old_name='src\common\CMakeLists.txt' new_name='src\common\CMakeLists.txt'>
+ 		<file_info nloc='None' complexity='None' token_count='None'></file_info>
+ 		<modified_lines>
+ 			<added_lines>9</added_lines>
+ 			<deleted_lines>9</deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='src\global_scheduler\global_scheduler.cc' new_name='src\global_scheduler\global_scheduler.cc'>
+ 		<file_info nloc='323' complexity='43' token_count='2076'></file_info>
+ 		<method name='start_server' parameters='node_ip_address,redis_primary_addr,redis_primary_port'>
+ 				<method_info nloc='22' complexity='1' token_count='143' nesting_level='0' start_line='407' end_line='446'></method_info>
+ 			<added_lines>419,420,421,422</added_lines>
+ 			<deleted_lines>419,420</deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines></added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='src\local_scheduler\local_scheduler_algorithm.cc' new_name='src\local_scheduler\local_scheduler_algorithm.cc'>
+ 		<file_info nloc='819' complexity='135' token_count='5351'></file_info>
+ 		<method name='give_task_to_global_scheduler' parameters='state,algorithm_state,spec,task_spec_size'>
+ 				<method_info nloc='18' complexity='3' token_count='122' nesting_level='0' start_line='969' end_line='988'></method_info>
+ 			<added_lines>982,983,984,985,986,987</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<method name='give_task_to_global_scheduler_retry' parameters='id,user_context,user_data'>
+ 				<method_info nloc='11' complexity='1' token_count='83' nesting_level='0' start_line='947' end_line='959'></method_info>
+ 			<added_lines>947,948,949,950,951,952,953,954,955,956,957,958,959</added_lines>
+ 			<deleted_lines>951</deleted_lines>
+ 		</method>
+ 		<method name='give_task_to_local_scheduler_retry' parameters='id,user_context,user_data'>
+ 				<method_info nloc='14' complexity='1' token_count='112' nesting_level='0' start_line='898' end_line='914'></method_info>
+ 			<added_lines>906,907,908,909,910,911,912,913</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines>17,18,19,20,21,22,23,24,25,26,27,960</added_lines>
+ 			<deleted_lines>895,896</deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ </commit>
+</bug_data>

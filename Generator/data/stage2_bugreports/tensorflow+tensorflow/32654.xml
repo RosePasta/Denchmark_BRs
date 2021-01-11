@@ -1,0 +1,1441 @@
+<bug id='32654' author='vmarkovtsev' open_date='2019-09-19T12:02:21Z' closed_time='2019-09-29T22:13:23Z'>
+	<summary>tf.distribute.MirroredStrategy leads to an infinite polling cycle with 4 GPUs</summary>
+	<description>
+&lt;denchmark-h:h3&gt;System information&lt;/denchmark-h&gt;
+
+A physical tower with 4 GPUs running Ubuntu 18.04 over Kubernetes
+
+256 GB of RAM
+TensorFlow: tested on tf-nightly-gpu-2.0-preview==2.0.0.dev20190902 to tf-nightly-gpu-2.0-preview==2.0.0.dev20190918
+Python 3.6.8
+CUDA 10.0, cuDNN 7.6.3.30 (also tested with cuDNN 7.5.0.56)
+NVIDIA GTX 1080
+
+
+nvidia-smi
++-----------------------------------------------------------------------------+
+| NVIDIA-SMI 410.78       Driver Version: 410.78       CUDA Version: 10.0     |
+|-------------------------------+----------------------+----------------------+
+| GPU  Name        Persistence-M| Bus-Id        Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp  Perf  Pwr:Usage/Cap|         Memory-Usage | GPU-Util  Compute M. |
+|===============================+======================+======================|
+|   0  GeForce GTX 108...  Off  | 00000000:02:00.0 Off |                  N/A |
+| 53%   70C    P2    79W / 250W |  10889MiB / 11178MiB |    100%      Default |
++-------------------------------+----------------------+----------------------+
+|   1  GeForce GTX 108...  Off  | 00000000:03:00.0 Off |                  N/A |
+| 52%   69C    P2    76W / 250W |  10893MiB / 11178MiB |    100%      Default |
++-------------------------------+----------------------+----------------------+
+|   2  GeForce GTX 108...  Off  | 00000000:82:00.0 Off |                  N/A |
+| 48%   65C    P2    78W / 250W |  10889MiB / 11178MiB |    100%      Default |
++-------------------------------+----------------------+----------------------+
+|   3  GeForce GTX 108...  Off  | 00000000:83:00.0 Off |                  N/A |
+| 45%   62C    P2    76W / 250W |  10893MiB / 11178MiB |    100%      Default |
++-------------------------------+----------------------+----------------------+
+
+
+&lt;denchmark-h:h3&gt;Problem&lt;/denchmark-h&gt;
+
+I run the following sample code:
+#!/usr/bin/env python3
+import sys
+import tensorflow as tf
+
+
+def main():
+    batch_size = 12
+    features_shape = 372, 558, 3
+    labels = 10
+    sample = tf.random.uniform(features_shape)
+
+    def with_shape(t, shape):
+        t = tf.squeeze(t)
+        t.set_shape(shape)
+        return t
+
+    ds_train = tf.data.Dataset.from_tensors([sample]).map(lambda s: (s, tf.ones((labels,)))) \
+        .repeat().batch(batch_size).map(lambda s, l: (with_shape(s, (batch_size,) + features_shape),
+                                                      with_shape(l, (batch_size, labels))))
+    ds_val = tf.data.Dataset.from_tensors([sample]).map(lambda s: (s, tf.ones((labels,)))) \
+        .repeat().batch(batch_size).take(10).map(
+        lambda s, l: (with_shape(s, (batch_size,) + features_shape), with_shape(l, (batch_size, labels))))
+    with tf.distribute.MirroredStrategy().scope():
+        model = tf.keras.applications.DenseNet121(
+            weights=None, input_shape=features_shape, classes=labels)
+        model.build((batch_size,) + features_shape)
+        model.summary()
+        optimizer = tf.keras.optimizers.RMSprop(learning_rate=0.001)
+        cross_entropy = tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.1)
+        model.compile(optimizer=optimizer, loss=cross_entropy, metrics=["accuracy"])
+    model.fit(ds_train, validation_data=ds_val, epochs=1, steps_per_epoch=100)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+It outputs the following log and hangs for at least 9 hours (I killed it after):
+
+log
+2019-09-19 11:22:16.548532: I tensorflow/compiler/xla/service/service.cc:176]   StreamExecutor device (3): GeForce GTX 1080 Ti, Compute Capability 6.1
+2019-09-19 11:22:16.553080: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1632] Found device 0 with properties:
+name: GeForce GTX 1080 Ti major: 6 minor: 1 memoryClockRate(GHz): 1.62
+pciBusID: 0000:02:00.0
+2019-09-19 11:22:16.554064: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1632] Found device 1 with properties:
+name: GeForce GTX 1080 Ti major: 6 minor: 1 memoryClockRate(GHz): 1.62
+pciBusID: 0000:03:00.0
+2019-09-19 11:22:16.555051: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1632] Found device 2 with properties:
+name: GeForce GTX 1080 Ti major: 6 minor: 1 memoryClockRate(GHz): 1.62
+pciBusID: 0000:82:00.0
+2019-09-19 11:22:16.555890: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1632] Found device 3 with properties:
+name: GeForce GTX 1080 Ti major: 6 minor: 1 memoryClockRate(GHz): 1.62
+pciBusID: 0000:83:00.0
+2019-09-19 11:22:16.556021: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamiclibrary libcudart.so.10.0
+2019-09-19 11:22:16.556046: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamiclibrary libcublas.so.10.0
+2019-09-19 11:22:16.556062: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamiclibrary libcufft.so.10.0
+2019-09-19 11:22:16.556079: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamiclibrary libcurand.so.10.0
+2019-09-19 11:22:16.556095: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamiclibrary libcusolver.so.10.0
+2019-09-19 11:22:16.556111: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamiclibrary libcusparse.so.10.0
+2019-09-19 11:22:16.556127: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamiclibrary libcudnn.so.7
+2019-09-19 11:22:16.562745: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1760] Adding visible gpu devices: 0, 1, 2, 3
+2019-09-19 11:22:16.562815: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamiclibrary libcudart.so.10.0
+2019-09-19 11:22:16.566634: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1173] Device interconnect StreamExecutorwith strength 1 edge matrix:
+2019-09-19 11:22:16.566650: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1179]      0 1 2 3
+2019-09-19 11:22:16.566657: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1192] 0:   N Y N N
+2019-09-19 11:22:16.566661: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1192] 1:   Y N N N
+2019-09-19 11:22:16.566666: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1192] 2:   N N N Y
+2019-09-19 11:22:16.566670: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1192] 3:   N N Y N
+2019-09-19 11:22:16.571630: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1318] Created TensorFlow device (/job:localhost/replica:0/task:0/device:GPU:0 with 10470 MB memory) -&gt; physical GPU (device: 0, name: GeForce GTX 1080 Ti, pci bus id: 0000:02:00.0, compute capability: 6.1)
+2019-09-19 11:22:16.573706: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1318] Created TensorFlow device (/job:localhost/replica:0/task:0/device:GPU:1 with 10470 MB memory) -&gt; physical GPU (device: 1, name: GeForce GTX 1080 Ti, pci bus id: 0000:03:00.0, compute capability: 6.1)
+2019-09-19 11:22:16.575382: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1318] Created TensorFlow device (/job:localhost/replica:0/task:0/device:GPU:2 with 10470 MB memory) -&gt; physical GPU (device: 2, name: GeForce GTX 1080 Ti, pci bus id: 0000:82:00.0, compute capability: 6.1)
+2019-09-19 11:22:16.576566: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1318] Created TensorFlow device (/job:localhost/replica:0/task:0/device:GPU:3 with 10470 MB memory) -&gt; physical GPU (device: 3, name: GeForce GTX 1080 Ti, pci bus id: 0000:83:00.0, compute capability: 6.1)
+WARNING:tensorflow:Entity . at 0x7fe776f021e0&gt; could not be transformed and will be executed as-is. Please report this to the AutoGraph team. When filing the bug, set the verbosity to 10 (on Linux, `export AUTOGRAPH_VERBOSITY=10`) and attach the full output. Cause: expected exactly one node node, found []
+2019-09-19 11:22:17.393146: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1632] Found device 0 with properties:
+name: GeForce GTX 1080 Ti major: 6 minor: 1 memoryClockRate(GHz): 1.62
+pciBusID: 0000:02:00.0
+2019-09-19 11:22:17.394380: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1632] Found device 1 with properties:
+name: GeForce GTX 1080 Ti major: 6 minor: 1 memoryClockRate(GHz): 1.62
+pciBusID: 0000:03:00.0
+2019-09-19 11:22:17.395221: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1632] Found device 2 with properties:
+name: GeForce GTX 1080 Ti major: 6 minor: 1 memoryClockRate(GHz): 1.62
+pciBusID: 0000:82:00.0
+2019-09-19 11:22:17.396088: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1632] Found device 3 with properties:
+name: GeForce GTX 1080 Ti major: 6 minor: 1 memoryClockRate(GHz): 1.62
+pciBusID: 0000:83:00.0
+2019-09-19 11:22:17.396168: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamiclibrary libcudart.so.10.0
+2019-09-19 11:22:17.396202: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamiclibrary libcublas.so.10.0
+2019-09-19 11:22:17.396218: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamiclibrary libcufft.so.10.0
+2019-09-19 11:22:17.396233: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamiclibrary libcurand.so.10.0
+2019-09-19 11:22:17.396263: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamiclibrary libcusolver.so.10.0
+2019-09-19 11:22:17.396278: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamiclibrary libcusparse.so.10.0
+2019-09-19 11:22:17.396293: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamiclibrary libcudnn.so.7
+2019-09-19 11:22:17.402450: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1760] Adding visible gpu devices: 0, 1, 2, 3
+2019-09-19 11:22:17.402599: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1173] Device interconnect StreamExecutorwith strength 1 edge matrix:
+2019-09-19 11:22:17.402611: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1179]      0 1 2 3
+2019-09-19 11:22:17.402619: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1192] 0:   N Y N N
+2019-09-19 11:22:17.402625: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1192] 1:   Y N N N
+2019-09-19 11:22:17.402631: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1192] 2:   N N N Y
+2019-09-19 11:22:17.402637: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1192] 3:   N N Y N
+2019-09-19 11:22:17.407338: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1318] Created TensorFlow device (/device:GPU:0 with 10470 MB memory) -&gt; physical GPU (device: 0, name: GeForce GTX 1080 Ti, pci bus id: 0000:02:00.0, compute capability: 6.1)
+2019-09-19 11:22:17.408425: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1318] Created TensorFlow device (/device:GPU:1 with 10470 MB memory) -&gt; physical GPU (device: 1, name: GeForce GTX 1080 Ti, pci bus id: 0000:03:00.0, compute capability: 6.1)
+2019-09-19 11:22:17.409430: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1318] Created TensorFlow device (/device:GPU:2 with 10470 MB memory) -&gt; physical GPU (device: 2, name: GeForce GTX 1080 Ti, pci bus id: 0000:82:00.0, compute capability: 6.1)
+2019-09-19 11:22:17.410293: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1318] Created TensorFlow device (/device:GPU:3 with 10470 MB memory) -&gt; physical GPU (device: 3, name: GeForce GTX 1080 Ti, pci bus id: 0000:83:00.0, compute capability: 6.1)
+Model: "densenet121"
+__________________________________________________________________________________________________
+Layer (type)                    Output Shape         Param #     Connected to
+==================================================================================================
+input_1 (InputLayer)            [(None, 372, 558, 3) 0
+__________________________________________________________________________________________________
+zero_padding2d (ZeroPadding2D)  (None, 378, 564, 3)  0           input_1[0][0]
+__________________________________________________________________________________________________
+conv1/conv (Conv2D)             (None, 186, 279, 64) 9408        zero_padding2d[0][0]
+__________________________________________________________________________________________________
+conv1/bn (BatchNormalization)   (None, 186, 279, 64) 256         conv1/conv[0][0]
+__________________________________________________________________________________________________
+conv1/relu (Activation)         (None, 186, 279, 64) 0           conv1/bn[0][0]
+__________________________________________________________________________________________________
+zero_padding2d_1 (ZeroPadding2D (None, 188, 281, 64) 0           conv1/relu[0][0]
+__________________________________________________________________________________________________
+pool1 (MaxPooling2D)            (None, 93, 140, 64)  0           zero_padding2d_1[0][0]
+__________________________________________________________________________________________________
+conv2_block1_0_bn (BatchNormali (None, 93, 140, 64)  256         pool1[0][0]
+__________________________________________________________________________________________________
+conv2_block1_0_relu (Activation (None, 93, 140, 64)  0           conv2_block1_0_bn[0][0]
+__________________________________________________________________________________________________
+conv2_block1_1_conv (Conv2D)    (None, 93, 140, 128) 8192        conv2_block1_0_relu[0][0]
+__________________________________________________________________________________________________
+conv2_block1_1_bn (BatchNormali (None, 93, 140, 128) 512         conv2_block1_1_conv[0][0]
+__________________________________________________________________________________________________
+conv2_block1_1_relu (Activation (None, 93, 140, 128) 0           conv2_block1_1_bn[0][0]
+__________________________________________________________________________________________________
+conv2_block1_2_conv (Conv2D)    (None, 93, 140, 32)  36864       conv2_block1_1_relu[0][0]
+__________________________________________________________________________________________________
+conv2_block1_concat (Concatenat (None, 93, 140, 96)  0           pool1[0][0]
+                                                                 conv2_block1_2_conv[0][0]
+__________________________________________________________________________________________________
+conv2_block2_0_bn (BatchNormali (None, 93, 140, 96)  384         conv2_block1_concat[0][0]
+__________________________________________________________________________________________________
+conv2_block2_0_relu (Activation (None, 93, 140, 96)  0           conv2_block2_0_bn[0][0]
+__________________________________________________________________________________________________
+conv2_block2_1_conv (Conv2D)    (None, 93, 140, 128) 12288       conv2_block2_0_relu[0][0]
+__________________________________________________________________________________________________
+conv2_block2_1_bn (BatchNormali (None, 93, 140, 128) 512         conv2_block2_1_conv[0][0]
+__________________________________________________________________________________________________
+conv2_block2_1_relu (Activation (None, 93, 140, 128) 0           conv2_block2_1_bn[0][0]
+__________________________________________________________________________________________________
+conv2_block2_2_conv (Conv2D)    (None, 93, 140, 32)  36864       conv2_block2_1_relu[0][0]
+__________________________________________________________________________________________________
+conv2_block2_concat (Concatenat (None, 93, 140, 128) 0           conv2_block1_concat[0][0]
+                                                                 conv2_block2_2_conv[0][0]
+__________________________________________________________________________________________________
+conv2_block3_0_bn (BatchNormali (None, 93, 140, 128) 512         conv2_block2_concat[0][0]
+__________________________________________________________________________________________________
+conv2_block3_0_relu (Activation (None, 93, 140, 128) 0           conv2_block3_0_bn[0][0]
+__________________________________________________________________________________________________
+conv2_block3_1_conv (Conv2D)    (None, 93, 140, 128) 16384       conv2_block3_0_relu[0][0]
+__________________________________________________________________________________________________
+conv2_block3_1_bn (BatchNormali (None, 93, 140, 128) 512         conv2_block3_1_conv[0][0]
+__________________________________________________________________________________________________
+conv2_block3_1_relu (Activation (None, 93, 140, 128) 0           conv2_block3_1_bn[0][0]
+__________________________________________________________________________________________________
+conv2_block3_2_conv (Conv2D)    (None, 93, 140, 32)  36864       conv2_block3_1_relu[0][0]
+__________________________________________________________________________________________________
+conv2_block3_concat (Concatenat (None, 93, 140, 160) 0           conv2_block2_concat[0][0]
+                                                                 conv2_block3_2_conv[0][0]
+__________________________________________________________________________________________________
+conv2_block4_0_bn (BatchNormali (None, 93, 140, 160) 640         conv2_block3_concat[0][0]
+__________________________________________________________________________________________________
+conv2_block4_0_relu (Activation (None, 93, 140, 160) 0           conv2_block4_0_bn[0][0]
+__________________________________________________________________________________________________
+conv2_block4_1_conv (Conv2D)    (None, 93, 140, 128) 20480       conv2_block4_0_relu[0][0]
+__________________________________________________________________________________________________
+conv2_block4_1_bn (BatchNormali (None, 93, 140, 128) 512         conv2_block4_1_conv[0][0]
+__________________________________________________________________________________________________
+conv2_block4_1_relu (Activation (None, 93, 140, 128) 0           conv2_block4_1_bn[0][0]
+__________________________________________________________________________________________________
+conv2_block4_2_conv (Conv2D)    (None, 93, 140, 32)  36864       conv2_block4_1_relu[0][0]
+__________________________________________________________________________________________________
+conv2_block4_concat (Concatenat (None, 93, 140, 192) 0           conv2_block3_concat[0][0]
+                                                                 conv2_block4_2_conv[0][0]
+__________________________________________________________________________________________________
+conv2_block5_0_bn (BatchNormali (None, 93, 140, 192) 768         conv2_block4_concat[0][0]
+__________________________________________________________________________________________________
+conv2_block5_0_relu (Activation (None, 93, 140, 192) 0           conv2_block5_0_bn[0][0]
+__________________________________________________________________________________________________
+conv2_block5_1_conv (Conv2D)    (None, 93, 140, 128) 24576       conv2_block5_0_relu[0][0]
+__________________________________________________________________________________________________
+conv2_block5_1_bn (BatchNormali (None, 93, 140, 128) 512         conv2_block5_1_conv[0][0]
+__________________________________________________________________________________________________
+conv2_block5_1_relu (Activation (None, 93, 140, 128) 0           conv2_block5_1_bn[0][0]
+__________________________________________________________________________________________________
+conv2_block5_2_conv (Conv2D)    (None, 93, 140, 32)  36864       conv2_block5_1_relu[0][0]
+__________________________________________________________________________________________________
+conv2_block5_concat (Concatenat (None, 93, 140, 224) 0           conv2_block4_concat[0][0]
+                                                                 conv2_block5_2_conv[0][0]
+__________________________________________________________________________________________________
+conv2_block6_0_bn (BatchNormali (None, 93, 140, 224) 896         conv2_block5_concat[0][0]
+__________________________________________________________________________________________________
+conv2_block6_0_relu (Activation (None, 93, 140, 224) 0           conv2_block6_0_bn[0][0]
+__________________________________________________________________________________________________
+conv2_block6_1_conv (Conv2D)    (None, 93, 140, 128) 28672       conv2_block6_0_relu[0][0]
+__________________________________________________________________________________________________
+conv2_block6_1_bn (BatchNormali (None, 93, 140, 128) 512         conv2_block6_1_conv[0][0]
+__________________________________________________________________________________________________
+conv2_block6_1_relu (Activation (None, 93, 140, 128) 0           conv2_block6_1_bn[0][0]
+__________________________________________________________________________________________________
+conv2_block6_2_conv (Conv2D)    (None, 93, 140, 32)  36864       conv2_block6_1_relu[0][0]
+__________________________________________________________________________________________________
+conv2_block6_concat (Concatenat (None, 93, 140, 256) 0           conv2_block5_concat[0][0]
+                                                                 conv2_block6_2_conv[0][0]
+__________________________________________________________________________________________________
+pool2_bn (BatchNormalization)   (None, 93, 140, 256) 1024        conv2_block6_concat[0][0]
+__________________________________________________________________________________________________
+pool2_relu (Activation)         (None, 93, 140, 256) 0           pool2_bn[0][0]
+__________________________________________________________________________________________________
+pool2_conv (Conv2D)             (None, 93, 140, 128) 32768       pool2_relu[0][0]
+__________________________________________________________________________________________________
+pool2_pool (AveragePooling2D)   (None, 46, 70, 128)  0           pool2_conv[0][0]
+__________________________________________________________________________________________________
+conv3_block1_0_bn (BatchNormali (None, 46, 70, 128)  512         pool2_pool[0][0]
+__________________________________________________________________________________________________
+conv3_block1_0_relu (Activation (None, 46, 70, 128)  0           conv3_block1_0_bn[0][0]
+__________________________________________________________________________________________________
+conv3_block1_1_conv (Conv2D)    (None, 46, 70, 128)  16384       conv3_block1_0_relu[0][0]
+__________________________________________________________________________________________________
+conv3_block1_1_bn (BatchNormali (None, 46, 70, 128)  512         conv3_block1_1_conv[0][0]
+__________________________________________________________________________________________________
+conv3_block1_1_relu (Activation (None, 46, 70, 128)  0           conv3_block1_1_bn[0][0]
+__________________________________________________________________________________________________
+conv3_block1_2_conv (Conv2D)    (None, 46, 70, 32)   36864       conv3_block1_1_relu[0][0]
+__________________________________________________________________________________________________
+conv3_block1_concat (Concatenat (None, 46, 70, 160)  0           pool2_pool[0][0]
+                                                                 conv3_block1_2_conv[0][0]
+__________________________________________________________________________________________________
+conv3_block2_0_bn (BatchNormali (None, 46, 70, 160)  640         conv3_block1_concat[0][0]
+__________________________________________________________________________________________________
+conv3_block2_0_relu (Activation (None, 46, 70, 160)  0           conv3_block2_0_bn[0][0]
+__________________________________________________________________________________________________
+conv3_block2_1_conv (Conv2D)    (None, 46, 70, 128)  20480       conv3_block2_0_relu[0][0]
+__________________________________________________________________________________________________
+conv3_block2_1_bn (BatchNormali (None, 46, 70, 128)  512         conv3_block2_1_conv[0][0]
+__________________________________________________________________________________________________
+conv3_block2_1_relu (Activation (None, 46, 70, 128)  0           conv3_block2_1_bn[0][0]
+__________________________________________________________________________________________________
+conv3_block2_2_conv (Conv2D)    (None, 46, 70, 32)   36864       conv3_block2_1_relu[0][0]
+__________________________________________________________________________________________________
+conv3_block2_concat (Concatenat (None, 46, 70, 192)  0           conv3_block1_concat[0][0]
+                                                                 conv3_block2_2_conv[0][0]
+__________________________________________________________________________________________________
+conv3_block3_0_bn (BatchNormali (None, 46, 70, 192)  768         conv3_block2_concat[0][0]
+__________________________________________________________________________________________________
+conv3_block3_0_relu (Activation (None, 46, 70, 192)  0           conv3_block3_0_bn[0][0]
+__________________________________________________________________________________________________
+conv3_block3_1_conv (Conv2D)    (None, 46, 70, 128)  24576       conv3_block3_0_relu[0][0]
+__________________________________________________________________________________________________
+conv3_block3_1_bn (BatchNormali (None, 46, 70, 128)  512         conv3_block3_1_conv[0][0]
+__________________________________________________________________________________________________
+conv3_block3_1_relu (Activation (None, 46, 70, 128)  0           conv3_block3_1_bn[0][0]
+__________________________________________________________________________________________________
+conv3_block3_2_conv (Conv2D)    (None, 46, 70, 32)   36864       conv3_block3_1_relu[0][0]
+__________________________________________________________________________________________________
+conv3_block3_concat (Concatenat (None, 46, 70, 224)  0           conv3_block2_concat[0][0]
+                                                                 conv3_block3_2_conv[0][0]
+__________________________________________________________________________________________________
+conv3_block4_0_bn (BatchNormali (None, 46, 70, 224)  896         conv3_block3_concat[0][0]
+__________________________________________________________________________________________________
+conv3_block4_0_relu (Activation (None, 46, 70, 224)  0           conv3_block4_0_bn[0][0]
+__________________________________________________________________________________________________
+conv3_block4_1_conv (Conv2D)    (None, 46, 70, 128)  28672       conv3_block4_0_relu[0][0]
+__________________________________________________________________________________________________
+conv3_block4_1_bn (BatchNormali (None, 46, 70, 128)  512         conv3_block4_1_conv[0][0]
+__________________________________________________________________________________________________
+conv3_block4_1_relu (Activation (None, 46, 70, 128)  0           conv3_block4_1_bn[0][0]
+__________________________________________________________________________________________________
+conv3_block4_2_conv (Conv2D)    (None, 46, 70, 32)   36864       conv3_block4_1_relu[0][0]
+__________________________________________________________________________________________________
+conv3_block4_concat (Concatenat (None, 46, 70, 256)  0           conv3_block3_concat[0][0]
+                                                                 conv3_block4_2_conv[0][0]
+__________________________________________________________________________________________________
+conv3_block5_0_bn (BatchNormali (None, 46, 70, 256)  1024        conv3_block4_concat[0][0]
+__________________________________________________________________________________________________
+conv3_block5_0_relu (Activation (None, 46, 70, 256)  0           conv3_block5_0_bn[0][0]
+__________________________________________________________________________________________________
+conv3_block5_1_conv (Conv2D)    (None, 46, 70, 128)  32768       conv3_block5_0_relu[0][0]
+__________________________________________________________________________________________________
+conv3_block5_1_bn (BatchNormali (None, 46, 70, 128)  512         conv3_block5_1_conv[0][0]
+__________________________________________________________________________________________________
+conv3_block5_1_relu (Activation (None, 46, 70, 128)  0           conv3_block5_1_bn[0][0]
+__________________________________________________________________________________________________
+conv3_block5_2_conv (Conv2D)    (None, 46, 70, 32)   36864       conv3_block5_1_relu[0][0]
+__________________________________________________________________________________________________
+conv3_block5_concat (Concatenat (None, 46, 70, 288)  0           conv3_block4_concat[0][0]
+                                                                 conv3_block5_2_conv[0][0]
+__________________________________________________________________________________________________
+conv3_block6_0_bn (BatchNormali (None, 46, 70, 288)  1152        conv3_block5_concat[0][0]
+__________________________________________________________________________________________________
+conv3_block6_0_relu (Activation (None, 46, 70, 288)  0           conv3_block6_0_bn[0][0]
+__________________________________________________________________________________________________
+conv3_block6_1_conv (Conv2D)    (None, 46, 70, 128)  36864       conv3_block6_0_relu[0][0]
+__________________________________________________________________________________________________
+conv3_block6_1_bn (BatchNormali (None, 46, 70, 128)  512         conv3_block6_1_conv[0][0]
+__________________________________________________________________________________________________
+conv3_block6_1_relu (Activation (None, 46, 70, 128)  0           conv3_block6_1_bn[0][0]
+__________________________________________________________________________________________________
+conv3_block6_2_conv (Conv2D)    (None, 46, 70, 32)   36864       conv3_block6_1_relu[0][0]
+__________________________________________________________________________________________________
+conv3_block6_concat (Concatenat (None, 46, 70, 320)  0           conv3_block5_concat[0][0]
+                                                                 conv3_block6_2_conv[0][0]
+__________________________________________________________________________________________________
+conv3_block7_0_bn (BatchNormali (None, 46, 70, 320)  1280        conv3_block6_concat[0][0]
+__________________________________________________________________________________________________
+conv3_block7_0_relu (Activation (None, 46, 70, 320)  0           conv3_block7_0_bn[0][0]
+__________________________________________________________________________________________________
+conv3_block7_1_conv (Conv2D)    (None, 46, 70, 128)  40960       conv3_block7_0_relu[0][0]
+__________________________________________________________________________________________________
+conv3_block7_1_bn (BatchNormali (None, 46, 70, 128)  512         conv3_block7_1_conv[0][0]
+__________________________________________________________________________________________________
+conv3_block7_1_relu (Activation (None, 46, 70, 128)  0           conv3_block7_1_bn[0][0]
+__________________________________________________________________________________________________
+conv3_block7_2_conv (Conv2D)    (None, 46, 70, 32)   36864       conv3_block7_1_relu[0][0]
+__________________________________________________________________________________________________
+conv3_block7_concat (Concatenat (None, 46, 70, 352)  0           conv3_block6_concat[0][0]
+                                                                 conv3_block7_2_conv[0][0]
+__________________________________________________________________________________________________
+conv3_block8_0_bn (BatchNormali (None, 46, 70, 352)  1408        conv3_block7_concat[0][0]
+__________________________________________________________________________________________________
+conv3_block8_0_relu (Activation (None, 46, 70, 352)  0           conv3_block8_0_bn[0][0]
+__________________________________________________________________________________________________
+conv3_block8_1_conv (Conv2D)    (None, 46, 70, 128)  45056       conv3_block8_0_relu[0][0]
+__________________________________________________________________________________________________
+conv3_block8_1_bn (BatchNormali (None, 46, 70, 128)  512         conv3_block8_1_conv[0][0]
+__________________________________________________________________________________________________
+conv3_block8_1_relu (Activation (None, 46, 70, 128)  0           conv3_block8_1_bn[0][0]
+__________________________________________________________________________________________________
+conv3_block8_2_conv (Conv2D)    (None, 46, 70, 32)   36864       conv3_block8_1_relu[0][0]
+__________________________________________________________________________________________________
+conv3_block8_concat (Concatenat (None, 46, 70, 384)  0           conv3_block7_concat[0][0]
+                                                                 conv3_block8_2_conv[0][0]
+__________________________________________________________________________________________________
+conv3_block9_0_bn (BatchNormali (None, 46, 70, 384)  1536        conv3_block8_concat[0][0]
+__________________________________________________________________________________________________
+conv3_block9_0_relu (Activation (None, 46, 70, 384)  0           conv3_block9_0_bn[0][0]
+__________________________________________________________________________________________________
+conv3_block9_1_conv (Conv2D)    (None, 46, 70, 128)  49152       conv3_block9_0_relu[0][0]
+__________________________________________________________________________________________________
+conv3_block9_1_bn (BatchNormali (None, 46, 70, 128)  512         conv3_block9_1_conv[0][0]
+__________________________________________________________________________________________________
+conv3_block9_1_relu (Activation (None, 46, 70, 128)  0           conv3_block9_1_bn[0][0]
+__________________________________________________________________________________________________
+conv3_block9_2_conv (Conv2D)    (None, 46, 70, 32)   36864       conv3_block9_1_relu[0][0]
+__________________________________________________________________________________________________
+conv3_block9_concat (Concatenat (None, 46, 70, 416)  0           conv3_block8_concat[0][0]
+                                                                 conv3_block9_2_conv[0][0]
+__________________________________________________________________________________________________
+conv3_block10_0_bn (BatchNormal (None, 46, 70, 416)  1664        conv3_block9_concat[0][0]
+__________________________________________________________________________________________________
+conv3_block10_0_relu (Activatio (None, 46, 70, 416)  0           conv3_block10_0_bn[0][0]
+__________________________________________________________________________________________________
+conv3_block10_1_conv (Conv2D)   (None, 46, 70, 128)  53248       conv3_block10_0_relu[0][0]
+__________________________________________________________________________________________________
+conv3_block10_1_bn (BatchNormal (None, 46, 70, 128)  512         conv3_block10_1_conv[0][0]
+__________________________________________________________________________________________________
+conv3_block10_1_relu (Activatio (None, 46, 70, 128)  0           conv3_block10_1_bn[0][0]
+__________________________________________________________________________________________________
+conv3_block10_2_conv (Conv2D)   (None, 46, 70, 32)   36864       conv3_block10_1_relu[0][0]
+__________________________________________________________________________________________________
+conv3_block10_concat (Concatena (None, 46, 70, 448)  0           conv3_block9_concat[0][0]
+                                                                 conv3_block10_2_conv[0][0]
+__________________________________________________________________________________________________
+conv3_block11_0_bn (BatchNormal (None, 46, 70, 448)  1792        conv3_block10_concat[0][0]
+__________________________________________________________________________________________________
+conv3_block11_0_relu (Activatio (None, 46, 70, 448)  0           conv3_block11_0_bn[0][0]
+__________________________________________________________________________________________________
+conv3_block11_1_conv (Conv2D)   (None, 46, 70, 128)  57344       conv3_block11_0_relu[0][0]
+__________________________________________________________________________________________________
+conv3_block11_1_bn (BatchNormal (None, 46, 70, 128)  512         conv3_block11_1_conv[0][0]
+__________________________________________________________________________________________________
+conv3_block11_1_relu (Activatio (None, 46, 70, 128)  0           conv3_block11_1_bn[0][0]
+__________________________________________________________________________________________________
+conv3_block11_2_conv (Conv2D)   (None, 46, 70, 32)   36864       conv3_block11_1_relu[0][0]
+__________________________________________________________________________________________________
+conv3_block11_concat (Concatena (None, 46, 70, 480)  0           conv3_block10_concat[0][0]
+                                                                 conv3_block11_2_conv[0][0]
+__________________________________________________________________________________________________
+conv3_block12_0_bn (BatchNormal (None, 46, 70, 480)  1920        conv3_block11_concat[0][0]
+__________________________________________________________________________________________________
+conv3_block12_0_relu (Activatio (None, 46, 70, 480)  0           conv3_block12_0_bn[0][0]
+__________________________________________________________________________________________________
+conv3_block12_1_conv (Conv2D)   (None, 46, 70, 128)  61440       conv3_block12_0_relu[0][0]
+__________________________________________________________________________________________________
+conv3_block12_1_bn (BatchNormal (None, 46, 70, 128)  512         conv3_block12_1_conv[0][0]
+__________________________________________________________________________________________________
+conv3_block12_1_relu (Activatio (None, 46, 70, 128)  0           conv3_block12_1_bn[0][0]
+__________________________________________________________________________________________________
+conv3_block12_2_conv (Conv2D)   (None, 46, 70, 32)   36864       conv3_block12_1_relu[0][0]
+__________________________________________________________________________________________________
+conv3_block12_concat (Concatena (None, 46, 70, 512)  0           conv3_block11_concat[0][0]
+                                                                 conv3_block12_2_conv[0][0]
+__________________________________________________________________________________________________
+pool3_bn (BatchNormalization)   (None, 46, 70, 512)  2048        conv3_block12_concat[0][0]
+__________________________________________________________________________________________________
+pool3_relu (Activation)         (None, 46, 70, 512)  0           pool3_bn[0][0]
+__________________________________________________________________________________________________
+pool3_conv (Conv2D)             (None, 46, 70, 256)  131072      pool3_relu[0][0]
+__________________________________________________________________________________________________
+pool3_pool (AveragePooling2D)   (None, 23, 35, 256)  0           pool3_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block1_0_bn (BatchNormali (None, 23, 35, 256)  1024        pool3_pool[0][0]
+__________________________________________________________________________________________________
+conv4_block1_0_relu (Activation (None, 23, 35, 256)  0           conv4_block1_0_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block1_1_conv (Conv2D)    (None, 23, 35, 128)  32768       conv4_block1_0_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block1_1_bn (BatchNormali (None, 23, 35, 128)  512         conv4_block1_1_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block1_1_relu (Activation (None, 23, 35, 128)  0           conv4_block1_1_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block1_2_conv (Conv2D)    (None, 23, 35, 32)   36864       conv4_block1_1_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block1_concat (Concatenat (None, 23, 35, 288)  0           pool3_pool[0][0]
+                                                                 conv4_block1_2_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block2_0_bn (BatchNormali (None, 23, 35, 288)  1152        conv4_block1_concat[0][0]
+__________________________________________________________________________________________________
+conv4_block2_0_relu (Activation (None, 23, 35, 288)  0           conv4_block2_0_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block2_1_conv (Conv2D)    (None, 23, 35, 128)  36864       conv4_block2_0_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block2_1_bn (BatchNormali (None, 23, 35, 128)  512         conv4_block2_1_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block2_1_relu (Activation (None, 23, 35, 128)  0           conv4_block2_1_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block2_2_conv (Conv2D)    (None, 23, 35, 32)   36864       conv4_block2_1_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block2_concat (Concatenat (None, 23, 35, 320)  0           conv4_block1_concat[0][0]
+                                                                 conv4_block2_2_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block3_0_bn (BatchNormali (None, 23, 35, 320)  1280        conv4_block2_concat[0][0]
+__________________________________________________________________________________________________
+conv4_block3_0_relu (Activation (None, 23, 35, 320)  0           conv4_block3_0_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block3_1_conv (Conv2D)    (None, 23, 35, 128)  40960       conv4_block3_0_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block3_1_bn (BatchNormali (None, 23, 35, 128)  512         conv4_block3_1_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block3_1_relu (Activation (None, 23, 35, 128)  0           conv4_block3_1_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block3_2_conv (Conv2D)    (None, 23, 35, 32)   36864       conv4_block3_1_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block3_concat (Concatenat (None, 23, 35, 352)  0           conv4_block2_concat[0][0]
+                                                                 conv4_block3_2_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block4_0_bn (BatchNormali (None, 23, 35, 352)  1408        conv4_block3_concat[0][0]
+__________________________________________________________________________________________________
+conv4_block4_0_relu (Activation (None, 23, 35, 352)  0           conv4_block4_0_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block4_1_conv (Conv2D)    (None, 23, 35, 128)  45056       conv4_block4_0_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block4_1_bn (BatchNormali (None, 23, 35, 128)  512         conv4_block4_1_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block4_1_relu (Activation (None, 23, 35, 128)  0           conv4_block4_1_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block4_2_conv (Conv2D)    (None, 23, 35, 32)   36864       conv4_block4_1_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block4_concat (Concatenat (None, 23, 35, 384)  0           conv4_block3_concat[0][0]
+                                                                 conv4_block4_2_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block5_0_bn (BatchNormali (None, 23, 35, 384)  1536        conv4_block4_concat[0][0]
+__________________________________________________________________________________________________
+conv4_block5_0_relu (Activation (None, 23, 35, 384)  0           conv4_block5_0_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block5_1_conv (Conv2D)    (None, 23, 35, 128)  49152       conv4_block5_0_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block5_1_bn (BatchNormali (None, 23, 35, 128)  512         conv4_block5_1_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block5_1_relu (Activation (None, 23, 35, 128)  0           conv4_block5_1_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block5_2_conv (Conv2D)    (None, 23, 35, 32)   36864       conv4_block5_1_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block5_concat (Concatenat (None, 23, 35, 416)  0           conv4_block4_concat[0][0]
+                                                                 conv4_block5_2_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block6_0_bn (BatchNormali (None, 23, 35, 416)  1664        conv4_block5_concat[0][0]
+__________________________________________________________________________________________________
+conv4_block6_0_relu (Activation (None, 23, 35, 416)  0           conv4_block6_0_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block6_1_conv (Conv2D)    (None, 23, 35, 128)  53248       conv4_block6_0_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block6_1_bn (BatchNormali (None, 23, 35, 128)  512         conv4_block6_1_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block6_1_relu (Activation (None, 23, 35, 128)  0           conv4_block6_1_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block6_2_conv (Conv2D)    (None, 23, 35, 32)   36864       conv4_block6_1_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block6_concat (Concatenat (None, 23, 35, 448)  0           conv4_block5_concat[0][0]
+                                                                 conv4_block6_2_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block7_0_bn (BatchNormali (None, 23, 35, 448)  1792        conv4_block6_concat[0][0]
+__________________________________________________________________________________________________
+conv4_block7_0_relu (Activation (None, 23, 35, 448)  0           conv4_block7_0_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block7_1_conv (Conv2D)    (None, 23, 35, 128)  57344       conv4_block7_0_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block7_1_bn (BatchNormali (None, 23, 35, 128)  512         conv4_block7_1_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block7_1_relu (Activation (None, 23, 35, 128)  0           conv4_block7_1_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block7_2_conv (Conv2D)    (None, 23, 35, 32)   36864       conv4_block7_1_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block7_concat (Concatenat (None, 23, 35, 480)  0           conv4_block6_concat[0][0]
+                                                                 conv4_block7_2_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block8_0_bn (BatchNormali (None, 23, 35, 480)  1920        conv4_block7_concat[0][0]
+__________________________________________________________________________________________________
+conv4_block8_0_relu (Activation (None, 23, 35, 480)  0           conv4_block8_0_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block8_1_conv (Conv2D)    (None, 23, 35, 128)  61440       conv4_block8_0_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block8_1_bn (BatchNormali (None, 23, 35, 128)  512         conv4_block8_1_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block8_1_relu (Activation (None, 23, 35, 128)  0           conv4_block8_1_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block8_2_conv (Conv2D)    (None, 23, 35, 32)   36864       conv4_block8_1_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block8_concat (Concatenat (None, 23, 35, 512)  0           conv4_block7_concat[0][0]
+                                                                 conv4_block8_2_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block9_0_bn (BatchNormali (None, 23, 35, 512)  2048        conv4_block8_concat[0][0]
+__________________________________________________________________________________________________
+conv4_block9_0_relu (Activation (None, 23, 35, 512)  0           conv4_block9_0_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block9_1_conv (Conv2D)    (None, 23, 35, 128)  65536       conv4_block9_0_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block9_1_bn (BatchNormali (None, 23, 35, 128)  512         conv4_block9_1_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block9_1_relu (Activation (None, 23, 35, 128)  0           conv4_block9_1_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block9_2_conv (Conv2D)    (None, 23, 35, 32)   36864       conv4_block9_1_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block9_concat (Concatenat (None, 23, 35, 544)  0           conv4_block8_concat[0][0]
+                                                                 conv4_block9_2_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block10_0_bn (BatchNormal (None, 23, 35, 544)  2176        conv4_block9_concat[0][0]
+__________________________________________________________________________________________________
+conv4_block10_0_relu (Activatio (None, 23, 35, 544)  0           conv4_block10_0_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block10_1_conv (Conv2D)   (None, 23, 35, 128)  69632       conv4_block10_0_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block10_1_bn (BatchNormal (None, 23, 35, 128)  512         conv4_block10_1_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block10_1_relu (Activatio (None, 23, 35, 128)  0           conv4_block10_1_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block10_2_conv (Conv2D)   (None, 23, 35, 32)   36864       conv4_block10_1_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block10_concat (Concatena (None, 23, 35, 576)  0           conv4_block9_concat[0][0]
+                                                                 conv4_block10_2_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block11_0_bn (BatchNormal (None, 23, 35, 576)  2304        conv4_block10_concat[0][0]
+__________________________________________________________________________________________________
+conv4_block11_0_relu (Activatio (None, 23, 35, 576)  0           conv4_block11_0_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block11_1_conv (Conv2D)   (None, 23, 35, 128)  73728       conv4_block11_0_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block11_1_bn (BatchNormal (None, 23, 35, 128)  512         conv4_block11_1_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block11_1_relu (Activatio (None, 23, 35, 128)  0           conv4_block11_1_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block11_2_conv (Conv2D)   (None, 23, 35, 32)   36864       conv4_block11_1_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block11_concat (Concatena (None, 23, 35, 608)  0           conv4_block10_concat[0][0]
+                                                                 conv4_block11_2_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block12_0_bn (BatchNormal (None, 23, 35, 608)  2432        conv4_block11_concat[0][0]
+__________________________________________________________________________________________________
+conv4_block12_0_relu (Activatio (None, 23, 35, 608)  0           conv4_block12_0_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block12_1_conv (Conv2D)   (None, 23, 35, 128)  77824       conv4_block12_0_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block12_1_bn (BatchNormal (None, 23, 35, 128)  512         conv4_block12_1_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block12_1_relu (Activatio (None, 23, 35, 128)  0           conv4_block12_1_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block12_2_conv (Conv2D)   (None, 23, 35, 32)   36864       conv4_block12_1_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block12_concat (Concatena (None, 23, 35, 640)  0           conv4_block11_concat[0][0]
+                                                                 conv4_block12_2_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block13_0_bn (BatchNormal (None, 23, 35, 640)  2560        conv4_block12_concat[0][0]
+__________________________________________________________________________________________________
+conv4_block13_0_relu (Activatio (None, 23, 35, 640)  0           conv4_block13_0_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block13_1_conv (Conv2D)   (None, 23, 35, 128)  81920       conv4_block13_0_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block13_1_bn (BatchNormal (None, 23, 35, 128)  512         conv4_block13_1_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block13_1_relu (Activatio (None, 23, 35, 128)  0           conv4_block13_1_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block13_2_conv (Conv2D)   (None, 23, 35, 32)   36864       conv4_block13_1_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block13_concat (Concatena (None, 23, 35, 672)  0           conv4_block12_concat[0][0]
+                                                                 conv4_block13_2_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block14_0_bn (BatchNormal (None, 23, 35, 672)  2688        conv4_block13_concat[0][0]
+__________________________________________________________________________________________________
+conv4_block14_0_relu (Activatio (None, 23, 35, 672)  0           conv4_block14_0_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block14_1_conv (Conv2D)   (None, 23, 35, 128)  86016       conv4_block14_0_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block14_1_bn (BatchNormal (None, 23, 35, 128)  512         conv4_block14_1_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block14_1_relu (Activatio (None, 23, 35, 128)  0           conv4_block14_1_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block14_2_conv (Conv2D)   (None, 23, 35, 32)   36864       conv4_block14_1_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block14_concat (Concatena (None, 23, 35, 704)  0           conv4_block13_concat[0][0]
+                                                                 conv4_block14_2_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block15_0_bn (BatchNormal (None, 23, 35, 704)  2816        conv4_block14_concat[0][0]
+__________________________________________________________________________________________________
+conv4_block15_0_relu (Activatio (None, 23, 35, 704)  0           conv4_block15_0_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block15_1_conv (Conv2D)   (None, 23, 35, 128)  90112       conv4_block15_0_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block15_1_bn (BatchNormal (None, 23, 35, 128)  512         conv4_block15_1_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block15_1_relu (Activatio (None, 23, 35, 128)  0           conv4_block15_1_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block15_2_conv (Conv2D)   (None, 23, 35, 32)   36864       conv4_block15_1_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block15_concat (Concatena (None, 23, 35, 736)  0           conv4_block14_concat[0][0]
+                                                                 conv4_block15_2_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block16_0_bn (BatchNormal (None, 23, 35, 736)  2944        conv4_block15_concat[0][0]
+__________________________________________________________________________________________________
+conv4_block16_0_relu (Activatio (None, 23, 35, 736)  0           conv4_block16_0_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block16_1_conv (Conv2D)   (None, 23, 35, 128)  94208       conv4_block16_0_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block16_1_bn (BatchNormal (None, 23, 35, 128)  512         conv4_block16_1_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block16_1_relu (Activatio (None, 23, 35, 128)  0           conv4_block16_1_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block16_2_conv (Conv2D)   (None, 23, 35, 32)   36864       conv4_block16_1_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block16_concat (Concatena (None, 23, 35, 768)  0           conv4_block15_concat[0][0]
+                                                                 conv4_block16_2_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block17_0_bn (BatchNormal (None, 23, 35, 768)  3072        conv4_block16_concat[0][0]
+__________________________________________________________________________________________________
+conv4_block17_0_relu (Activatio (None, 23, 35, 768)  0           conv4_block17_0_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block17_1_conv (Conv2D)   (None, 23, 35, 128)  98304       conv4_block17_0_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block17_1_bn (BatchNormal (None, 23, 35, 128)  512         conv4_block17_1_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block17_1_relu (Activatio (None, 23, 35, 128)  0           conv4_block17_1_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block17_2_conv (Conv2D)   (None, 23, 35, 32)   36864       conv4_block17_1_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block17_concat (Concatena (None, 23, 35, 800)  0           conv4_block16_concat[0][0]
+                                                                 conv4_block17_2_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block18_0_bn (BatchNormal (None, 23, 35, 800)  3200        conv4_block17_concat[0][0]
+__________________________________________________________________________________________________
+conv4_block18_0_relu (Activatio (None, 23, 35, 800)  0           conv4_block18_0_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block18_1_conv (Conv2D)   (None, 23, 35, 128)  102400      conv4_block18_0_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block18_1_bn (BatchNormal (None, 23, 35, 128)  512         conv4_block18_1_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block18_1_relu (Activatio (None, 23, 35, 128)  0           conv4_block18_1_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block18_2_conv (Conv2D)   (None, 23, 35, 32)   36864       conv4_block18_1_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block18_concat (Concatena (None, 23, 35, 832)  0           conv4_block17_concat[0][0]
+                                                                 conv4_block18_2_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block19_0_bn (BatchNormal (None, 23, 35, 832)  3328        conv4_block18_concat[0][0]
+__________________________________________________________________________________________________
+conv4_block19_0_relu (Activatio (None, 23, 35, 832)  0           conv4_block19_0_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block19_1_conv (Conv2D)   (None, 23, 35, 128)  106496      conv4_block19_0_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block19_1_bn (BatchNormal (None, 23, 35, 128)  512         conv4_block19_1_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block19_1_relu (Activatio (None, 23, 35, 128)  0           conv4_block19_1_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block19_2_conv (Conv2D)   (None, 23, 35, 32)   36864       conv4_block19_1_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block19_concat (Concatena (None, 23, 35, 864)  0           conv4_block18_concat[0][0]
+                                                                 conv4_block19_2_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block20_0_bn (BatchNormal (None, 23, 35, 864)  3456        conv4_block19_concat[0][0]
+__________________________________________________________________________________________________
+conv4_block20_0_relu (Activatio (None, 23, 35, 864)  0           conv4_block20_0_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block20_1_conv (Conv2D)   (None, 23, 35, 128)  110592      conv4_block20_0_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block20_1_bn (BatchNormal (None, 23, 35, 128)  512         conv4_block20_1_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block20_1_relu (Activatio (None, 23, 35, 128)  0           conv4_block20_1_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block20_2_conv (Conv2D)   (None, 23, 35, 32)   36864       conv4_block20_1_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block20_concat (Concatena (None, 23, 35, 896)  0           conv4_block19_concat[0][0]
+                                                                 conv4_block20_2_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block21_0_bn (BatchNormal (None, 23, 35, 896)  3584        conv4_block20_concat[0][0]
+__________________________________________________________________________________________________
+conv4_block21_0_relu (Activatio (None, 23, 35, 896)  0           conv4_block21_0_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block21_1_conv (Conv2D)   (None, 23, 35, 128)  114688      conv4_block21_0_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block21_1_bn (BatchNormal (None, 23, 35, 128)  512         conv4_block21_1_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block21_1_relu (Activatio (None, 23, 35, 128)  0           conv4_block21_1_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block21_2_conv (Conv2D)   (None, 23, 35, 32)   36864       conv4_block21_1_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block21_concat (Concatena (None, 23, 35, 928)  0           conv4_block20_concat[0][0]
+                                                                 conv4_block21_2_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block22_0_bn (BatchNormal (None, 23, 35, 928)  3712        conv4_block21_concat[0][0]
+__________________________________________________________________________________________________
+conv4_block22_0_relu (Activatio (None, 23, 35, 928)  0           conv4_block22_0_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block22_1_conv (Conv2D)   (None, 23, 35, 128)  118784      conv4_block22_0_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block22_1_bn (BatchNormal (None, 23, 35, 128)  512         conv4_block22_1_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block22_1_relu (Activatio (None, 23, 35, 128)  0           conv4_block22_1_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block22_2_conv (Conv2D)   (None, 23, 35, 32)   36864       conv4_block22_1_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block22_concat (Concatena (None, 23, 35, 960)  0           conv4_block21_concat[0][0]
+                                                                 conv4_block22_2_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block23_0_bn (BatchNormal (None, 23, 35, 960)  3840        conv4_block22_concat[0][0]
+__________________________________________________________________________________________________
+conv4_block23_0_relu (Activatio (None, 23, 35, 960)  0           conv4_block23_0_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block23_1_conv (Conv2D)   (None, 23, 35, 128)  122880      conv4_block23_0_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block23_1_bn (BatchNormal (None, 23, 35, 128)  512         conv4_block23_1_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block23_1_relu (Activatio (None, 23, 35, 128)  0           conv4_block23_1_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block23_2_conv (Conv2D)   (None, 23, 35, 32)   36864       conv4_block23_1_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block23_concat (Concatena (None, 23, 35, 992)  0           conv4_block22_concat[0][0]
+                                                                 conv4_block23_2_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block24_0_bn (BatchNormal (None, 23, 35, 992)  3968        conv4_block23_concat[0][0]
+__________________________________________________________________________________________________
+conv4_block24_0_relu (Activatio (None, 23, 35, 992)  0           conv4_block24_0_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block24_1_conv (Conv2D)   (None, 23, 35, 128)  126976      conv4_block24_0_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block24_1_bn (BatchNormal (None, 23, 35, 128)  512         conv4_block24_1_conv[0][0]
+__________________________________________________________________________________________________
+conv4_block24_1_relu (Activatio (None, 23, 35, 128)  0           conv4_block24_1_bn[0][0]
+__________________________________________________________________________________________________
+conv4_block24_2_conv (Conv2D)   (None, 23, 35, 32)   36864       conv4_block24_1_relu[0][0]
+__________________________________________________________________________________________________
+conv4_block24_concat (Concatena (None, 23, 35, 1024) 0           conv4_block23_concat[0][0]
+                                                                 conv4_block24_2_conv[0][0]
+__________________________________________________________________________________________________
+pool4_bn (BatchNormalization)   (None, 23, 35, 1024) 4096        conv4_block24_concat[0][0]
+__________________________________________________________________________________________________
+pool4_relu (Activation)         (None, 23, 35, 1024) 0           pool4_bn[0][0]
+__________________________________________________________________________________________________
+pool4_conv (Conv2D)             (None, 23, 35, 512)  524288      pool4_relu[0][0]
+__________________________________________________________________________________________________
+pool4_pool (AveragePooling2D)   (None, 11, 17, 512)  0           pool4_conv[0][0]
+__________________________________________________________________________________________________
+conv5_block1_0_bn (BatchNormali (None, 11, 17, 512)  2048        pool4_pool[0][0]
+__________________________________________________________________________________________________
+conv5_block1_0_relu (Activation (None, 11, 17, 512)  0           conv5_block1_0_bn[0][0]
+__________________________________________________________________________________________________
+conv5_block1_1_conv (Conv2D)    (None, 11, 17, 128)  65536       conv5_block1_0_relu[0][0]
+__________________________________________________________________________________________________
+conv5_block1_1_bn (BatchNormali (None, 11, 17, 128)  512         conv5_block1_1_conv[0][0]
+__________________________________________________________________________________________________
+conv5_block1_1_relu (Activation (None, 11, 17, 128)  0           conv5_block1_1_bn[0][0]
+__________________________________________________________________________________________________
+conv5_block1_2_conv (Conv2D)    (None, 11, 17, 32)   36864       conv5_block1_1_relu[0][0]
+__________________________________________________________________________________________________
+conv5_block1_concat (Concatenat (None, 11, 17, 544)  0           pool4_pool[0][0]
+                                                                 conv5_block1_2_conv[0][0]
+__________________________________________________________________________________________________
+conv5_block2_0_bn (BatchNormali (None, 11, 17, 544)  2176        conv5_block1_concat[0][0]
+__________________________________________________________________________________________________
+conv5_block2_0_relu (Activation (None, 11, 17, 544)  0           conv5_block2_0_bn[0][0]
+__________________________________________________________________________________________________
+conv5_block2_1_conv (Conv2D)    (None, 11, 17, 128)  69632       conv5_block2_0_relu[0][0]
+__________________________________________________________________________________________________
+conv5_block2_1_bn (BatchNormali (None, 11, 17, 128)  512         conv5_block2_1_conv[0][0]
+__________________________________________________________________________________________________
+conv5_block2_1_relu (Activation (None, 11, 17, 128)  0           conv5_block2_1_bn[0][0]
+__________________________________________________________________________________________________
+conv5_block2_2_conv (Conv2D)    (None, 11, 17, 32)   36864       conv5_block2_1_relu[0][0]
+__________________________________________________________________________________________________
+conv5_block2_concat (Concatenat (None, 11, 17, 576)  0           conv5_block1_concat[0][0]
+                                                                 conv5_block2_2_conv[0][0]
+__________________________________________________________________________________________________
+conv5_block3_0_bn (BatchNormali (None, 11, 17, 576)  2304        conv5_block2_concat[0][0]
+__________________________________________________________________________________________________
+conv5_block3_0_relu (Activation (None, 11, 17, 576)  0           conv5_block3_0_bn[0][0]
+__________________________________________________________________________________________________
+conv5_block3_1_conv (Conv2D)    (None, 11, 17, 128)  73728       conv5_block3_0_relu[0][0]
+__________________________________________________________________________________________________
+conv5_block3_1_bn (BatchNormali (None, 11, 17, 128)  512         conv5_block3_1_conv[0][0]
+__________________________________________________________________________________________________
+conv5_block3_1_relu (Activation (None, 11, 17, 128)  0           conv5_block3_1_bn[0][0]
+__________________________________________________________________________________________________
+conv5_block3_2_conv (Conv2D)    (None, 11, 17, 32)   36864       conv5_block3_1_relu[0][0]
+__________________________________________________________________________________________________
+conv5_block3_concat (Concatenat (None, 11, 17, 608)  0           conv5_block2_concat[0][0]
+                                                                 conv5_block3_2_conv[0][0]
+__________________________________________________________________________________________________
+conv5_block4_0_bn (BatchNormali (None, 11, 17, 608)  2432        conv5_block3_concat[0][0]
+__________________________________________________________________________________________________
+conv5_block4_0_relu (Activation (None, 11, 17, 608)  0           conv5_block4_0_bn[0][0]
+__________________________________________________________________________________________________
+conv5_block4_1_conv (Conv2D)    (None, 11, 17, 128)  77824       conv5_block4_0_relu[0][0]
+__________________________________________________________________________________________________
+conv5_block4_1_bn (BatchNormali (None, 11, 17, 128)  512         conv5_block4_1_conv[0][0]
+__________________________________________________________________________________________________
+conv5_block4_1_relu (Activation (None, 11, 17, 128)  0           conv5_block4_1_bn[0][0]
+__________________________________________________________________________________________________
+conv5_block4_2_conv (Conv2D)    (None, 11, 17, 32)   36864       conv5_block4_1_relu[0][0]
+__________________________________________________________________________________________________
+conv5_block4_concat (Concatenat (None, 11, 17, 640)  0           conv5_block3_concat[0][0]
+                                                                 conv5_block4_2_conv[0][0]
+__________________________________________________________________________________________________
+conv5_block5_0_bn (BatchNormali (None, 11, 17, 640)  2560        conv5_block4_concat[0][0]
+__________________________________________________________________________________________________
+conv5_block5_0_relu (Activation (None, 11, 17, 640)  0           conv5_block5_0_bn[0][0]
+__________________________________________________________________________________________________
+conv5_block5_1_conv (Conv2D)    (None, 11, 17, 128)  81920       conv5_block5_0_relu[0][0]
+__________________________________________________________________________________________________
+conv5_block5_1_bn (BatchNormali (None, 11, 17, 128)  512         conv5_block5_1_conv[0][0]
+__________________________________________________________________________________________________
+conv5_block5_1_relu (Activation (None, 11, 17, 128)  0           conv5_block5_1_bn[0][0]
+__________________________________________________________________________________________________
+conv5_block5_2_conv (Conv2D)    (None, 11, 17, 32)   36864       conv5_block5_1_relu[0][0]
+__________________________________________________________________________________________________
+conv5_block5_concat (Concatenat (None, 11, 17, 672)  0           conv5_block4_concat[0][0]
+                                                                 conv5_block5_2_conv[0][0]
+__________________________________________________________________________________________________
+conv5_block6_0_bn (BatchNormali (None, 11, 17, 672)  2688        conv5_block5_concat[0][0]
+__________________________________________________________________________________________________
+conv5_block6_0_relu (Activation (None, 11, 17, 672)  0           conv5_block6_0_bn[0][0]
+__________________________________________________________________________________________________
+conv5_block6_1_conv (Conv2D)    (None, 11, 17, 128)  86016       conv5_block6_0_relu[0][0]
+__________________________________________________________________________________________________
+conv5_block6_1_bn (BatchNormali (None, 11, 17, 128)  512         conv5_block6_1_conv[0][0]
+__________________________________________________________________________________________________
+conv5_block6_1_relu (Activation (None, 11, 17, 128)  0           conv5_block6_1_bn[0][0]
+__________________________________________________________________________________________________
+conv5_block6_2_conv (Conv2D)    (None, 11, 17, 32)   36864       conv5_block6_1_relu[0][0]
+__________________________________________________________________________________________________
+conv5_block6_concat (Concatenat (None, 11, 17, 704)  0           conv5_block5_concat[0][0]
+                                                                 conv5_block6_2_conv[0][0]
+__________________________________________________________________________________________________
+conv5_block7_0_bn (BatchNormali (None, 11, 17, 704)  2816        conv5_block6_concat[0][0]
+__________________________________________________________________________________________________
+conv5_block7_0_relu (Activation (None, 11, 17, 704)  0           conv5_block7_0_bn[0][0]
+__________________________________________________________________________________________________
+conv5_block7_1_conv (Conv2D)    (None, 11, 17, 128)  90112       conv5_block7_0_relu[0][0]
+__________________________________________________________________________________________________
+conv5_block7_1_bn (BatchNormali (None, 11, 17, 128)  512         conv5_block7_1_conv[0][0]
+__________________________________________________________________________________________________
+conv5_block7_1_relu (Activation (None, 11, 17, 128)  0           conv5_block7_1_bn[0][0]
+__________________________________________________________________________________________________
+conv5_block7_2_conv (Conv2D)    (None, 11, 17, 32)   36864       conv5_block7_1_relu[0][0]
+__________________________________________________________________________________________________
+conv5_block7_concat (Concatenat (None, 11, 17, 736)  0           conv5_block6_concat[0][0]
+                                                                 conv5_block7_2_conv[0][0]
+__________________________________________________________________________________________________
+conv5_block8_0_bn (BatchNormali (None, 11, 17, 736)  2944        conv5_block7_concat[0][0]
+__________________________________________________________________________________________________
+conv5_block8_0_relu (Activation (None, 11, 17, 736)  0           conv5_block8_0_bn[0][0]
+__________________________________________________________________________________________________
+conv5_block8_1_conv (Conv2D)    (None, 11, 17, 128)  94208       conv5_block8_0_relu[0][0]
+__________________________________________________________________________________________________
+conv5_block8_1_bn (BatchNormali (None, 11, 17, 128)  512         conv5_block8_1_conv[0][0]
+__________________________________________________________________________________________________
+conv5_block8_1_relu (Activation (None, 11, 17, 128)  0           conv5_block8_1_bn[0][0]
+__________________________________________________________________________________________________
+conv5_block8_2_conv (Conv2D)    (None, 11, 17, 32)   36864       conv5_block8_1_relu[0][0]
+__________________________________________________________________________________________________
+conv5_block8_concat (Concatenat (None, 11, 17, 768)  0           conv5_block7_concat[0][0]
+                                                                 conv5_block8_2_conv[0][0]
+__________________________________________________________________________________________________
+conv5_block9_0_bn (BatchNormali (None, 11, 17, 768)  3072        conv5_block8_concat[0][0]
+__________________________________________________________________________________________________
+conv5_block9_0_relu (Activation (None, 11, 17, 768)  0           conv5_block9_0_bn[0][0]
+__________________________________________________________________________________________________
+conv5_block9_1_conv (Conv2D)    (None, 11, 17, 128)  98304       conv5_block9_0_relu[0][0]
+__________________________________________________________________________________________________
+conv5_block9_1_bn (BatchNormali (None, 11, 17, 128)  512         conv5_block9_1_conv[0][0]
+__________________________________________________________________________________________________
+conv5_block9_1_relu (Activation (None, 11, 17, 128)  0           conv5_block9_1_bn[0][0]
+__________________________________________________________________________________________________
+conv5_block9_2_conv (Conv2D)    (None, 11, 17, 32)   36864       conv5_block9_1_relu[0][0]
+__________________________________________________________________________________________________
+conv5_block9_concat (Concatenat (None, 11, 17, 800)  0           conv5_block8_concat[0][0]
+                                                                 conv5_block9_2_conv[0][0]
+__________________________________________________________________________________________________
+conv5_block10_0_bn (BatchNormal (None, 11, 17, 800)  3200        conv5_block9_concat[0][0]
+__________________________________________________________________________________________________
+conv5_block10_0_relu (Activatio (None, 11, 17, 800)  0           conv5_block10_0_bn[0][0]
+__________________________________________________________________________________________________
+conv5_block10_1_conv (Conv2D)   (None, 11, 17, 128)  102400      conv5_block10_0_relu[0][0]
+__________________________________________________________________________________________________
+conv5_block10_1_bn (BatchNormal (None, 11, 17, 128)  512         conv5_block10_1_conv[0][0]
+__________________________________________________________________________________________________
+conv5_block10_1_relu (Activatio (None, 11, 17, 128)  0           conv5_block10_1_bn[0][0]
+__________________________________________________________________________________________________
+conv5_block10_2_conv (Conv2D)   (None, 11, 17, 32)   36864       conv5_block10_1_relu[0][0]
+__________________________________________________________________________________________________
+conv5_block10_concat (Concatena (None, 11, 17, 832)  0           conv5_block9_concat[0][0]
+                                                                 conv5_block10_2_conv[0][0]
+__________________________________________________________________________________________________
+conv5_block11_0_bn (BatchNormal (None, 11, 17, 832)  3328        conv5_block10_concat[0][0]
+__________________________________________________________________________________________________
+conv5_block11_0_relu (Activatio (None, 11, 17, 832)  0           conv5_block11_0_bn[0][0]
+__________________________________________________________________________________________________
+conv5_block11_1_conv (Conv2D)   (None, 11, 17, 128)  106496      conv5_block11_0_relu[0][0]
+__________________________________________________________________________________________________
+conv5_block11_1_bn (BatchNormal (None, 11, 17, 128)  512         conv5_block11_1_conv[0][0]
+__________________________________________________________________________________________________
+conv5_block11_1_relu (Activatio (None, 11, 17, 128)  0           conv5_block11_1_bn[0][0]
+__________________________________________________________________________________________________
+conv5_block11_2_conv (Conv2D)   (None, 11, 17, 32)   36864       conv5_block11_1_relu[0][0]
+__________________________________________________________________________________________________
+conv5_block11_concat (Concatena (None, 11, 17, 864)  0           conv5_block10_concat[0][0]
+                                                                 conv5_block11_2_conv[0][0]
+__________________________________________________________________________________________________
+conv5_block12_0_bn (BatchNormal (None, 11, 17, 864)  3456        conv5_block11_concat[0][0]
+__________________________________________________________________________________________________
+conv5_block12_0_relu (Activatio (None, 11, 17, 864)  0           conv5_block12_0_bn[0][0]
+__________________________________________________________________________________________________
+conv5_block12_1_conv (Conv2D)   (None, 11, 17, 128)  110592      conv5_block12_0_relu[0][0]
+__________________________________________________________________________________________________
+conv5_block12_1_bn (BatchNormal (None, 11, 17, 128)  512         conv5_block12_1_conv[0][0]
+__________________________________________________________________________________________________
+conv5_block12_1_relu (Activatio (None, 11, 17, 128)  0           conv5_block12_1_bn[0][0]
+__________________________________________________________________________________________________
+conv5_block12_2_conv (Conv2D)   (None, 11, 17, 32)   36864       conv5_block12_1_relu[0][0]
+__________________________________________________________________________________________________
+conv5_block12_concat (Concatena (None, 11, 17, 896)  0           conv5_block11_concat[0][0]
+                                                                 conv5_block12_2_conv[0][0]
+__________________________________________________________________________________________________
+conv5_block13_0_bn (BatchNormal (None, 11, 17, 896)  3584        conv5_block12_concat[0][0]
+__________________________________________________________________________________________________
+conv5_block13_0_relu (Activatio (None, 11, 17, 896)  0           conv5_block13_0_bn[0][0]
+__________________________________________________________________________________________________
+conv5_block13_1_conv (Conv2D)   (None, 11, 17, 128)  114688      conv5_block13_0_relu[0][0]
+__________________________________________________________________________________________________
+conv5_block13_1_bn (BatchNormal (None, 11, 17, 128)  512         conv5_block13_1_conv[0][0]
+__________________________________________________________________________________________________
+conv5_block13_1_relu (Activatio (None, 11, 17, 128)  0           conv5_block13_1_bn[0][0]
+__________________________________________________________________________________________________
+conv5_block13_2_conv (Conv2D)   (None, 11, 17, 32)   36864       conv5_block13_1_relu[0][0]
+__________________________________________________________________________________________________
+conv5_block13_concat (Concatena (None, 11, 17, 928)  0           conv5_block12_concat[0][0]
+                                                                 conv5_block13_2_conv[0][0]
+__________________________________________________________________________________________________
+conv5_block14_0_bn (BatchNormal (None, 11, 17, 928)  3712        conv5_block13_concat[0][0]
+__________________________________________________________________________________________________
+conv5_block14_0_relu (Activatio (None, 11, 17, 928)  0           conv5_block14_0_bn[0][0]
+__________________________________________________________________________________________________
+conv5_block14_1_conv (Conv2D)   (None, 11, 17, 128)  118784      conv5_block14_0_relu[0][0]
+__________________________________________________________________________________________________
+conv5_block14_1_bn (BatchNormal (None, 11, 17, 128)  512         conv5_block14_1_conv[0][0]
+__________________________________________________________________________________________________
+conv5_block14_1_relu (Activatio (None, 11, 17, 128)  0           conv5_block14_1_bn[0][0]
+__________________________________________________________________________________________________
+conv5_block14_2_conv (Conv2D)   (None, 11, 17, 32)   36864       conv5_block14_1_relu[0][0]
+__________________________________________________________________________________________________
+conv5_block14_concat (Concatena (None, 11, 17, 960)  0           conv5_block13_concat[0][0]
+                                                                 conv5_block14_2_conv[0][0]
+__________________________________________________________________________________________________
+conv5_block15_0_bn (BatchNormal (None, 11, 17, 960)  3840        conv5_block14_concat[0][0]
+__________________________________________________________________________________________________
+conv5_block15_0_relu (Activatio (None, 11, 17, 960)  0           conv5_block15_0_bn[0][0]
+__________________________________________________________________________________________________
+conv5_block15_1_conv (Conv2D)   (None, 11, 17, 128)  122880      conv5_block15_0_relu[0][0]
+__________________________________________________________________________________________________
+conv5_block15_1_bn (BatchNormal (None, 11, 17, 128)  512         conv5_block15_1_conv[0][0]
+__________________________________________________________________________________________________
+conv5_block15_1_relu (Activatio (None, 11, 17, 128)  0           conv5_block15_1_bn[0][0]
+__________________________________________________________________________________________________
+conv5_block15_2_conv (Conv2D)   (None, 11, 17, 32)   36864       conv5_block15_1_relu[0][0]
+__________________________________________________________________________________________________
+conv5_block15_concat (Concatena (None, 11, 17, 992)  0           conv5_block14_concat[0][0]
+                                                                 conv5_block15_2_conv[0][0]
+__________________________________________________________________________________________________
+conv5_block16_0_bn (BatchNormal (None, 11, 17, 992)  3968        conv5_block15_concat[0][0]
+__________________________________________________________________________________________________
+conv5_block16_0_relu (Activatio (None, 11, 17, 992)  0           conv5_block16_0_bn[0][0]
+__________________________________________________________________________________________________
+conv5_block16_1_conv (Conv2D)   (None, 11, 17, 128)  126976      conv5_block16_0_relu[0][0]
+__________________________________________________________________________________________________
+conv5_block16_1_bn (BatchNormal (None, 11, 17, 128)  512         conv5_block16_1_conv[0][0]
+__________________________________________________________________________________________________
+conv5_block16_1_relu (Activatio (None, 11, 17, 128)  0           conv5_block16_1_bn[0][0]
+__________________________________________________________________________________________________
+conv5_block16_2_conv (Conv2D)   (None, 11, 17, 32)   36864       conv5_block16_1_relu[0][0]
+__________________________________________________________________________________________________
+conv5_block16_concat (Concatena (None, 11, 17, 1024) 0           conv5_block15_concat[0][0]
+                                                                 conv5_block16_2_conv[0][0]
+__________________________________________________________________________________________________
+bn (BatchNormalization)         (None, 11, 17, 1024) 4096        conv5_block16_concat[0][0]
+__________________________________________________________________________________________________
+relu (Activation)               (None, 11, 17, 1024) 0           bn[0][0]
+__________________________________________________________________________________________________
+avg_pool (GlobalAveragePooling2 (None, 1024)         0           relu[0][0]
+__________________________________________________________________________________________________
+fc1000 (Dense)                  (None, 10)           10250       avg_pool[0][0]
+==================================================================================================
+Total params: 7,047,754
+Trainable params: 6,964,106
+Non-trainable params: 83,648
+__________________________________________________________________________________________________
+Train for 100 steps, validate for 10 steps
+WARNING:tensorflow:From /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/keras/layers/normalization.py:477: where (from tensorflow.python.ops.array_ops) is deprecated and will be removed in a future version.
+Instructions for updating:
+Use tf.where in 2.0, which has the same broadcast rule as np.where
+2019-09-19 11:25:34.482086: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamiclibrary libcublas.so.10.0
+2019-09-19 11:25:34.711640: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamiclibrary libcudnn.so.7
+2019-09-19 11:25:35.685779: W tensorflow/stream_executor/gpu/redzone_allocator.cc:312] Not found: ./bin/ptxas not found
+Relying on driver to perform ptx compilation. This message will be only logged once.
+
+
+If I remove the MirroredStrategy scope, the code runs successfully and does not hang (doing meaningless training).
+&lt;denchmark-h:h3&gt;Investigation&lt;/denchmark-h&gt;
+
+
+top
+ 3161 root      20   0  0.112t 0.013t 948384 S  24.0  5.3 181:17.23 python3
+
+
+nvidia-smi's output is the same that I used in the "System information": all the GPUs are constantly 100% busy.
+
+top -H -p 3161 - threads of the running process
+ Threads: 155 total,   0 running, 155 sleeping,   0 stopped,   0 zombie
+%Cpu(s):  0.9 us,  0.8 sy,  0.0 ni, 97.8 id,  0.0 wa,  0.3 hi,  0.2 si,  0.0 st
+KiB Mem : 26408952+total, 99229216 free, 21207464 used, 14365283+buff/cache
+KiB Swap:        0 total,        0 free,        0 used. 20145740+avail Mem
+PID USER      PR  NI    VIRT    RES    SHR S %CPU %MEM     TIME+ COMMAND
+3261 root      20   0  0.112t 0.013t 948360 S  6.3  5.3  42:18.36 python3
+3255 root      20   0  0.112t 0.013t 948360 S  6.0  5.3  41:49.75 python3
+3259 root      20   0  0.112t 0.013t 948360 S  6.0  5.3  42:09.41 python3
+3257 root      20   0  0.112t 0.013t 948360 S  5.6  5.3  42:10.03 python3
+3161 root      20   0  0.112t 0.013t 948360 S  0.0  5.3   2:11.62 python3
+3165 root      20   0  0.112t 0.013t 948360 S  0.0  5.3   0:00.00 python3
+3166 root      20   0  0.112t 0.013t 948360 S  0.0  5.3   0:15.45 python3
+...
+
+
+
+bt in gdb --pid 3161 - trace of the main thread
+#0  0x00007f26924c5839 in syscall () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007f264b30e53b in nsync::nsync_mu_semaphore_p_with_deadline(nsync::nsync_semaphore_s_*, timespec) ()
+   from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/_pywrap_tensorflow_internal.so
+#2  0x00007f264b30db59 in nsync::nsync_sem_wait_with_cancel_(nsync::waiter*, timespec, nsync::nsync_note_s_*) ()
+   from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/_pywrap_tensorflow_internal.so
+#3  0x00007f264b30b11b in nsync::nsync_cv_wait_with_deadline_generic(nsync::nsync_cv_s_*, void*, void (*)(void*), void (*)(void*), timespec, nsync::nsync_note_s_*) ()
+   from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/_pywrap_tensorflow_internal.so
+#4  0x00007f264b30b5f3 in nsync::nsync_cv_wait_with_deadline(nsync::nsync_cv_s_*, nsync::nsync_mu_s_*, timespec, nsync::nsync_note_s_*) () from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/_pywrap_tensorflow_internal.so
+#5  0x00007f264344f60c in tensorflow::KernelAndDeviceFunc::Run(tensorflow::ScopedStepContainer*, absl::InlinedVector &gt; const&amp;, std::vector &gt;*, tensorflow::NodeExecStats*, tensorflow::StepStats*, tensorflow::GraphCollector*, tensorflow::CancellationManager*) ()
+   from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/_pywrap_tensorflow_internal.so
+#6  0x00007f264344fa06 in tensorflow::KernelAndDeviceFunc::Run(absl::InlinedVector &gt; const&amp;, std::vector &gt;*, tensorflow::NodeExecStats*, tensorflow::StepStats*, tensorflow::GraphCollector*, tensorflow::CancellationManager*) ()
+   from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/_pywrap_tensorflow_internal.so
+#7  0x00007f26434313f6 in tensorflow::EagerKernelExecute(tensorflow::EagerContext*, absl::InlinedVector &gt; const&amp;, std::unique_ptr const&amp;, tensorflow::NodeExecStats*, tensorflow::StepStats*, tensorflow::GraphCollector*, tensorflow::CancellationManager*, absl::Span) ()
+   from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/_pywrap_tensorflow_internal.so
+#8  0x00007f2643431aed in tensorflow::ExecuteNode::Run() ()
+   from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/_pywrap_tensorflow_internal.so
+#9  0x00007f264346ca85 in tensorflow::EagerExecutor::RunItem(std::unique_ptr) ()
+   from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/_pywrap_tensorflow_internal.so
+#10 0x00007f264346d18d in tensorflow::EagerExecutor::AddOrExecute(std::unique_ptr &gt;) ()
+   from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/_pywrap_tensorflow_internal.so
+#11 0x00007f264342cd86 in tensorflow::(anonymous namespace)::EagerLocalExecute(tensorflow::EagerOperation*, tensorflow::TensorHandle**, int*) ()
+   from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/_pywrap_tensorflow_internal.so
+#12 0x00007f264342ed00 in tensorflow::EagerExecute(tensorflow::EagerOperation*, tensorflow::TensorHandle**, int*) ()
+---Type  to continue, or q  to quit---
+   from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/_pywrap_tensorflow_internal.so
+#13 0x00007f26432bc05d in TFE_Execute ()
+   from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/_pywrap_tensorflow_internal.so
+#14 0x00007f264324640c in TFE_Py_ExecuteCancelable(TFE_Context*, char const*, char const*, absl::InlinedVector &gt;*, _object*, TFE_CancellationManager*, absl::InlinedVector &gt;*, TF_Status*) ()
+   from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/_pywrap_tensorflow_internal.so
+#15 0x00007f2643246941 in TFE_Py_Execute(TFE_Context*, char const*, char const*, absl::InlinedVector &gt;*, _object*, absl::InlinedVector &gt;*, TF_Status*) ()
+   from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/_pywrap_tensorflow_internal.so
+#16 0x00007f2642ddeb34 in _wrap_TFE_Py_Execute ()
+   from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/_pywrap_tensorflow_internal.so
+#17 0x00000000005097cf in _PyCFunction_FastCallDict (kwargs=, nargs=,
+    args=, func_obj=)
+    at ../Objects/methodobject.c:234
+#18 _PyCFunction_FastCallKeywords (kwnames=, nargs=, stack=,
+    func=) at ../Objects/methodobject.c:294
+#19 call_function.lto_priv () at ../Python/ceval.c:4851
+#20 0x000000000050b4a9 in _PyEval_EvalFrameDefault () at ../Python/ceval.c:3335
+#21 0x0000000000507125 in PyEval_EvalFrameEx (throwflag=0, f=
+    Frame 0x62d109a8, for file /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/eager/execute.py, line 61,in quick_execute (op_name='__inference_distributed_function_164755', num_outputs=3, inputs=[, , , , , , , , , , ,  to continue, or q  to quit---
+95, in call (self=&lt;_EagerDefinedFunction(name=b'__inference_distributed_function_164755', _function_deleter=&lt;_EagerDefinedFunctionDeleter(name=b'__inference_distributed_function_164755') at remote 0x7f1e0e0df438&gt;, _registered_on_context=True, definition=, signature=, _num_outputs=3, _output_types=[9, 1, 1], _output_shapes=[, , ], _control_captures=set(), _func_graph_outputs=[, _group_lock=, acquire=, release=, _group_lock=, acquire=, release=, _waiters=) at remote0x7f2384537f60&gt;, _num_groups=2, _group_member_counts=[0, 0]) at remote 0x7f2384537c88&gt;, _nodes_by_id={1: , _inputs_val=(), _id_value=1, _original_op=None, _traceback=, _device_code_locations=[, _name='distributed_function', _autograph=False, _autograph_options=None, _experimental_relax_shapes=False, _function_cache=}, primary={: , _group_lock=, acquire=) at ../Objects/abstract.c:2310
+#45 _PyObject_Call_Prepend (kwargs={}, args=, obj=,
+    func=) at ../Objects/abstract.c:2373
+#46 method_call.lto_priv () at ../Objects/classobject.c:314
+#47 0x0000000000549f41 in PyObject_Call (kwargs={},
+    args=(, _tensors=[], _variant_tensor_attr=, _self_setattr_tracking=True, _self_unconditional_checkpoint_dependencies=[], _self_unconditional_dependency_names={'_variant_tracker': &lt;_VariantTracker(_resource_handle=&lt;...&gt;, _resource_device='CPU', _resource_deleter=, _create_resource=, _sel...(truncated),
+    func=) at ../Objects/abstract.c:2261
+#48 slot_tp_call () at ../Objects/typeobject.c:6207
+#49 0x000000000059f50e in PyObject_Call () at ../Objects/abstract.c:2261
+#50 0x000000000050c854 in do_call_core (kwdict={},
+---Type  to continue, or q  to quit---
+    callargs=(, _tensors=[], _variant_tensor_attr=, _self_setattr_tracking=True, _self_unconditional_checkpoint_dependencies=[], _self_unconditional_dependency_names={'_variant_tracker': &lt;_VariantTracker(_resource_handle=&lt;...&gt;, _resource_device='CPU', _resource_deleter=, _create_resource=, _sel...(truncated),
+    func=, _function_spec=, _is_method=False, _default_values=None, _args_to_indices={'input_iterator': 0}, arg_names=['input_iterator'], vararg_name=None, _arg_indices_to_default_values={}, _input_signature=None) at remote 0x7f25642e3630&gt;, _name='distributed_function', _autograph=False, _autograph_options=None, _experimental_relax_shapes=False, _function_cache=}, primary={: , _group_lock=, acquire=, release=, _waiters=, _tensors=[], _variant_tensor_attr=, _self_setattr_tracking=True, _self_unconditional_checkpoint_dependencies=[], _self_unconditional_dependency_names={'_variant_tracker': &lt;_VariantTracker(_resource_handle=&lt;...&gt;, _resource_device='CPU', _resource_deleter...(truncated)) at ../Python/ceval.c:754
+#53 _PyEval_EvalCodeWithName.lto_priv.1821 () at ../Python/ceval.c:4166
+#54 0x0000000000508794 in _PyFunction_FastCallDict () at ../Python/ceval.c:5084
+#55 0x00000000005940d1 in _PyObject_FastCallDict (kwargs={}, nargs=2, args=0x7ffcaa451e10,
+    func=) at ../Objects/abstract.c:2310
+#56 _PyObject_Call_Prepend (kwargs={}, args=, obj=,
+    func=) at ../Objects/abstract.c:2373
+#57 method_call.lto_priv () at ../Objects/classobject.c:314
+---Type  to continue, or q  to quit---
+#58 0x000000000059f50e in PyObject_Call () at ../Objects/abstract.c:2261
+#59 0x000000000050c854 in do_call_core (kwdict={},
+    callargs=(, _tensors=[], _variant_tensor_attr=, _self_setattr_tracking=True, _self_unconditional_checkpoint_dependencies=[], _self_unconditional_dependency_names={'_variant_tracker': &lt;_VariantTracker(_resource_handle=&lt;...&gt;, _resource_device='CPU', _resource_deleter=, _create_resource=, _sel...(truncated),
+    func=) at ../Python/ceval.c:5120
+#60 _PyEval_EvalFrameDefault () at ../Python/ceval.c:3404
+#61 0x0000000000507125 in PyEval_EvalFrameEx (throwflag=0,
+    f=Frame 0x7f2564359dd8, for file /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/eager/def_function.py, line 480, in __call__ (self=, _python_function=, _function_spec=, _is_method=False, _default_values=None, _args_to_indices={'input_iterator': 0}, arg_names=['input_iterator'], vararg_name=None, _arg_indices_to_default_values={}, _input_signature=None) at remote 0x7f256435b400&gt;, _autograph=False, _experimental_autograph_options=None, experimental_relax_shapes=False, _experimental_compile=None, _created_variables=[, , , , , , , , , ) at ../Objects/abstract.c:2310
+#65 _PyObject_Call_Prepend (kwargs=0x0, args=, obj=,
+    func=) at ../Objects/abstract.c:2373
+#66 method_call.lto_priv () at ../Objects/classobject.c:314
+#67 0x0000000000549f41 in PyObject_Call (kwargs=0x0,
+    args=(, _tensors=[], _variant_tensor_attr= to continue, or q  to quit---
+Tensor at remote 0x7f263d5148d0&gt;, _self_setattr_tracking=True, _self_unconditional_checkpoint_dependencies=[], _self_unconditional_dependency_names={'_variant_tracker': &lt;_VariantTracker(_resource_handle=&lt;...&gt;, _resource_device='CPU', _resource_deleter=, _create_resource=, _sel...(truncated),
+    func=) at ../Objects/abstract.c:2261
+#68 slot_tp_call () at ../Objects/typeobject.c:6207
+#69 0x00000000005a95fc in _PyObject_FastCallDict (kwargs=, nargs=1, args=0x7f25642fdc98,
+    func=, _python_function=,_function_spec=, _is_method=False, _default_values=None, _args_to_indices={'input_iterator': 0}, arg_names=['input_iterator'], vararg_name=None, _arg_indices_to_default_values={}, _input_signature=None) at remote 0x7f256435b400&gt;, _autograph=False, _experimental_autograph_options=None, experimental_relax_shapes=False, _experimental_compile=None, _created_variables=[, , , , , , , ,, , , , , , _tensors=[], _variant_tensor_attr=, _self_setattr_tracking=True, _self_unconditional_checkpoint_dependencies=[], _self_unconditional_dependency_names={'_variant_tracker': &lt;_VariantTracker(_resource_handle=&lt;...&gt;, _resource_...(truncated)) at ../Python/ceval.c:754
+#74 _PyEval_EvalCodeWithName.lto_priv.1821 () at ../Python/ceval.c:4166
+#75 0x0000000000508fa0 in fast_function.lto_priv () at ../Python/ceval.c:4992
+#76 0x000000000050999d in call_function.lto_priv () at ../Python/ceval.c:4872
+#77 0x000000000050b4a9 in _PyEval_EvalFrameDefault () at ../Python/ceval.c:3335
+#78 0x0000000000507125 in PyEval_EvalFrameEx (throwflag=0,
+    f=Frame 0x689353d8, for file /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/keras/engine/training_v2.---Type  to continue, or q  to quit---
+py, line 123, in run_one_epoch (model=, _group_lock=, acquire=, release=, _waiters=) at remote 0x7f260c5101d0&gt;, _num_groups=2, _group_member_counts=[0, 0]) at remote 0x7f260c510160&gt;, _nodes_by_id={1: , _inputs_val=None, _id_value=1, _original_op=None, _traceback=, _device_code_locations=[, model=, _group_lock=, acquire=, release=, _waiters=) at remote 0x7f260c5101d0&gt;, _num_groups=2, _group_member_counts=[0, 0]) at remote 0x7f260c510160&gt;, _nodes_by_id={1: , _inputs_val=None, _id_value=1, _original_op=None, _traceback=, _device_code_locations=[, _group_lock=, acquire=, release=, _waiters=) at remote 0x7f260c5101d0&gt;, _num_groups=2, _group_member_counts=[0, 0]) at remote 0x7f260c510160&gt;, _nodes_by_id={1: , _inputs_val=None, _id_value=1, _original_op=None, _traceback=, _device_code_locations=[ to continue, or q  to quit---
+#89 _PyEval_EvalCodeWithName.lto_priv.1821 () at ../Python/ceval.c:4166
+#90 0x0000000000508fa0 in fast_function.lto_priv () at ../Python/ceval.c:4992
+#91 0x000000000050999d in call_function.lto_priv () at ../Python/ceval.c:4872
+#92 0x000000000050c36e in _PyEval_EvalFrameDefault () at ../Python/ceval.c:3351
+#93 0x0000000000507125 in PyEval_EvalFrameEx (throwflag=0,
+    f=Frame 0x52a7658, for file /user/vmarkovtsev/images/hang.py, line 31, in main (sample=, ds_train=, _tensors=[], _variant_tensor_attr=, _self_setattr_tracking=True, _self_unconditional_checkpoint_dependencies=[], _self_unconditional_dependency_names={'_variant_tracker': &lt;_VariantTracker(_resource_handle=&lt;...&gt;, _resource_device='CPU', _resource_deleter=, _create_resource=, _self_setattr_tracking=True, _self_unconditional_checkpoint_dependencies=[], _self_unconditional_dependency_n...(truncated)) at ../Python/ceval.c:754
+#94 _PyEval_EvalCodeWithName.lto_priv.1821 () at ../Python/ceval.c:4166
+#95 0x0000000000508fa0 in fast_function.lto_priv () at ../Python/ceval.c:4992
+#96 0x000000000050999d in call_function.lto_priv () at ../Python/ceval.c:4872
+#97 0x000000000050b4a9 in _PyEval_EvalFrameDefault () at ../Python/ceval.c:3335
+#98 0x0000000000507125 in PyEval_EvalFrameEx (throwflag=0,
+    f=Frame 0x20509a8, for file /user/vmarkovtsev/images/hang.py, line 35, in  ()) at ../Python/ceval.c:754
+#99 _PyEval_EvalCodeWithName.lto_priv.1821 () at ../Python/ceval.c:4166
+#100 0x000000000050a3b3 in PyEval_EvalCodeEx (closure=0x0, kwdefs=0x0, defcount=0, defs=0x0, kwcount=0, kws=0x0,
+    argcount=0, args=0x0, locals=, globals=, _co=)
+    at ../Python/ceval.c:4187
+#101 PyEval_EvalCode (co=, globals=, locals=) at ../Python/ceval.c:731
+#102 0x00000000006349e2 in run_mod () at ../Python/pythonrun.c:1025
+#103 0x0000000000634a97 in PyRun_FileExFlags () at ../Python/pythonrun.c:978
+#104 0x000000000063824f in PyRun_SimpleFileExFlags () at ../Python/pythonrun.c:419
+#105 0x0000000000638425 in PyRun_AnyFileExFlags () at ../Python/pythonrun.c:81
+#106 0x0000000000638df1 in run_file (p_cf=0x7ffcaa45361c, filename=, fp=)
+    at ../Modules/main.c:340
+#107 Py_Main () at ../Modules/main.c:810
+#108 0x00000000004b0de0 in main (argc=2, argv=0x7ffcaa453818) at ../Programs/python.c:69
+
+
+
+bt of each of the 4 running threads
+#0  0x00007fa23e7989d0 in nanosleep () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007fa1ec03cffd in tensorflow::(anonymous namespace)::PosixEnv::SleepForMicroseconds(long long) ()
+   from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/../libtensorflow_framework.so.2
+#2  0x00007fa1f5d2dcd5 in tensorflow::EventMgr::PollLoop() ()
+   from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/_pywrap_tensorflow_internal.so
+#3  0x00007fa1ec0528d1 in Eigen::ThreadPoolTempl::WorkerLoop(int) ()
+   from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/../libtensorflow_framework.so.2
+#4  0x00007fa1ec04feb8 in std::_Function_handler)::{lambda()#1}&gt;::_M_invoke(std::_Any_data const&amp;) ()
+   from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/../libtensorflow_framework.so.2
+#5  0x00007fa1ec6a58df in std::execute_native_thread_routine (__p=0x6360ed0)
+    at /dt7-src/libstdc++-v3/src/nonshared11/../c++11/thread.cc:83
+#6  0x00007fa23e49c6db in start_thread () from /lib/x86_64-linux-gnu/libpthread.so.0
+#7  0x00007fa23e7d588f in clone () from /lib/x86_64-linux-gnu/libc.so.6
+
+
+&lt;denchmark-h:h3&gt;Speculation&lt;/denchmark-h&gt;
+
+As we see, there are 4 threads - I guess one for each of my GPUs - which are polling something. They make 25-30% CPU load together. There are more than a hundred other threads, so I don't know which ones I should bt additionally. I tried with different batch sizes, which ofc influences the memory consumption, but does not change anything with the hang.
+I can provide the access to the hardware or execute arbitrary commands if needed.
+	</description>
+	<comments>
+		<comment id='1' author='vmarkovtsev' date='2019-09-27T08:52:52Z'>
+		Thank you for the bug report.
+If you're able to compile and run from source, can you re-run with setting env variable TF_CPP_VMODULE="nccl_manager=2" ? This will give us more logging wrt nccl which maybe be a potential place this could be hanging.
+		</comment>
+		<comment id='2' author='vmarkovtsev' date='2019-09-27T10:40:01Z'>
+		&lt;denchmark-link:https://github.com/guptapriya&gt;@guptapriya&lt;/denchmark-link&gt;
+ Can you please build me a wheel that I can install? Compiling TF from source with some additional hacks is so error-prone and hard for me. BTW why are the nightlies not suitable?
+		</comment>
+		<comment id='3' author='vmarkovtsev' date='2019-09-27T11:14:34Z'>
+		&lt;denchmark-link:https://github.com/guptapriya&gt;@guptapriya&lt;/denchmark-link&gt;
+ This is the log I get on :
+&lt;denchmark-code&gt;2019-09-27 11:12:56.480481: I tensorflow/core/nccl/nccl_manager.cc:213] New NcclManager 0x7fe01001c190
+2019-09-27 11:12:57.411454: I tensorflow/core/nccl/nccl_manager.cc:602] RunCollective rank 0 global_rank -1 root_rank -1
+2019-09-27 11:12:57.411490: I tensorflow/core/nccl/nccl_manager.cc:602] RunCollective rank 1 global_rank -1 root_rank -1
+2019-09-27 11:12:57.411499: I tensorflow/core/nccl/nccl_manager.cc:602] RunCollective rank 2 global_rank -1 root_rank -1
+2019-09-27 11:12:57.411524: I tensorflow/core/nccl/nccl_manager.cc:602] RunCollective rank 3 global_rank -1 root_rank -1
+2019-09-27 11:12:57.411627: I tensorflow/core/nccl/nccl_manager.cc:679] call NcclAllReduce collective_key c1;-3597338873254438932;0:0 participant 0 sendbuff 0x7fe378d2d600 recvbuff 0x7fe378d2d600 nccl_comm 0x7fdf54001610 comm_stream 0x7fdf7c58a5c0 cuda_stream 0x7fdf7c58c030
+2019-09-27 11:12:57.411635: I tensorflow/core/nccl/nccl_manager.cc:679] call NcclAllReduce collective_key c1;-3597338873254438932;0:0 participant 2 sendbuff 0x7fe8f9d78e00 recvbuff 0x7fe8f9d78e00 nccl_comm 0x7fdf44000fd0 comm_stream 0x7fe01000eb20 cuda_stream 0x7feb58000e70
+2019-09-27 11:12:57.411638: I tensorflow/core/nccl/nccl_manager.cc:679] call NcclAllReduce collective_key c1;-3597338873254438932;0:0 participant 3 sendbuff 0x7fe0e980e200 recvbuff 0x7fe0e980e200 nccl_comm 0x7fdf48001d20 comm_stream 0x7fdf7c58dc80 cuda_stream 0x7fdf7c588c90
+2019-09-27 11:12:57.411632: I tensorflow/core/nccl/nccl_manager.cc:679] call NcclAllReduce collective_key c1;-3597338873254438932;0:0 participant 1 sendbuff 0x7fe6371f5400 recvbuff 0x7fe6371f5400 nccl_comm 0x7fdf58000fd0 comm_stream 0x7fe010018a30 cuda_stream 0x7fdf7c8e8830
+&lt;/denchmark-code&gt;
+
+&lt;nothing is printed to the terminal after that&gt;
+		</comment>
+		<comment id='4' author='vmarkovtsev' date='2019-09-27T11:36:33Z'>
+		bt of the threads which have "nccl" in bt
+&lt;denchmark-code&gt;Thread 155 (Thread 0x7f1cc4b7a700 (LWP 7307)):
+#0  0x00007f2b209eb839 in syscall () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007f2ace5db1cb in nsync::nsync_mu_semaphore_p_with_deadline(nsync::nsync_semaphore_s_*, timespec) ()
+   from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/../libtensorflow_framework.so.2
+#2  0x00007f2ace5da7e9 in nsync::nsync_sem_wait_with_cancel_(nsync::waiter*, timespec, nsync::nsync_note_s_*) ()
+   from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/../libtensorflow_framework.so.2
+#3  0x00007f2ace5d7dab in nsync::nsync_cv_wait_with_deadline_generic(nsync::nsync_cv_s_*, void*, void (*)(void*), void (*)(void*), timespec, nsync::nsync_note_s_*) ()
+   from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/../libtensorflow_framework.so.2
+#4  0x00007f2ace5d8283 in nsync::nsync_cv_wait_with_deadline(nsync::nsync_cv_s_*, nsync::nsync_mu_s_*, timespec, nsync::nsync_note_s_*) () from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/../libtensorflow_framework.so.2
+#5  0x00007f2ad52ef649 in tensorflow::NcclManager::LoopKernelLaunches(tensorflow::NcclManager::NcclStream*) ()
+   from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/_pywrap_tensorflow_internal.so
+#6  0x00007f2ad52f0678 in std::_Function_handler&lt;void (), tensorflow::NcclManager::GetCommunicator(tensorflow::NcclManager::Collective*, tensorflow::NcclManager::Communicator**)::{lambda()#2}&gt;::_M_invoke(std::_Any_data const&amp;) ()
+   from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/_pywrap_tensorflow_internal.so
+#7  0x00007f2ace81a3af in std::execute_native_thread_routine (__p=0x7f1c687b4fd0)
+    at /dt7-src/libstdc++-v3/src/nonshared11/../c++11/thread.cc:83
+#8  0x00007f2b206b86db in start_thread () from /lib/x86_64-linux-gnu/libpthread.so.0
+#9  0x00007f2b209f188f in clone () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 154 (Thread 0x7f1d30b78700 (LWP 7306)):
+#0  0x00007f2b209eb839 in syscall () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007f2ace5db1cb in nsync::nsync_mu_semaphore_p_with_deadline(nsync::nsync_semaphore_s_*, timespec) ()
+   from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/../libtensorflow_framework.so.2
+#2  0x00007f2ace5da7e9 in nsync::nsync_sem_wait_with_cancel_(nsync::waiter*, timespec, nsync::nsync_note_s_*) ()
+   from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/../libtensorflow_framework.so.2
+#3  0x00007f2ace5d7dab in nsync::nsync_cv_wait_with_deadline_generic(nsync::nsync_cv_s_*, void*, void (*)(void*), void (*)(void*), timespec, nsync::nsync_note_s_*) ()
+   from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/../libtensorflow_framework.so.2
+#4  0x00007f2ace5d8283 in nsync::nsync_cv_wait_with_deadline(nsync::nsync_cv_s_*, nsync::nsync_mu_s_*, timespec, nsync::nsync_note_s_*) () from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/../libtensorflow_framework.so.2
+#5  0x00007f2ad52ef649 in tensorflow::NcclManager::LoopKernelLaunches(tensorflow::NcclManager::NcclStream*) ()
+   from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/_pywrap_tensorflow_internal.so
+#6  0x00007f2ad52f0678 in std::_Function_handler&lt;void (), tensorflow::NcclManager::GetCommunicator(tensorflow::NcclManager::Collective*, tensorflow::NcclManager::Communicator**)::{lambda()#2}&gt;::_M_invoke(std::_Any_data const&amp;) ()
+   from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/_pywrap_tensorflow_internal.so
+#7  0x00007f2ace81a3af in std::execute_native_thread_routine (__p=0x7f1c687b6c50)
+    at /dt7-src/libstdc++-v3/src/nonshared11/../c++11/thread.cc:83
+#8  0x00007f2b206b86db in start_thread () from /lib/x86_64-linux-gnu/libpthread.so.0
+#9  0x00007f2b209f188f in clone () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 153 (Thread 0x7f1d31379700 (LWP 7305)):
+#0  0x00007f2b209eb839 in syscall () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007f2ace5db1cb in nsync::nsync_mu_semaphore_p_with_deadline(nsync::nsync_semaphore_s_*, timespec) ()
+   from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/../libtensorflow_framework.so.2
+#2  0x00007f2ace5da7e9 in nsync::nsync_sem_wait_with_cancel_(nsync::waiter*, timespec, nsync::nsync_note_s_*) ()
+   from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/../libtensorflow_framework.so.2
+#3  0x00007f2ace5d7dab in nsync::nsync_cv_wait_with_deadline_generic(nsync::nsync_cv_s_*, void*, void (*)(void*), void (*)(void*), timespec, nsync::nsync_note_s_*) ()
+   from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/../libtensorflow_framework.so.2
+#4  0x00007f2ace5d8283 in nsync::nsync_cv_wait_with_deadline(nsync::nsync_cv_s_*, nsync::nsync_mu_s_*, timespec, nsync::nsync_note_s_*) () from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/../libtensorflow_framework.so.2
+#5  0x00007f2ad52ef649 in tensorflow::NcclManager::LoopKernelLaunches(tensorflow::NcclManager::NcclStream*) ()
+   from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/_pywrap_tensorflow_internal.so
+#6  0x00007f2ad52f0678 in std::_Function_handler&lt;void (), tensorflow::NcclManager::GetCommunicator(tensorflow::NcclManager::Collective*, tensorflow::NcclManager::Communicator**)::{lambda()#2}&gt;::_M_invoke(std::_Any_data const&amp;) ()
+   from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/_pywrap_tensorflow_internal.so
+#7  0x00007f2ace81a3af in std::execute_native_thread_routine (__p=0x7f1c687a1f70)
+    at /dt7-src/libstdc++-v3/src/nonshared11/../c++11/thread.cc:83
+#8  0x00007f2b206b86db in start_thread () from /lib/x86_64-linux-gnu/libpthread.so.0
+#9  0x00007f2b209f188f in clone () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 152 (Thread 0x7f1d31b7a700 (LWP 7304)):
+#0  0x00007f2b209eb839 in syscall () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007f2ace5db1cb in nsync::nsync_mu_semaphore_p_with_deadline(nsync::nsync_semaphore_s_*, timespec) ()
+   from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/../libtensorflow_framework.so.2
+#2  0x00007f2ace5da7e9 in nsync::nsync_sem_wait_with_cancel_(nsync::waiter*, timespec, nsync::nsync_note_s_*) ()
+   from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/../libtensorflow_framework.so.2
+#3  0x00007f2ace5d7dab in nsync::nsync_cv_wait_with_deadline_generic(nsync::nsync_cv_s_*, void*, void (*)(void*), void (*)(void*), timespec, nsync::nsync_note_s_*) ()
+   from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/../libtensorflow_framework.so.2
+#4  0x00007f2ace5d8283 in nsync::nsync_cv_wait_with_deadline(nsync::nsync_cv_s_*, nsync::nsync_mu_s_*, timespec, nsync::nsync_note_s_*) () from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/../libtensorflow_framework.so.2
+#5  0x00007f2ad52ef649 in tensorflow::NcclManager::LoopKernelLaunches(tensorflow::NcclManager::NcclStream*) ()
+   from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/_pywrap_tensorflow_internal.so
+#6  0x00007f2ad52f0678 in std::_Function_handler&lt;void (), tensorflow::NcclManager::GetCommunicator(tensorflow::NcclManager::Collective*, tensorflow::NcclManager::Communicator**)::{lambda()#2}&gt;::_M_invoke(std::_Any_data const&amp;) ()
+   from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/_pywrap_tensorflow_internal.so
+#7  0x00007f2ace81a3af in std::execute_native_thread_routine (__p=0x7f1c687a3300)
+    at /dt7-src/libstdc++-v3/src/nonshared11/../c++11/thread.cc:83
+#8  0x00007f2b206b86db in start_thread () from /lib/x86_64-linux-gnu/libpthread.so.0
+#9  0x00007f2b209f188f in clone () from /lib/x86_64-linux-gnu/libc.so.6
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='5' author='vmarkovtsev' date='2019-09-28T20:16:58Z'>
+		Ah yes, I later learned that the env variable works with pip packages as well.
+Thank you for the logs. It seems like it could have something to do with NCCL. Can you re-run with NCCL_DEBUG=INFO (another env variable) which will give us more info?
+		</comment>
+		<comment id='6' author='vmarkovtsev' date='2019-09-28T20:18:44Z'>
+		cc &lt;denchmark-link:https://github.com/dubey&gt;@dubey&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='7' author='vmarkovtsev' date='2019-09-28T20:57:34Z'>
+		&lt;denchmark-link:https://github.com/guptapriya&gt;@guptapriya&lt;/denchmark-link&gt;
+ sure, this is what I see:
+&lt;denchmark-code&gt;jupyter-vmarkovtsev:7580:7706 [0] NCCL INFO NET/Socket : Using [0]eth0:10.2.3.32&lt;0&gt;
+jupyter-vmarkovtsev:7580:7706 [0] NCCL INFO NET/Plugin : No plugin found (libnccl-net.so).
+
+jupyter-vmarkovtsev:7580:7706 [0] external/nccl_archive/src/misc/ibvwrap.cc:63 NCCL WARN Failed to open libibverbs.so[.1]
+NCCL version 2.4.7+cudaCUDA_MAJOR.CUDA_MINOR
+jupyter-vmarkovtsev:7580:7765 [0] NCCL INFO Setting affinity for GPU 0 to ff00ff
+jupyter-vmarkovtsev:7580:7764 [2] NCCL INFO Setting affinity for GPU 2 to ff00ff00
+jupyter-vmarkovtsev:7580:7763 [3] NCCL INFO Setting affinity for GPU 3 to ff00ff00
+jupyter-vmarkovtsev:7580:7762 [1] NCCL INFO Setting affinity for GPU 1 to ff00ff
+jupyter-vmarkovtsev:7580:7762 [1] NCCL INFO Channel 00 :    0   3   1   2
+jupyter-vmarkovtsev:7580:7765 [0] NCCL INFO Ring 00 : 3[0] -&gt; 1[3] via direct shared memory
+jupyter-vmarkovtsev:7580:7763 [3] NCCL INFO Ring 00 : 1[3] -&gt; 2[2] via P2P/direct pointer
+jupyter-vmarkovtsev:7580:7764 [2] NCCL INFO Ring 00 : 2[2] -&gt; 0[1] via direct shared memory
+jupyter-vmarkovtsev:7580:7762 [1] NCCL INFO Ring 00 : 0[1] -&gt; 3[0] via P2P/direct pointer
+jupyter-vmarkovtsev:7580:7762 [1] NCCL INFO Using 256 threads, Min Comp Cap 6, Trees disabled
+jupyter-vmarkovtsev:7580:7764 [2] NCCL INFO comm 0x7f1dbc001b20 rank 2 nranks 4 cudaDev 2 nvmlDev 2 - Init COMPLETE
+jupyter-vmarkovtsev:7580:7762 [1] NCCL INFO comm 0x7f1dd0001610 rank 0 nranks 4 cudaDev 1 nvmlDev 1 - Init COMPLETE
+jupyter-vmarkovtsev:7580:7765 [0] NCCL INFO comm 0x7f1db4001810 rank 3 nranks 4 cudaDev 0 nvmlDev 0 - Init COMPLETE
+jupyter-vmarkovtsev:7580:7763 [3] NCCL INFO comm 0x7f1dc4000fd0 rank 1 nranks 4 cudaDev 3 nvmlDev 3 - Init COMPLETE
+jupyter-vmarkovtsev:7580:7757 [1] NCCL INFO Launch mode Group/CGMD
+&lt;/denchmark-code&gt;
+
+&lt;hangs&gt;
+
+ifconfig
+eth0: flags=4163  mtu 1450
+        inet 10.2.3.32  netmask 255.255.255.255  broadcast 0.0.0.0
+        ether ae:72:33:81:21:71  txqueuelen 0  (Ethernet)
+        RX packets 2336309  bytes 18475645041 (18.4 GB)
+        RX errors 0  dropped 0  overruns 0  frame 0
+        TX packets 3641498  bytes 414040978 (414.0 MB)
+        TX errors 0  dropped 0 overruns 0  carrier 0  collisions 0
+
+
+		</comment>
+		<comment id='8' author='vmarkovtsev' date='2019-09-28T21:39:28Z'>
+		NCCL_DEBUG_SUBSYS=COLL also gives this right before Launch mode Group/CGMD:
+&lt;denchmark-code&gt;jupyter-vmarkovtsev:7959:8138 [0] NCCL INFO AllReduce: opCount 0 sendbuff 0x7f2485d3ea00 recvbuff 0x7f2485d3ea00 count 6964106 datatype 7 op 0 root 0 comm 0x7f1adc000fd0 [nranks=4] stream 0x7f1b1eff6520
+jupyter-vmarkovtsev:7959:8137 [3] NCCL INFO AllReduce: opCount 0 sendbuff 0x7f1c75849600 recvbuff 0x7f1c75849600 count 6964106 datatype 7 op 0 root 0 comm 0x7f1ae8001d20 [nranks=4] stream 0x7f1b1efe3180
+jupyter-vmarkovtsev:7959:8136 [1] NCCL INFO AllReduce: opCount 0 sendbuff 0x7f21c1ee1800 recvbuff 0x7f21c1ee1800 count 6964106 datatype 7 op 0 root 0 comm 0x7f1ae4001610 [nranks=4] stream 0x7f1ba4013210
+jupyter-vmarkovtsev:7959:8139 [2] NCCL INFO AllReduce: opCount 0 sendbuff 0x7f1f09abcc00 recvbuff 0x7f1f09abcc00 count 6964106 datatype 7 op 0 root 0 comm 0x7f1ae0000fd0 [nranks=4] stream 0x7f1b1efe4460
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='9' author='vmarkovtsev' date='2019-09-28T22:11:16Z'>
+		AllReduce tests from &lt;denchmark-link:https://github.com/nvidia/nccl-tests&gt;https://github.com/nvidia/nccl-tests&lt;/denchmark-link&gt;
+ hang for me
+&lt;denchmark-code&gt;./build/all_reduce_perf -b 8 -e 256M -f 2 -g 4
+&lt;/denchmark-code&gt;
+
+So this is probably not a problem with Tensorflow itself... Reporting this upstream.
+		</comment>
+		<comment id='10' author='vmarkovtsev' date='2019-09-29T22:13:23Z'>
+		Thanks, please reopen if needed.
+		</comment>
+		<comment id='11' author='vmarkovtsev' date='2019-09-29T22:13:25Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=32654&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=32654&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='12' author='vmarkovtsev' date='2019-09-30T15:51:27Z'>
+		My root problem was malfunctioning peer to peer GPU access. I saw something like this in dmesg:
+&lt;denchmark-code&gt;[1478401.486621] DMAR: DRHD: handling fault status reg 502
+[1478401.486981] DMAR: [DMA Write] Request device [02:00.0] fault addr cd139000 [fault reason 05] PTE Write access is not set
+[1478401.487694] DMAR: DRHD: handling fault status reg 2
+[1478401.488053] DMAR: [DMA Write] Request device [82:00.0] fault addr f8139000 [fault reason 05] PTE Write access is not set
+[1478401.716106] DMAR: DRHD: handling fault status reg 602
+[1478401.716534] DMAR: [DMA Write] Request device [02:00.0] fault addr cd139000 [fault reason 05] PTE Write access is not set
+[1478401.719859] DMAR: DRHD: handling fault status reg 102
+[1478401.720267] DMAR: [DMA Write] Request device [82:00.0] fault addr f8139000 [fault reason 05] PTE Write access is not set
+[1478419.000793] dmar_fault: 32 callbacks suppressed
+[1478419.000795] DMAR: DRHD: handling fault status reg 702
+[1478419.001500] DMAR: [DMA Write] Request device [02:00.0] fault addr cd139000 [fault reason 05] PTE Write access is not set
+[1478421.063012] DMAR: DRHD: handling fault status reg 202
+[1478421.063361] DMAR: [DMA Write] Request device [82:00.0] fault addr f8139000 [fault reason 05] PTE Write access is not set
+&lt;/denchmark-code&gt;
+
+My workaround is export NCCL_P2P_DISABLE=1.
+		</comment>
+		<comment id='13' author='vmarkovtsev' date='2019-09-30T16:05:37Z'>
+		Thanks for posting the update!  It may help others who run into a similar issue.
+		</comment>
+		<comment id='14' author='vmarkovtsev' date='2019-10-02T16:43:31Z'>
+		Although NCCL_P2P_DISABLE=1 fixed the original problem, I've got an even worse one. I saw the Keras' progress bar, then it hanged again. More DMAR errors in dmesg, the process consumes 100% CPU (1 core) and is immortal: even kill -9 does not help. Disabling VT-x in BIOS did not help. I will try booting the kernel with intel_iommu=off to see if it helps.
+		</comment>
+		<comment id='15' author='vmarkovtsev' date='2019-10-02T18:06:27Z'>
+		I confirm that booting the kernel with intel_iommu=off fixed all the hangs and I am finally enjoying the multi-gpu training.
+		</comment>
+	</comments>
+</bug>

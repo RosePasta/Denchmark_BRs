@@ -1,0 +1,151 @@
+<bug id='14080' author='satyakrishnagorti' open_date='2019-02-06T23:48:12Z' closed_time='2019-03-28T18:57:10Z'>
+	<summary>Adam Optimizer Memory Leak in Scala</summary>
+	<description>
+&lt;denchmark-h:h2&gt;Description&lt;/denchmark-h&gt;
+
+Memory leak issue while using Adam optimizer with MXNet Scala Bindings. Running the code below will keep consuming more and more memory till you run out.
+&lt;denchmark-h:h2&gt;Steps to Reproduce&lt;/denchmark-h&gt;
+
+// Simple MLP network
+def mlpNetwork(): Symbol = {
+    val input = Symbol.Variable("data")
+    val label = Symbol.Variable("label")
+    val fc1 = Symbol.FullyConnected(name = "fc1")()(Map("data" -&gt; input, "num_hidden" -&gt; 128))
+    val act1 = Symbol.Activation(name = "relu")()(Map("data" -&gt; fc1, "act_type" -&gt; "relu"))
+    val fc2 = Symbol.FullyConnected(name = "fc2")()(Map("data" -&gt; act1, "num_hidden" -&gt; 1))
+    val loss = Symbol.LinearRegressionOutput(name="loss")()(Map("data" -&gt; fc2, "label" -&gt; label))
+    loss
+  }
+
+def getNDArrayIter: NDArrayIter = {
+    val f = NDArray.zeros(100, 20, 20)
+    val l = NDArray.zeros(100, 1)
+    val data = Array(f)
+    val labels = Array(l)
+    val batchSize = 10
+    val iter = new NDArrayIter(data, labels, batchSize)
+    iter
+  }
+
+val net = mlpNetwork()
+val iter = getNDArrayIter()
+val optimizer = new Adam(0.001f, 0.9f, 0.999f, 1e-8f, 1 - 1e-8f, 0f, 10f, null);
+val init = new Normal(0.01f);
+val model = FeedForward.newBuilder(modelSpec)
+                .setContext(Array(Context.gpu(0)))
+                .setInitializer(init)
+                .setNumEpoch(100000)
+                .setOptimizer(optimizer)
+                .setTrainData(iter)
+                .setEvalData(iter)
+                .build();
+
+&lt;denchmark-h:h2&gt;Issue&lt;/denchmark-h&gt;
+
+The issue is (I think) some temporary NDArrays are not getting disposed in Adam optimizer when using disposeDepsExcept.
+The places exactly where the memory leak occurs is in 3 locations where the method disposeDepsExcept is used in Adam's update method.
+&lt;denchmark-h:h2&gt;Temporary Fix&lt;/denchmark-h&gt;
+
+Replace all the 3 lines that use disposeDepsExcept in update method of Adam.scala by explicitly disposing the temporary NDArrays that were created as shown below
+Instead of the 3 following lines in Adam.scala
+val meanT = (beta1t * mean + (1.0 - beta1t) * resdGrad)
+      .disposeDepsExcept(mean, resdGrad)
+
+val varianceT = (beta2 * variance + (1.0f - beta2) * resdGrad * resdGrad)
+      .disposeDepsExcept(variance, resdGrad)
+
+val step = (learningRate * meanT / (NDArray.sqrt(varianceT) + epsilon))
+      .disposeDepsExcept(meanT, varianceT)
+Replace it by:
+val beta1Mean = beta1 * mean
+    val beta1ResGrad = (1.0 - beta1t) * resdGrad
+    val meanT = beta1Mean + beta1ResGrad
+    // dipose temp NDArrays
+    betaMean.dispose()
+    betaResGrad.dispose()
+
+val beta2Variance = beta2 * variance
+    val beta2ResGrad = (1.0f - beta2) * resdGrad
+    val beta2ResGradSquare = beta2ResGrad * resdGrad
+    val varianceT = beta2Variance + beta2ResGradSquare
+    // dipose temp NDArrays
+    beta2Variance.dispose()
+    beta2ResGrad.dispose()
+    beta2ResGradSquare.dispose()
+
+
+    val lrMeanT = learningRate * meanT
+    val sqrtVar = NDArray.sqrt(varianceT)
+    val sqrtVarPlusEpsilon = sqrtVar + epsilon
+    val step = lrMeanT / sqrtVarPlusEpsilon
+    // dipose temp NDArrays
+    lrMeanT.dispose()
+    sqrtVar.dispose()
+    sqrtVarPlusEpsilon.dispose()
+
+The above changes fixes things for now, but for some reason disposeDepsExcept is not doing its job in this case.
+&lt;denchmark-h:h2&gt;Environment info (Required)&lt;/denchmark-h&gt;
+
+&lt;denchmark-code&gt;----------Python Info----------
+Version      : 3.7.1
+Compiler     : GCC 7.3.0
+Build        : ('default', 'Dec 14 2018 19:28:38')
+Arch         : ('64bit', '')
+------------Pip Info-----------
+Version      : 18.1
+Directory    : /home/satya/anaconda3/lib/python3.7/site-packages/pip
+----------MXNet Info-----------
+Version      : 1.3.1
+Directory    : /home/satya/Documents/workspace/mxnet_1.3.x/python/mxnet
+Hashtag not found. Not installed from pre-built package.
+----------System Info----------
+Platform     : Linux-4.4.0-141-generic-x86_64-with-debian-stretch-sid
+system       : Linux
+node         : DS5
+release      : 4.4.0-141-generic
+version      : #167-Ubuntu SMP Wed Dec 5 10:40:15 UTC 2018
+----------Network Test----------
+Setting timeout: 10
+Timing for MXNet: https://github.com/apache/incubator-mxnet, DNS: 0.0405 sec, LOAD: 0.6186 sec.
+Timing for Gluon Tutorial(en): http://gluon.mxnet.io, DNS: 0.1403 sec, LOAD: 0.4726 sec.
+Timing for Gluon Tutorial(cn): https://zh.gluon.ai, DNS: 0.2418 sec, LOAD: 0.4049 sec.
+Timing for FashionMNIST: https://apache-mxnet.s3-accelerate.dualstack.amazonaws.com/gluon/dataset/fashion-mnist/train-labels-idx1-ubyte.gz, DNS: 0.0445 sec, LOAD: 0.1894 sec.
+Timing for PYPI: https://pypi.python.org/pypi/pip, DNS: 0.0779 sec, LOAD: 0.2447 sec.
+Timing for Conda: https://repo.continuum.io/pkgs/free/, DNS: 0.0409 sec, LOAD: 0.0746 sec.
+&lt;/denchmark-code&gt;
+
+Package used (Python/R/Scala/Julia): Scala
+For Scala user, please provide:
+
+Java version: 1.8.0_201
+Maven version: 3.6.0
+Scala runtime if applicable: 2.11.6
+
+&lt;denchmark-h:h2&gt;Build info (Required if built from source)&lt;/denchmark-h&gt;
+
+Compiler (gcc/clang/mingw/visual studio): gcc
+MXNet commit hash: &lt;denchmark-link:https://github.com/apache/incubator-mxnet/commit/96b4b6ef3c60c63644a7c4d672109b97561b839d&gt;96b4b6e&lt;/denchmark-link&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='satyakrishnagorti' date='2019-02-06T23:48:15Z'>
+		Hey, this is the MXNet Label Bot.
+Thank you for submitting the issue! I will try and suggest some labels so that the appropriate MXNet community members can help resolve it.
+Here are my recommended labels: Scala, Bug
+		</comment>
+		<comment id='2' author='satyakrishnagorti' date='2019-02-07T00:08:50Z'>
+		&lt;denchmark-link:https://github.com/satyakrishnagorti&gt;@satyakrishnagorti&lt;/denchmark-link&gt;
+ Here's a documentation on how to manage memory in MXNet Scala :
+&lt;denchmark-link:https://github.com/apache/incubator-mxnet/blob/master/scala-package/memory-management.md&gt;https://github.com/apache/incubator-mxnet/blob/master/scala-package/memory-management.md&lt;/denchmark-link&gt;
+
+The first method in this document details using : ResourceScope and can help in your use case.
+Do try it out and let us know the results.
+		</comment>
+		<comment id='3' author='satyakrishnagorti' date='2019-02-07T00:51:18Z'>
+		Looks like the Adam Optimizer needs to be updated to use ResourceScope. Should probably take a look at the other optimizers at the same time. Thanks for reporting this &lt;denchmark-link:https://github.com/satyakrishnagorti&gt;@satyakrishnagorti&lt;/denchmark-link&gt;
+.
+&lt;denchmark-link:https://github.com/mxnet-label-bot&gt;@mxnet-label-bot&lt;/denchmark-link&gt;
+ add [Scala, bug]
+		</comment>
+	</comments>
+</bug>

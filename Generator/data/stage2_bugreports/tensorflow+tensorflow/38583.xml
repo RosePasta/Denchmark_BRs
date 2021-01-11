@@ -1,0 +1,366 @@
+<bug id='38583' author='snailrowen1337' open_date='2020-04-16T00:08:33Z' closed_time='2020-05-11T18:11:29Z'>
+	<summary>Tf.function raises TypeError</summary>
+	<description>
+System information
+
+Have I written custom code (as opposed to using a stock
+example script provided in TensorFlow): yes
+OS Platform and Distribution (e.g.,
+Linux Ubuntu 16.04): Linux Ubuntu 16.04
+TensorFlow installed from (source or
+binary): pip
+TensorFlow version (use command below): v2.1.0-rc2-17-ge5bf8de 2.1.0
+Python version: 3
+CUDA/cuDNN version: - GPU model and memory: Tesla v100
+
+
+When running the code attached below (it's from &lt;denchmark-link:https://github.com/titu1994/keras-attention-augmented-convs&gt;https://github.com/titu1994/keras-attention-augmented-convs&lt;/denchmark-link&gt;
+) it crashes with the trace attached at the bottom. But When I remove the @tf.function annotation, it works.
+Describe the expected behavior
+I would expect that the annotation does not make the program crash.
+Standalone code to reproduce the issue
+Provide a reproducible test case that is the bare minimum necessary to generate
+the problem. If possible, please share a link to Colab/Jupyter/any notebook.
+&lt;denchmark-code&gt;import tensorflow as tf
+from tensorflow.keras.layers import Layer
+from tensorflow.keras.layers import Conv2D
+from tensorflow.keras.layers import BatchNormalization
+from tensorflow.keras.layers import concatenate
+from tensorflow.keras import initializers
+import tensorflow.keras.backend as K
+
+
+def _conv_layer(filters, kernel_size, strides=(1, 1), padding='same', name=None):
+    return Conv2D(filters, kernel_size, strides=strides, padding=padding,
+                  use_bias=True, kernel_initializer='he_normal', name=name)
+
+
+def _normalize_depth_vars(depth_k, depth_v, filters):
+
+
+    if type(depth_k) == float:
+        depth_k = int(filters * depth_k)
+    else:
+        depth_k = int(depth_k)
+
+    if type(depth_v) == float:
+        depth_v = int(filters * depth_v)
+    else:
+        depth_v = int(depth_v)
+
+    return depth_k, depth_v
+
+
+class AttentionAugmentation2D(Layer):
+
+    def __init__(self, depth_k, depth_v, num_heads, relative=True, **kwargs):
+
+        super(AttentionAugmentation2D, self).__init__(**kwargs)
+
+        if depth_k % num_heads != 0:
+            raise ValueError('`depth_k` (%d) is not divisible by `num_heads` (%d)' % (
+                depth_k, num_heads))
+
+        if depth_v % num_heads != 0:
+            raise ValueError('`depth_v` (%d) is not divisible by `num_heads` (%d)' % (
+                depth_v, num_heads))
+
+        if depth_k // num_heads &lt; 1.:
+            raise ValueError('depth_k / num_heads cannot be less than 1 ! '
+                             'Given depth_k = %d, num_heads = %d' % (
+                             depth_k, num_heads))
+
+        if depth_v // num_heads &lt; 1.:
+            raise ValueError('depth_v / num_heads cannot be less than 1 ! '
+                             'Given depth_v = %d, num_heads = %d' % (
+                                 depth_v, num_heads))
+
+        self.depth_k = depth_k
+        self.depth_v = depth_v
+        self.num_heads = num_heads
+        self.relative = relative
+
+        self.axis = 1 if K.image_data_format() == 'channels_first' else -1
+
+    def build(self, input_shape):
+        self._shape = input_shape
+
+        # normalize the format of depth_v and depth_k
+        self.depth_k, self.depth_v = _normalize_depth_vars(self.depth_k, self.depth_v,
+                                                           input_shape)
+
+        if self.axis == 1:
+            _, channels, height, width = input_shape
+        else:
+            _, height, width, channels = input_shape
+
+        if self.relative:
+            dk_per_head = self.depth_k // self.num_heads
+
+            if dk_per_head == 0:
+                print('dk per head', dk_per_head)
+
+            self.key_relative_w = self.add_weight('key_rel_w',
+                                                  shape=[2 * width - 1, dk_per_head],
+                                                  initializer=initializers.RandomNormal(
+                                                      stddev=dk_per_head ** -0.5))
+
+            self.key_relative_h = self.add_weight('key_rel_h',
+                                                  shape=[2 * height - 1, dk_per_head],
+                                                  initializer=initializers.RandomNormal(
+                                                      stddev=dk_per_head ** -0.5))
+
+        else:
+            self.key_relative_w = None
+            self.key_relative_h = None
+
+    def call(self, inputs, **kwargs):
+        if self.axis == 1:
+            # If channels first, force it to be channels last for these ops
+            inputs = K.permute_dimensions(inputs, [0, 2, 3, 1])
+
+        q, k, v = tf.split(inputs, [self.depth_k, self.depth_k, self.depth_v], axis=-1)
+
+        q = self.split_heads_2d(q)
+        k = self.split_heads_2d(k)
+        v = self.split_heads_2d(v)
+
+        # scale query
+        depth_k_heads = self.depth_k / self.num_heads
+        q *= (depth_k_heads ** -0.5)
+
+        # [Batch, num_heads, height * width, depth_k or depth_v] if axis == -1
+        qk_shape = [self._batch, self.num_heads, self._height * self._width, self.depth_k // self.num_heads]
+        v_shape = [self._batch, self.num_heads, self._height * self._width, self.depth_v // self.num_heads]
+        flat_q = K.reshape(q, K.stack(qk_shape))
+        flat_k = K.reshape(k, K.stack(qk_shape))
+        flat_v = K.reshape(v, K.stack(v_shape))
+
+        # [Batch, num_heads, HW, HW]
+        logits = tf.matmul(flat_q, flat_k, transpose_b=True)
+
+        # Apply relative encodings
+        if self.relative:
+            h_rel_logits, w_rel_logits = self.relative_logits(q)
+            logits += h_rel_logits
+            logits += w_rel_logits
+
+        weights = K.softmax(logits, axis=-1)
+        attn_out = tf.matmul(weights, flat_v)
+
+        attn_out_shape = [self._batch, self.num_heads, self._height, self._width, self.depth_v // self.num_heads]
+        attn_out_shape = K.stack(attn_out_shape)
+        attn_out = K.reshape(attn_out, attn_out_shape)
+        attn_out = self.combine_heads_2d(attn_out)
+        # [batch, height, width, depth_v]
+
+        if self.axis == 1:
+            # return to [batch, depth_v, height, width] for channels first
+            attn_out = K.permute_dimensions(attn_out, [0, 3, 1, 2])
+
+        attn_out.set_shape(self.compute_output_shape(self._shape))
+
+        return attn_out
+
+    def compute_output_shape(self, input_shape):
+        output_shape = list(input_shape)
+        output_shape[self.axis] = self.depth_v
+        return tuple(output_shape)
+
+    def split_heads_2d(self, ip):
+        tensor_shape = K.shape(ip)
+
+        # batch, height, width, channels for axis = -1
+        tensor_shape = [tensor_shape[i] for i in range(len(self._shape))]
+
+        batch = tensor_shape[0]
+        height = tensor_shape[1]
+        width = tensor_shape[2]
+        channels = tensor_shape[3]
+
+        # Save the spatial tensor dimensions
+        self._batch = batch
+        self._height = height
+        self._width = width
+
+        ret_shape = K.stack([batch, height, width,  self.num_heads, channels // self.num_heads])
+        split = K.reshape(ip, ret_shape)
+        transpose_axes = (0, 3, 1, 2, 4)
+        split = K.permute_dimensions(split, transpose_axes)
+
+        return split
+
+    def relative_logits(self, q):
+        shape = K.shape(q)
+        # [batch, num_heads, H, W, depth_v]
+        shape = [shape[i] for i in range(5)]
+
+        height = shape[2]
+        width = shape[3]
+
+        rel_logits_w = self.relative_logits_1d(q, self.key_relative_w, height, width,
+                                               transpose_mask=[0, 1, 2, 4, 3, 5])
+
+        rel_logits_h = self.relative_logits_1d(
+            K.permute_dimensions(q, [0, 1, 3, 2, 4]),
+            self.key_relative_h, width, height,
+            transpose_mask=[0, 1, 4, 2, 5, 3])
+
+        return rel_logits_h, rel_logits_w
+
+    def relative_logits_1d(self, q, rel_k, H, W, transpose_mask):
+        rel_logits = tf.einsum('bhxyd,md-&gt;bhxym', q, rel_k)
+        rel_logits = K.reshape(rel_logits, [-1, self.num_heads * H, W, 2 * W - 1])
+        rel_logits = self.rel_to_abs(rel_logits)
+        rel_logits = K.reshape(rel_logits, [-1, self.num_heads, H, W, W])
+        rel_logits = K.expand_dims(rel_logits, axis=3)
+        rel_logits = K.tile(rel_logits, [1, 1, 1, H, 1, 1])
+        rel_logits = K.permute_dimensions(rel_logits, transpose_mask)
+        rel_logits = K.reshape(rel_logits, [-1, self.num_heads, H * W, H * W])
+        return rel_logits
+
+    def rel_to_abs(self, x):
+        shape = K.shape(x)
+        shape = [shape[i] for i in range(3)]
+        B, Nh, L, = shape
+        col_pad = K.zeros(K.stack([B, Nh, L, 1]))
+        x = K.concatenate([x, col_pad], axis=3)
+        flat_x = K.reshape(x, [B, Nh, L * 2 * L])
+        flat_pad = K.zeros(K.stack([B, Nh, L - 1]))
+        flat_x_padded = K.concatenate([flat_x, flat_pad], axis=2)
+        final_x = K.reshape(flat_x_padded, [B, Nh, L + 1, 2 * L - 1])
+        final_x = final_x[:, :, :L, L - 1:]
+        return final_x
+
+    def combine_heads_2d(self, inputs):
+        # [batch, num_heads, height, width, depth_v // num_heads]
+        transposed = K.permute_dimensions(inputs, [0, 2, 3, 1, 4])
+        # [batch, height, width, num_heads, depth_v // num_heads]
+        shape = K.shape(transposed)
+        shape = [shape[i] for i in range(5)]
+
+        a, b = shape[-2:]
+        ret_shape = K.stack(shape[:-2] + [a * b])
+        # [batch, height, width, depth_v]
+        return K.reshape(transposed, ret_shape)
+
+    def get_config(self):
+        config = {
+            'depth_k': self.depth_k,
+            'depth_v': self.depth_v,
+            'num_heads': self.num_heads,
+            'relative': self.relative,
+        }
+        base_config = super(AttentionAugmentation2D, self).get_config()
+        return dict(list(base_config.items()) + list(config.items()))
+
+
+def augmented_conv2d(ip, filters, kernel_size=(3, 3), strides=(1, 1),
+                     depth_k=0.2, depth_v=0.2, num_heads=8, relative_encodings=True):
+
+
+    channel_axis = 1 if K.image_data_format() == 'channels_first' else -1
+
+    depth_k, depth_v = _normalize_depth_vars(depth_k, depth_v, filters)
+
+    conv_out = _conv_layer(filters - depth_v, kernel_size, strides)(ip)
+
+    # Augmented Attention Block
+    qkv_conv = _conv_layer(2 * depth_k + depth_v, (1, 1), strides)(ip)
+    attn_out = AttentionAugmentation2D(depth_k, depth_v, num_heads, relative_encodings)(qkv_conv)
+    attn_out = _conv_layer(depth_v, kernel_size=(1, 1))(attn_out)
+
+    output = concatenate([conv_out, attn_out], axis=channel_axis)
+    output = BatchNormalization()(output)
+    return output
+
+
+@tf.function
+def main():
+    from tensorflow.keras.layers import Input
+    from tensorflow.keras.models import Model
+
+    ip = Input(shape=(32, 32, 3))
+    x = augmented_conv2d(ip, filters=20, kernel_size=(3, 3),
+                         depth_k=0.2, depth_v=0.2,  # dk/v (0.2) * f_out (20) = 4
+                         num_heads=4, relative_encodings=True)
+
+    model = Model(ip, x)
+    model.summary()
+
+    # Check if attention builds properly
+    x = tf.zeros((1, 32, 32, 3))
+    y = model(x)
+    print("Attention Augmented Conv out shape : ", y.shape)
+
+if __name__ == '__main__':
+    main()
+&lt;/denchmark-code&gt;
+
+Other info / logs Include any logs or source code that would be helpful to
+diagnose the problem. If including tracebacks, please include the full
+traceback. Large logs and files should be attached.
+&lt;denchmark-code&gt;
+TypeError: in converted code:
+
+    attn_aug_conv.py:318 main  *
+        x = augmented_conv2d(ip, filters=20, kernel_size=(3, 3),
+    attn_aug_conv.py:305 augmented_conv2d  *
+        attn_out = AttentionAugmentation2D(depth_k, depth_v, num_heads, relative_encodings)(qkv_conv)
+    /home/miniconda3/lib/python3.7/site-packages/tensorflow_core/python/keras/engine/base_layer.py:778 __call__
+        outputs = call_fn(cast_inputs, *args, **kwargs)
+    attn_aug_conv.py:158 call  *
+        h_rel_logits, w_rel_logits = self.relative_logits(q)
+    attn_aug_conv.py:215 relative_logits  *
+        rel_logits_w = self.relative_logits_1d(q, self.key_relative_w, height, width,
+    attn_aug_conv.py:228 relative_logits_1d  *
+        rel_logits = self.rel_to_abs(rel_logits)
+    attn_aug_conv.py:240 rel_to_abs  *
+        col_pad = K.zeros(K.stack([B, Nh, L, 1]))
+    /home/miniconda3/lib/python3.7/site-packages/tensorflow_core/python/keras/backend.py:1300 zeros
+        v = array_ops.zeros(shape=shape, dtype=tf_dtype, name=name)
+    /home/miniconda3/lib/python3.7/site-packages/tensorflow_core/python/ops/array_ops.py:2446 zeros
+        output = fill(shape, constant(zero, dtype=dtype), name=name)
+    /home/miniconda3/lib/python3.7/site-packages/tensorflow_core/python/ops/array_ops.py:233 fill
+        result = gen_array_ops.fill(dims, value, name=name)
+    /home/miniconda3/lib/python3.7/site-packages/tensorflow_core/python/ops/gen_array_ops.py:3240 fill
+        dims, value, name=name, ctx=_ctx)
+    /home/miniconda3/lib/python3.7/site-packages/tensorflow_core/python/ops/gen_array_ops.py:3267 fill_eager_fallback
+        ctx=ctx, name=name)
+    /home/miniconda3/lib/python3.7/site-packages/tensorflow_core/python/eager/execute.py:76 quick_execute
+        raise e
+    /home/miniconda3/lib/python3.7/site-packages/tensorflow_core/python/eager/execute.py:61 quick_execute
+        num_outputs)
+
+    TypeError: An op outside of the function building code is being passed
+    a "Graph" tensor. It is possible to have Graph tensors
+    leak out of the function building context by including a
+    tf.init_scope in your function building code.
+    For example, the following function will fail:
+      @tf.function
+      def has_init_scope():
+        my_constant = tf.constant(1.)
+        with tf.init_scope():
+          added = my_constant * 2
+    The graph tensor has name: attention_augmentation2d/stack_6:0
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='snailrowen1337' date='2020-04-16T03:24:05Z'>
+		I have tried on colab with TF version 2.1.0, 2.2.0-rc3 and was able to reproduce the issue.Please, find the gist &lt;denchmark-link:https://colab.sandbox.google.com/gist/ravikyram/50779adee64cd9c063166054e4ef2476/untitled775.ipynb&gt;here&lt;/denchmark-link&gt;
+. Thanks!
+		</comment>
+		<comment id='2' author='snailrowen1337' date='2020-05-11T18:11:29Z'>
+		Thanks &lt;denchmark-link:https://github.com/snailrowen1337&gt;@snailrowen1337&lt;/denchmark-link&gt;
+ for the report. It's a little hard to diagnose this without a minimal example, though, given how much custom code you are wrapping in a tf.function here-- can you spend some time debugging to get the tf.function closer to the root cause? You can also try posting this on Stack Overflow, as there is a larger community of users who can help there. Once the problem is narrowed down, please open a new bug report with the precise API that is causing a problem.
+		</comment>
+		<comment id='3' author='snailrowen1337' date='2020-05-11T18:11:31Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/38583&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/38583&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,294 @@
+<bug id='26430' author='wookayin' open_date='2019-03-07T07:58:05Z' closed_time='2019-08-05T20:15:03Z'>
+	<summary>Keras model saving is not working when graph is finalized</summary>
+	<description>
+
+TensorFlow installed from (source or binary): from pip
+TensorFlow version (use command below): 1.13.1
+Python version: 3.6
+
+TLDR) A Keras model used in a static-graph and session mode cannot save its weight when the graph is finalized.
+import tensorflow as tf
+model = tf.keras.models.Sequential([
+    tf.keras.layers.Dense(256)
+])
+
+x = tf.zeros([10, 3])   # dummy input
+model(x)
+
+sess = tf.InteractiveSession()
+sess.run(tf.global_variables_initializer())
+
+# finalize the graph (or it's done automatically in MonitoredSession)
+tf.get_default_graph().finalize()
+
+# Error!
+model.save('/tmp/keras-test')
+The error is RuntimeError: Graph is finalized and cannot be modified. Stacktrace:
+&lt;denchmark-code&gt;  File "$PREFIX/lib/python3.6/site-packages/tensorflow/python/keras/engine/network.py", line 1415, in save_weights
+    saving.save_weights_to_hdf5_group(f, self.layers)
+  File "$PREFIX/lib/python3.6/site-packages/tensorflow/python/keras/engine/saving.py", line 742, in save_weights_to_hdf5_group
+    weight_values = K.batch_get_value(symbolic_weights)
+  File "$PREFIX/lib/python3.6/site-packages/tensorflow/python/keras/backend.py", line 2819, in batch_get_value
+    return get_session().run(tensors)
+  File "$PREFIX/lib/python3.6/site-packages/tensorflow/python/keras/backend.py", line 482, in get_session
+    _initialize_variables(session)
+  File "$PREFIX/lib/python3.6/site-packages/tensorflow/python/keras/backend.py", line 758, in _initialize_variables
+    [variables_module.is_variable_initialized(v) for v in candidate_vars])
+  File "$PREFIX/lib/python3.6/site-packages/tensorflow/python/keras/backend.py", line 758, in &lt;listcomp&gt;
+    [variables_module.is_variable_initialized(v) for v in candidate_vars])
+  File "$PREFIX/lib/python3.6/site-packages/tensorflow/python/util/tf_should_use.py", line 193, in wrapped
+    return _add_should_use_warning(fn(*args, **kwargs))
+  File "$PREFIX/lib/python3.6/site-packages/tensorflow/python/ops/variables.py", line 2924, in is_variable_initialized
+    return state_ops.is_variable_initialized(variable)
+  File "$PREFIX/lib/python3.6/site-packages/tensorflow/python/ops/state_ops.py", line 133, in is_variable_initialized
+    return ref.is_initialized(name=name)
+  File "$PREFIX/lib/python3.6/site-packages/tensorflow/python/ops/resource_variable_ops.py", line 833, in is_initialized
+    return gen_resource_variable_ops.var_is_initialized_op(self.handle, name)
+  File "$PREFIX/lib/python3.6/site-packages/tensorflow/python/ops/gen_resource_variable_ops.py", line 1334, in var_is_initialized_op
+    "VarIsInitializedOp", resource=resource, name=name)
+  File "$PREFIX/lib/python3.6/site-packages/tensorflow/python/framework/op_def_library.py", line 788, in _apply_op_helper
+    op_def=op_def)
+  File "$PREFIX/lib/python3.6/site-packages/tensorflow/python/util/deprecation.py", line 507, in new_func
+    return func(*args, **kwargs)
+  File "$PREFIX/lib/python3.6/site-packages/tensorflow/python/framework/ops.py", line 3272, in create_op
+    self._check_not_finalized()
+  File "$PREFIX/lib/python3.6/site-packages/tensorflow/python/framework/ops.py", line 2945, in _check_not_finalized
+    raise RuntimeError("Graph is finalized and cannot be modified.")
+RuntimeError: Graph is finalized and cannot be modified.
+&lt;/denchmark-code&gt;
+
+The operation being created here is:
+&lt;denchmark-code&gt; &lt;tf.Operation 'VarIsInitializedOp_1' type=VarIsInitializedOp&gt;,
+ &lt;tf.Operation 'VarIsInitializedOp_2' type=VarIsInitializedOp&gt;]
+&lt;/denchmark-code&gt;
+
+From &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/master/tensorflow/python/keras/backend.py#L761&gt;keras/backend.py&lt;/denchmark-link&gt;
+:
+ is_initialized = session.run(
+     [variables_module.is_variable_initialized(v) for v in candidate_vars])
+Well, I think we should not create and call this "new op" to check whether a variable is initialized. Why is it implemented in this way? Not only it doesn't work, but also it will result in op leak as well even though it would work without finalizing the graph? (UPD: it seems that the result is cached through _keras_initialized so it won't be the case) There is another way to check whether the variable is initialized or not without creating a new operation.
+	</description>
+	<comments>
+		<comment id='1' author='wookayin' date='2019-03-07T08:10:40Z'>
+		A workaround I'm using currently is to call model.save once before the MonitoredSession starts, so that those VarIsInitializedOp's can be created before finalizing the graph.
+		</comment>
+		<comment id='2' author='wookayin' date='2019-03-28T17:49:49Z'>
+		&lt;denchmark-link:https://github.com/wookayin&gt;@wookayin&lt;/denchmark-link&gt;
+ Can you clarify why you need to finalize the graph before saving? Typically, you would save before finalizing the graph, because saving requires graph + var access.
+		</comment>
+		<comment id='3' author='wookayin' date='2019-03-29T16:32:32Z'>
+		&lt;denchmark-link:https://github.com/karmel&gt;@karmel&lt;/denchmark-link&gt;
+ My use case was as follows:
+
+Define graphs and build models as usual
+Create MonitoredSession (which is a wrapper of standard Session) -- upon entering the context scope, the graph gets finalized
+Run training steps (say, 1000 iterations)
+Save the graph (and the graph has been finalized) &lt;--- error!
+
+Though it might not be known very widely, indeed saving graph requires creating operations, hence should be before graph finalization --- but in order to save variables, variables need to have been initialized after session creation. I see a cyclic dependency here. (please look at my workaround above as well)
+		</comment>
+		<comment id='4' author='wookayin' date='2019-07-23T06:08:27Z'>
+		Same problem when using Estimator + Keras model. I using tf1.14.
+		</comment>
+		<comment id='5' author='wookayin' date='2019-07-23T08:00:33Z'>
+		&lt;denchmark-code&gt;I0723 15:56:05.430358 140354566588224 basic_session_run_hooks.py:606] Saving checkpoints for 2550 into exp/emo/keras-lstm/ckpt/model.ckpt.
+316 I0723 15:56:05.641069 140354566588224 estimator.py:1145] Calling model_fn.
+317 Traceback (most recent call last):
+318   File "/home/luban//nlu-ml/delta/main.py", line 114, in &lt;module&gt;
+319     app.run(main)
+320   File "/home/luban/.local/lib/python3.6/site-packages/absl/app.py", line 300, in run
+321     _run_main(main, args)
+322   File "/home/luban/.local/lib/python3.6/site-packages/absl/app.py", line 251, in _run_main
+323     sys.exit(main(argv))
+324   File "/home/luban//nlu-ml/delta/main.py", line 82, in main
+325     solver.train_and_eval()
+326   File "/home/luban//nlu-ml/delta/utils/solver/estimator_solver.py", line 441, in train_and_eval
+327     self.train_and_eval_one_epoch(nn, train_spec, eval_spec)
+328   File "/home/luban//nlu-ml/delta/utils/solver/estimator_solver.py", line 397, in train_and_eval_one_epoch
+329     nn, train_spec, eval_spec)
+330   File "/home/luban//env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow_estimator/python/estimator/training.py", line 473, in train_and_evaluate
+331     return executor.run()
+332   File "/home/luban//env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow_estimator/python/estimator/training.py", line 613, in run
+333     return self.run_local()
+334   File "/home/luban//env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow_estimator/python/estimator/training.py", line 714, in run_local
+335     saving_listeners=saving_listeners)
+336   File "/home/luban//env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow_estimator/python/estimator/estimator.py", line 367, in train
+337     loss = self._train_model(input_fn, hooks, saving_listeners)
+338   File "/home/luban//env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow_estimator/python/estimator/estimator.py", line 1156, in _train_model
+339     return self._train_model_distributed(input_fn, hooks, saving_listeners)
+340   File "/home/luban//env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow_estimator/python/estimator/estimator.py", line 1219, in _train_model_distributed
+341     self._config._train_distribute, input_fn, hooks, saving_listeners)
+342   File "/home/luban//env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow_estimator/python/estimator/estimator.py", line 1329, in _actual_train_model_distributed
+343     saving_listeners)
+344   File "/home/luban//env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow_estimator/python/estimator/estimator.py", line 1484, in _train_with_estimator_spec
+345     _, loss = mon_sess.run([estimator_spec.train_op, estimator_spec.loss])
+346   File "/home/luban//env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow/python/training/monitored_session.py", line 754, in run
+347     run_metadata=run_metadata)
+348   File "/home/luban//env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow/python/training/monitored_session.py", line 1252, in run
+349     run_metadata=run_metadata)
+350   File "/home/luban//env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow/python/training/monitored_session.py", line 1353, in run
+351     raise six.reraise(*original_exc_info)
+352   File "/home/luban/.local/lib/python3.6/site-packages/six.py", line 693, in reraise
+353     raise value
+354   File "/home/luban//env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow/python/training/monitored_session.py", line 1338, in run
+355     return self._sess.run(*args, **kwargs)
+356   File "/home/luban//env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow/python/training/monitored_session.py", line 1419, in run
+357     run_metadata=run_metadata))
+358   File "/home/luban//env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow/python/training/basic_session_run_hooks.py", line 594, in after_run
+359     if self._save(run_context.session, global_step):
+360   File "/home/luban//env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow/python/training/basic_session_run_hooks.py", line 619, in _save
+361     if l.after_save(session, step):
+362   File "/home/luban//env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow_estimator/python/estimator/training.py", line 519, in after_save
+363     self._evaluate(global_step_value)  # updates self.eval_result
+364   File "/home/luban//env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow_estimator/python/estimator/training.py", line 539, in _evaluate
+365     self._evaluator.evaluate_and_export())
+366   File "/home/luban//env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow_estimator/python/estimator/training.py", line 920, in evaluate_and_export
+367     hooks=self._eval_spec.hooks)
+368   File "/home/luban//env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow_estimator/python/estimator/estimator.py", line 477, in evaluate
+369     name=name)
+370   File "/home/luban//env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow_estimator/python/estimator/estimator.py", line 519, in _actual_eval
+     return _evaluate()
+372   File "/home/luban//env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow_estimator/python/estimator/estimator.py", line 501, in _evaluate
+373     self._evaluate_build_graph(input_fn, hooks, checkpoint_path))
+374   File "/home/luban//env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow_estimator/python/estimator/estimator.py", line 1501, in _evaluate_build_graph
+375     self._call_model_fn_eval(input_fn, self.config))
+376   File "/home/luban//env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow_estimator/python/estimator/estimator.py", line 1537, in _call_model_fn_eval
+377     features, labels, ModeKeys.EVAL, config)
+378   File "/home/luban//env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow_estimator/python/estimator/estimator.py", line 1146, in _call_model_fn
+379     model_fn_results = self._model_fn(features=features, **kwargs)
+380   File "/home/luban//nlu-ml/delta/utils/solver/estimator_solver.py", line 80, in _model_fn
+381     model_outputs = self.model_class(features, training=is_train)
+382   File "/home/luban//env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow/python/keras/engine/base_layer.py", line 634, in __call__
+383     outputs = call_fn(inputs, *args, **kwargs)
+384   File "/home/luban//env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow/python/autograph/impl/api.py", line 149, in wrapper
+385     raise e.ag_error_metadata.to_exception(type(e))
+386 RuntimeError: in converted code:
+387     relative to /home/luban/:
+388 
+389     nlu-ml/delta/models/speech_cls_model.py:49 call *
+390         x = self.lstm2(x)
+391     env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow/python/keras/layers/recurrent.py:619 __call__
+392         return super(RNN, self).__call__(inputs, **kwargs)
+393     env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow/python/keras/engine/base_layer.py:634 __call__
+394         outputs = call_fn(inputs, *args, **kwargs)
+395     env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow/python/keras/layers/recurrent.py:2533 call
+396         inputs, mask=mask, training=training, initial_state=initial_state)
+397     env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow/python/keras/layers/recurrent.py:743 call
+398         zero_output_for_mask=self.zero_output_for_mask)
+399     env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow/python/keras/backend.py:3732 rnn
+400         input_time_zero, tuple(initial_states) + tuple(constants))
+401     env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow/python/keras/layers/recurrent.py:728 step
+402         output, new_states = self.cell.call(inputs, states, **kwargs)
+403     env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow/python/keras/layers/recurrent.py:2215 call
+404         self.kernel, num_or_size_splits=4, axis=1)
+405     env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow/python/ops/array_ops.py:1563 split
+406         axis=axis, num_split=num_or_size_splits, value=value, name=name)
+407     env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow/python/ops/gen_array_ops.py:9496 split
+408         "Split", split_dim=axis, value=value, num_split=num_split, name=name)
+409     env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow/python/framework/op_def_library.py:527 _apply_op_helper
+410         preferred_dtype=default_dtype)
+411     env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow/python/framework/ops.py:1224 internal_convert_to_tensor
+412         ret = conversion_func(value, dtype=dtype, name=name, as_ref=as_ref)
+413     env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow/python/framework/constant_op.py:305 _constant_tensor_conversion_function
+414         return constant(v, dtype=dtype, name=name)
+415     env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow/python/framework/constant_op.py:246 constant
+416         allow_broadcast=True)
+417     env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow/python/framework/constant_op.py:290 _constant_impl
+418         name=name).outputs[0]
+419     env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow/python/util/deprecation.py:507 new_func
+420         return func(*args, **kwargs)
+421     env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow/python/framework/ops.py:3588 create_op
+422         self._check_not_finalized()
+423     env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow/python/framework/ops.py:3225 _check_not_finalized
+424         raise RuntimeError("Graph is finalized and cannot be modified.")
+425 
+426     RuntimeError: Graph is finalized and cannot be modified.
+427 
+428 E0723 15:56:06.049019 140354566588224 tf_should_use.py:71] ==================================
+429 Object was never used (type &lt;class 'tensorflow.python.ops.tensor_array_ops.TensorArray'&gt;):
+430 &lt;tensorflow.python.ops.tensor_array_ops.TensorArray object at 0x7fa5fc348f98&gt;      
+If you want to mark it as used call its "mark_used()" method.
+432 It was originally created here:
+433   File "/home/luban//env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow/python/keras/backend.py", line 3722, in &lt;genexpr&gt;
+434     for ta, input_ in zip(input_ta, flatted_inputs))  File "/home/luban//env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow/python/util/tf_should_use.py", line 193, in wrapped
+435     return _add_should_use_warning(fn(*args, **kwargs))
+436 ==================================
+437 E0723 15:56:06.049994 140354566588224 tf_should_use.py:71] ==================================
+438 Object was never used (type &lt;class 'tensorflow.python.ops.tensor_array_ops.TensorArray'&gt;):
+439 &lt;tensorflow.python.ops.tensor_array_ops.TensorArray object at 0x7fa5fc37a240&gt;
+440 If you want to mark it as used call its "mark_used()" method.
+441 It was originally created here:
+442   File "/home/luban//env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow/python/keras/backend.py", line 3722, in &lt;genexpr&gt;
+443     for ta, input_ in zip(input_ta, flatted_inputs))  File "/home/luban//env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow/python/util/tf_should_use.py", line 193, in wrapped
+444     return _add_should_use_warning(fn(*args, **kwargs))  File "/home/luban/
+/env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow/python/ops/tensor_array_ops.py", line 1256, in unstack
+445     return self._implementation.unstack(value, name=name)  File "/home/luban//env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow/python/util/tf_should_use.py", line 193, in wrapped
+446     return _add_should_use_warning(fn(*args, **kwargs))
+447 ==================================
+448 E0723 15:56:06.050341 140354566588224 tf_should_use.py:71] ==================================
+449 Object was never used (type &lt;class 'tensorflow.python.ops.tensor_array_ops.TensorArray'&gt;):
+450 &lt;tensorflow.python.ops.tensor_array_ops.TensorArray object at 0x7fa5fc37ac88&gt;
+451 If you want to mark it as used call its "mark_used()" method.
+452 It was originally created here:
+453   File "/home/luban//env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow/python/keras/backend.py", line 3722, in &lt;genexpr&gt;
+454     for ta, input_ in zip(input_ta, flatted_inputs))  File "/home/luban//env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow/python/util/tf_should_use.py", line 193, in wrapped
+455     return _add_should_use_warning(fn(*args, **kwargs))  File "/home/luban//env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow/python/ops/tensor_array_ops.py", line 1256, in unstack
+456     return self._implementation.unstack(value, name=name)  File "/home//env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow/python/util/tf_should_use.py", line 193, in wrapped
+457     return _add_should_use_warning(fn(*args, **kwargs))  File "env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow/python/ops/tensor_array_ops.py", line 351, in unstack
+458     indices=math_ops.range(0, num_elements), value=value, name=name)  File "//env/py3.6_tf1.14pip/lib/python3.6/site-packages/tensorflow/python/util/tf_should_use.py", line 193, in wrapped
+459     return _add_should_use_warning(fn(*args, **kwargs))
+460 ==================================                                                                                                                                                       
+&lt;/denchmark-code&gt;
+
+how to fix this ?
+		</comment>
+		<comment id='6' author='wookayin' date='2019-08-05T18:36:12Z'>
+		Any updates on this?
+		</comment>
+		<comment id='7' author='wookayin' date='2019-08-05T19:51:55Z'>
+		&lt;denchmark-link:https://github.com/zh794390558&gt;@zh794390558&lt;/denchmark-link&gt;
+ A dirty but easiest workaround for this would be:
+# g : tf.Graph (e.g. tf.get_default_graph())
+
+g._finalized = False       # de-finalized for a while
+# ... (add more ops) ...
+g.finalize()              # finalize again
+		</comment>
+		<comment id='8' author='wookayin' date='2019-08-05T20:04:27Z'>
+		&lt;denchmark-link:https://github.com/wookayin&gt;@wookayin&lt;/denchmark-link&gt;
+, can this work with ?
+UPDATE: no, it fails with AttributeError: can't set attribute.
+		</comment>
+		<comment id='9' author='wookayin' date='2019-08-05T20:15:03Z'>
+		This is working as intended -- saving when the Graph is finalized won't work because the Saver needs to add saving/restore ops to properly save the variables.
+		</comment>
+		<comment id='10' author='wookayin' date='2019-08-05T20:15:04Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=26430&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=26430&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='11' author='wookayin' date='2019-08-05T20:27:02Z'>
+		&lt;denchmark-link:https://github.com/k-w-w&gt;@k-w-w&lt;/denchmark-link&gt;
+, any ideas why &lt;denchmark-link:https://github.com/sdll/psenet/blob/8ecf0631051b877a8bfb8ca5ed3e7d6c92bf8428/psenet/train.py#L97&gt;training the tf.estimator&lt;/denchmark-link&gt;
+ with a Keras model under the hood can fail with this error?
+		</comment>
+		<comment id='12' author='wookayin' date='2019-08-05T20:31:09Z'>
+		&lt;denchmark-link:https://github.com/k-w-w&gt;@k-w-w&lt;/denchmark-link&gt;
+ I don't think this can be closed. Nor any documentation of the behavior we have.
+I think the problem is really when one use MonitoredSession, tf.{estimator,train}.train_and_evalute (or any similar wrappers), tf.Estimator because the graph gets automatically finalized inside and we don't have much control of (keras) model to ensure the creation of saving/restore ops.
+		</comment>
+		<comment id='13' author='wookayin' date='2019-08-05T20:41:00Z'>
+		&lt;denchmark-link:https://github.com/sdll&gt;@sdll&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/wookayin&gt;@wookayin&lt;/denchmark-link&gt;
+ How is the model being exported to SavedModel? Are you using ?
+		</comment>
+		<comment id='14' author='wookayin' date='2019-08-06T06:33:44Z'>
+		&lt;denchmark-link:https://github.com/k-w-w&gt;@k-w-w&lt;/denchmark-link&gt;
+, the problem occurs when &lt;denchmark-link:https://github.com/sdll/psenet/blob/8ecf0631051b877a8bfb8ca5ed3e7d6c92bf8428/psenet/train.py#L217&gt;using tf.estimator.train_and_evaluate&lt;/denchmark-link&gt;
+ as &lt;denchmark-link:https://github.com/wookayin&gt;@wookayin&lt;/denchmark-link&gt;
+ describes. The training step goes well, but then the program crashes on eval. Might this be because we need to convert the keras model to the estimator, instead of using keras in ?
+		</comment>
+	</comments>
+</bug>

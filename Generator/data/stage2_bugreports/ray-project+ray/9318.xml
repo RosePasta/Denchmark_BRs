@@ -1,0 +1,121 @@
+<bug id='9318' author='acowlikeobject' open_date='2020-07-06T13:41:41Z' closed_time='2020-07-17T06:46:18Z'>
+	<summary>ObjectID KeyError when using ActorPool.map_unordered() from threads</summary>
+	<description>
+I have a mostly I/O bound pipeline that I run in threads.  One step of this pipeline is CPU-bound, so I thought I'd try using an ActorPool to run that step.
+Here's a simplified example with the pipeline reduced to just the call to the ActorPool:
+import threading
+from concurrent.futures.thread import ThreadPoolExecutor
+
+import ray
+
+@ray.remote
+class Worker:
+    def a_cpu_bound_calc(self, i):
+        return f'{i} done'
+
+def pipeline(pool, inputs):
+    for result in pool.map_unordered(lambda a, v: a.a_cpu_bound_calc.remote(v), inputs):
+        print(f'Thread {threading.get_ident()}, result: {result}')
+
+ray.init()
+worker_pool = ray.util.ActorPool([Worker.remote() for _ in range(5)])
+input_lists = [
+    ['a', 'b'],
+    [1, 2]
+]
+
+with ThreadPoolExecutor() as pool:
+    for future in [pool.submit(pipeline, worker_pool, inputs) for inputs in input_lists]:
+        future.result()
+I would expect each thread to work on the inputs submitted to it (letters and numbers, respectively).
+Instead, the inputs get interleaved, and often one thread ends up printing the results of all inputs, and there is always a KeyError raised at the end (maybe a thread looking for a task that the other thread pulled?):
+2020-07-06 09:21:09,873 WARNING services.py:923 -- Redis failed to start, retrying now.
+2020-07-06 09:21:10,068 INFO services.py:1165 -- View the Ray dashboard at localhost:8266
+Thread 139628329801472, result: a done
+Thread 139628329801472, result: 2 done
+Thread 139628329801472, result: 1 done
+Thread 139628329801472, result: b done
+Traceback (most recent call last):
+  File "test.py", line 29, in &lt;module&gt;
+    future.result()
+  File "/home/user/miniconda3/lib/python3.7/concurrent/futures/_base.py", line 428, in result
+    return self.__get_result()
+  File "/home/user/miniconda3/lib/python3.7/concurrent/futures/_base.py", line 384, in __get_result
+    raise self._exception
+  File "/home/user/miniconda3/lib/python3.7/concurrent/futures/thread.py", line 57, in run
+    result = self.fn(*self.args, **self.kwargs)
+  File "test.py", line 15, in pipeline
+    for result in pool.map_unordered(lambda a, v: a.a_cpu_bound_calc.remote(v), inputs):
+  File "/home/user/miniconda3/lib/python3.7/site-packages/ray/util/actor_pool.py", line 88, in map_unordered
+    yield self.get_next_unordered()
+  File "/home/user/miniconda3/lib/python3.7/site-packages/ray/util/actor_pool.py", line 203, in get_next_unordered
+    i, a = self._future_to_actor.pop(future)
+KeyError: ObjectID(5d7672e4177705c07e0a4dfc010000c001000000)
+If this is what's happening, then on one one hand, it seems obvious: in a multi-threaded context, different threads are scheduling tasks on the same pool, so collisions are inevitable.  On the other hand, I wouldn't expect two different map calls to get mingled.
+Is this expected behavior?  If yes, then what is the recommended way to submit tasks to a pool (to run unordered, preferably), and then wait on those specific tasks to complete?
+Ray version and other system information (Python version, TensorFlow version, OS): ray 0.8.6, ubuntu 18.04, python 3.7.4
+
+ I have verified my script runs in a clean environment and reproduces the issue.
+ I have verified the issue also occurs with the latest wheels.
+
+	</description>
+	<comments>
+		<comment id='1' author='acowlikeobject' date='2020-07-10T04:00:58Z'>
+		Is it possible to avoid using the Actor pool in a threaded fashion and just submit things as they come? I think you'll probably want to do something like ActorPool.submit &lt;denchmark-link:https://github.com/ray-project/ray/blob/master/python/ray/util/actor_pool.py#L90&gt;https://github.com/ray-project/ray/blob/master/python/ray/util/actor_pool.py#L90&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='2' author='acowlikeobject' date='2020-07-12T02:11:25Z'>
+		Our threaded pipeline is: [ingest -&gt; split into N subtasks -&gt; compute N subtasks in ActorPool -&gt; combine N results],
+The combination needs to know when computes for this pipeline's subtasks are done.  The ActorPool.submit doesn't return a future to wait on, so doesn't help here.
+There are ways around this, like using an ActorPool for the pipeline instead of threads (each map will run in its process), or using remote functions instead of ActorPools (they return futures), or some other way of communicating to the combination step that the compute is done.
+We'll probably end up the first (using ActorPools to run the pipelines instead of threads).  Believe an example in the docs uses this approach "pool across pools" approach.  Is there a way to suppress that "lots of workers" warning?
+		</comment>
+		<comment id='3' author='acowlikeobject' date='2020-07-12T02:16:58Z'>
+		If a remote function returns an iterable of variable length, is there a way to map another remote function over the iterable?  Something like this:
+split_tasks = split.remote(ingest)
+computed = [compute.remote(x) for x in split_tasks]
+This will complain that split_tasks is not iterable.  I know we can set num_return_vals, but the length of the iterable here is variable.
+		</comment>
+		<comment id='4' author='acowlikeobject' date='2020-07-12T02:40:16Z'>
+		
+There are ways around this, like using an ActorPool for the pipeline instead of threads (each map will run in its process), or using remote functions instead of ActorPools (they return futures), or some other way of communicating to the combination step that the compute is done.
+
+Yeah, as you noted it looks like ActorPool is not thread-safe. However, what if you did something like:
+def pipeline(workers, inputs):
+    worker_pool = ray.util.ActorPool(workers)  # CHANGE HERE 
+    for result in pool.map_unordered(lambda a, v: a.a_cpu_bound_calc.remote(v), inputs):
+        print(f'Thread {threading.get_ident()}, result: {result}')
+
+ray.init()
+
+input_lists = [
+    ['a', 'b'],
+    [1, 2]
+]
+all_workers = [Worker.remote() for _ in range(5)]
+
+with ThreadPoolExecutor() as pool:
+    # CHANGE HERE 
+    for future in [pool.submit(pipeline, all_workers, inputs) for inputs in input_lists]:
+        future.result()
+Here, the actor pool is just a wrapper over some created actors - so all I'm doing is just instantiating it on multiple threads.
+		</comment>
+		<comment id='5' author='acowlikeobject' date='2020-07-12T02:50:05Z'>
+		
+This will complain that split_tasks is not iterable. I know we can set num_return_vals, but the length of the iterable here is variable.
+
+Hmm, I think the simplest way is to break this up into separate returns using a single actor.
+		</comment>
+		<comment id='6' author='acowlikeobject' date='2020-07-17T06:46:18Z'>
+		
+def pipeline(workers, inputs):
+    worker_pool = ray.util.ActorPool(workers)  # CHANGE HERE 
+    for result in pool.map_unordered(lambda a, v: a.a_cpu_bound_calc.remote(v), inputs):
+        print(f'Thread {threading.get_ident()}, result: {result}')
+Here, the actor pool is just a wrapper over some created actors - so all I'm doing is just instantiating it on multiple threads.
+
+Apologies for the delay.  This is interesting.  I didn't realize you could create pools of the same workers multiple times... but I guess why not.  As you say, an ActorPool is a thin utility wrapper, with precisely the utility (scheduling/mapping) that I want to make thread safe.
+Think this gives us some good options... thanks very much for the help!
+		</comment>
+	</comments>
+</bug>

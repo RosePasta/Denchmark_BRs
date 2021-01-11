@@ -1,0 +1,115 @@
+<bug id='13190' author='Dorokhov' open_date='2017-09-20T16:04:58Z' closed_time='2017-10-04T20:50:56Z'>
+	<summary>TF_AddGradients gradients returns wrong result when multiple outputs specified</summary>
+	<description>
+&lt;denchmark-h:h3&gt;System information&lt;/denchmark-h&gt;
+
+Darwin Mac-Admin.local 15.6.0 Darwin Kernel Version 15.6.0: Thu Jun 23 18:25:34 PDT 2016; root:xnu-3248.60.10~1/RELEASE_X86_64 x86_64
+Mac OS X 10.11.6
+&lt;denchmark-h:h3&gt;Describe the problem&lt;/denchmark-h&gt;
+
+Hi. I've added a unit test for TF_AddGradients API (see code below) which is similar to
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/ca3bc0f1c2f917cf6e7c49d58f5ec604a9af9367/tensorflow/python/ops/gradients_test.py#L337&gt;this python test&lt;/denchmark-link&gt;
+
+In the test, I provide two outputs
+y[0]=x[0] ** 2
+y[1] = y[0] ** 8
+where input x[0]=3.
+According to the &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/03619fab3f4dd6f28b67418455a953b0fccdd9bf/tensorflow/c/c_api.h#L1018&gt;documentation&lt;/denchmark-link&gt;
+  result should be calculated by formula d(y_1 + y_2 + ...)/dx_1 and be equal to 17502, but the API prints 6.
+What am I missing? Thanks.
+&lt;denchmark-h:h3&gt;Source code / logs&lt;/denchmark-h&gt;
+
+&lt;denchmark-code&gt;    TF_Status* s = TF_NewStatus();
+    TF_Graph* graph = TF_NewGraph();
+
+    const int ny = 2;
+    const int nx = 1;
+    TF_Output inputs[nx];
+    TF_Output outputs[ny];
+    TF_Output grad_outputs[nx];
+
+    TF_Operation* ph0 = Placeholder(graph, s);
+
+    TF_Operation* y0 = Square(graph, s, ph0, "Square0");
+    TF_Operation* y1 = Square(graph, s, y0, "Square1");
+    TF_Operation* y2 = Square(graph, s, y1, "Square2");
+    inputs[0] = TF_Output{ph0, 0};
+    outputs[0] = TF_Output{y0, 0};
+    outputs[1] = TF_Output{y2, 0};
+
+    TF_AddGradients(graph, outputs, ny, inputs, nx, nullptr, s, grad_outputs);
+    EXPECT_EQ(TF_OK, TF_GetCode(s)) &lt;&lt; TF_Message(s);
+
+    std::unique_ptr&lt;CSession&gt; csession(new CSession(graph, s));
+
+    std::vector&lt;TF_Output&gt; grad_outputs_vec;
+    grad_outputs_vec.assign(grad_outputs, grad_outputs + 2);
+    csession-&gt;SetInputs({{ph0, Int32Tensor(3)}});
+    csession-&gt;SetOutputs(grad_outputs_vec);
+    csession-&gt;Run(s);
+    ASSERT_EQ(TF_OK, TF_GetCode(s)) &lt;&lt; TF_Message(s);
+
+    TF_Tensor* out0 = csession-&gt;output_tensor(0);
+    int* data = static_cast&lt;int*&gt;(TF_TensorData(out0));
+    ASSERT_EQ(17502, *data); 
+
+Failure
+      Expected: 17502
+To be equal to: *data
+      Which is: 6
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='Dorokhov' date='2017-09-28T05:46:46Z'>
+		&lt;denchmark-link:https://github.com/suharshs&gt;@suharshs&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/skye&gt;@skye&lt;/denchmark-link&gt;
+ : Mind taking a look?
+		</comment>
+		<comment id='2' author='Dorokhov' date='2017-09-28T08:39:38Z'>
+		This indeed seems strange. I can reproduce this in python as well along with some other examples to try to narrow it down.
+&lt;denchmark-code&gt;import tensorflow as tf
+
+x = tf.placeholder(tf.float32)
+
+y0 = x * x
+y1 = y0 * y0
+# y2 == y3 == y4 == y5, but they y2 and y3 are incorrect.
+y2 = y1 * y1
+y3 = y0 * y0 * y0 * y0
+y4 = x * x * x * x * x * x * x * x
+y5 = tf.pow(y0, 4)
+
+ga = tf.gradients([y0], x) # Correct : 6.0
+gb = tf.gradients([y1], x) # Correct : 108.0
+gc = tf.gradients([y2], x) # Correct : 17496.0
+gd = tf.gradients([y3], x) # Correct : 17496.0
+ge = tf.gradients([y4], x) # Correct : 17496.0
+gf = tf.gradients([y5], x) # Correct : 17496.0
+
+g0 = tf.gradients([y0, y1], x) # Correct       : 114.0
+g1 = tf.gradients([y1, y2], x) # Correct       : 17604.0
+g2 = tf.gradients([y0, y2], x) # Incorrect     : 6.0
+g3 = tf.gradients([y0, y3], x) # Incorrect     : 4380.0
+g4 = tf.gradients([y0, y4], x) # Correct       : 17502.0
+g5 = tf.gradients([y0, y5], x) # Correct       : 17502.0
+g6 = tf.gradients([y0, y1, y2], x) # Correct   : 17610.0
+
+with tf.Session() as sess:
+    print(sess.run([ga, gb, gc, gd, gf], feed_dict={x: 3.0}))
+    print(sess.run([g0, g1, g2, g3, g4, g5, g6], feed_dict={x: 3.0}))
+&lt;/denchmark-code&gt;
+
+It seems that building up x ^ 8 by using intermediate tensors via multiplication results in errors. Curiously using tf.pow(y0) vs y0* y0 * y0 *y0 results in different gradients when paired with y0. I don't know the issue yet, but will take another look tomorrow.
+		</comment>
+		<comment id='3' author='Dorokhov' date='2017-09-28T09:03:46Z'>
+		&lt;denchmark-link:https://github.com/Dorokhov&gt;@Dorokhov&lt;/denchmark-link&gt;
+ please take another look. I was mistaken in my previous comments. I went ahead and deleted my old comments so as to not cause more confusion :)
+		</comment>
+		<comment id='4' author='Dorokhov' date='2017-09-28T21:55:19Z'>
+		Huh, looks like I was using a old version of tensorflow. The issue in python was resolved here: &lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/fb56fc90167c3919cb59f753f233ef2a41469cb2#diff-7d33d81b07b3cb1679ed1b011a66e447&gt;fb56fc9#diff-7d33d81b07b3cb1679ed1b011a66e447&lt;/denchmark-link&gt;
+
+I will send a similar fix for C++. Thanks.
+		</comment>
+	</comments>
+</bug>

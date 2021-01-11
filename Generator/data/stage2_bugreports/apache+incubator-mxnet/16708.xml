@@ -1,0 +1,648 @@
+<bug id='16708' author='nickguletskii' open_date='2019-11-02T12:16:44Z' closed_time='2020-04-10T23:14:11Z'>
+	<summary>Training an FPN model using grad_req="add"  causes rapid divergence, while manually implemented gradient accumulation works fine</summary>
+	<description>
+&lt;denchmark-h:h2&gt;Description&lt;/denchmark-h&gt;
+
+While working with FPNs and gradient accumulation, I've discovered that using  with certain models utilizing FPNs causes almost immediate divergence. This issue is similar to &lt;denchmark-link:https://github.com/apache/incubator-mxnet/issues/16686&gt;#16686&lt;/denchmark-link&gt;
+, but the results are much more extreme: the toy model I have provided in this issue diverges in just a couple of steps. A proprietary model (which I cannot share) diverges immediately.
+&lt;denchmark-h:h2&gt;To Reproduce&lt;/denchmark-h&gt;
+
+&lt;denchmark-h:h3&gt;Steps to reproduce&lt;/denchmark-h&gt;
+
+(Paste the commands you ran that produced the error.)
+
+Save the following script:
+
+import argparse
+from enum import Enum
+from typing import Tuple, Iterable
+
+import mxnet as mx
+import mxnet.gluon.nn as nn
+from gluoncv.model_zoo import resnet18_v1b
+from gluoncv.nn.feature import FPNFeatureExpander
+from mxnet import autograd
+from mxnet.gluon import HybridBlock, Trainer
+from mxnet.gluon.loss import SoftmaxCrossEntropyLoss
+from mxnet.initializer import Xavier
+from mxnet.test_utils import assert_almost_equal
+
+
+class SimpleModel(HybridBlock):
+    def __init__(self, context):
+        super().__init__()
+        with self.name_scope():
+            self.glob_avg_pool = nn.GlobalAvgPool2D()
+            self.linear = nn.Dense(2)
+            self.loss = SoftmaxCrossEntropyLoss()
+
+    def hybrid_forward(self, F, x, label, *args, **kwargs):
+        res = self.linear(self.glob_avg_pool(x))
+        return self.loss(res, label)
+
+
+class FPNModel(HybridBlock):
+    def __init__(self, context):
+        super().__init__()
+        with self.name_scope():
+            base_network = resnet18_v1b(pretrained=False, dilated=False, use_global_stats=True, ctx=context)
+            features = FPNFeatureExpander(
+                network=base_network,
+                outputs=['layers1_relu3_fwd', 'layers2_relu3_fwd', 'layers3_relu3_fwd',
+                         'layers4_relu3_fwd'], num_filters=[256, 256, 256, 256], use_1x1=True,
+                use_upsample=True, use_elewadd=True, use_p6=True, no_bias=False, pretrained=False, ctx=context)
+            self.features = features
+            self.loss = SoftmaxCrossEntropyLoss()
+            self.conv2d = nn.Conv2D(256, kernel_size=(3, 3), weight_initializer=Xavier(magnitude=2))
+            self.glob_avg_pool = nn.GlobalAvgPool2D()
+            self.linear = nn.Dense(2)
+
+    def hybrid_forward(self, F, x, label, *args, **kwargs):
+        feat = self.features(x)
+        res = [self.linear(self.glob_avg_pool(F.relu(self.conv2d(y)))) for y in feat]
+        res = F.ElementWiseSum(*res) / len(res)
+        return self.loss(res, label)
+
+
+steps = 256
+accumulate_over = 8
+batch_size = 4
+
+
+def create_trainer(model):
+    pattern = '|'.join(['.*dense', 'P', '.*down(2|3|4)_conv', '.*layers(2|3|4)_conv'])
+    trainer = Trainer(model.collect_params(pattern), "sgd", {"learning_rate": 0.01, "wd": 1e-2})
+    params = [x for x in model.collect_params(pattern).values() if x.grad_req != "null"]
+    return params, trainer
+
+
+class TrainUsingGradAdd:
+    def __init__(self, context):
+        self.context = context
+
+    def train(self, model: FPNModel, data_iter: Iterable[Tuple[mx.nd.NDArray, mx.nd.NDArray]]):
+        params, trainer = create_trainer(model)
+
+        for p in params:
+            if p.grad_req != "null":
+                p.grad_req = "add"
+
+        for i, (data, label) in enumerate(data_iter):
+            data = mx.nd.array(data.asnumpy(), ctx=self.context)
+            label = mx.nd.array(label.asnumpy(), ctx=self.context)
+
+            with autograd.record():
+                loss = model(data, label)
+            loss_mean = loss.mean().asscalar()
+            yield None, loss_mean
+
+            loss.backward()
+            trainer.allreduce_grads()
+
+            if i % accumulate_over == accumulate_over - 1:
+                yield params, loss
+                trainer.update(batch_size)
+
+                for p in params:
+                    p.zero_grad()
+
+
+class TrainManually:
+    def __init__(self, context):
+        self.context = context
+
+    def train(self, model: FPNModel, data_iter: Iterable[Tuple[mx.nd.NDArray, mx.nd.NDArray]]):
+        params, trainer = create_trainer(model)
+
+        # Create an external memory for accumulated gradients
+        params_memory = []
+        for p in params:
+            if p.grad_req != "null":
+                p.grad_req = "write"
+            params_memory.append(mx.nd.zeros_like(p.grad()))
+
+        for i, (data, label) in enumerate(data_iter):
+            # Create a copy of the input array in order to prevent any chance of sharing arrays
+            data = mx.nd.array(data.asnumpy(), ctx=self.context)
+            label = mx.nd.array(label.asnumpy(), ctx=self.context)
+
+            with autograd.record():
+                loss = model(data, label)
+            loss_mean = loss.mean().asscalar()
+            yield None, loss_mean
+
+            loss.backward()
+            trainer.allreduce_grads()
+
+            # Commit the gradients to our external memory
+            for j, p in enumerate(params):
+                params_memory[j] = params_memory[j] + p.grad()
+                p.zero_grad()
+
+            if i % accumulate_over == accumulate_over - 1:
+                # If it's time to accumulate, copy the external memory into the model's grads and update.
+                for j, p in enumerate(params):
+                    for g in p._grad:
+                        params_memory[j].copyto(g)
+                yield params, loss_mean
+                trainer.update(batch_size)
+
+                # Zero out the external memory.
+                for j, p in enumerate(params):
+                    params_memory[j] = mx.nd.zeros_like(p.grad())
+                    p.zero_grad()
+
+
+class ModelType(Enum):
+    SIMPLE = "simple"
+    FPN = "fpn"
+
+    def __str__(self):
+        return self.value
+
+
+class ContextType(Enum):
+    CPU = "cpu"
+    GPU = "gpu"
+
+    def __str__(self):
+        return self.value
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Demonstrate MXNet gradient accumulation divergence.")
+    parser.add_argument("--hybridize", dest="hybridize", action="store_true", default=False)
+    parser.add_argument("--check-grads", dest="check_grads", action="store_true", default=False)
+    parser.add_argument("--model", dest="model", type=ModelType, choices=list(ModelType), required=True)
+    parser.add_argument("--ctx", dest="ctx", type=ContextType, choices=list(ContextType), default=ContextType.GPU)
+    args = parser.parse_args()
+
+    model_class = {ModelType.SIMPLE: SimpleModel, ModelType.FPN: FPNModel}[args.model]
+    context = {ContextType.CPU: mx.cpu(0), ContextType.GPU: mx.gpu(0)}[args.ctx]
+
+    # Create a prototype model
+    model_proto = model_class(mx.cpu(0))
+    model_proto.initialize()
+    dummy = mx.nd.zeros((batch_size, 3, 224, 224))
+    model_proto(dummy, mx.nd.zeros((batch_size, 1)))
+
+    # Save the prototype model and create two independent copies.
+    model_proto.save_parameters("tmp.dat")
+    model1 = model_class(context)
+    model2 = model_class(context)
+    model1.load_parameters("tmp.dat", ctx=[context])
+    model2.load_parameters("tmp.dat", ctx=[context])
+
+    if args.hybridize:
+        model1.hybridize(static_shape=True, static_alloc=True)
+        model2.hybridize(static_shape=True, static_alloc=True)
+
+    # Create a synthetic, meaningless dataset.
+    data = [
+        (mx.nd.random_uniform(-0.1, 0.1, (batch_size, 3, 224, 224)), mx.nd.random_randint(0, 2, (batch_size, 1)))
+        for i in range(steps)
+    ]
+
+    trainer1 = TrainUsingGradAdd(context)
+    trainer2 = TrainManually(context)
+    results = zip(trainer1.train(model1, data), trainer2.train(model2, data))
+    i = 0
+    for (params1, loss1), (params2, loss2) in results:
+        if params1 is None:
+            # Received a message containing the current step's losses.
+            print(f"[Step {i}] Loss using grad_req=add: {loss1:15.4f}, Loss using manual accumulation: {loss2:15.4f}")
+            i += 1
+            continue
+        elif args.check_grads:
+            # Received a message indicating that the trainers are about to perform an optimizer update.
+            print(f"[Step {i}] Checking grads...")
+            for j, (p1, p2) in enumerate(zip(params1, params2)):
+                assert_almost_equal(p1.grad(), p2.grad(), atol=1e-3, rtol=1e-3)
+                print(f"[Step {i}] Param {j} passed check.")
+            print(f"[Step {i}] Grads passed the check.")
+
+
+if __name__ == '__main__':
+    main()
+
+Create a Python 3.7 virtual environment with MXNet and GluonCV.
+Run this script using the following arguments: --model fpn
+Observe output similar to the following:
+
+&lt;denchmark-code&gt;[Step 0] Loss using grad_req=add:          0.6549, Loss using manual accumulation:          0.6549
+[Step 1] Loss using grad_req=add:          0.6425, Loss using manual accumulation:          0.6425
+[Step 2] Loss using grad_req=add:          0.7125, Loss using manual accumulation:          0.7125
+[Step 3] Loss using grad_req=add:          0.5841, Loss using manual accumulation:          0.5841
+[Step 4] Loss using grad_req=add:          0.5806, Loss using manual accumulation:          0.5806
+[Step 5] Loss using grad_req=add:          0.6895, Loss using manual accumulation:          0.6895
+[Step 6] Loss using grad_req=add:          0.8093, Loss using manual accumulation:          0.8093
+[Step 7] Loss using grad_req=add:          0.8047, Loss using manual accumulation:          0.8047
+[Step 8] Loss using grad_req=add: 1834741120.0000, Loss using manual accumulation:          0.9169
+[Step 9] Loss using grad_req=add:          0.0000, Loss using manual accumulation:          0.4054
+[Step 10] Loss using grad_req=add: 1836693248.0000, Loss using manual accumulation:          0.9217
+[Step 11] Loss using grad_req=add:  609944192.0000, Loss using manual accumulation:          0.5779
+[Step 12] Loss using grad_req=add:  610550464.0000, Loss using manual accumulation:          0.5803
+[Step 13] Loss using grad_req=add: 1211621632.0000, Loss using manual accumulation:          0.7496
+[Step 14] Loss using grad_req=add: 1220296576.0000, Loss using manual accumulation:          0.7565
+[Step 15] Loss using grad_req=add: 1219960064.0000, Loss using manual accumulation:          0.7459
+[Step 16] Loss using grad_req=add:             nan, Loss using manual accumulation:          1.5486
+[Step 17] Loss using grad_req=add:             nan, Loss using manual accumulation:          3.0809
+[Step 18] Loss using grad_req=add:             nan, Loss using manual accumulation:          3.0444
+[Step 19] Loss using grad_req=add:             nan, Loss using manual accumulation:          6.1567
+[Step 20] Loss using grad_req=add:             nan, Loss using manual accumulation:          1.5123
+[Step 21] Loss using grad_req=add:             nan, Loss using manual accumulation:          0.0021
+[Step 22] Loss using grad_req=add:             nan, Loss using manual accumulation:          3.0783
+
+&lt;/denchmark-code&gt;
+
+
+Running the script with  --model simple --check-grads will demonstrate that this bug doesn't exhibit itself on simple models. It seems that it's pretty difficult to satisfy the conditions necessary for the model to diverge, since I've tried multiple toy models before finding one that can demonstrate the issue.
+Performing the training on the CPU (using --ctx cpu) does not change the results.
+
+&lt;denchmark-h:h2&gt;What have you tried to solve it?&lt;/denchmark-h&gt;
+
+
+I've tried replacing ElementWiseSum with a manual reduction, since the test for ElementWiseSum is flaky. This seems to have no effect at all.
+The training diverges even if MXNET_ENGINE_TYPE=NaiveEngine and MXNET_EXEC_ENABLE_INPLACE=false, both on the CPU and GPU.
+
+&lt;denchmark-h:h2&gt;Environment&lt;/denchmark-h&gt;
+
+We recommend using our script for collecting the diagnostic information. Run the following command and paste the outputs below:
+&lt;denchmark-code&gt;----------Python Info----------
+Version      : 3.7.2
+Compiler     : GCC 7.4.0
+Build        : ('default', 'Oct 23 2019 22:40:04')
+Arch         : ('64bit', '')
+------------Pip Info-----------
+Version      : 18.1
+Directory    : /home/nick/.pyenv/versions/mxnet-dev/lib/python3.7/site-packages/pip
+----------MXNet Info-----------
+Version      : 1.6.0
+Directory    : /home/nick/workspaces/incubator-mxnet/python/mxnet
+Num GPUs     : 1
+Hashtag not found. Not installed from pre-built package.
+----------System Info----------
+Platform     : Linux-5.0.0-32-generic-x86_64-with-debian-buster-sid
+system       : Linux
+node         : REDACTED
+release      : 5.0.0-32-generic
+version      : #34~18.04.2-Ubuntu SMP Thu Oct 10 10:36:02 UTC 2019
+----------Hardware Info----------
+machine      : x86_64
+processor    : x86_64
+Architecture:        x86_64
+CPU op-mode(s):      32-bit, 64-bit
+Byte Order:          Little Endian
+CPU(s):              4
+On-line CPU(s) list: 0-3
+Thread(s) per core:  1
+Core(s) per socket:  4
+Socket(s):           1
+NUMA node(s):        1
+Vendor ID:           GenuineIntel
+CPU family:          6
+Model:               42
+Model name:          Intel(R) Core(TM) i5-2500K CPU @ 3.30GHz
+Stepping:            7
+CPU MHz:             2033.099
+CPU max MHz:         3700,0000
+CPU min MHz:         1600,0000
+BogoMIPS:            6619.53
+Virtualization:      VT-x
+L1d cache:           32K
+L1i cache:           32K
+L2 cache:            256K
+L3 cache:            6144K
+NUMA node0 CPU(s):   0-3
+Flags:               fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx rdtscp lm constant_tsc arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf pni pclmulqdq dtes64 monitor ds_cpl vmx est tm2 ssse3 cx16 xtpr pdcm pcid sse4_1 sse4_2 popcnt tsc_deadline_timer aes xsave avx lahf_lm epb pti ssbd ibrs ibpb stibp tpr_shadow vnmi flexpriority ept vpid xsaveopt dtherm ida arat pln pts md_clear flush_l1d
+----------Network Test----------
+Setting timeout: 10
+Timing for MXNet: https://github.com/apache/incubator-mxnet, DNS: 0.0070 sec, LOAD: 0.6282 sec.
+Timing for GluonNLP GitHub: https://github.com/dmlc/gluon-nlp, DNS: 0.0005 sec, LOAD: 0.5815 sec.
+Timing for GluonNLP: http://gluon-nlp.mxnet.io, DNS: 0.1150 sec, LOAD: 0.2121 sec.
+Timing for D2L: http://d2l.ai, DNS: 0.0653 sec, LOAD: 0.5121 sec.
+Timing for D2L (zh-cn): http://zh.d2l.ai, DNS: 0.0429 sec, LOAD: 0.2834 sec.
+Timing for FashionMNIST: https://repo.mxnet.io/gluon/dataset/fashion-mnist/train-labels-idx1-ubyte.gz, DNS: 0.1022 sec, LOAD: 0.8152 sec.
+Timing for PYPI: https://pypi.python.org/pypi/pip, DNS: 0.0060 sec, LOAD: 0.9495 sec.
+Timing for Conda: https://repo.continuum.io/pkgs/free/, DNS: 0.0510 sec, LOAD: 0.5734 sec.
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='nickguletskii' date='2019-11-04T02:23:54Z'>
+		Thanks for reporting this! It looks that some operators haven't implemented grad_req=add correctly.
+		</comment>
+		<comment id='2' author='nickguletskii' date='2019-11-04T21:08:04Z'>
+		There is also some bugs in grad accumulation as well
+		</comment>
+		<comment id='3' author='nickguletskii' date='2019-11-06T01:38:29Z'>
+		I've confirmed that this issue do exist and I'm able to reproduce that.
+		</comment>
+		<comment id='4' author='nickguletskii' date='2019-11-11T19:42:53Z'>
+		&lt;denchmark-link:https://github.com/zachgk&gt;@zachgk&lt;/denchmark-link&gt;
+ assign &lt;denchmark-link:https://github.com/szha&gt;@szha&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='5' author='nickguletskii' date='2019-11-11T19:44:14Z'>
+		&lt;denchmark-link:https://github.com/samskalicky&gt;@samskalicky&lt;/denchmark-link&gt;
+ Actually, &lt;denchmark-link:https://github.com/zhreshold&gt;@zhreshold&lt;/denchmark-link&gt;
+ is investigating this issue.
+		</comment>
+		<comment id='6' author='nickguletskii' date='2019-11-11T20:55:37Z'>
+		&lt;denchmark-link:https://github.com/zhreshold&gt;@zhreshold&lt;/denchmark-link&gt;
+ any update on this issue? Can you assign this issue to yourself if you're looking into it?
+		</comment>
+		<comment id='7' author='nickguletskii' date='2019-11-11T21:56:05Z'>
+		At first glance it's related to implementation in contrib operator, however, when I dig into it, it's more complicated than I though, I am still investigating.
+		</comment>
+		<comment id='8' author='nickguletskii' date='2019-11-14T01:12:35Z'>
+		Interestingly disable use_p6 in FPN can fix the issue, I am still investigating what's the root cause.
+		</comment>
+		<comment id='9' author='nickguletskii' date='2019-11-14T01:44:41Z'>
+		As long as ElementWiseSum more than 4 elements, it cause grad_req == add to behave differently, it's still unknown whether it's the fault of ElementWiseSum or something else.
+Minimum reproducable code without GluonCV, run with python3 test.py --model debug --set-repeat 5 cause divergence while python3 test.py --model debug --set-repeat 4 is ok.
+&lt;denchmark-code&gt;(base) ubuntu@ip-172-31-30-69:~/debug_fpn_grad$ python3 test.py --model debug --set-repeat 4
+[01:42:03] src/operator/nn/./cudnn/./cudnn_algoreg-inl.h:97: Running performance tests to find the best convolution algorithm, this can take a while... (set the environment variable MXNET_CUDNN_AUTOTUNE_DEFAULT to 0 to disable)
+[Step 0] Loss using grad_req=add:          0.6931, Loss using manual accumulation:          0.6931
+[Step 1] Loss using grad_req=add:          0.6930, Loss using manual accumulation:          0.6930
+[Step 2] Loss using grad_req=add:          0.6945, Loss using manual accumulation:          0.6945
+[Step 3] Loss using grad_req=add:          0.6904, Loss using manual accumulation:          0.6904
+[Step 4] Loss using grad_req=add:          0.6905, Loss using manual accumulation:          0.6905
+[Step 5] Loss using grad_req=add:          0.6932, Loss using manual accumulation:          0.6932
+[Step 6] Loss using grad_req=add:          0.6893, Loss using manual accumulation:          0.6893
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-code&gt;(base) ubuntu@ip-172-31-30-69:~/debug_fpn_grad$ python3 test.py --model debug --set-repeat 5
+[01:42:40] src/operator/nn/./cudnn/./cudnn_algoreg-inl.h:97: Running performance tests to find the best convolution algorithm, this can take a while... (set the environment variable MXNET_CUDNN_AUTOTUNE_DEFAULT to 0 to disable)
+[Step 0] Loss using grad_req=add:          0.6931, Loss using manual accumulation:          0.6931
+[Step 1] Loss using grad_req=add:          0.6930, Loss using manual accumulation:          0.6930
+[Step 2] Loss using grad_req=add:          0.7011, Loss using manual accumulation:          0.6945
+[Step 3] Loss using grad_req=add:          0.6776, Loss using manual accumulation:          0.6904
+[Step 4] Loss using grad_req=add:          0.8201, Loss using manual accumulation:          0.6905
+[Step 5] Loss using grad_req=add:          0.7151, Loss using manual accumulation:          0.6932
+[Step 6] Loss using grad_req=add:          0.6301, Loss using manual accumulation:          0.6893
+[Step 7] Loss using grad_req=add:          0.6301, Loss using manual accumulation:          0.6893
+&lt;/denchmark-code&gt;
+
+Note that I am using empty feature extraction layer nn.HybridSequential here.
+import argparse
+from enum import Enum
+from typing import Tuple, Iterable
+
+import mxnet as mx
+import mxnet.gluon.nn as nn
+from mxnet import autograd
+from mxnet.gluon import HybridBlock, Trainer
+from mxnet.gluon.loss import SoftmaxCrossEntropyLoss
+from mxnet.initializer import Xavier
+from mxnet.test_utils import assert_almost_equal
+
+class SimpleModel(HybridBlock):
+    def __init__(self, context):
+        super().__init__()
+        with self.name_scope():
+            self.glob_avg_pool = nn.GlobalAvgPool2D()
+            self.linear = nn.Dense(2)
+            self.loss = SoftmaxCrossEntropyLoss()
+
+    def hybrid_forward(self, F, x, label, *args, **kwargs):
+        res = self.linear(self.glob_avg_pool(x))
+        return self.loss(res, label)
+
+
+class FPNModel(HybridBlock):
+    def __init__(self, context):
+        super().__init__()
+        with self.name_scope():
+            base_network = resnet18_v1b(pretrained=False, dilated=False, use_global_stats=True, ctx=context)
+            features = FPNFeatureExpander(
+                network=base_network,
+                outputs=['layers1_relu3_fwd', 'layers2_relu3_fwd', 'layers3_relu3_fwd',
+                         'layers4_relu3_fwd'], num_filters=[256, 256, 256, 256], use_1x1=True,
+                use_upsample=True, use_elewadd=True, use_p6=False, no_bias=False, pretrained=False, ctx=context)
+            self.features = features
+            self.loss = SoftmaxCrossEntropyLoss()
+            self.conv2d = nn.Conv2D(256, kernel_size=(3, 3), weight_initializer=Xavier(magnitude=2))
+            self.glob_avg_pool = nn.GlobalAvgPool2D()
+            self.linear = nn.Dense(2)
+
+    def hybrid_forward(self, F, x, label, *args, **kwargs):
+        feat = self.features(x)
+        res = [self.linear(self.glob_avg_pool(F.relu(self.conv2d(y)))) for y in feat]
+        res = F.ElementWiseSum(*res) / len(res)
+        return self.loss(res, label)
+
+class DebugModel(HybridBlock):
+    def __init__(self, context):
+        super().__init__()
+        self.repeat = 4
+        with self.name_scope():
+            self.features = nn.HybridSequential()
+            self.glob_avg_pool = nn.GlobalAvgPool2D()
+            self.linear = nn.Dense(2)
+            self.loss = SoftmaxCrossEntropyLoss()
+            self.conv2d = nn.Conv2D(256, kernel_size=(3, 3), weight_initializer=Xavier(magnitude=2))
+
+    def hybrid_forward(self, F, x, label, *args, **kwargs):
+        feat = self.features(x)
+        feat = [feat] * self.repeat
+        res = [self.linear(self.glob_avg_pool(F.relu(self.conv2d(y)))) for y in feat]
+        res = F.ElementWiseSum(*res) / len(res)
+        return self.loss(res, label)
+
+
+steps = 256
+accumulate_over = 2
+batch_size = 4
+
+
+def create_trainer(model):
+    pattern = '|'.join(['.*dense', 'P', '.*down(2|3|4)_conv', '.*layers(2|3|4)_conv'])
+    trainer = Trainer(model.collect_params(pattern), "sgd", {"learning_rate": 0.01, "wd": 1e-2})
+    params = [x for x in model.collect_params(pattern).values() if x.grad_req != "null"]
+    return params, trainer
+
+
+class TrainUsingGradAdd:
+    def __init__(self, context):
+        self.context = context
+
+    def train(self, model: FPNModel, data_iter: Iterable[Tuple[mx.nd.NDArray, mx.nd.NDArray]]):
+        params, trainer = create_trainer(model)
+
+        for p in params:
+            if p.grad_req != "null":
+                p.grad_req = "add"
+                p.zero_grad()
+
+        for i, (data, label) in enumerate(data_iter):
+            data = mx.nd.array(data.asnumpy(), ctx=self.context)
+            label = mx.nd.array(label.asnumpy(), ctx=self.context)
+
+            with autograd.record():
+                loss = model(data, label)
+            loss_mean = loss.mean().asscalar()
+            yield None, loss_mean
+
+            loss.backward()
+            trainer.allreduce_grads()
+
+            if i % accumulate_over == accumulate_over - 1:
+                yield params, loss
+                trainer.update(batch_size)
+
+                for p in params:
+                    p.zero_grad()
+
+
+class TrainManually:
+    def __init__(self, context):
+        self.context = context
+
+    def train(self, model: FPNModel, data_iter: Iterable[Tuple[mx.nd.NDArray, mx.nd.NDArray]]):
+        params, trainer = create_trainer(model)
+
+        # Create an external memory for accumulated gradients
+        params_memory = []
+        for p in params:
+            if p.grad_req != "null":
+                p.grad_req = "write"
+            params_memory.append(mx.nd.zeros_like(p.grad()))
+
+        for i, (data, label) in enumerate(data_iter):
+            # Create a copy of the input array in order to prevent any chance of sharing arrays
+            data = mx.nd.array(data.asnumpy(), ctx=self.context)
+            label = mx.nd.array(label.asnumpy(), ctx=self.context)
+
+            with autograd.record():
+                loss = model(data, label)
+            loss_mean = loss.mean().asscalar()
+            yield None, loss_mean
+
+            loss.backward()
+            trainer.allreduce_grads()
+
+            # Commit the gradients to our external memory
+            for j, p in enumerate(params):
+                params_memory[j] = params_memory[j] + p.grad()
+                p.zero_grad()
+
+            if i % accumulate_over == accumulate_over - 1:
+                # If it's time to accumulate, copy the external memory into the model's grads and update.
+                for j, p in enumerate(params):
+                    for g in p._grad:
+                        params_memory[j].copyto(g)
+                yield params, loss_mean
+                trainer.update(batch_size)
+
+                # Zero out the external memory.
+                for j, p in enumerate(params):
+                    params_memory[j] = mx.nd.zeros_like(p.grad())
+                    p.zero_grad()
+
+
+class ModelType(Enum):
+    SIMPLE = "simple"
+    FPN = "fpn"
+    DEBUG = "debug"
+
+    def __str__(self):
+        return self.value
+
+
+class ContextType(Enum):
+    CPU = "cpu"
+    GPU = "gpu"
+
+    def __str__(self):
+        return self.value
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Demonstrate MXNet gradient accumulation divergence.")
+    parser.add_argument("--hybridize", dest="hybridize", action="store_true", default=False)
+    parser.add_argument("--check-grads", dest="check_grads", action="store_true", default=False)
+    parser.add_argument("--set-repeat", dest="set_repeat", default=4, type=int)
+    parser.add_argument("--model", dest="model", type=ModelType, choices=list(ModelType), required=True)
+    parser.add_argument("--ctx", dest="ctx", type=ContextType, choices=list(ContextType), default=ContextType.GPU)
+    args = parser.parse_args()
+
+    model_class = {ModelType.SIMPLE: SimpleModel, ModelType.FPN: FPNModel, ModelType.DEBUG: DebugModel}[args.model]
+    context = {ContextType.CPU: mx.cpu(0), ContextType.GPU: mx.gpu(0)}[args.ctx]
+
+    # Create a prototype model
+    model_proto = model_class(mx.cpu(0))
+    model_proto.initialize()
+    dummy = mx.nd.zeros((batch_size, 3, 224, 224))
+    model_proto(dummy, mx.nd.zeros((batch_size, 1)))
+
+    # Save the prototype model and create two independent copies.
+    model_proto.save_parameters("tmp.dat")
+    model1 = model_class(context)
+    model2 = model_class(context)
+    if args.model == ModelType.DEBUG:
+        model1.repeat = args.set_repeat
+        model2.repeat = args.set_repeat
+    model1.load_parameters("tmp.dat", ctx=[context])
+    model2.load_parameters("tmp.dat", ctx=[context])
+    #s = model1(mx.sym.var('data', mx.sym.var('label')))
+    #s.to_json()
+
+    if args.hybridize:
+        model1.hybridize(static_shape=True, static_alloc=True)
+        model2.hybridize(static_shape=True, static_alloc=True)
+
+    # Create a synthetic, meaningless dataset.
+    data = [
+        (mx.nd.random_uniform(-0.1, 0.1, (batch_size, 3, 224, 224)), mx.nd.random_randint(0, 2, (batch_size, 1)))
+        for i in range(steps)
+    ]
+
+    trainer1 = TrainUsingGradAdd(context)
+    trainer2 = TrainManually(context)
+    results = zip(trainer1.train(model1, data), trainer2.train(model2, data))
+    i = 0
+    for (params1, loss1), (params2, loss2) in results:
+        if params1 is None:
+            # Received a message containing the current step's losses.
+            print(f"[Step {i}] Loss using grad_req=add: {loss1:15.4f}, Loss using manual accumulation: {loss2:15.4f}")
+            i += 1
+            continue
+        elif args.check_grads:
+            # Received a message indicating that the trainers are about to perform an optimizer update.
+            print(f"[Step {i}] Checking grads...")
+            for j, (p1, p2) in enumerate(zip(params1, params2)):
+                assert_almost_equal(p1.grad(), p2.grad(), atol=1e-3, rtol=1e-3)
+                print(f"[Step {i}] Param {j} passed check.")
+            print(f"[Step {i}] Grads passed the check.")
+
+
+if __name__ == '__main__':
+    main()
+		</comment>
+		<comment id='10' author='nickguletskii' date='2019-11-14T08:21:03Z'>
+		&lt;denchmark-link:https://github.com/zhreshold&gt;@zhreshold&lt;/denchmark-link&gt;
+ I don't think that  is at fault, because replacing it with the following function doesn't change anything for both examples:
+def elementwise_sum(F, *args):
+    return reduce(lambda x, y: F.broadcast_plus(x, y), args)
+		</comment>
+		<comment id='11' author='nickguletskii' date='2019-11-27T00:34:34Z'>
+		After digging a while, I found several confusing facts about this bug.
+
+@nickguletskii is correct, it's not about ElementWiseSum
+Duplicating same node with (1, 2, 3, 4, 8, 9, 10...) times, the loss and gradients are always GOOD, however, with (5, 6, 7), the gradients will diverge at the first iteration
+
+		</comment>
+		<comment id='12' author='nickguletskii' date='2019-12-08T02:39:46Z'>
+		&lt;denchmark-link:https://github.com/zhreshold&gt;@zhreshold&lt;/denchmark-link&gt;
+ any luck?
+		</comment>
+		<comment id='13' author='nickguletskii' date='2019-12-09T22:53:48Z'>
+		Traversing autograd module, no luck yet.
+		</comment>
+		<comment id='14' author='nickguletskii' date='2020-04-10T23:14:11Z'>
+		Fixed by &lt;denchmark-link:https://github.com/apache/incubator-mxnet/pull/17995&gt;#17995&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

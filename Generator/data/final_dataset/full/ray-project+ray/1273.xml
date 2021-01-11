@@ -1,0 +1,207 @@
+<bug_data>
+<bug id='1273' author='robertnishihara' open_date='2017-11-29T21:37:50Z' closed_time='2018-09-13T22:28:17Z'>
+ 	<summary>Calling ray.wait inside of a remote function can cause an application to hang.</summary>
+ 	<description>
+ When a worker calls ray.get inside a task, it will release its CPU resources to the local scheduler so that other tasks can be scheduled while it is blocked. ray.wait probably needs to do the same thing. You can see this problem as follows.
+ import ray
+ import time
+ ray.init(num_cpus=1)
+ 
+ @ray.remote
+ def f():
+     return 1
+ 
+ @ray.remote
+ def g():
+     # This line will hang. The f task won't be scheduled because g doesn't
+     # release its resources.
+     ray.wait([f.remote()])
+ 
+ ray.get(g.remote())  # This line will hang.
+ 	</description>
+ 	<comments>
+ 		<comment id='1' author='robertnishihara' date='2018-09-12T15:10:20Z'>
+ 		I have run across what is likely the same bug, but the symptom is underutilization of available resources because ray.wait is holding them. Here's an example that can be used to illustrate either the hanging or underutilization case.
+ import ray
+ import time
+ 
+ N, M = 5, 4
+ 
+ demonstrate_hang = False
+ demonstrate_underutilization = True
+ 
+ if demonstrate_hang:
+     # Not enough CPUs. Outer tasks will hold them all while                                                                                
+     # waiting and not let inners ever get any.                                                                                             
+     num_cpus = N
+ elif demonstrate_underutilization:
+     # Enough CPUs for all the outer tasks and one inner to                                                                                 
+     # squeeze through so we make progress and eventually get                                                                               
+     # everything done. But we could be more efficient and                                                                                  
+     # run more inners at a time if the waiting outers released                                                                             
+     # CPUs. Towards the end we are able to run more inners at                                                                              
+     # once as there are fewer outers left.                                                                                                 
+     num_cpus = N + 1
+ else:
+     # Enough CPUs for all inner and outer tasks to claim one                                                                               
+     # so everyone runs at once.                                                                                                            
+     num_cpus = N * (M + 1)
+ 
+ ray.init(num_cpus=num_cpus)
+ 
+ start = time.time()
+ 
+ @ray.remote
+ def inner(a, b):
+     t = time.time() - start
+     print("Starting inner {}-{} at {:.3f}".format(a, b, t))
+     time.sleep(2)
+     t = time.time() - start
+     print("Finished inner {}-{} at {:.3f}".format(a, b, t))
+ 
+ @ray.remote
+ def outer(a):
+     t = time.time() - start
+     print("Starting outer {} at {:.3f}".format(a, t))
+     ray.wait([inner.remote(a, jj) for jj in range(M)], num_returns=M)
+     t = time.time() - start
+     print("Finished outer {} at {:.3f}".format(a, t))
+ 
+ t = time.time() - start
+ print("Starting all at {:.3f}".format(t))
+ 
+ ray.wait([outer.remote(ii) for ii in range(N)], num_returns=N)
+ 
+ t = time.time() - start
+ print("Finished all at {:.3f}".format(t))
+ 		</comment>
+ 		<comment id='2' author='robertnishihara' date='2018-09-12T20:05:25Z'>
+ 		Thanks &lt;denchmark-link:https://github.com/vengroff&gt;@vengroff&lt;/denchmark-link&gt;
+  for reporting this (and for the clean example), I can reproduce the hanging with your script.
+ I have a fix in &lt;denchmark-link:https://github.com/ray-project/ray/pull/2864&gt;#2864&lt;/denchmark-link&gt;
+  which should address the issue in the new backend. Setting  and running with the environment variable  fixes the issue.
+ Note that this requires that environment variable to be set (in order to pick up the fix), but it is not turned on by default yet. However, it will be for 0.6.
+ 		</comment>
+ 		<comment id='3' author='robertnishihara' date='2018-09-17T21:40:13Z'>
+ 		Thank you. I have verified the fix works in the latest wheel.
+ 		</comment>
+ 		<comment id='4' author='robertnishihara' date='2018-09-18T12:52:38Z'>
+ 		As I run larger workloads, I have started to see warnings like the following:
+ &lt;denchmark-code&gt;W0918 12:46:01.291203  3699 node_manager.cc:1081] Resources oversubscribed: {GPU,0.000000}, {CPU,7.000000}, 
+ W0918 12:46:43.063521  3699 node_manager.cc:1081] Resources oversubscribed: {GPU,0.000000}, {CPU,8.000000}, 
+ W0918 12:46:47.504438  3699 node_manager.cc:1081] Resources oversubscribed: {GPU,0.000000}, {CPU,9.000000}, 
+ W0918 12:47:30.264201  3699 node_manager.cc:1081] Resources oversubscribed: {GPU,0.000000}, {CPU,10.000000}, 
+ W0918 12:47:31.554244  3699 node_manager.cc:1081] Resources oversubscribed: {GPU,0.000000}, {CPU,11.000000}, 
+ W0918 12:47:32.415546  3699 node_manager.cc:1081] Resources oversubscribed: {GPU,0.000000}, {CPU,12.000000}, 
+ W0918 12:47:33.160295  3699 node_manager.cc:1081] Resources oversubscribed: {GPU,0.000000}, {CPU,13.000000}, 
+ W0918 12:47:33.843848  3699 node_manager.cc:1081] Resources oversubscribed: {GPU,0.000000}, {CPU,14.000000}, 
+ W0918 12:47:34.280972  3699 node_manager.cc:1081] Resources oversubscribed: {GPU,0.000000}, {CPU,15.000000}, 
+ W0918 12:47:34.462929  3699 node_manager.cc:1081] Resources oversubscribed: {GPU,0.000000}, {CPU,15.000000}, 
+ W0918 12:47:35.035676  3699 node_manager.cc:1081] Resources oversubscribed: {GPU,0.000000}, {CPU,16.000000}, 
+ W0918 12:47:35.614987  3699 node_manager.cc:1081] Resources oversubscribed: {GPU,0.000000}, {CPU,17.000000}, 
+ &lt;/denchmark-code&gt;
+ 
+ I have not yet dug in to see if these are the result of an accounting hiccup when waiting tasks release resources or something more significant. Just thought I'd point it out in case it's obvious to you what is going on before I debug further.
+ 		</comment>
+ 		<comment id='5' author='robertnishihara' date='2018-09-18T21:13:59Z'>
+ 		Thanks for bringing this up! It's an innocuous warning.
+ Suppose there is a total of 1 CPU available, and consider the following workload
+ &lt;denchmark-code&gt;@ray.remote
+ def f():
+     pass
+ 
+ @ray.remote
+ def h():
+     pass
+ 
+ @ray.remote
+ def g():
+     ray.get(f.remote())
+ 
+ g.remote()
+ h.remote()
+ &lt;/denchmark-code&gt;
+ 
+ This is what could happen:
+ 
+ g and h are submitted
+ g begins executing (1 CPU is in use)
+ g submits f
+ g blocks in ray.get and returns its 1 CPU to the scheduler, (now 0 CPUs are in use)
+ f begins executing (1 CPU) is in use
+ f finishes and returns (now 0 CPUs in use)
+ h begins executing (1 CPU in use)
+ g gets unblocked and continues executing (now 2 CPUs in use temporarily)
+ h finishes (now 1 CPU in use)
+ g finishes (now 0 CPUs in use)
+ 
+ Something similar could happen with ray.wait.
+ We could probably prevent this, but it seemed ok to allow resources to be temporarily oversubscribed.
+ 		</comment>
+ 		<comment id='6' author='robertnishihara' date='2018-09-18T21:14:43Z'>
+ 		It might be worse with ray.wait now that I think about it because ray.wait can return (if a timeout is use) before any tasks finish executing).
+ 		</comment>
+ 	</comments>
+ </bug>
+<commit id='f16d33593b4577b453660d70d5aa5b1b56d9bdf6' author='Robert Nishihara' date='2018-09-13 15:28:17-07:00'>
+ 	<dmm_unit complexity='1.0' interfacing='1.0' size='0.75'></dmm_unit>
+ 	<modification change_type='MODIFY' old_name='java\test\src\main\java\org\ray\api\test\PlasmaFreeTest.java' new_name='java\test\src\main\java\org\ray\api\test\PlasmaFreeTest.java'>
+ 		<file_info nloc='42' complexity='3' token_count='385'></file_info>
+ 		<method name='PlasmaFreeTest::test' parameters=''>
+ 				<method_info nloc='22' complexity='2' token_count='250' nesting_level='1' start_line='25' end_line='51'></method_info>
+ 			<added_lines>44,45,46</added_lines>
+ 			<deleted_lines>44</deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines></added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='src\ray\raylet\node_manager.cc' new_name='src\ray\raylet\node_manager.cc'>
+ 		<file_info nloc='1034' complexity='142' token_count='8426'></file_info>
+ 		<method name='ray::raylet::NodeManager::HandleClientUnblocked' parameters='client'>
+ 				<method_info nloc='19' complexity='3' token_count='117' nesting_level='2' start_line='1118' end_line='1148'></method_info>
+ 			<added_lines>1118,1119,1120,1121,1122,1123,1124,1125,1126,1127,1128,1129,1130,1131,1132,1133,1134,1135,1136,1137,1138,1139,1140,1141,1142,1143,1144,1145,1146,1147,1148</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<method name='ray::raylet::NodeManager::ProcessClientMessage' parameters='client,message_type,message_data'>
+ 				<method_info nloc='184' complexity='28' token_count='1597' nesting_level='2' start_line='522' end_line='776'></method_info>
+ 			<added_lines>700,704,714,715,716,717,718,719,720,721,722,723,724,725,726,727,728,731,732,741,742,743,744</added_lines>
+ 			<deleted_lines>700,701,702,703,704,705,706,707,708,709,710,711,712,713,714,715,716,717,718,719,723,724,725,726,727,728,729,730,731,732,733,734,735,736,737,738,739,740,741,742,743,744,745,746,747,748,749,750,762</deleted_lines>
+ 		</method>
+ 		<method name='ray::raylet::NodeManager::HandleClientBlocked' parameters='client,required_object_ids'>
+ 				<method_info nloc='15' complexity='2' token_count='104' nesting_level='2' start_line='1094' end_line='1116'></method_info>
+ 			<added_lines>1094,1095,1096,1097,1098,1099,1100,1101,1102,1103,1104,1105,1106,1107,1108,1109,1110,1111,1112,1113,1114,1115,1116</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines>1117,1149</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='src\ray\raylet\node_manager.h' new_name='src\ray\raylet\node_manager.h'>
+ 		<file_info nloc='92' complexity='0' token_count='604'></file_info>
+ 		<modified_lines>
+ 			<added_lines>195,196,197,198,199,200,201,202,203,204,205,206,207,208,209,210,211</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='test\runtest.py' new_name='test\runtest.py'>
+ 		<file_info nloc='1873' complexity='440' token_count='14821'></file_info>
+ 		<method name='testBlockingTasks.h' parameters='i'>
+ 				<method_info nloc='3' complexity='2' token_count='38' nesting_level='2' start_line='2067' end_line='2071'></method_info>
+ 			<added_lines>2067,2068,2069,2070,2071</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<method name='testBlockingTasks' parameters='self'>
+ 				<method_info nloc='15' complexity='3' token_count='85' nesting_level='1' start_line='2052' end_line='2087'></method_info>
+ 			<added_lines>2066,2067,2068,2069,2070,2071,2072,2073,2074</added_lines>
+ 			<deleted_lines>2066</deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines></added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ </commit>
+</bug_data>

@@ -1,0 +1,222 @@
+<bug id='8772' author='talipini' open_date='2020-06-03T22:02:35Z' closed_time='2020-06-25T21:54:30Z'>
+	<summary>[tune] trainable restore_from_object fails with FileNotFound</summary>
+	<description>
+&lt;denchmark-h:h3&gt;What is the problem?&lt;/denchmark-h&gt;
+
+When trainable tries to restore_from_object, the restore process fails because of the wrong path. After loading the checkpoint object, the method writes it in the tmpdir (see code snippet below) but passes tmpdir/checkpoint dir to restore function. Shouldn't the write happen to the tmpdir/checkpoint dir?
+Current code does this --
+path = os.path.join(tmpdir, relpath_name)  #&lt;-------- written to tmpdir. This should be tmpdir/checkpoint?
+.....
+self.restore(checkpoint_path)  #&lt;------ passing tmpdir/checkpoint dir to restore
+Full function snippet below.
+Ray version and other system information (Python version, TensorFlow version, OS):
+ray    - 0.9.0.dev0
+python - 3.7.7
+TF - 2.2.0
+&lt;denchmark-h:h3&gt;Reproduction (REQUIRED)&lt;/denchmark-h&gt;
+
+#From the Trainable class
+def restore_from_object(self, obj):
+"""Restores training state from a checkpoint object.
+&lt;denchmark-code&gt;    These checkpoints are returned from calls to save_to_object().
+    """
+    info = pickle.loads(obj)
+    data = info["data"]
+    tmpdir = tempfile.mkdtemp("restore_from_object", dir=self.logdir)
+    checkpoint_path = os.path.join(tmpdir, info["checkpoint_name"])
+
+    for relpath_name, file_contents in data.items():
+       path = os.path.join(tmpdir, relpath_name)  #&lt;-------- written to tmpdir
+
+        # This may be a subdirectory, hence not just using tmpdir
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(file_contents)
+
+    self.restore(checkpoint_path)  #&lt;------ passing tmpdir/checkpoint dir to restore
+    shutil.rmtree(tmpdir)
+&lt;/denchmark-code&gt;
+
+If we cannot run your script, we cannot fix your issue.
+
+ I have verified my script runs in a clean environment and reproduces the issue.
+ I have verified the issue also occurs with the latest wheels.
+
+	</description>
+	<comments>
+		<comment id='1' author='talipini' date='2020-06-03T22:45:54Z'>
+		Can you provide a small script for reproducing this?
+		</comment>
+		<comment id='2' author='talipini' date='2020-06-04T03:15:57Z'>
+		Here is a sample example. Sorry, this is the smallest I could do without spending hours on it.
+When you run the below example, you will see errors from restore_from_object looking for checkpoint_*/.tune_metadata.  This error happens when restore_from_object is used to restore checkpoint so you might have to run the sample couple of times to induce that situation, if it doesn't happen right away.
+I believe this is happening because restore_from_object restores the checkpoint to tmpdir but passes tmpdir/checkpoint dir to restore. If you uncomment the line  'path = os.path.join(checkpoint_path, relpath_name)' in the restore_from_object function below, the checkpoint is restored properly. The bug fix could be just changing that line to restore it to tmpdir/checkpoint in restore_from_object. I am not sure if there are other dependencies that are relying on the checkpoint obj. to be restored under tmpdir.
+Temporary workaround if anyone else facing this issue could be to just override this method and replace the line to write to tmpdir/checkpoint as shown below.
+&lt;denchmark-code&gt;ERROR worker.py:1033 -- Possible unhandled error from worker: ray::MyTrainable.restore_from_object() (pid=26218, ip=192.168.0.117)
+  File "python/ray/_raylet.pyx", line 446, in ray._raylet.execute_task
+  File "python/ray/_raylet.pyx", line 400, in ray._raylet.execute_task.function_executor
+  File "test_tune_bug.py", line 80, in restore_from_object
+    self.restore(checkpoint_path)
+  File ".../lib/python3.7/site-packages/ray/tune/trainable.py", line 402, in restore
+    with open(checkpoint_path + ".tune_metadata", "rb") as f:
+FileNotFoundError: [Errno 2] No such file or directory: '/home/xxxxx/tune_results/pbt_test/MyTrainable_0_l2=0.043385,lr_rate=0.3078_2020-06-03_22-02-18kjrqj57y/tmpygu_ijborestore_from_object/checkpoint_15/.tune_metadata'
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-code&gt;import ray.tune as tune
+from ray.tune.schedulers import PopulationBasedTraining
+
+from tensorflow.keras.models import Sequential
+from tensorflow.python.keras.layers import Dense 
+from tensorflow.keras.optimizers import Adadelta
+
+import time
+import random
+import numpy as np
+import tensorflow as tf
+import pickle
+import shutil
+import os, tempfile
+ 
+
+class MyTrainable(tune.Trainable):
+ 
+    def _setup(self, config):
+        self.counter = 0
+        self.model = Sequential()
+        self.model.add(Dense(10, activation="relu"))
+        self.model.add(Dense(4))
+        #Input random dataset to be able to save the model.
+        self.model._set_inputs(np.random.uniform(low=-1.0, high=5, size=(10,1)))
+
+
+    def _train(self):
+
+        lr_rate = self.config['lr_rate']
+        self.counter +=1 
+        
+        train_results = {}
+        train_results['Valuation_Acc'] = self.counter * lr_rate #just sending back a framed valuation.
+        time.sleep(0.2)
+        return train_results
+
+ 
+    
+    def _save(self, checkpoint_dir):
+        print(f"ID: {self.trial_name}: Saving model to {checkpoint_dir}")
+        tf.keras.models.save_model(
+                self.model,
+                checkpoint_dir,
+                overwrite=True,
+                include_optimizer=True,
+                save_format='tf',
+                signatures=None,
+                options=None
+            )
+        
+        return checkpoint_dir
+        
+
+    def _restore(self, checkpoint_path):
+        print(f"ID: {self.trial_name}: Looking for checkpoint at  - {checkpoint_path}")
+        return True
+    
+    def restore_from_object(self, obj):
+        #reproduced function from Trainable class 
+
+        info = pickle.loads(obj) 
+
+        data = info["data"]
+        tmpdir = tempfile.mkdtemp("restore_from_object", dir=self.logdir)
+        checkpoint_path = os.path.join(tmpdir, info["checkpoint_name"])
+
+        print(f"Restoring checkpoint object to {checkpoint_path} ")
+         
+
+        for relpath_name, file_contents in data.items():
+            path = os.path.join(tmpdir, relpath_name) #&lt;---- This should be checkpoint_path, not tmpdir? 
+            # path = os.path.join(checkpoint_path, relpath_name) #&lt;---- Bug fix ? 
+
+            # This may be a subdirectory, hence not just using tmpdir
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(file_contents)
+
+        self.restore(checkpoint_path)
+        shutil.rmtree(tmpdir)
+
+
+if __name__ == '__main__':     
+  
+    config = {'lr_rate': tune.uniform(0.1,0.4),
+                'l2': tune.uniform(0.001,0.1)
+            }
+
+    pbt_scheduler = PopulationBasedTraining(
+        time_attr="training_iteration",
+        metric ='Valuation_Acc',
+        mode = 'max',
+        perturbation_interval = 5,
+        hyperparam_mutations ={
+            'lr_rate': lambda: random.uniform(0.5, 1),
+            'l2': lambda: random.uniform(0.001,0.1)
+        }
+    )
+
+    resultAnalysis = tune.run(MyTrainable, 
+            config = config,
+            name ='pbt_test',
+            num_samples=2,
+            stop={
+                "training_iteration":50,
+            },
+            scheduler=pbt_scheduler,
+            local_dir="~/tune_results",
+            )
+     
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='3' author='talipini' date='2020-06-15T17:54:47Z'>
+		Sorry for the delay, this should be fixed in &lt;denchmark-link:https://github.com/ray-project/ray/pull/8471&gt;#8471&lt;/denchmark-link&gt;
+. Can you please try again on the &lt;denchmark-link:https://docs.ray.io/en/master/installation.html#latest-snapshots-nightlies&gt;latest master wheels&lt;/denchmark-link&gt;
+ and ping me if you still see this?
+		</comment>
+		<comment id='4' author='talipini' date='2020-06-15T23:39:56Z'>
+		
+Sorry for the delay, this should be fixed in #8471. Can you please try again on the latest master wheels and ping me if you still see this?
+
+Hey &lt;denchmark-link:https://github.com/richardliaw&gt;@richardliaw&lt;/denchmark-link&gt;
+, I am having the same issue. I just tried on the latest master commit and am now getting the following:
+&lt;denchmark-code&gt;raise value.as_instanceof_cause()
+ray.exceptions.RayTaskError(IsADirectoryError): ^[[36mray::TrainableName.restore_from_object()^[[39m (pid=20007, ip=172.19.0.2)
+  File "python/ray/_raylet.pyx", line 446, in ray._raylet.execute_task
+  File "python/ray/_raylet.pyx", line 400, in ray._raylet.execute_task.function_executor
+  File "/opt/conda/lib/python3.7/site-packages/ray/tune/trainable.py", line 478, in restore_from_object
+    self.restore(checkpoint_path)
+  File "/opt/conda/lib/python3.7/site-packages/ray/tune/trainable.py", line 456, in restore
+    self._restore(checkpoint_path)
+  File "~/mydir/rllib/trainables/league_play.py", line 242, in _restore
+    self.trainer._restore(checkpoint_dir)
+  File "/opt/conda/lib/python3.7/site-packages/ray/rllib/agents/trainer.py", line 675, in _restore
+    extra_data = pickle.load(open(checkpoint_path, "rb"))
+IsADirectoryError: [Errno 21] Is a directory: '~/mydir/ray_results/TrainableName/TrialName_0_2020-06-15_23-21-47ypgmkmo9/tmpei5nixiirestore_from_object/./'
+
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='5' author='talipini' date='2020-06-16T03:45:45Z'>
+		Hey &lt;denchmark-link:https://github.com/wyattlansford&gt;@wyattlansford&lt;/denchmark-link&gt;
+ I think what you posted is a league_play.py specific issue. RLlib expects a path, while you're passing in a checkpoint_dir?
+		</comment>
+		<comment id='6' author='talipini' date='2020-06-16T13:31:36Z'>
+		Yep, seems like you're right. The fix you made seemed to have fixed the first issue for me though. Thanks
+		</comment>
+		<comment id='7' author='talipini' date='2020-06-17T16:28:24Z'>
+		&lt;denchmark-link:https://github.com/richardliaw&gt;@richardliaw&lt;/denchmark-link&gt;
+ - Sorry, cannot get to it until later this week.  I will verify as soon as I can. Thanks for a quick turnaround.
+		</comment>
+		<comment id='8' author='talipini' date='2020-06-25T21:54:29Z'>
+		I will close this for now, please reopen if still an issue.
+		</comment>
+	</comments>
+</bug>

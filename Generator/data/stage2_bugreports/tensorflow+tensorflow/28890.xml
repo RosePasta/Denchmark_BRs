@@ -1,0 +1,175 @@
+<bug id='28890' author='trentlo' open_date='2019-05-21T01:13:48Z' closed_time='2019-07-08T22:11:29Z'>
+	<summary>XLA_GPU_JIT Slows Down GNMT (when large clusters are formed)</summary>
+	<description>
+System information
+
+Have I written custom code: Use models from NVIDIA OpenSeq2Seq
+OS Platform and Distribution:  Ubuntu 16.04
+TensorFlow installed from (source or binary): Source
+TensorFlow version (use command below): upstream-base-779-g83909d2 1.13.1
+Python version: 3.5.2
+Bazel version (if compiling from source): 0.24.1
+GCC/Compiler version (if compiling from source): 5.4.0 20160609
+CUDA/cuDNN version: 10.0
+GPU model and memory: NVIDIA GV100
+
+Code to reproduce the issue
+Note that let's assume a context where the deadness analysis is disabled for forming large clusters. In such scenarios, XLA_GPU_JIT slows down this reported GNMT implementation by around 30%.
+Reproduction steps:
+
+Download the training dataset from the following link. Assuming putting it under /wmt16/
+https://drive.google.com/open?id=1ooQiWhmzmYsk2qMOfaunjTlx_z6lcUyO
+git clone https://github.com/NVIDIA/OpenSeq2Seq.git
+cd OpenSeq2Seq
+git apply gnmt_config.txt (file here). Assuming the dataset is placed under /wmt16/.
+Run command:
+TF_XLA_FLAGS="--tf_xla_disable_deadness_safety_checks_for_debugging=true " CUDA_VISIBLE_DEVICES=0 python run.py --config_file=example_configs/text2text/en-de/en-de-gnmt-like-4GPUs.py --benchmark --bench_start 50 --bench_steps 100 --use_xla_jit
+Remove --use_xla_jit to run with native Tensorflow.
+
+Observed slowdown
+The performance measured on my GV100 (1 GPU):
+With XLA_JIT:
+Avg time per step: 1.000s
+With native Tensorflow:
+Avg time per step: 0.760s
+This is around 30% slowdown, comparing XLA_JIT to native TF.
+A Theory of why such a slowdown
+My theory of why XLA slows down is as follows. Ideally, the TF runtime (host) should be able to run ahead of the device, so that the host overhead can be hidden. To achieve that, the TF runtime usually executes the dataflow ops in parallel on multiple CPUs to feed computation to one GPU stream. For example, when ops related to an LSTM cell are executed, the tf.while ops (e.g., Merge/Switch, etc.) could be executed in parallel, so that the loop related latencies are hidden. This, however, is not the case observed in XLA_JIT on the forward path of the GNMT.
+A possible explanation of why the host does not run ahead is a result of interaction between host-device synchronization needed by tf.while and long-latency _XlaRun ops. The tf.while ops involve synchronization between host and device as they need to copy some computation results back to the host to make decisions about when to exit the loop. For example, a typical op sequence of tf.while is Add, Less, LoopCond, and Switch; the result of Add is on device but TF computes Less, LoopCond, and Switch on host. These synchronization latencies are better hidden in pure TF executions, as there are more parallel ops and each op is of lower latency. In contrast, scheduling a long-latency op such as _XlaRun along with the op sequence of tf.while on the same GPU stream can introduce extra dependency (established through the runtime scheduling order on the single GPU stream) and force the host to wait for the completion of this long-latency op even if they have no dependencies in the dataflow graph. Often, this is the case observed.
+
+Further reference for script options:
+&lt;denchmark-link:https://nvidia.github.io/OpenSeq2Seq/html/machine-translation.html&gt;https://nvidia.github.io/OpenSeq2Seq/html/machine-translation.html&lt;/denchmark-link&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='trentlo' date='2019-05-21T01:16:45Z'>
+		&lt;denchmark-link:https://github.com/sanjoy&gt;@sanjoy&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/jlebar&gt;@jlebar&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='2' author='trentlo' date='2019-05-21T08:47:31Z'>
+		Trent, thank you for filing this bug with so many details.
+Do you all at nvidia have cycles to dig into this?  If so we can provide suggestions for how to check your hypothesis of the etiology and how to fix it.
+		</comment>
+		<comment id='3' author='trentlo' date='2019-05-21T17:22:30Z'>
+		Yes, nvidia is happy to help with the investigation and a fix.
+		</comment>
+		<comment id='4' author='trentlo' date='2019-05-30T18:56:34Z'>
+		Following up the post.
+Experiments
+I did some experiments to confirm the issues. I noticed some nodes of the i++ cycles are clustered into XLA clusters, and so some hack is done to decluster them. After that, the execution time improves as shown below:
+Avg time per step: 0.814s
+Then I noticed that a cuStreamSync is always invoked at the end of GpuExecutable::Execute(), which is not necessary in the case of single compute stream. The behavior was introduced recently by Commit &lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/c7b255ae3505ea009c291b738ef22fbe943be6f1&gt;c7b255a&lt;/denchmark-link&gt;
+ on May 4 by &lt;denchmark-link:https://github.com/hawkinsp&gt;@hawkinsp&lt;/denchmark-link&gt;
+. I disabled the change for experiments. The measured execution time is shown below.
+Avg time per step: 0.676s
+So, combining the two changes, the execution time improves from 1 sec to 0.676 sec (+48%) and it is +12% on top of native TF.
+Update on Etiology
+To describe the reported issue more precisely, it is because some nodes in the i++ cycle are clustered into the XLA clusters. It introduces extra dependencies and blocks the progression of the i++ cycles.
+Note that saying the result of the Add node is on device in the main description of this post is not accurate. The result of the Add node is on host. However, the i++ cycles also contain LoopAnd, and one of the i++ cycles even contains (reduction) All and LogicalNot. So, the host-device synchronization remains.
+Please feel free to let me know if you'd like to see any further information? If it all sounds good, I will try to leverage the tf2xla declustering pass to decluster the nodes related to the i++ cycles. &lt;denchmark-link:https://github.com/sanjoy&gt;@sanjoy&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='5' author='trentlo' date='2019-05-30T19:45:54Z'>
+		
+Following up the post.
+Experiments
+I did some experiments to confirm the issues. I noticed some nodes of the i++ cycles are clustered into XLA clusters, and so some hack is done to decluster them. After that, the execution time improves as shown below:
+Avg time per step: 0.814s
+Then I noticed that a cuStreamSync is always invoked at the end of GpuExecutable::Execute(), which is not necessary in the case of single compute stream. The behavior was introduced recently by Commit c7b255a on May 4 by @hawkinsp. I disabled the change for experiments. The measured execution time is shown below.
+
+That seems wrong -- we should be calling the ExecuteOnStreamAsync from XlaRunOp.  I'll take a look to see what I can do.
+
+Avg time per step: 0.676s
+So, combining the two changes, the execution time improves from 1 sec to 0.676 sec (+48%) and it is +12% on top of native TF.
+Update on Etiology
+To describe the reported issue more precisely, it is because some nodes in the i++ cycle are clustered into the XLA clusters. It introduces extra dependencies and blocks the progression of the i++ cycles.
+Note that saying the result of the Add node is on device in the main description of this post is not accurate. The result of the Add node is on host. However, the i++ cycles also contain LoopAnd, and one of the i++ cycles even contains (reduction) All and LogicalNot. So, the host-device synchronization remains.
+Please feel free to let me know if you'd like to see any further information? If it all sounds good, I will try to leverage the tf2xla declustering pass to decluster the nodes related to the i++ cycles. @sanjoy
+
+Ok, great.
+Btw, I added some auto-clustering "integration" tests to: &lt;denchmark-link:https://github.com/tensorflow/tensorflow/tree/master/tensorflow/compiler/jit/tests&gt;https://github.com/tensorflow/tensorflow/tree/master/tensorflow/compiler/jit/tests&lt;/denchmark-link&gt;
+  You should be able to add an integration test with GNMT in that directory.
+		</comment>
+		<comment id='6' author='trentlo' date='2019-05-30T19:59:11Z'>
+		Thanks for the instant reply.
+
+Btw, I added some auto-clustering "integration" tests to: https://github.com/tensorflow/tensorflow/tree/master/tensorflow/compiler/jit/tests You should be able to add an integration test with GNMT in that directory.
+
+Thanks for this. The real pbtxt from the GNMT is 35MB. I guess we don't want to commit it. I will see if I can find a smaller yet representative model.
+		</comment>
+		<comment id='7' author='trentlo' date='2019-05-30T20:03:36Z'>
+		
+Thanks for this. The real pbtxt from the GNMT is 35MB. I guess we don't want to commit it. I will see if I can find a smaller yet representative model.
+
+I think the file size limit is 2MB.  I'd be fine if you wanted to check in the same large model in a more compact representation (gziped binary protobuf perhaps?) if that makes it fit.  Of course you'll then have to change the test harness to decompress and parse the binary proto instead of pbtxt.
+		</comment>
+		<comment id='8' author='trentlo' date='2019-05-30T20:48:33Z'>
+		Ya, it is quite small after gzip-ed. I will commit it as an integration test along with the future change to the declustering.
+BTW, I attach the dump from mark_for_compilation for your reference. Guess you may be interested in taking a look of the graph.
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/files/3238673/mark_for_compilation_annotated_4.pbtxt.gz&gt;mark_for_compilation_annotated_4.pbtxt.gz&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='9' author='trentlo' date='2019-05-30T21:17:56Z'>
+		
+I will commit it as an integration test along with the future change to the declustering.
+
+Up to you, but you should feel free to commit it before so the effect of the declustering change is clearer (e.g. see &lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/004f4645f6d5ab71a24319dbfe727ebb70d47767#diff-578512bc12b9e17a62969910f46211d7&gt;004f464#diff-578512bc12b9e17a62969910f46211d7&lt;/denchmark-link&gt;
+ )
+		</comment>
+		<comment id='10' author='trentlo' date='2019-05-30T21:32:23Z'>
+		
+
+I will commit it as an integration test along with the future change to the declustering.
+
+Up to you, but you should feel free to commit it before so the effect of the declustering change is clearer (e.g. see 004f464#diff-578512bc12b9e17a62969910f46211d7 )
+
+See your point. Will commit the test before the declustering change.
+		</comment>
+		<comment id='11' author='trentlo' date='2019-06-24T21:30:54Z'>
+		&lt;denchmark-link:https://github.com/trentlo&gt;@trentlo&lt;/denchmark-link&gt;
+ I see that the associated PR is merged. Can we close this issue if it's resolved?
+		</comment>
+		<comment id='12' author='trentlo' date='2019-06-25T05:10:34Z'>
+		Thanks &lt;denchmark-link:https://github.com/ymodak&gt;@ymodak&lt;/denchmark-link&gt;
+ for the follow-up.
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/pull/29470&gt;#29470&lt;/denchmark-link&gt;
+ addresses only half the issue.
+To close this issue (and see performance), we need another patch to remove the cuStreamSync at the end of every ExecuteOnStream. Softly ping &lt;denchmark-link:https://github.com/hawkinsp&gt;@hawkinsp&lt;/denchmark-link&gt;
+ as I heard he may already have some codes dealing with this issue.
+		</comment>
+		<comment id='13' author='trentlo' date='2019-06-25T17:55:14Z'>
+		CC &lt;denchmark-link:https://github.com/akuegel&gt;@akuegel&lt;/denchmark-link&gt;
+.  I can't find Alexander on Github -- Adrian do you know his handle if he has one?
+		</comment>
+		<comment id='14' author='trentlo' date='2019-07-05T13:07:33Z'>
+		So in the end I decided to submit the patch that reverts it to the previous state, see &lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/5a142145f86377ed1ffc1ac19d1d6d6853f8f355&gt;5a14214&lt;/denchmark-link&gt;
+
+We still don't understand why asynchronous execution seems to be worse in some cases.
+Unfortunately neither me nor Alex &lt;denchmark-link:https://github.com/pifon2a&gt;@pifon2a&lt;/denchmark-link&gt;
+ (who looked at this) know this part of the code.
+		</comment>
+		<comment id='15' author='trentlo' date='2019-07-05T14:56:56Z'>
+		
+@pifon2a
+
+Thanks for taking care of this. It is indeed strange that switching from async to sync can see performance degradation.
+If you can find a way to give me a reproducer, I am happy to profile the case to see if I am able to understand the cause.
+		</comment>
+		<comment id='16' author='trentlo' date='2019-07-05T15:01:36Z'>
+		To clarify the issue: Does your patch see the performance degradation? Or the degradation is only  seen when switching to use ExecuteAsyncOnStream?
+		</comment>
+		<comment id='17' author='trentlo' date='2019-07-08T22:11:29Z'>
+		Closing this issue. Thanks everyone for taking care of this.
+&lt;denchmark-link:https://github.com/pifon2a&gt;@pifon2a&lt;/denchmark-link&gt;
+: let me know if you'd like me to help with the performance degradation. We can track it in another issue if needed though.
+		</comment>
+		<comment id='18' author='trentlo' date='2019-07-08T22:11:30Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=28890&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=28890&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

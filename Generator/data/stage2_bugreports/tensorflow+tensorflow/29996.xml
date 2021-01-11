@@ -1,0 +1,179 @@
+<bug id='29996' author='morgangiraud' open_date='2019-06-20T07:22:19Z' closed_time='2019-07-10T18:52:04Z'>
+	<summary>TF2 - apparent memory leak when running dataset ops eagerly</summary>
+	<description>
+System information
+
+Have I written custom code: yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): OSX
+TensorFlow installed from (source or binary): 2.0.0beta
+TensorFlow version (use command below): v1.12.1-3259-gf59745a381 2.0.0-beta0
+Python version: 3.6.8
+
+Describe the current behavior
+When using the function tf.autograph.to_graph, I see a memory leak which I don't see if I use the annotation @tf.function
+Describe the expected behavior
+There should not be a memory leak.
+Code to reproduce the issue
+import os
+import psutil
+import numpy as np
+
+import tensorflow as tf
+
+process = psutil.Process(os.getpid())
+
+
+# @tf.function
+def train_epoch(model, p_data):
+    for real_inputs in p_data:
+        model * real_inputs
+
+
+train_epoch = tf.autograph.to_graph(train_epoch)
+
+data = np.random.normal(0., 1., [10000, 2])
+p_data = tf.data.Dataset.from_tensor_slices(data).batch(32)
+
+model = tf.Variable([1., 1.], dtype=tf.float64)
+
+for i in range(5000):
+    train_epoch(model, p_data)
+
+    if i % 50 == 0:
+        print(process.memory_info().rss)
+	</description>
+	<comments>
+		<comment id='1' author='morgangiraud' date='2019-06-20T13:09:38Z'>
+		I have tried on Colab with TF version 2.0beta and was able to reproduce the issue.
+		</comment>
+		<comment id='2' author='morgangiraud' date='2019-06-28T13:27:26Z'>
+		I did a few tests. In short, this seems to be related to Dataset.reduce (which is what is generated in this case).
+The leak reproduces even without autograph.to_code, if we run the code that would be effectively generated:
+&lt;denchmark-code&gt;import os
+import psutil
+import numpy as np
+
+import tensorflow as tf
+
+tf = tf.compat.v2
+tf.enable_v2_behavior()
+
+process = psutil.Process(os.getpid())
+
+
+# @tf.function
+def train_epoch(model, p_data):
+
+  def reduce_func(_, real_inputs):
+    model * real_inputs
+    return (tf.constant(0),)  # These tf.constant(0) are dummy variables - reduce requires at least one var.
+
+  p_data.reduce(((tf.constant(0),), ()), reduce_func)
+
+
+# train_epoch = tf.autograph.to_graph(train_epoch)
+
+data = np.random.normal(0., 1., [10000, 2])
+p_data = tf.data.Dataset.from_tensor_slices(data).batch(32)
+
+model = tf.Variable([1., 1.], dtype=tf.float64)
+
+for i in range(5000):
+    train_epoch(model, p_data)
+
+    if i % 50 == 0:
+        print(process.memory_info().rss)
+&lt;/denchmark-code&gt;
+
+The leak only seems to happen for datasets - if we replace p_data with reshaped version of data (in effect causing the for loop to run as a tf.while_loop), the leak doesn't reproduce:
+&lt;denchmark-code&gt;import os
+import psutil
+import numpy as np
+
+import tensorflow as tf
+
+tf = tf.compat.v2
+tf.enable_v2_behavior()
+
+process = psutil.Process(os.getpid())
+
+
+# @tf.function
+def train_epoch(model, data):
+    for real_inputs in data:
+        model * real_inputs
+
+
+train_epoch = tf.autograph.to_graph(train_epoch)
+
+data = np.random.normal(0., 1., [10016, 2])  # Fit batches evenly
+data = data.reshape([313, 32, 2])
+# p_data = tf.data.Dataset.from_tensor_slices(data).batch(32)
+
+model = tf.Variable([1., 1.], dtype=tf.float64)
+
+for i in range(5000):
+    train_epoch(model, data)
+
+    if i % 50 == 0:
+        print(process.memory_info().rss)
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='3' author='morgangiraud' date='2019-06-28T13:28:38Z'>
+		&lt;denchmark-link:https://github.com/jsimsa&gt;@jsimsa&lt;/denchmark-link&gt;
+ any insight into this?
+		</comment>
+		<comment id='4' author='morgangiraud' date='2019-07-10T18:52:04Z'>
+		Jiri and I spoke offline. For technical reasons, Dataset.reduce re-traces its function whenever called during Eager execution. This in effect adds a new trace to the default graph, which accounts for the increase in memory use.
+For this reason, we recommend caution when iterating over Datasets repeatedly in Eager execution, even with AutoGraph. We recommend using tf.function, as in increases performance and avoids these memory build-ups. tf.function also applies AutoGraph, so you won't need to call it separately.
+&lt;denchmark-code&gt;@tf.function
+def train_epoch(model, p_data):
+    for real_inputs in p_data:
+        model * real_inputs
+
+for i in range(5000):
+    train_epoch(model, p_data)
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='5' author='morgangiraud' date='2019-07-10T18:52:06Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=29996&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=29996&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='6' author='morgangiraud' date='2019-08-19T14:17:57Z'>
+		&lt;denchmark-link:https://github.com/mdanatg&gt;@mdanatg&lt;/denchmark-link&gt;
+  Is there any other way than wrapping the iteration of a dataset into a tf.function. My custom training loops need eager tensors to use the tf.summary API. Can I manually free the memory from the tf.dataset?
+Furthermore, this should be noted in the &lt;denchmark-link:https://www.tensorflow.org/beta/tutorials/eager/custom_training_walkthrough#training_loop&gt;documentation&lt;/denchmark-link&gt;
+, since it iterates several times of the dataset while being in eager mode.
+		</comment>
+		<comment id='7' author='morgangiraud' date='2019-08-19T18:56:07Z'>
+		&lt;denchmark-link:https://github.com/jaingaurav&gt;@jaingaurav&lt;/denchmark-link&gt;
+ I agree that it's worth noting it in the docs somewhere.
+&lt;denchmark-link:https://github.com/2649&gt;@2649&lt;/denchmark-link&gt;
+ as far as I know, the tf.summary API should work inside tf.function as well - unless you're perhaps encountering a different bug? Unfortunately I don't know of a way to manually free up the memory. &lt;denchmark-link:https://github.com/jsimsa&gt;@jsimsa&lt;/denchmark-link&gt;
+ might know of a way.
+		</comment>
+		<comment id='8' author='morgangiraud' date='2019-08-20T07:40:46Z'>
+		&lt;denchmark-link:https://github.com/mdanatg&gt;@mdanatg&lt;/denchmark-link&gt;
+ No it is not really a bug. I have some numpy operations in my summary calls, which do not work in tf.function. But I just changed them to ´tf´ operations. It is just a comfort problem.
+		</comment>
+		<comment id='9' author='morgangiraud' date='2019-08-20T16:36:04Z'>
+		Ok, the memory leak has a higher impact on my custom training loops than I expected. For everyone who needs a quick fix:  You can disable trace (tf.summary.trace_off()) before you iterate over a dataset and enable it afterwards (tf.summary.trace_on() ).  This worked in my case.
+&lt;denchmark-link:https://github.com/mdanatg&gt;@mdanatg&lt;/denchmark-link&gt;
+ Do you see any problems with this workaround?
+		</comment>
+		<comment id='10' author='morgangiraud' date='2019-08-21T18:20:52Z'>
+		It's hard to make a in the general case, but I don't see a problem with disabling trace, if it's not needed.
+		</comment>
+		<comment id='11' author='morgangiraud' date='2019-12-09T19:48:00Z'>
+		Thanks &lt;denchmark-link:https://github.com/2649&gt;@2649&lt;/denchmark-link&gt;
+ for proposing this quick fix. I wonder if you could provide some intuitions/explanations as to why this worked?
+Checking as this doesn't seem to work for me.
+BTW, I strongly think this problem should at least be mentioned (if not fixed) in all of the official docs whenever iterating a dataset happens.
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,441 @@
+<bug_data>
+<bug id='4556' author='Vozf' open_date='2020-11-06T19:52:04Z' closed_time='2020-11-10T21:13:43Z'>
+ 	<summary>Gpu memory leak with self.log on_epoch=True</summary>
+ 	<description>
+ pl 1.0.5
+ Using new logging api I want to log a metric in LightningModule
+ &lt;denchmark-code&gt;self.log(";;;;;;;;;;;;;;;;;;;", 1, on_step=False, on_epoch=True)
+ &lt;/denchmark-code&gt;
+ 
+ This is a dummy example but it is sufficient to add to LightningModule's training_step to cause a memory leak on gpu.
+ What could go wrong? We want to log a metric which is not even a cuda tensor. How could it lead to a gpu memory leak?
+ Well thanks to the magic of metric epoch aggregation stuff
+ Let's dig in and take a look at here
+ 
+ 
+ 
+ pytorch-lightning/pytorch_lightning/trainer/training_loop.py
+ 
+ 
+         Lines 550 to 569
+       in
+       b3db197
+ 
+ 
+ 
+ 
+ 
+ 
+  # ------------------------------------ 
+ 
+ 
+ 
+  # TRAINING_STEP + TRAINING_STEP_END 
+ 
+ 
+ 
+  # ------------------------------------ 
+ 
+ 
+ 
+  batch_output = self.run_training_batch(batch, batch_idx, dataloader_idx) 
+ 
+ 
+ 
+  
+ 
+ 
+ 
+  # when returning -1 from train_step, we end epoch early 
+ 
+ 
+ 
+  if batch_output.signal == -1: 
+ 
+ 
+ 
+  break 
+ 
+ 
+ 
+  
+ 
+ 
+ 
+  # only track outputs when user implements training_epoch_end 
+ 
+ 
+ 
+  # otherwise we will build up unnecessary memory 
+ 
+ 
+ 
+  epoch_end_outputs = self.process_train_step_outputs( 
+ 
+ 
+ 
+  batch_output.training_step_output_for_epoch_end, 
+ 
+ 
+ 
+  self.early_stopping_accumulator, 
+ 
+ 
+ 
+  self.checkpoint_accumulator, 
+ 
+ 
+ 
+  ) 
+ 
+ 
+ 
+  
+ 
+ 
+ 
+  # hook 
+ 
+ 
+ 
+  # TODO: add outputs to batches 
+ 
+ 
+ 
+  self.on_train_batch_end(epoch_output, epoch_end_outputs, batch, batch_idx, dataloader_idx) 
+ 
+ 
+ 
+ 
+ 
+ Here we run batch, convert batch_output to epoch_end_outputs if on_epoch was set and append epoch_end_outputs to epoch_output inside on_train_batch_end
+ epoch_output is defined here
+ 
+ 
+ 
+ pytorch-lightning/pytorch_lightning/trainer/training_loop.py
+ 
+ 
+          Line 540
+       in
+       b3db197
+ 
+ 
+ 
+ 
+ 
+ 
+  epoch_output = [[] for _ in range(self.num_optimizers)] 
+ 
+ 
+ 
+ 
+ 
+ Everything seems normal, but there is a problem inside  there is a surprise - loss value stored on gpu.
+ &lt;denchmark-link:https://user-images.githubusercontent.com/22998537/98406840-ba17f600-207f-11eb-9661-1535d90612a1.png&gt;&lt;/denchmark-link&gt;
+ 
+ I think you can guess by now what could go wrong if we store a lot of separate cuda tensors in a long long 
+ Yeah the gpu memory is going to end and you'll get a famous
+ &lt;denchmark-code&gt;RuntimeError: CUDA out of memory. Tried to allocate 114.00 MiB (GPU 1; 10.92 GiB total capacity; 9.39 GiB already allocated; 27.38 MiB free; 10.24 GiB reserved in total by PyTorch)
+ &lt;/denchmark-code&gt;
+ 
+ Where is the loss appended to output? Here
+ 
+ 
+ 
+ pytorch-lightning/pytorch_lightning/trainer/training_loop.py
+ 
+ 
+         Lines 396 to 427
+       in
+       b3db197
+ 
+ 
+ 
+ 
+ 
+ 
+  def _process_training_step_output_1_0(self, training_step_output, split_batch): 
+ 
+ 
+ 
+  result = self.trainer.get_model()._results 
+ 
+ 
+ 
+  
+ 
+ 
+ 
+  loss = None 
+ 
+ 
+ 
+  hiddens = None 
+ 
+ 
+ 
+  
+ 
+ 
+ 
+  # handle dict return 
+ 
+ 
+ 
+  if isinstance(training_step_output, dict): 
+ 
+ 
+ 
+  loss = training_step_output.pop("loss", None) 
+ 
+ 
+ 
+  hiddens = training_step_output.pop("hiddens", None) 
+ 
+ 
+ 
+  result["extra"] = training_step_output 
+ 
+ 
+ 
+  
+ 
+ 
+ 
+  # handle scalar return 
+ 
+ 
+ 
+  elif isinstance(training_step_output, torch.Tensor): 
+ 
+ 
+ 
+  loss = training_step_output 
+ 
+ 
+ 
+  result["extra"] = {} 
+ 
+ 
+ 
+  
+ 
+ 
+ 
+  # map to results under the hood 
+ 
+ 
+ 
+  result.minimize = loss 
+ 
+ 
+ 
+  result.hiddens = hiddens 
+ 
+ 
+ 
+  
+ 
+ 
+ 
+  # track batch for manual reduction with result 
+ 
+ 
+ 
+  result.track_batch_size(len(split_batch)) 
+ 
+ 
+ 
+  
+ 
+ 
+ 
+  # track metrics without grads for epoch reduction 
+ 
+ 
+ 
+  training_step_output_for_epoch_end = copy(result) 
+ 
+ 
+ 
+  training_step_output_for_epoch_end.detach() 
+ 
+ 
+ 
+  
+ 
+ 
+ 
+  # what flows back into the system 
+ 
+ 
+ 
+  training_step_output = result 
+ 
+ 
+ 
+  
+ 
+ 
+ 
+  return training_step_output_for_epoch_end, training_step_output 
+ 
+ 
+ 
+ 
+ 
+ In the first line we get a pretty result without the loss in it, and in line 414 the loss get appended and we start our memory leak chain of events
+ How is it affecting the training? It can lead to error only on the first epoch of training. If you've got enough memory to hold a list of gpu losses during the 1st epoch there won't be any exceptions as subsequent epochs will have the same list of losses, if not you'll get it somewhere in the middle of 1st epoch. And of course the more steps you have in an epoch the more memory this list of gpu losses will require as one loss is stored per step
+ Here is the comparison for my task. My gpu could hold 2k steps before memory error
+ With 
+ &lt;denchmark-link:https://user-images.githubusercontent.com/22998537/98408278-f51b2900-2081-11eb-92ae-ceeb80693753.png&gt;&lt;/denchmark-link&gt;
+ 
+ Without 
+ &lt;denchmark-link:https://user-images.githubusercontent.com/22998537/98408336-10863400-2082-11eb-97d8-9d00f13c70ca.png&gt;&lt;/denchmark-link&gt;
+ 
+ You can see how there is a rapid growth in the first minute in both as the model is loaded and feeded the 1st batch.
+ The difference is in subsequent minutes where in the former case the list of losses eats 7gb of gpu memory and leads to crash, and in the latter nothing happens and training goes on
+ Pretty cool how one  could eat 2 times more gpu memory more than actual training process
+ 	</description>
+ 	<comments>
+ 		<comment id='1' author='Vozf' date='2020-11-09T06:02:01Z'>
+ 		Same problem! However, I use self.log("log name", (scalar tensor).item()) to avoid that OOM problem. Maybe you can log the data in the tensor instead of the tensor itself.
+ 		</comment>
+ 		<comment id='2' author='Vozf' date='2020-11-09T06:36:43Z'>
+ 		I'm logging just a python1 not a tensor as you can see from the example
+ 		</comment>
+ 		<comment id='3' author='Vozf' date='2020-11-09T11:19:02Z'>
+ 		&lt;denchmark-link:https://github.com/tchaton&gt;@tchaton&lt;/denchmark-link&gt;
+ , &lt;denchmark-link:https://github.com/Borda&gt;@Borda&lt;/denchmark-link&gt;
+   Any thoughts on this?
+ 		</comment>
+ 		<comment id='4' author='Vozf' date='2020-11-09T12:14:25Z'>
+ 		For anyone having the same problem, I monkeypatched like this to avoid setting loss
+ &lt;denchmark-code&gt;    from pytorch_lightning.trainer.training_loop import TrainLoop
+ 
+     old_process_training_step_outputs = TrainLoop.process_train_step_outputs
+ 
+     def process_train_step_outputs_delete_loss(*args, **kwargs):
+         results = old_process_training_step_outputs(*args, **kwargs)
+         for result in results:
+             for res in result:
+                 res.minimize = None
+         return results
+ 
+     TrainLoop.process_train_step_outputs = process_train_step_outputs_delete_loss
+ &lt;/denchmark-code&gt;
+ 
+ 		</comment>
+ 		<comment id='5' author='Vozf' date='2020-11-09T15:39:33Z'>
+ 		Validation loop has the same issue cuda tensors are stored in a list, but they are detached compared to non-detached train loop so overhead isn't big, but it's still there. This can be fixed by loss.cpu() before returning it in validation_step or not returning anything at all
+ 		</comment>
+ 		<comment id='6' author='Vozf' date='2020-11-09T17:44:31Z'>
+ 		Hey &lt;denchmark-link:https://github.com/Vozf&gt;@Vozf&lt;/denchmark-link&gt;
+  and &lt;denchmark-link:https://github.com/AristoYU&gt;@AristoYU&lt;/denchmark-link&gt;
+ ,
+ I deeply apologise for this bug. Let me work on it in priority !
+ Best regards,
+ Thomas Chaton.
+ 		</comment>
+ 		<comment id='7' author='Vozf' date='2020-11-10T10:07:20Z'>
+ 		I also had this issue
+ 		</comment>
+ 	</comments>
+ </bug>
+<commit id='514cb22bd719e6ca056cacce730c8de875c9dbf6' author='chaton' date='2020-11-10 21:13:41+00:00'>
+ 	<dmm_unit complexity='0.6' interfacing='0.44' size='0.68'></dmm_unit>
+ 	<modification change_type='MODIFY' old_name='pytorch_lightning\core\step_result.py' new_name='pytorch_lightning\core\step_result.py'>
+ 		<file_info nloc='672' complexity='196' token_count='4553'></file_info>
+ 		<method name='cpu' parameters='self'>
+ 				<method_info nloc='4' complexity='3' token_count='39' nesting_level='1' start_line='398' end_line='402'></method_info>
+ 			<added_lines>398,399,400,401,402</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines>403</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='pytorch_lightning\trainer\connectors\logger_connector\epoch_result_store.py' new_name='pytorch_lightning\trainer\connectors\logger_connector\epoch_result_store.py'>
+ 		<file_info nloc='414' complexity='85' token_count='2548'></file_info>
+ 		<method name='cache_result' parameters='self'>
+ 				<method_info nloc='24' complexity='5' token_count='129' nesting_level='1' start_line='368' end_line='408'></method_info>
+ 			<added_lines>395,396,397,398</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines></added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='pytorch_lightning\trainer\connectors\logger_connector\logger_connector.py' new_name='pytorch_lightning\trainer\connectors\logger_connector\logger_connector.py'>
+ 		<file_info nloc='417' complexity='116' token_count='2977'></file_info>
+ 		<method name='on_trainer_init' parameters='self,logger,flush_logs_every_n_steps,log_every_n_steps'>
+ 				<method_info nloc='4' complexity='1' token_count='31' nesting_level='1' start_line='96' end_line='102'></method_info>
+ 			<added_lines>96</added_lines>
+ 			<deleted_lines>96</deleted_lines>
+ 		</method>
+ 		<method name='on_trainer_init' parameters='self,logger,int,int,bool'>
+ 				<method_info nloc='5' complexity='1' token_count='46' nesting_level='1' start_line='96' end_line='104'></method_info>
+ 			<added_lines>96,104</added_lines>
+ 			<deleted_lines>96</deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines>105</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='pytorch_lightning\trainer\trainer.py' new_name='pytorch_lightning\trainer\trainer.py'>
+ 		<file_info nloc='650' complexity='72' token_count='3169'></file_info>
+ 		<method name='run_evaluation' parameters='self,bool,max_batches'>
+ 				<method_info nloc='44' complexity='6' token_count='372' nesting_level='1' start_line='548' end_line='644'></method_info>
+ 			<added_lines>616,617,620</added_lines>
+ 			<deleted_lines>606,607,610,611</deleted_lines>
+ 		</method>
+ 		<method name='track_output_for_epoch_end' parameters='self,outputs,output'>
+ 				<method_info nloc='12' complexity='8' token_count='91' nesting_level='1' start_line='646' end_line='657'></method_info>
+ 			<added_lines>646,647,648,649,650,651,652,653,654,655,656,657</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<method name='__init__' parameters='self,LightningLoggerBase,True,bool,None,None,float,int,int,int,str,None,bool,str,None,None,int,int,0,int,float,1,int,bool,int,int,1,int,int,None,None,int,0,int,0,int,0,int,0,int,int,str,None,bool,int,None,int,None,None,BaseProfiler,bool,None,bool,bool,bool,bool,False,bool,bool,str,False,bool,None,str,str,None,bool,bool'>
+ 				<method_info nloc='53' complexity='1' token_count='468' nesting_level='1' start_line='87' end_line='139'></method_info>
+ 			<added_lines>139</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines>63,277,278,279,371,372,373,374,375,376,658</added_lines>
+ 			<deleted_lines>366</deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='pytorch_lightning\trainer\training_loop.py' new_name='pytorch_lightning\trainer\training_loop.py'>
+ 		<file_info nloc='545' complexity='166' token_count='4102'></file_info>
+ 		<method name='_process_training_step_output_1_0' parameters='self,training_step_output,split_batch'>
+ 				<method_info nloc='20' complexity='4' token_count='129' nesting_level='1' start_line='410' end_line='443'></method_info>
+ 			<added_lines>437,438</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines></added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='pytorch_lightning\utilities\memory.py' new_name='pytorch_lightning\utilities\memory.py'>
+ 		<file_info nloc='48' complexity='19' token_count='260'></file_info>
+ 		<method name='recursive_detach' parameters='dict'>
+ 				<method_info nloc='22' complexity='4' token_count='87' nesting_level='0' start_line='20' end_line='41'></method_info>
+ 			<added_lines>20,29,39,40,41</added_lines>
+ 			<deleted_lines>20,38</deleted_lines>
+ 		</method>
+ 		<method name='recursive_detach' parameters='dict,bool'>
+ 				<method_info nloc='26' complexity='5' token_count='106' nesting_level='0' start_line='20' end_line='46'></method_info>
+ 			<added_lines>20,29,39,40,41,42,43</added_lines>
+ 			<deleted_lines>20,38</deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines></added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ </commit>
+</bug_data>

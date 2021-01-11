@@ -1,0 +1,176 @@
+<bug id='11783' author='HarvinderBhullar' open_date='2020-11-03T11:46:59Z' closed_time='2020-11-11T15:31:00Z'>
+	<summary>RaySGD: Pytorch code does not work with Mlflow</summary>
+	<description>
+Mlflow code  is not working with cifr_pytorch_example.py example code. I am registering my experiments after shutting down training, (I tried before shutting down training as well without success) the program just hangs without any activity. I could not find anything related to this issue in the logs.  I am facing this issue only with PyTorch, tensorflow code is working fine.
+I am using rayproject/ray-ml docker container to test this code
+Python Ver: 3.7.7
+Ray: 1.0.0
+PyTorch: 1.6.0
+Use this code to reproduce it
+import os
+import torch
+import torch.nn as nn
+import argparse
+
+from filelock import FileLock
+from torch.utils.data import DataLoader, Subset
+from torchvision.datasets import CIFAR10
+import torchvision.transforms as transforms
+
+from tqdm import trange
+
+import ray
+from ray.util.sgd.torch import TorchTrainer, TrainingOperator
+from ray.util.sgd.torch.resnet import ResNet18
+from ray.util.sgd.utils import BATCH_SIZE, override
+
+import mlflow
+import mlflow.pytorch
+import pickle
+
+def initialization_hook():
+    # Need this for avoiding a connection restart issue on AWS.
+    os.environ["NCCL_SOCKET_IFNAME"] = "^docker0,lo"
+    os.environ["NCCL_LL_THRESHOLD"] = "0"
+
+    # set the below if needed
+    # print("NCCL DEBUG SET")
+    # os.environ["NCCL_DEBUG"] = "INFO"
+
+
+class CifarTrainingOperator(TrainingOperator):
+    @override(TrainingOperator)
+    def setup(self, config):
+        # Create model.
+        model = ResNet18(config)
+
+        # Create optimizer.
+        optimizer = torch.optim.SGD(
+            model.parameters(),
+            lr=config.get("lr", 0.1),
+            momentum=config.get("momentum", 0.9))
+
+        # Load in training and validation data.
+        transform_train = transforms.Compose([
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465),
+                                 (0.2023, 0.1994, 0.2010)),
+        ])  # meanstd transformation
+
+        transform_test = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465),
+                                 (0.2023, 0.1994, 0.2010)),
+        ])
+        with FileLock(".ray.lock"):
+            train_dataset = CIFAR10(
+                root="~/data",
+                train=True,
+                download=True,
+                transform=transform_train)
+            validation_dataset = CIFAR10(
+                root="~/data",
+                train=False,
+                download=False,
+                transform=transform_test)
+
+        if config["test_mode"]:
+            train_dataset = Subset(train_dataset, list(range(64)))
+            validation_dataset = Subset(validation_dataset, list(range(64)))
+
+        train_loader = DataLoader(
+            train_dataset, batch_size=config[BATCH_SIZE], num_workers=1)
+        validation_loader = DataLoader(
+            validation_dataset, batch_size=config[BATCH_SIZE], num_workers=1)
+
+        # Create scheduler.
+        scheduler = torch.optim.lr_scheduler.MultiStepLR(
+            optimizer, milestones=[150, 250, 350], gamma=0.1)
+
+        # Create loss.
+        criterion = nn.CrossEntropyLoss()
+
+        # Register all components.
+        self.model, self.optimizer, self.criterion, self.scheduler = \
+            self.register(models=model, optimizers=optimizer,
+                          criterion=criterion, schedulers=scheduler)
+        self.register_data(
+            train_loader=train_loader, validation_loader=validation_loader)
+
+
+if __name__ == "__main__":
+    num_workers = 1
+    num_epochs =1
+    use_gpu =False
+    fp16 = False
+    tune = False
+    smoke_test = False
+
+
+    num_cpus = 4 if smoke_test else None
+    print("initialize connection")
+    ray.init(address="auto")
+    print("connected")
+    #ray.init()
+    trainer1 = TorchTrainer(
+        training_operator_cls=CifarTrainingOperator,
+        initialization_hook=initialization_hook,
+        num_workers=num_workers,
+        config={
+            "lr": 0.1,
+            "test_mode": True,  # subset the data
+            # this will be split across workers.
+            BATCH_SIZE: 128 * num_workers
+        },
+        use_gpu=False,
+        scheduler_step_freq="epoch",
+        use_fp16=fp16,
+        use_tqdm=False)
+    print("starting training")
+    pbar = trange(num_epochs, unit="epoch")
+    for i in pbar:
+        info = {"num_steps": 1} if smoke_test else {}
+        info["epoch_idx"] = i
+        info["num_epochs"] = num_epochs
+        # Increase `max_retries` to turn on fault tolerance.
+        trainer1.train(max_retries=1, info=info)
+        val_stats = trainer1.validate()
+        pbar.set_postfix(dict(acc=val_stats["val_accuracy"]))
+
+    print(trainer1.validate())
+    model = trainer1.get_model()
+
+    print(model.eval())
+    trainer1.shutdown()
+    experiment_id = mlflow.set_experiment('cifr')
+    with mlflow.start_run(experiment_id=experiment_id, run_name='cpu-version-fromlaptop'):
+        print("started mlflow run")
+        mlflow.pytorch.log_model(model, artifact_path="model", pickle_module=pickle, code_paths=['.'])
+    print("shutting down")
+  
+    print("success!")
+
+ I have verified my script runs in a clean environment and reproduces the issue.
+
+	</description>
+	<comments>
+		<comment id='1' author='HarvinderBhullar' date='2020-11-03T16:54:17Z'>
+		Can you please post  the error message that you're getting?
+		</comment>
+		<comment id='2' author='HarvinderBhullar' date='2020-11-03T18:47:16Z'>
+		Program just hangs before following line. I waited for 20 minutes.
+&lt;denchmark-code&gt;mlflow.pytorch.log_model(model, artifact_path="model", pickle_module=pickle, code_paths=['.'])
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='3' author='HarvinderBhullar' date='2020-11-03T22:26:05Z'>
+		Hi &lt;denchmark-link:https://github.com/HarvinderBhullar&gt;@HarvinderBhullar&lt;/denchmark-link&gt;
+ can you try moving the entire model into CPU? Or perhaps using torch.save instead of pickle?
+		</comment>
+		<comment id='4' author='HarvinderBhullar' date='2020-11-11T15:31:00Z'>
+		The issue turns out be to in my code as I mentioned code_paths=['.']. Since I was running the code in the root folder, it was trying to pickle all the files in the current directory and hence taking for ever. I am closing this issue.
+		</comment>
+	</comments>
+</bug>

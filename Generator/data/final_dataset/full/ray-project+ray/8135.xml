@@ -1,0 +1,733 @@
+<bug_data>
+<bug id='8135' author='yskim5892' open_date='2020-04-22T19:18:16Z' closed_time='2020-05-04T09:25:13Z'>
+ 	<summary>[RLlib] Model with continuous action space outputs inf</summary>
+ 	<description>
+ &lt;denchmark-h:h3&gt;What is the problem?&lt;/denchmark-h&gt;
+ 
+ Ray version and other system information (Python version, TensorFlow version, OS):
+ 
+ Python 3.7.5
+ Ray : from commit d66d126
+ OS : Linux (Ubuntu 18.04)
+ 
+ I've made a custom environment which implements MultiAgentEnv, custom trainer similar to DDPGTrainer, and a custom optimizer.
+ In this setting, high level agent's action space is Box(24), which is same as the observation space.
+ When I try to train with these, high level agent just outputs action full of infs(after random-action timesteps for exploration). I've added print lines for debugging, so you can easily check it.
+ I think this problem is not related with my custom replay buffer or custom optimizer, because the policy is just simply outputting action full of infs(as you can check from prints).  It might be related with the multiagent pipeline, because this problem didn't happen when I ran single DDPGTrainer on a simple environment with continuous action space.
+ &lt;denchmark-h:h3&gt;Reproduction (REQUIRED)&lt;/denchmark-h&gt;
+ 
+ Please provide a script that can be run to reproduce the issue. The script should have no external library dependencies (i.e., use fake or mock data / environments):
+ If we cannot run your script, we cannot fix your issue.
+ &lt;denchmark-code&gt;import ray
+ from ray import tune
+ from ray.tune import function
+ from ray.rllib.env import MultiAgentEnv
+ 
+ from ray.rllib.evaluation.metrics import get_learner_stats
+ from ray.rllib.optimizers.policy_optimizer import PolicyOptimizer
+ from ray.rllib.optimizers.replay_buffer import ReplayBuffer
+ from ray.rllib.utils.annotations import override
+ from ray.rllib.utils.timer import TimerStat
+ from ray.rllib.utils.memory import ray_get_and_free
+ 
+ from ray.rllib.agents.ddpg.ddpg import DDPGTrainer, DEFAULT_CONFIG
+ from ray.rllib.agents.ddpg.ddpg_tf_policy import DDPGTFPolicy
+ from ray.rllib.policy.sample_batch import SampleBatch, MultiAgentBatch
+ from ray.rllib.utils.compression import pack_if_needed, unpack_if_needed
+ 
+ import numpy as np
+ import gym
+ import random
+ import collections
+ 
+ class MultiStepReplayBuffer(ReplayBuffer):
+     def __init__(self, size, sub_replay_buffer):
+         ReplayBuffer.__init__(self, size)
+         # storage: List of (obs, action, reward, next_obs, done, start_idx, steps)
+         self.sub = sub_replay_buffer
+         self._next_subidx = 0
+         
+     def add(self, obs, action, reward, next_obs, done, steps):
+         assert steps &lt;= self._maxsize
+         assert (self._next_subidx + steps) % self._maxsize == self.sub._next_idx
+         data = (obs, action, reward, next_obs, done, self._next_subidx, steps)
+         self._num_added += 1
+         
+         a = self._next_subidx
+         b = self._next_subidx + steps
+ 
+         overlapped = True
+         while len(self._storage) &gt;= 1 and overlapped:
+             overlapped = False
+             c = self._storage[0][5]
+             d = c + self._storage[0][6]
+             if b &lt; self._maxsize and c &lt; b and a &lt; d:
+                 overlapped = True
+             elif b &gt;= self._maxsize:
+                 b = b % self._maxsize
+                 if c &lt; b or a &lt; d:
+                     overlapped = True
+             if overlapped:
+                 self._eviction_started = True
+                 self._storage.pop(0)
+     
+         self._storage.append(data)
+         self._next_subidx = b
+ 
+     def _encode_sample(self, idxes):
+         obses, actions, rewards, next_obses, dones, l_obs_seqs, l_action_seqs, l_reward_seqs = [], [], [], [], [], [], [], []
+         for i in idxes:
+             obs, action, reward, next_obs, done, subidx, step = self._storage[i]
+             obses.append(np.array(unpack_if_needed(obs), copy=False))
+             actions.append(np.array(action, copy=False))
+             rewards.append(reward)
+             next_obses.append(np.array(unpack_if_needed(next_obs), copy=False))
+             dones.append(done)
+             l_obs_seq, l_action_seq, l_reward_seq = [], [], []
+             for j in range(subidx, subidx + step):
+                 j = j % self._maxsize
+                 l_obs, l_action, l_reward, _, _ = self.sub._storage[j]
+                 l_obs_seq.append(np.array(unpack_if_needed(l_obs), copy=False))
+                 l_action_seq.append(np.array(l_action, copy=False))
+                 l_reward_seq.append(l_reward)
+             l_obs_seqs.append(l_obs_seq)
+             l_action_seqs.append(l_action_seq)
+             l_reward_seqs.append(l_reward_seq)
+             self._hit_count[i] += 1
+         return np.array(obses), np.array(actions), np.array(rewards), np.array(next_obses), np.array(dones), np.array(l_obs_seqs), np.array(l_action_seqs), np.array(l_reward_seqs)
+ 
+ 
+ class HIRO_Optimizer(PolicyOptimizer):
+     def __init__(self, workers, learning_starts=1000, buffer_size=10000, train_batch_size=32, before_learn_on_batch=None):
+         PolicyOptimizer.__init__(self, workers)
+         self.replay_starts = learning_starts
+         self.max_buffer_size = buffer_size
+         self.train_batch_size = train_batch_size
+         self.before_learn_on_batch = before_learn_on_batch
+ 
+         assert self.max_buffer_size &gt;= self.replay_starts
+ 
+         def new_buffer():
+             return ReplayBuffer(buffer_size)
+ 
+         self.replay_buffers = {'l' : ReplayBuffer(buffer_size)}
+         self.replay_buffers['h'] = MultiStepReplayBuffer(buffer_size, self.replay_buffers['l'])
+         
+         self.buffer_size = 0
+         self.l_steps = 0
+ 
+         self.sample_timer = TimerStat()
+         self.replay_timer = TimerStat()
+         self.grad_timer = TimerStat()
+         
+         self.learner_stats = {}
+ 
+     @override(PolicyOptimizer)
+     def step(self):
+         with self.sample_timer:
+             batch = self.workers.local_worker().sample()
+ 
+             for policy_id, s in batch.policy_batches.items():
+                 for row in s.rows():
+                     if policy_id == 'h':
+                         self.replay_buffers[policy_id].add(
+                             pack_if_needed(row['obs']),
+                             row['actions'],
+                             row['rewards'],
+                             pack_if_needed(row['new_obs']),
+                             row['dones'],
+                             self.l_steps)
+                         self.l_steps = 0
+                     if policy_id == 'l':
+                         self.replay_buffers[policy_id].add(
+                             pack_if_needed(row['obs']),
+                             row['actions'],
+                             row['rewards'],
+                             pack_if_needed(row['new_obs']),
+                             row['dones'],
+                             weight=None)
+                         self.l_steps += 1
+         
+         if self.num_steps_sampled &gt;= self.replay_starts:
+             self._optimize()
+         
+         self.num_steps_sampled += batch.count
+         print(self.num_steps_sampled)
+ 
+     @override(PolicyOptimizer)
+     def stats(self):
+         return dict(
+             PolicyOptimizer.stats(self), **{
+                 'sample_time_ms': round(1000 * self.sample_timer.mean, 3),
+                 'replay_time_ms': round(1000 * self.replay_timer.mean, 3),
+                 'grad_time_ms': round(1000 * self.grad_timer.mean, 3),
+                 'opt_peak_throughput': round(self.grad_timer.mean_throughput, 3),
+                 'opt_samples': round(self.grad_timer.mean_units_processed, 3),
+                 'learner': self.learner_stats,
+             })
+ 
+     def _optimize(self):
+         samples = self._replay()
+ 
+         with self.grad_timer:
+             if self.before_learn_on_batch:
+                 samples = self.before_learn_on_batch(samples, self.workers.local_worker().policy_map, self.train_batch_size)
+             info_dict = self.workers.local_worker().learn_on_batch(samples)
+             for policy_id, info in info_dict.items():
+                 self.learner_stats[policy_id] = get_learner_stats(info)
+             self.grad_timer.push_units_processed(samples.count)
+ 
+         self.num_steps_trained += samples.count
+ 
+     def _replay(self):
+         samples = {}
+         idxes = None
+         with self.replay_timer:
+             for policy_id, replay_buffer in self.replay_buffers.items():
+                 idxes = replay_buffer.sample_idxes(self.train_batch_size)
+ 
+                 if policy_id == 'l':
+                     (obses, actions, rewards, next_obses, dones) = replay_buffer.sample_with_idxes(idxes)
+                     weights, batch_indexes = np.ones_like(rewards), -np.ones_like(rewards)
+ 
+                     samples[policy_id] = SampleBatch({
+                         'obs': obses,
+                         'actions': actions,
+                         'rewards': rewards,
+                         'new_obs': next_obses,
+                         'dones': dones,
+                         'weights': weights,
+                         'batch_indexes': batch_indexes
+                     })
+ 
+                 elif policy_id == 'h':
+                     (obses, actions, rewards, next_obses, dones, l_obs_seqs, l_action_seqs, l_reward_seqs) = replay_buffer.sample_with_idxes(idxes)
+                     weights, batch_indexes = np.ones_like(rewards), -np.ones_like(rewards)
+                     samples[policy_id] = SampleBatch({
+                         'obs': obses,
+                         'actions': actions,
+                         'rewards': rewards,
+                         'new_obs': next_obses,
+                         'dones': dones,
+                         'weights': weights,
+                         'batch_indexes': batch_indexes,
+                         'l_obs_seqs': l_obs_seqs,
+                         'l_action_seqs': l_action_seqs,
+                         'l_reward_seqs': l_reward_seqs
+                     })
+         return MultiAgentBatch(samples, self.train_batch_size)
+ 
+ 
+ def make_policy_optimizer(workers, config):
+     return HIRO_Optimizer(    
+         workers,
+         learning_starts=config['learning_starts'],
+         buffer_size=config['buffer_size'],
+         train_batch_size=config['train_batch_size'])
+ 
+ HIROTrainer = DDPGTrainer.with_updates(
+     name="HIRO",
+     default_config=DEFAULT_CONFIG,
+     make_policy_optimizer=make_policy_optimizer
+ )
+ 
+ 
+ class HIRO_env_wrapper(MultiAgentEnv):
+     def __init__(self, config):
+         try:
+             self.env = config['flat_env']
+             self.observation_space = self.env.observation_space
+             self.action_space = self.env.action_space
+         except AttributeError:
+             self.env = gym.make(config['flat_env'])
+             self.observation_space = self.env.observation_space
+             self.action_space = self.env.action_space
+         self.config = config
+ 
+     def reset(self):
+         self.state = self.env.reset()
+         self.goal = self.state
+         self.l_steps = 0
+ 
+         return {'h': self.state, 'l': np.concatenate((self.state, self.goal))}
+ 
+     def step(self, action_dict):
+         obs, rew, done, info = {}, {}, {'__all__' : False}, {'l' : {}}
+ 
+         if 'h' in action_dict:
+             action = action_dict['h']
+             self.goal = action
+             self.h_reward = 0
+             self.l_reward = 0
+             self.l_steps = 0
+ 
+         if 'l' in action_dict:
+             action = action_dict['l']
+             self.l_steps += 1
+             next_state, ext_reward, f_done, _ = self.env.step(action)
+ 
+             self.h_reward += ext_reward
+             self.goal = self.state + self.goal - next_state
+             self.l_reward = -(np.dot(self.goal, self.goal)) ** 0.5
+ 
+             self.state = next_state
+ 
+             if f_done:
+                 done = {'l' : True, 'h' : True, '__all__': True}
+                 obs['h'] = self.state
+                 rew['h'] = self.h_reward
+                 info['h'] = {}
+ 
+             elif self.l_steps &gt;= self.config['max_sub_policy_steps']:
+                 done = {'l' : True, 'h' : False, '__all__': False}
+                 obs['h'] = self.state
+                 rew['h'] = self.h_reward
+                 info['h'] = {}
+ 
+         obs['l'] = np.concatenate((self.state, self.goal))
+         rew['l'] = self.l_reward
+         print(rew, done)
+         print(action_dict)
+         return obs, rew, done, info
+ 
+ from ray.rllib.agents.ddpg.ddpg import DDPGTrainer, DEFAULT_CONFIG
+ trainer = HIROTrainer
+ config = DEFAULT_CONFIG
+ 
+ config['env_config'] = {'flat_env': 'BipedalWalker-v3', 'max_sub_policy_steps' : 5, 'num_goal_candidates' : 4}
+ env = HIRO_env_wrapper(config['env_config'])
+ config['env'] = HIRO_env_wrapper
+ obs_space = env.observation_space
+ action_space = env.action_space
+ 
+ def policy_mapping(agent_id):
+     return agent_id
+ l_obs_space = gym.spaces.Box(low=obs_space.low[0], high=obs_space.high[0], shape=(obs_space.shape[0]*2,))
+ 
+ config['multiagent'] = {
+     'policies': {
+         'h': (None, obs_space, obs_space, {}),
+         'l': (None, l_obs_space, action_space, {}),
+     },
+     'policies_to_train': ['h', 'l'],
+     'policy_mapping_fn': policy_mapping,
+ }
+ 
+ ray.init(num_cpus=18, num_gpus=3)
+ config['timesteps_per_iteration'] = 5
+ config['train_batch_size'] = 8
+ config['num_gpus'] = 3
+ config['lr'] = tune.sample_from(lambda spec : np.random.choice(np.array([1e-5, 3e-5, 1e-4, 3e-4, 1e-3], dtype=np.float32)))
+ 
+ tune.run(trainer, config=config)
+ 
+ &lt;/denchmark-code&gt;
+ 
+ 
+ [v] I have verified my script runs in a clean environment and reproduces the issue.
+ [v] I have verified the issue also occurs with the latest wheels.
+ 
+ 	</description>
+ 	<comments>
+ 		<comment id='1' author='yskim5892' date='2020-04-23T03:49:19Z'>
+ 		I've found some simpler(or minimal) setup that produces this problem. I think you'd better check the issue with this setting.
+ Code :
+ &lt;denchmark-code&gt;import ray
+ from ray import tune
+ from ray.rllib.env import MultiAgentEnv
+ import numpy as np
+ import gym
+ 
+ class temp_env(MultiAgentEnv):
+     def __init__(self, config):
+         self.observation_space = gym.spaces.Box(low=float('-inf'), high=float('inf'), shape=[4])
+         self.action_space = gym.spaces.Box(low=float('-inf'), high=float('inf'), shape=[4])
+         self.count = 0
+         self.config = config
+ 
+     def reset(self):
+         self.state = np.random.normal(size=(4))
+         return {'a': self.state}
+ 
+     def step(self, action_dict):
+         action = action_dict['a']
+         rew = -np.linalg.norm(self.state - action)
+         self.state = np.random.normal(size=(4))
+         self.count += 1
+         print(self.count, rew, action)
+ 
+         return {'a': self.state}, {'a': rew}, {'__all__': rew &gt;= -0.1}, {'a' : {}}
+ 
+ def policy_mapping(agent_id):
+     return agent_id
+ 
+ from ray.rllib.agents.ddpg.ddpg import DDPGTrainer, DEFAULT_CONFIG
+ trainer = DDPGTrainer
+ config = DEFAULT_CONFIG
+ 
+ env = temp_env(config['env_config'])
+ config['env'] = temp_env
+ obs_space = env.observation_space
+ action_space = env.action_space
+ 
+ ray.init(num_cpus=18, num_gpus=3)
+ config['num_gpus'] = 3
+ config['lr'] = tune.sample_from(lambda spec : np.random.choice(np.array([1e-5, 3e-5, 1e-4, 3e-4, 1e-3], dtype=np.float32)))
+ 
+ config['multiagent'] = {
+     'policies': {
+         'a': (None, obs_space, action_space, {}),
+     },
+     'policies_to_train': ['a'],
+     'policy_mapping_fn': policy_mapping,
+ }
+ config['prioritized_replay'] = False
+ 
+ tune.run(trainer, config=config)
+ &lt;/denchmark-code&gt;
+ 
+ Output:
+ &lt;denchmark-code&gt;(pid=9477) 1998 -0.8631670757585075 [ 0.13583446  0.9148087  -0.3667308   0.49348983]                                                             [172/31315]
+ (pid=9477) 1999 -4.473830981654697 [-0.8914048  1.2773074 -1.2671033 -1.0367289]
+ Result for DDPG_temp_env_00000:
+   custom_metrics: {}
+   date: 2020-04-23_12-44-30
+   done: false
+   episode_len_mean: .nan
+   episode_reward_max: .nan
+   episode_reward_mean: .nan
+   episode_reward_min: .nan
+   episodes_this_iter: 0
+   episodes_total: 0
+   experiment_id: 3b03eb6a59fa47c99c170634e38be968
+   experiment_tag: '0'
+   hostname: silver
+   info:
+     exploration_infos:
+     - cur_scale: 1.0
+     grad_time_ms: 5.322
+     learner:
+       a:
+         max_q: -0.643890380859375
+         mean_q: -2.6590957641601562
+         min_q: -5.414635181427002
+         model: {}
+     num_steps_sampled: 2000
+     num_steps_trained: 128000
+     num_target_updates: 2000
+     opt_peak_throughput: 48106.713
+     opt_samples: 256.0
+     replay_time_ms: 12.831
+     sample_time_ms: 5.855
+     update_time_ms: 0.005
+   iterations_since_restore: 2
+   node_ip: 147.46.219.155
+   num_healthy_workers: 0
+   off_policy_estimator: {}
+   optimizer_steps_this_iter: 1000
+   perf:
+     cpu_util_percent: 48.71363636363637
+     ram_util_percent: 63.24545454545456
+   pid: 9477
+   policy_reward_max: {}
+   policy_reward_mean: {}
+   policy_reward_min: {}
+   sampler_perf: {}
+   time_since_restore: 22.34330129623413
+   time_this_iter_s: 15.495360374450684
+   time_total_s: 22.34330129623413
+   timestamp: 1587613470
+   timesteps_since_restore: 2000
+   timesteps_this_iter: 1000
+   timesteps_total: 2000
+   training_iteration: 2
+   trial_id: '00000'
+ 
+ (pid=9477) 2000 -3.373277687817646 [-1.4948887 -0.0500416 -1.3712397 -2.068592 ]
+ == Status ==
+ Memory usage on this node: 79.6/125.6 GiB
+ Using FIFO scheduling algorithm.
+ Resources requested: 1/18 CPUs, 3/3 GPUs, 0.0/30.08 GiB heap, 0.0/10.35 GiB objects
+ Result logdir: /home/silver/ray_results/DDPG
+ Number of trials: 1 (1 RUNNING)
+ +---------------------+----------+---------------------+--------+------------------+------+----------+
+ | Trial name          | status   | loc                 |   iter |   total time (s) |   ts |   reward |
+ |---------------------+----------+---------------------+--------+------------------+------+----------|
+ | DDPG_temp_env_00000 | RUNNING  | 147.46.219.155:9477 |      2 |          22.3433 | 2000 |      nan |
+ +---------------------+----------+---------------------+--------+------------------+------+----------+
+ 
+ 
+ (pid=9477) 2001 -inf [inf inf inf inf]
+ (pid=9477) 2002 -inf [inf inf inf inf]
+ (pid=9477) 2003 -inf [inf inf inf inf]
+ 
+ 
+ &lt;/denchmark-code&gt;
+ 
+ As you can see, outputting inf starts exactly at 2001 step.
+ 		</comment>
+ 		<comment id='2' author='yskim5892' date='2020-04-23T05:31:44Z'>
+ 		I've just found out that this problem happens even without Multiagent setting. Just simple trainer on simple environment with continuous actions space outputs actions full of infs.
+ The same issue happens with A3CTrainer, but seems to not happen with PPOTrainer, ImpalaTrainer.
+ Code:
+ &lt;denchmark-code&gt;import ray
+ from ray import tune
+ import numpy as np
+ import gym
+ 
+ class temp_env(gym.Env):
+     def __init__(self, config):
+         self.observation_space = gym.spaces.Box(low=float('-inf'), high=float('inf'), shape=[4])
+         self.action_space = gym.spaces.Box(low=float('-inf'), high=float('inf'), shape=[4])
+         self.count = 0
+         self.config = config
+ 
+     def reset(self):
+         self.state = np.random.normal(size=(4))
+         return self.state
+ 
+     def step(self, action):
+         rew = -np.linalg.norm(self.state - action)
+         self.state = np.random.normal(size=(4))
+         self.count += 1
+         print(self.count, rew, action)
+ 
+         return self.state, rew, rew &gt;= -0.1, {}
+ 
+ 
+ from ray.rllib.agents.ddpg.ddpg import DDPGTrainer, DEFAULT_CONFIG
+ trainer = DDPGTrainer
+ config = DEFAULT_CONFIG
+ 
+ env = temp_env(config['env_config'])
+ config['env'] = temp_env
+ 
+ ray.init(num_cpus=18, num_gpus=3)
+ config['num_gpus'] = 3
+ 
+ tune.run(trainer, config=config)
+ &lt;/denchmark-code&gt;
+ 
+ Output:
+ &lt;denchmark-code&gt;(pid=8860) 1998 -2.8897517974019196 [ 0.37765503  1.3648146  -0.25582075  1.2834811 ]
+ (pid=8860) 1999 -2.6102417085274663 [ 1.3649862  -1.2796965   0.13636492 -0.56519246]
+ (pid=8860) 2000 -2.416133637871286 [ 0.38399577  0.18302272 -0.21990576  0.6936583 ]
+ Result for DDPG_temp_env_00000:
+   custom_metrics: {}
+   date: 2020-04-23_14-30-11
+   done: false
+   episode_len_mean: .nan
+   episode_reward_max: .nan
+   episode_reward_mean: .nan
+   episode_reward_min: .nan
+   episodes_this_iter: 0
+   episodes_total: 0
+   experiment_id: f336e1a754b94bc88f39f98d15e57af9
+   experiment_tag: '0'
+   hostname: silver
+   info:
+     exploration_infos:
+     - cur_scale: 1.0
+     grad_time_ms: 30.428
+     learner:
+       default_policy:
+         max_q: -0.5143887400627136
+         mean_q: -2.735276699066162
+         min_q: -5.7676682472229
+         model: {}
+     num_steps_sampled: 2000
+     num_steps_trained: 128000
+     num_target_updates: 2000
+     opt_peak_throughput: 8413.355
+     opt_samples: 256.0
+     replay_time_ms: 18.703
+     sample_time_ms: 5.05
+     update_time_ms: 0.004
+   iterations_since_restore: 2
+   node_ip: 147.46.219.155
+   num_healthy_workers: 0
+   off_policy_estimator: {}
+   optimizer_steps_this_iter: 1000
+   perf:
+     cpu_util_percent: 46.84146341463415
+     ram_util_percent: 63.99024390243902
+   pid: 8860
+   policy_reward_max: {}
+   policy_reward_mean: {}
+   policy_reward_min: {}
+   sampler_perf: {}
+   time_since_restore: 35.39928650856018
+   time_this_iter_s: 28.73469829559326
+   time_total_s: 35.39928650856018
+   timestamp: 1587619811
+   timesteps_since_restore: 2000
+   timesteps_this_iter: 1000
+   timesteps_total: 2000
+   training_iteration: 2
+   trial_id: '00000'
+ 
+ == Status ==
+ Memory usage on this node: 80.5/125.6 GiB
+ Using FIFO scheduling algorithm.
+ Resources requested: 1/18 CPUs, 3/3 GPUs, 0.0/29.74 GiB heap, 0.0/10.25 GiB objects
+ Result logdir: /home/silver/ray_results/DDPG
+ Number of trials: 1 (1 RUNNING)
+ +---------------------+----------+---------------------+--------+------------------+------+----------+
+ | Trial name          | status   | loc                 |   iter |   total time (s) |   ts |   reward |
+ |---------------------+----------+---------------------+--------+------------------+------+----------|
+ | DDPG_temp_env_00000 | RUNNING  | 147.46.219.155:8860 |      2 |          35.3993 | 2000 |      nan |
+ +---------------------+----------+---------------------+--------+------------------+------+----------+
+ 
+ 
+ (pid=8860) 2001 -inf [inf inf inf inf]
+ 
+ &lt;/denchmark-code&gt;
+ 
+ 		</comment>
+ 		<comment id='3' author='yskim5892' date='2020-04-23T12:21:08Z'>
+ 		Perhaps this issue is related to &lt;denchmark-link:https://github.com/ray-project/ray/issues/7923&gt;#7923&lt;/denchmark-link&gt;
+ ?
+ 		</comment>
+ 		<comment id='4' author='yskim5892' date='2020-04-23T19:42:19Z'>
+ 		Is this because your action space is bounded between -inf and +inf? I noticed a NaN error for continuous action spaces using SAC (even when I bound my action space to say 0,1) but didn't get the same error using ddpg or td3. I'm also interested in why this error is occurring as I've been pulling my hair out thinking my environment was broken when it might be something else related to rllib.
+ 		</comment>
+ 		<comment id='5' author='yskim5892' date='2020-04-23T19:48:04Z'>
+ 		For me, the error also occurred in a bounded action space. I tried stable-baselines, and there it worked, so I'm quite confident that this is a bug in RLlib (that being said, I'd still choose RlLib over stable-baselines whenever possible).
+ 		</comment>
+ 		<comment id='6' author='yskim5892' date='2020-04-23T19:51:55Z'>
+ 		Any idea as to when this might occur or how to avoid it?
+ 		</comment>
+ 		<comment id='7' author='yskim5892' date='2020-05-03T20:47:21Z'>
+ 		Just reproduced it. Happens in tf and torch at roughly the same time. The loss is already NaN at the first optimizer step. Taking a closer look. &lt;denchmark-link:https://github.com/janblumenkamp&gt;@janblumenkamp&lt;/denchmark-link&gt;
+  Yeah, these issues could be all related. We'll see. ...
+ 		</comment>
+ 		<comment id='8' author='yskim5892' date='2020-05-03T20:57:26Z'>
+ 		Got it. It happens in our Lambda layer in the DDPG model. In there, we "scale" the actions to be within the bounds, which causes this issue due to the bounds being [-inf inf]:
+ &lt;denchmark-code&gt;                sigmoid_out = nn.Sigmoid()(2.0 * x)
+                 # Rescale to actual env policy scale
+                 # (shape of sigmoid_out is [batch_size, dim_actions],
+                 # so we reshape to get same dims)
+                 action_range = (action_space.high - action_space.low)[None]  # &lt;- HERE
+                 low_action = action_space.low[None]
+                 actions = torch.from_numpy(action_range) * sigmoid_out + \
+                     torch.from_numpy(low_action)
+                 return actions
+ &lt;/denchmark-code&gt;
+ 
+ Will fix this. ...
+ 		</comment>
+ 		<comment id='9' author='yskim5892' date='2020-05-03T20:57:54Z'>
+ 		&lt;denchmark-link:https://github.com/janblumenkamp&gt;@janblumenkamp&lt;/denchmark-link&gt;
+  &lt;denchmark-link:https://github.com/yskim5892&gt;@yskim5892&lt;/denchmark-link&gt;
+  &lt;denchmark-link:https://github.com/regproj&gt;@regproj&lt;/denchmark-link&gt;
+ 
+ 		</comment>
+ 		<comment id='10' author='yskim5892' date='2020-05-03T20:58:20Z'>
+ 		Thanks for filing this issue &lt;denchmark-link:https://github.com/yskim5892&gt;@yskim5892&lt;/denchmark-link&gt;
+  !
+ 		</comment>
+ 		<comment id='11' author='yskim5892' date='2020-05-04T08:21:39Z'>
+ 		It's also our OrnsteinUhlenbeck Noise exploration module.
+ In there, we scale the noise according to the action-space range (in this case: inf). Noise is inf, action becomes inf.
+ Question is: How large should noise be in case of an [-inf, inf] action space? 1000? 100? 1? 10? :)
+ 		</comment>
+ 		<comment id='12' author='yskim5892' date='2020-05-04T08:22:24Z'>
+ 		So there are two similar bugs here: Lambda squashing layer and the noise. Will create a PR today.
+ 		</comment>
+ 		<comment id='13' author='yskim5892' date='2020-05-04T09:25:12Z'>
+ 		Here is the PR: &lt;denchmark-link:https://github.com/ray-project/ray/pull/8302&gt;#8302&lt;/denchmark-link&gt;
+ 
+ Please let me know, if this doesn't work somehow. I tested both tf and torch versions of DDPG and none of them was showing the problem of inf actions/rewards anymore.
+ Closing this issue. Feel free to re-open if the problem still occurs on your end.
+ 		</comment>
+ 		<comment id='14' author='yskim5892' date='2020-10-01T12:22:22Z'>
+ 		Hi,
+ I'm having this issue too with a custom environment in multi agent settings. Both my observation and action spaces are continuous and bounded:
+ obs_space = Box(low=0, high=100, shape=(1,))
+ act_space = Box(low=np.array([0] * 2), high=np.array([1] * 2), shape=(2,))
+ The problem occurs nearly always at the beginning with one over two samples when running a Population Based Training with 2 samples, but it seem it does not occur when running a trainer without PBT.
+ The issue seems related to this one. I can give access to github repository if needed.
+ Best regards
+ Jean
+ 		</comment>
+ 	</comments>
+ </bug>
+<commit id='a00144f746bb2ba4da5b1ddaf4954d6f5320c953' author='Sven Mika' date='2020-05-04 22:27:30+02:00'>
+ 	<dmm_unit complexity='0.5' interfacing='0.0' size='0.0'></dmm_unit>
+ 	<modification change_type='MODIFY' old_name='rllib\agents\ddpg\ddpg_tf_model.py' new_name='rllib\agents\ddpg\ddpg_tf_model.py'>
+ 		<file_info nloc='118' complexity='12' token_count='734'></file_info>
+ 		<method name='lambda_' parameters='x'>
+ 				<method_info nloc='6' complexity='1' token_count='48' nesting_level='2' start_line='80' end_line='85'></method_info>
+ 			<added_lines>83,84,85</added_lines>
+ 			<deleted_lines>82,83,85</deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines>1,2,58,59,79,87,88,89</added_lines>
+ 			<deleted_lines>76,77,78,79</deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='rllib\agents\ddpg\ddpg_torch_model.py' new_name='rllib\agents\ddpg\ddpg_torch_model.py'>
+ 		<file_info nloc='127' complexity='13' token_count='716'></file_info>
+ 		<method name='forward' parameters='self_,x'>
+ 				<method_info nloc='4' complexity='1' token_count='34' nesting_level='3' start_line='91' end_line='94'></method_info>
+ 			<added_lines>91,93,94</added_lines>
+ 			<deleted_lines>91,92,93,94</deleted_lines>
+ 		</method>
+ 		<method name='forward' parameters='self,x'>
+ 				<method_info nloc='7' complexity='1' token_count='63' nesting_level='3' start_line='85' end_line='94'></method_info>
+ 			<added_lines>89,91,93,94</added_lines>
+ 			<deleted_lines>85,87,88,89,90,91,92,93,94</deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines>52,53,54,55,56,95,96,97,98</added_lines>
+ 			<deleted_lines>95,96</deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='rllib\agents\ddpg\ddpg_torch_policy.py' new_name='rllib\agents\ddpg\ddpg_torch_policy.py'>
+ 		<file_info nloc='188' complexity='31' token_count='1471'></file_info>
+ 		<method name='make_ddpg_optimizers' parameters='policy,config'>
+ 				<method_info nloc='8' complexity='1' token_count='82' nesting_level='0' start_line='162' end_line='175'></method_info>
+ 			<added_lines>163,164,165,169,170,172,173,174</added_lines>
+ 			<deleted_lines>163,167,169,170</deleted_lines>
+ 		</method>
+ 		<method name='ddpg_actor_critic_loss' parameters='policy,model,_,train_batch'>
+ 				<method_info nloc='90' complexity='14' token_count='739' nesting_level='0' start_line='30' end_line='159'></method_info>
+ 			<added_lines>83,84,158</added_lines>
+ 			<deleted_lines>130,157,158</deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines></added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='rllib\policy\torch_policy.py' new_name='rllib\policy\torch_policy.py'>
+ 		<file_info nloc='325' complexity='52' token_count='2165'></file_info>
+ 		<method name='learn_on_batch' parameters='self,postprocessed_batch'>
+ 				<method_info nloc='39' complexity='12' token_count='331' nesting_level='1' start_line='223' end_line='275'></method_info>
+ 			<added_lines>235</added_lines>
+ 			<deleted_lines>243</deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines></added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='rllib\utils\exploration\ornstein_uhlenbeck_noise.py' new_name='rllib\utils\exploration\ornstein_uhlenbeck_noise.py'>
+ 		<file_info nloc='119' complexity='9' token_count='845'></file_info>
+ 		<method name='_get_tf_exploration_action_op' parameters='self,action_dist,explore,timestep'>
+ 				<method_info nloc='36' complexity='4' token_count='333' nesting_level='1' start_line='85' end_line='132'></method_info>
+ 			<added_lines>99,100,101,102</added_lines>
+ 			<deleted_lines>99,100</deleted_lines>
+ 		</method>
+ 		<method name='_get_torch_exploration_action' parameters='self,action_dist,explore,timestep'>
+ 				<method_info nloc='32' complexity='4' token_count='274' nesting_level='1' start_line='135' end_line='177'></method_info>
+ 			<added_lines>161,162,163</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines></added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ </commit>
+</bug_data>

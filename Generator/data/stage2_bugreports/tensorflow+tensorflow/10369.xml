@@ -1,0 +1,178 @@
+<bug id='10369' author='snnn' open_date='2017-06-01T10:03:57Z' closed_time='2017-06-03T07:46:58Z'>
+	<summary>Deadlock in MapDataset</summary>
+	<description>
+&lt;denchmark-h:h3&gt;System information&lt;/denchmark-h&gt;
+
+
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow):
+no
+
+
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04):
+Linux Ubuntu 14.04
+
+
+TensorFlow installed from (source or binary): source
+
+
+TensorFlow version (use command below):
+95d90ab
+
+
+Bazel version (if compiling from source):
+0.5.0
+
+
+CUDA/cuDNN version:
+None
+
+
+GPU model and memory:
+None
+
+
+Exact command to reproduce:
+python map_dataset_op_test.py
+
+
+&lt;denchmark-h:h3&gt;Describe the problem&lt;/denchmark-h&gt;
+
+The process hangs forever
+&lt;denchmark-h:h3&gt;Source code / logs&lt;/denchmark-h&gt;
+
+Below is from map_dataset_op_test.py:
+&lt;denchmark-code&gt;"""Tests for the experimental input pipeline ops."""
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
+import numpy as np
+
+from tensorflow.contrib.data.python.ops import dataset_ops
+from tensorflow.python.framework import constant_op
+from tensorflow.python.framework import dtypes
+from tensorflow.python.framework import errors
+from tensorflow.python.ops import array_ops
+from tensorflow.python.ops import data_flow_ops
+from tensorflow.python.ops import lookup_ops
+from tensorflow.python.ops import math_ops
+from tensorflow.python.ops import random_ops
+from tensorflow.python.ops import string_ops
+from tensorflow.python.ops import variable_scope
+from tensorflow.python.platform import test
+
+
+class MapDatasetTest(test.TestCase):
+
+  def _buildParallelMapDataset(self, components, count, num_threads,
+							   output_buffer_size):
+	def _map_fn(x, y, z):
+	  return math_ops.square(x), math_ops.square(y), math_ops.square(z)
+	return (dataset_ops.Dataset.from_tensor_slices(components).map(
+		_map_fn, num_threads=num_threads, output_buffer_size=output_buffer_size)
+			.repeat(count))
+
+  def testParallelMapDataset(self):
+	"""Test an dataset that maps a TF function across its input elements."""
+	# The pipeline is TensorSliceDataset -&gt; ParallelMapDataset(square_3) -&gt;
+	# RepeatDataset(count).
+	components = [np.arange(7),
+				  np.array([[1, 2, 3]]) * np.arange(7)[:, np.newaxis],
+				  np.array(37.0) * np.arange(7)]
+	count = array_ops.placeholder(dtypes.int64, shape=[])
+	num_threads = array_ops.placeholder(dtypes.int32, shape=[])
+	output_buffer_size = array_ops.placeholder(dtypes.int64, shape=[])
+
+	dataset = self._buildParallelMapDataset(components, count, num_threads,
+											output_buffer_size)
+	iterator = dataset.make_initializable_iterator()
+	init_op = iterator.initializer
+	get_next = iterator.get_next()
+
+	self.assertEqual([c.shape[1:] for c in components],
+					 [t.shape for t in get_next])
+
+	with self.test_session() as sess:
+	  def do_test(num_threads_val, output_buffer_size_val):
+		# Test single-threaded access to the iterator.
+		sess.run(init_op, feed_dict={
+			count: 14,
+			num_threads: num_threads_val,
+			output_buffer_size: output_buffer_size_val})
+		for _ in range(14):
+		  for i in range(7):
+			result = sess.run(get_next)
+			for component, result_component in zip(components, result):
+			  self.assertAllEqual(component[i]**2, result_component)
+		with self.assertRaises(errors.OutOfRangeError):
+		  sess.run(get_next)
+
+		# Test multi-threaded access to the same iterator.
+		sess.run(init_op, feed_dict={
+			count: 18,
+			num_threads: num_threads_val,
+			output_buffer_size: output_buffer_size_val})
+		results = []
+		def iterator_thread():
+		  while True:
+			try:
+			  results.append(sess.run(get_next))
+			except errors.OutOfRangeError:
+			  return
+		threads = [self.checkedThread(target=iterator_thread) for _ in range(8)]
+		for t in threads:
+		  t.start()
+		for t in threads:
+		  t.join()
+
+		# `results` will contain the same elements components**2
+		# repeated 18 times, but in a non-deterministic order. Sort the
+		# results, and assert that each element of components**2 is
+		# produced 18 times.
+		results.sort(key=lambda x: x[0])
+		for i in range(7):
+		  for j in range(18):
+			for component, result_component in zip(components,
+												   results[i * 18 + j]):
+			  self.assertAllEqual(component[i]**2, result_component)
+
+	  for num_threads_val, output_buffer_size_val in [
+		  (1, 1), (1, 2), (2, 2), (2, 4), (8, 8), (8, 16)]:
+		do_test(num_threads_val, output_buffer_size_val)
+
+if __name__ == "__main__":
+  test.main()
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/files/1044353/s.txt&gt;bt.txt&lt;/denchmark-link&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='snnn' date='2017-06-01T10:10:44Z'>
+		&lt;denchmark-code&gt;(gdb) thr 14
+(gdb) f2
+(gdb) p *mutex
+$2 = {__data = {__lock = 2, __count = 0, __owner = 28288, __nusers = 1, __kind = 0, __spins = 0, __elision = 0,
+	__list = {__prev = 0x0, __next = 0x0}},
+&lt;/denchmark-code&gt;
+
+Thread 12 is waiting on a mutex, which is owned by LWP 28288. (Thread 12),  Thread 12 is waiting the output_buffer_ to be non-empty.
+		</comment>
+		<comment id='2' author='snnn' date='2017-06-01T20:27:48Z'>
+		&lt;denchmark-link:https://github.com/snnn&gt;@snnn&lt;/denchmark-link&gt;
+ : Could you reduce your sampler to something simpler? (Among other things, seems like you're running multiple groups of threads, if you can reduce it to the smallest example that demonstrates the failure, that will be helpful)
+CC &lt;denchmark-link:https://github.com/mrry&gt;@mrry&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='3' author='snnn' date='2017-06-02T18:11:05Z'>
+		This is definitely a real bug, which I suspect arises because you have 8 or fewer cores on the machine where you're running the test. The issue is that the current implementation of the IteratorGetNext op is a synchronous OpKernel but it can block an inter-op threadpool thread, and the unblocking action may require the use of another inter-op threadpool thread. The default threadpool size is the number of cores in your machine.
+I'm working on a fix, but there are two short-term workarounds:
+
+Increase the size of the inter-op threadpool when you create the session using tf.ConfigProto. Setting it to (maximum number of concurrent get_next() ops) + 1 (i.e. 9 in this case) should address the deadlock.
+Reduce the number of concurrent get_next() calls to (number of cores) - 1.
+
+The true fix will involve rewriting IteratorGetNext as an AsyncOpKernel, which I'm working on now....
+		</comment>
+	</comments>
+</bug>

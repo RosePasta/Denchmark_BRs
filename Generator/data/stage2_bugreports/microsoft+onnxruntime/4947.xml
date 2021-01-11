@@ -1,0 +1,103 @@
+<bug id='4947' author='daveray' open_date='2020-08-27T22:55:22Z' closed_time='2020-10-05T17:50:39Z'>
+	<summary>Java API OnnxTensor.createTensor() uses buffer incorrectly</summary>
+	<description>
+
+When constructing a tensor from a buffer (any type),  (&lt;denchmark-link:https://github.com/microsoft/onnxruntime/blob/master/java/src/main/java/ai/onnxruntime/OnnxTensor.java#L503&gt;e.g., here&lt;/denchmark-link&gt;
+) uses  rather than  to determine the buffer size. This results in an exception if the received buffer is created over only part of an array (e.g. via ).
+Urgency
+I can work around it, but it'll have some perf impact.
+System information
+
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Java API
+ONNX Runtime installed from (source or binary): binary 1.4.0
+ONNX Runtime version: 1.4.0
+
+To Reproduce
+Here's some sample code that fails:
+&lt;denchmark-code&gt;final IntBuffer src = IntBuffer.wrap(new int[]{0, 1, 2, 3, 4, 5, 6, 7, 8}, 3, 4).asReadOnlyBuffer();
+OnnxTensor.createTensor(OrtEnvironment.getEnvironment(), src, new long[]{4});
+&lt;/denchmark-code&gt;
+
+produces this exception:
+&lt;denchmark-code&gt;ai.onnxruntime.OrtException: Shape [4], requires 4 elements but the buffer has 9 elements.
+	at ai.onnxruntime.TensorInfo.constructFromBuffer(TensorInfo.java:259)
+	at ai.onnxruntime.OnnxTensor.createTensor(OnnxTensor.java:731)
+	at ai.onnxruntime.OnnxTensor.createTensor(OnnxTensor.java:701)
+&lt;/denchmark-code&gt;
+
+Expected behavior
+The above example should create a 1-d tensor with value [3, 4, 5, 6]
+	</description>
+	<comments>
+		<comment id='1' author='daveray' date='2020-08-28T00:41:05Z'>
+		&lt;denchmark-link:https://github.com/yuslepukhin&gt;@yuslepukhin&lt;/denchmark-link&gt;
+ Is it correct?
+		</comment>
+		<comment id='2' author='daveray' date='2020-08-28T14:26:04Z'>
+		Hmm, I wrote it as capacity because the offset into a Buffer wasn't a concept that I thought it should track as it's essentially treating a java.nio.Buffer as a complete ndarray that you can't slice. I didn't realise the Buffer.wrap call set the offset and that people would expect it to be semantically meaningful. Note that the IntBuffer.wrap call uses the whole backing array as the buffer, not the slice that's selected, it just sets the offset into the buffer to be the specified point. I guess at least it should state in the docs that it copies the whole buffer.
+What's the use case for passing in chunks of a Buffer?
+		</comment>
+		<comment id='3' author='daveray' date='2020-08-28T15:28:48Z'>
+		I have a large array in memory and would like to create tensors from parts of it without another array allocation (I understand that OnnxTensor will have to copy that bit of data at some point, in particular the non-data.isDirect() path).
+The contract of reading from a buffer is you can read from the current position up to the limit (designated via remaining or hasRemaining). It'll throw BufferUnderflowException if you try to read past its limit.
+I think you'll find replacing capacity() with remaining() will do the right thing. For example the tmp.put(data) here will only read from the current position to the limit:
+&lt;denchmark-code&gt;ByteBuffer buffer = ByteBuffer.allocateDirect(bufferSize).order(ByteOrder.nativeOrder());
+        tmp = buffer.asIntBuffer();
+        tmp.put(data);
+&lt;/denchmark-code&gt;
+
+the behavior of the isDirect() path I guess depends on how the buffer is used in the native code, but I don't have a direct buffer so I guess it isn't affecting me.
+		</comment>
+		<comment id='4' author='daveray' date='2020-08-28T15:29:03Z'>
+		The method should probably use buffer.limit() rather than buffer.capacity(), which is a straightforward fix, and definitely should be documented that it operates on the whole of the filled buffer. Potentially it could also have an optional parameter which controlled if it looks at the buffer position or not.
+When I use Buffers for moving around tensor data I don't tend to consider the position within that buffer to be a useful piece of state, it's not got a good analogy to an ndarray (as it's too primitive to be a functional slice). Given you can pass in whole batches of data to be scored at once, rather than slicing it into separate buffers inducing a copy, it seems better to do that.
+Edit: I'm happy to switch it over to use limit (as that's a bug on my part, though not the issue you're hitting), and if we add a boolean flag that lets it read the whole buffer vs from the position (i.e. switch limit vs remaining with the limit one doc'd that it will ignore the position) would that meet your need?
+		</comment>
+		<comment id='5' author='daveray' date='2020-08-28T15:42:26Z'>
+		The flag would work for me assuming the example above produces the expected behavior. Sorry to be a pest, but why not just follow the contract of Buffer so there are no surprises?
+		</comment>
+		<comment id='6' author='daveray' date='2020-08-28T15:51:51Z'>
+		Because the buffer semantics aren't ideal for an interchange format for numerical data as the position is usually irrelevant (and causes issues like needing to be reset each time the buffer is converted into an ONNXTensor which is very confusing if you're coming at it from an ML or Python perspective). Unfortunately until MemorySegment lands it's the only option inside the JDK.
+I'll work up a PR today or Monday, and then we can discuss the exact semantics in reference to some code?
+		</comment>
+		<comment id='7' author='daveray' date='2020-08-28T16:05:50Z'>
+		I get that the abstraction isn't perfect for what you want to do, but I don't understand what you gain by ignoring the contract. If you follow the contract it'll still work transparently for everyone that's using it naively (position = 0, limit = capacity), but it'll also work transparently for those who are using more "advanced" functionality. No flags required. FWIW, the equivalent TF Java API just works.
+Either way, I appreciate you looking into it and providing a workaround. Thanks!
+		</comment>
+		<comment id='8' author='daveray' date='2020-08-28T22:20:29Z'>
+		&lt;denchmark-link:https://github.com/daveray&gt;@daveray&lt;/denchmark-link&gt;
+ would you like to create a PR?
+		</comment>
+		<comment id='9' author='daveray' date='2020-08-31T17:56:12Z'>
+		On the JNI side it's harder to access the position of a direct ByteBuffer (I'll have to pass in position and remaining into the JNI call to avoid calling back into the JVM) and it'll have to do the pointer arithmetic on the C side to get the right position out, so it's going to be a bigger patch than just a Java side fix.
+There's also another issue, which is should the create method leave the state of the  unchanged (i.e. rewind it to the incoming position). It doesn't do that at the moment, because it's not sensitive to the position. I would prefer it to not change the state of the buffer in an observable way (to ONNX Runtime at least), but I'm not sure if that would cause issues for your usecase. &lt;denchmark-link:https://github.com/daveray&gt;@daveray&lt;/denchmark-link&gt;
+ what do you think?
+		</comment>
+		<comment id='10' author='daveray' date='2020-09-01T16:30:09Z'>
+		Hey. Sorry about the delayed response. I think leaving the state of the buffer unchanged would be fine. Thanks!
+		</comment>
+		<comment id='11' author='daveray' date='2020-09-02T04:38:56Z'>
+		
+On the JNI side it's harder to access the position of a direct ByteBuffer (I'll have to pass in position and remaining into the JNI call to avoid calling back into the JVM) and it'll have to do the pointer arithmetic on the C side to get the right position out, so it's going to be a bigger patch than just a Java side fix.
+
+Ah, the joys of refusing to use a tool like JavaCPP... That's one more thing you're going to need to reinvent! Like I keep telling you, why not put all that stuff in an external library so that it could be useful to other libraries than ORT? I see you've started to rely on multiple libraries in &lt;denchmark-link:https://github.com/oracle/tribuo/&gt;Tribuo&lt;/denchmark-link&gt;
+. (BTW, is this one an official Oracle project? Or is that also a personal hobby that just happens to be in a repository under Oracle but that isn't endorsed by Oracle in any way?) Do you realize that you'll need to keep patching all the libraries that you support there one by one to fix these kinds of issues when they pop up?
+&lt;denchmark-link:https://github.com/daveray&gt;@daveray&lt;/denchmark-link&gt;
+ FYI, the C/C++ API mapped with JavaCPP has no such issues:
+&lt;denchmark-link:https://github.com/bytedeco/javacpp-presets/tree/master/onnxruntime&gt;https://github.com/bytedeco/javacpp-presets/tree/master/onnxruntime&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='12' author='daveray' date='2020-09-02T05:04:42Z'>
+		&lt;denchmark-link:https://github.com/saudet&gt;@saudet&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://tribuo.org&gt;Tribuo&lt;/denchmark-link&gt;
+ will be officially launched at the Java developer day in a few weeks. It's been used in production inside Oracle for several years and we're excited to share it with everyone. I look forward to your contributions as we help to build the ML ecosystem on the Java platform.
+		</comment>
+		<comment id='13' author='daveray' date='2020-09-18T20:27:11Z'>
+		I've made a PR which should fix this issue. &lt;denchmark-link:https://github.com/daveray&gt;@daveray&lt;/denchmark-link&gt;
+ could you check it over? I think the test case I added accurately captures your usecase, but let me know if it doesn't. Sorry it took a while, got caught up with Tribuo launch stuff.
+		</comment>
+		<comment id='14' author='daveray' date='2020-10-05T16:58:12Z'>
+		I think we may close it if everyone agrees?
+		</comment>
+	</comments>
+</bug>

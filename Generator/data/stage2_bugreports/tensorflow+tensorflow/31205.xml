@@ -1,0 +1,151 @@
+<bug id='31205' author='sbsky' open_date='2019-07-31T16:27:12Z' closed_time='2020-05-22T04:18:26Z'>
+	<summary>TFLite: Changing weights</summary>
+	<description>
+System information
+
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): OSX
+TensorFlow installed from (source or binary): Binary
+TensorFlow version (use command below): v1.12.1-7529-g3e0ad8a004 2.0.0-dev20190731
+Python version: 3.6.8
+
+I'm attempting to implement Soft Conditional Computation (&lt;denchmark-link:https://arxiv.org/pdf/1904.04971.pdf&gt;https://arxiv.org/pdf/1904.04971.pdf&lt;/denchmark-link&gt;
+).  In this approach, the convolution weights are calculated dynamically for each input.  With a concrete function this works, however tflite seems to freeze the weights from the first input.  I was able to resolve this by calling resize_tensor_input() and allocate_tensors() for each image, at the cost of a small performance hit:
+&lt;denchmark-code&gt;    # Note: need to fake resize the input &amp; reallocate tensors
+    interpreter.resize_tensor_input(0, (1, in_size, in_size, nb_channels,))
+    interpreter.allocate_tensors()
+&lt;/denchmark-code&gt;
+
+My first thought was that tflite hardcodes the weights as an optimisation, however upon looking through the source code this doesn't seem to be the case, leading me to think this is a bug?
+Example to reproduce the issue:
+&lt;denchmark-code&gt;import tensorflow as tf
+import numpy as np
+
+reallocate_tensors = False  # Turn this on to reallocate tensors every run, fixing tflite accuracy
+nb_channels = 5
+wt_size = 100
+in_size = 30
+
+class DynamicWeightTest(tf.keras.layers.Layer):
+    def __init__(self,
+                 channels,
+                 select_size,
+                 **kwargs
+                 ):
+        super().__init__()
+
+        self.channels = channels
+        self.select_size = select_size
+
+
+    def call(self, inputs):
+        x = inputs[0]
+        wt = inputs[1]
+
+        x = tf.nn.conv2d(x, wt, (1, 1), 'VALID')
+
+        return x
+
+
+input_wt = tf.keras.layers.Input(shape=(1, nb_channels, wt_size), dtype=tf.float32)
+input_data = tf.keras.layers.Input(shape=(in_size, in_size, nb_channels,), dtype=tf.float32)
+x = DynamicWeightTest(channels=wt_size, select_size=nb_channels)([input_data, input_wt])
+
+model = tf.keras.Model(inputs=[input_data, input_wt], outputs=[x])
+
+# Get the concrete function from the Keras model.
+model_fn = tf.function(lambda x: model(x))
+model_fn_concrete = model_fn.get_concrete_function([input_data, input_wt])
+
+
+# tflite
+converter = tf.lite.TFLiteConverter.from_concrete_functions([model_fn_concrete])
+converter.optimizations = [tf.lite.Optimize.DEFAULT]
+
+tflite_model = converter.convert()
+
+# Load TFLite model and allocate tensors.
+interpreter = tf.lite.Interpreter(model_content=tflite_model)
+interpreter.allocate_tensors()
+
+# Get input and output tensors.
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
+
+for _ in range(10):
+    data = np.array(np.random.random_sample((1, in_size, in_size, nb_channels,)), dtype=np.float32)
+    wt = np.array(np.random.random_sample((1, 1, nb_channels, wt_size)), dtype=np.float32)
+    out_ref = model([data, wt])
+
+    # concrete
+    out_fn = model_fn_concrete(tf.constant(data), tf.constant(wt))
+
+    # Note: need to fake resize the input &amp; reallocate tensors
+    if reallocate_tensors:
+        interpreter.resize_tensor_input(0, (1, in_size, in_size, nb_channels,))
+        interpreter.allocate_tensors()
+
+    # Call tflite
+    interpreter.set_tensor(input_details[0]['index'], data)
+    interpreter.set_tensor(input_details[1]['index'], wt)
+    interpreter.invoke()
+    out_test = interpreter.get_tensor(output_details[0]['index'])
+
+    out_ref = out_ref.numpy()
+    out_fn = out_fn.numpy()
+    diff = 100. * np.sum(np.abs(out_test - out_ref)) / np.sum(np.abs(out_ref))
+    diff_fn = 100. * np.sum(np.abs(out_fn - out_ref)) / np.sum(np.abs(out_ref))
+    test_sum = np.sum(out_test)
+
+    print('Diff concrete function is: %f, diff tflite is: %f' % (diff_fn, diff))
+&lt;/denchmark-code&gt;
+
+Example output (without resize &amp; allocate fix):
+Diff concrete function is: 0.000000, diff tflite is: 0.000002
+Diff concrete function is: 0.000000, diff tflite is: 33.312505
+Diff concrete function is: 0.000000, diff tflite is: 34.966878
+Diff concrete function is: 0.000000, diff tflite is: 31.750450
+Diff concrete function is: 0.000000, diff tflite is: 33.716212
+Diff concrete function is: 0.000000, diff tflite is: 34.539647
+Diff concrete function is: 0.000000, diff tflite is: 35.657966
+Diff concrete function is: 0.000000, diff tflite is: 35.823278
+Diff concrete function is: 0.000000, diff tflite is: 36.413545
+Diff concrete function is: 0.000000, diff tflite is: 33.483852
+Edit: Changed above example to include a variable that turns on/off fix
+	</description>
+	<comments>
+		<comment id='1' author='sbsky' date='2019-08-01T06:04:32Z'>
+		&lt;denchmark-link:https://github.com/sbsky&gt;@sbsky&lt;/denchmark-link&gt;
+
+I tried to reproduce the issue. I am getting constant difference in tflite. Please, see below screenshot for your reference.Do you feel it is still a bug?.Please, confirm.Thanks!
+&lt;denchmark-link:https://user-images.githubusercontent.com/51902062/62269229-ffe31900-b44f-11e9-98a0-f06183e0e7d0.png&gt;&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='2' author='sbsky' date='2019-08-01T06:26:01Z'>
+		My apologies, I could've made the example a bit more clear.  In the example the fix is by default on.  I've now included a variable 'reallocate_tensors' that controls it, now with default off.  Are you able to reproduce?
+		</comment>
+		<comment id='3' author='sbsky' date='2020-03-27T18:53:29Z'>
+		&lt;denchmark-link:https://github.com/sbsky&gt;@sbsky&lt;/denchmark-link&gt;
+,
+On running the code with &lt;denchmark-link:https://colab.research.google.com/gist/amahendrakar/39d3391def95ea2eee7d5b2912218a77/tf2-0-template.ipynb&gt;TF v2.0&lt;/denchmark-link&gt;
+, I got different outputs for  and .
+However, with the latest &lt;denchmark-link:https://colab.research.google.com/gist/amahendrakar/23d6fb76ed3cdd02d1b4b0efa021ce37/tf-nightly.ipynb&gt;TF-nightly&lt;/denchmark-link&gt;
+, both the outputs are almost similar. Could you confirm if this is this the expected behavior? Please find the attached gist. Thanks!
+		</comment>
+		<comment id='4' author='sbsky' date='2020-04-01T08:00:59Z'>
+		&lt;denchmark-link:https://github.com/amahendrakar&gt;@amahendrakar&lt;/denchmark-link&gt;
+, no this is a further regression.  It seems that the previous workaround of reallocating tensors no longer functions.  tflite difference should be 0 &amp; match concrete function output.
+		</comment>
+		<comment id='5' author='sbsky' date='2020-05-21T23:31:22Z'>
+		Hey &lt;denchmark-link:https://github.com/sbsky&gt;@sbsky&lt;/denchmark-link&gt;
+ , we've found the issue and it is indeed a bug in the x86 multi-threaded conv implementation for TFLite. This only worked by accident historically, as the tensor reallocation would force update the cached weights field we use in conv. I have a patch now that should resolve the issue. Thanks for flagging this!
+Note that this should not be an issue on ARM devices, or on certain Conv permutations (e.g. dilated conv) where we use a completely different codepath.
+		</comment>
+		<comment id='6' author='sbsky' date='2020-05-22T04:18:28Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/31205&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/31205&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

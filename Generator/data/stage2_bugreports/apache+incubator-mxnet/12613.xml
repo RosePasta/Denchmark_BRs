@@ -1,0 +1,214 @@
+<bug id='12613' author='lovickie' open_date='2018-09-20T09:55:57Z' closed_time='2018-09-28T05:39:23Z'>
+	<summary>Report a bug of Engine::Get()</summary>
+	<description>
+GraphExecutor should hold Engine::_GetSharedRef() to a class member engine_ref_, or sometimes Engine might be deconstructed before GraphExecutor was deconstructed. Note that in ~GraphExecutor(), Engine::Get()-&gt;DeleteOperator() was called.
+This bug is similar to &lt;denchmark-link:https://github.com/apache/incubator-mxnet/issues/309&gt;#309&lt;/denchmark-link&gt;
+ , which has been fixed yet. In this bug, sometimes ObjectPool&lt;ThreadedOpr&gt;, ObjectPool&lt;OprBlock&gt;, ObjectPool&lt;VersionedVarBlock&gt;, common::ObjectPool&lt;ThreadedVar&gt;, might be deconstructed before ThreadedEngine was deconstructed.
+Why this shared_ptr bug appears everywhere? It's a general C++ problem. A simple example as follow:
+engine.h
+&lt;denchmark-code&gt;#pragma once
+
+#include &lt;memory&gt;
+
+class Eng {
+ public:
+  virtual ~Eng() = default;
+  virtual void Print() const = 0;
+};
+
+// src/engine/engine.cc
+class Engine : public Eng {
+ public:
+  Engine();
+  ~Engine();
+
+  static std::shared_ptr&lt;Engine&gt; _GetSharedRef();
+  static Engine* Get();
+
+  void Print() const;
+
+ private:
+  char *name_ = nullptr;
+};
+
+typedef Eng *get_t();
+typedef std::shared_ptr&lt;Engine&gt; get_ref_t();
+&lt;/denchmark-code&gt;
+
+engine.cc
+&lt;denchmark-code&gt;#include "engine.h"
+
+#include &lt;stdio.h&gt;
+
+Engine::Engine() {
+  name_ = new char[8];
+  snprintf(name_, 8, "HELLO");
+}
+
+Engine::~Engine() {
+  printf("BEGIN ~Engine\n");
+  if (name_)  delete name_;
+  printf("  END ~Engine\n");
+}
+
+std::shared_ptr&lt;Engine&gt; Engine::_GetSharedRef() {
+  static std::shared_ptr&lt;Engine&gt; sptr(new Engine());
+  return sptr;
+}
+
+Engine* Engine::Get() {
+  static Engine *inst = _GetSharedRef().get();    // Dangerous!
+  return inst;
+}
+
+void Engine::Print() const {
+  printf("name=%s\n", name_);
+}
+
+extern "C" Eng *get() {
+  return Engine::Get();
+}
+
+extern "C" std::shared_ptr&lt;Engine&gt; get_ref() {
+  return Engine::_GetSharedRef();
+}
+&lt;/denchmark-code&gt;
+
+executor.h
+&lt;denchmark-code&gt;#pragma once
+
+#include &lt;memory&gt;
+
+#include "engine.h"
+
+class Executor {
+ public:
+  virtual ~Executor() = default;
+  virtual void Print() = 0;
+};
+
+// src/executor/graph_executor.cc
+class GraphExecutor : public Executor {
+ public:
+  GraphExecutor(void *eng);
+  ~GraphExecutor();
+
+  static std::shared_ptr&lt;GraphExecutor&gt; _GetSharedRef(void *eng);
+  static GraphExecutor* Get(void *eng);
+
+  void Print();
+
+ private:
+  void *eng_;
+  std::shared_ptr&lt;Engine&gt; engine_ref_;  // TODO: important!
+};
+
+typedef Executor *create_t(void *);
+&lt;/denchmark-code&gt;
+
+executor.cc
+&lt;denchmark-code&gt;#include "executor.h"
+
+#include &lt;dlfcn.h&gt;
+#include &lt;stdio.h&gt;
+
+#include "engine.h"
+
+GraphExecutor::GraphExecutor(void *eng) {
+  eng_ = eng;
+
+  get_ref_t *get_ref = (get_ref_t *) dlsym(eng_, "get_ref");
+  engine_ref_ = get_ref();  // TODO: important!
+}
+
+GraphExecutor::~GraphExecutor() {
+  printf("BEGIN ~GraphExecutor\n");
+  Print();
+  printf("  END ~GraphExecutor\n");
+}
+
+void GraphExecutor::Print() {
+  get_t *get = (get_t *) dlsym(eng_, "get");
+  Eng *eng = get();
+  eng-&gt;Print();
+}
+
+std::shared_ptr&lt;GraphExecutor&gt; GraphExecutor::_GetSharedRef(void *eng) {
+  static std::shared_ptr&lt;GraphExecutor&gt; sptr(new GraphExecutor(eng));
+  return sptr;
+}
+
+GraphExecutor* GraphExecutor::Get(void *eng) {
+  static GraphExecutor *inst = _GetSharedRef(eng).get();    // Dangerous!
+  return inst;
+}
+
+extern "C" Executor *create(void *eng) {
+  return GraphExecutor::Get(eng);
+}
+&lt;/denchmark-code&gt;
+
+test.cc
+&lt;denchmark-code&gt;#include "engine.h"
+#include "executor.h"
+
+#include &lt;dlfcn.h&gt;
+#include &lt;stdio.h&gt;
+
+int main() {
+  void *handle_engine = dlopen("libengine.so", RTLD_LAZY);
+  void *handle = dlopen("libexe.so", RTLD_LAZY);
+
+  create_t *create = (create_t *) dlsym(handle, "create");
+  Executor *executor = create(handle_engine);
+  executor-&gt;Print();
+
+  //dlclose(handle_engine);
+  //dlclose(handle);
+  return 0;
+}
+&lt;/denchmark-code&gt;
+
+Makefile
+&lt;denchmark-code&gt;all:
+	gcc -std=c++11 -g engine.cc -fPIC -shared -o libengine.so
+	gcc -std=c++11 -g executor.cc -fPIC -shared -o libexe.so
+	g++ -std=c++11 -g test.cc -rdynamic -ldl -o b.out
+&lt;/denchmark-code&gt;
+
+make
+./b.out
+You will run well. But if there is no "engine_ref_ = get_ref();" in GraphExecutor::GraphExecutor(void *eng), it will coredump. This is the same problem as the bug.
+	</description>
+	<comments>
+		<comment id='1' author='lovickie' date='2018-09-20T10:05:38Z'>
+		I don't know how to paste the code elegantly, would anyone teach me please....
+		</comment>
+		<comment id='2' author='lovickie' date='2018-09-20T13:26:39Z'>
+		&lt;denchmark-link:https://github.com/lovickie&gt;@lovickie&lt;/denchmark-link&gt;
+ You should use   to surround your code.
+AFAIK, destruction order has been a long-standing problem here. Many years ago, when C++ 11 was not that popular, there were naked pointers everywhere...There should have been tons of PRs trying to fix this, but if there is any problem, you are more than welcome to submit a PR.
+		</comment>
+		<comment id='3' author='lovickie' date='2018-09-20T16:11:16Z'>
+		Thanks for submitting the issue &lt;denchmark-link:https://github.com/lovickie&gt;@lovickie&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://github.com/mxnet-label-bot&gt;@mxnet-label-bot&lt;/denchmark-link&gt;
+ [Bug, Backend, C]
+		</comment>
+		<comment id='4' author='lovickie' date='2018-09-21T06:44:07Z'>
+		More information as follows.
+My project x, use mxnet to do sth, and also provides python api. When import mxnet before import x, the destruction ran well. But if import x before import mxnet, it would coredump when destruction. Finally I found this bug.
+Thank reviewers for checking my PR.
+		</comment>
+		<comment id='5' author='lovickie' date='2018-09-26T18:11:31Z'>
+		The PR has been merged. &lt;denchmark-link:https://github.com/lovickie&gt;@lovickie&lt;/denchmark-link&gt;
+ Can this issue be closed?
+		</comment>
+		<comment id='6' author='lovickie' date='2018-09-27T20:23:40Z'>
+		&lt;denchmark-link:https://github.com/sandeep-krishnamurthy&gt;@sandeep-krishnamurthy&lt;/denchmark-link&gt;
+  Please close this issue.
+&lt;denchmark-link:https://github.com/lovickie&gt;@lovickie&lt;/denchmark-link&gt;
+ Please feel free to reopen if this issue has been closed in error.
+		</comment>
+	</comments>
+</bug>

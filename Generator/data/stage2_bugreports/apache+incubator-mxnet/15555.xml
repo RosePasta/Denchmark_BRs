@@ -1,0 +1,399 @@
+<bug id='15555' author='kostayScr' open_date='2019-07-16T07:42:18Z' closed_time='2019-07-24T05:10:01Z'>
+	<summary>Bug or highly unintuitive and undocumented behaviour corrupting NDArray data(possible race condition)[MKLDNN][C++]</summary>
+	<description>
+Copying from NDArray a to NDArray b and then back from b to a(saving network weights for early stopping) causes data corruption. It is not 100% consistent, probably hard to reproduce(but I had it reproducing semi-consistently, must be sensitive to the execution conditions, that's why I mention race possibility). Possibly because execution engine provides a weak gurantee, thus executing a-&gt;b and b-&gt;a out of order?(&lt;denchmark-link:https://mxnet.incubator.apache.org/versions/master/architecture/overview.html#execution-engine&gt;https://mxnet.incubator.apache.org/versions/master/architecture/overview.html#execution-engine&lt;/denchmark-link&gt;
+ "The execution of any two functions that modify a common variable is serialized in their push order.")
+Using MXNet with MKLDNN v0.20 beta and from C++, built from source downloaded from github(apache-mxnet-src-1.4.0.rc3-incubating). MXNet built with CMake and MSVC (VS 2019) .
+&lt;denchmark-code&gt;void Test()
+{
+	using namespace mxnet::cpp;
+	using ArgMap = map&lt;string, NDArray&gt;;
+	ArgMap args;
+	ArgMap auxiliaryState;
+	ArgMap bestModelArgs;
+	ArgMap bestModelAux;
+	auto AssignNDArrayMap = []( decltype( args ) &amp; lhs, const decltype( args ) &amp; rhs )
+	{
+		for ( auto &amp;[k, arr] : rhs )
+			arr.CopyTo( &amp;lhs.at(k) );
+	};
+	auto WaitMap = []( auto &amp;map ) 
+	{
+		return; //Workaround - commenting this return statement fixes the problem
+		for ( auto &amp;[k, v] : map )
+		{
+			v.WaitAll();
+			v.WaitToRead();
+			v.WaitToWrite();
+		}
+	};
+	auto SaveAsBestModel = [ &amp;WaitMap, &amp;bestModelArgs, &amp;bestModelAux, &amp;AssignNDArrayMap, &amp;args, &amp;auxiliaryState ]()
+	{
+		AssignNDArrayMap( bestModelArgs, args );
+		AssignNDArrayMap( bestModelAux, auxiliaryState );
+		WaitMap( bestModelArgs );
+		WaitMap( bestModelAux );
+	};
+	auto LoadBestModel = [ &amp;WaitMap, &amp;bestModelArgs, &amp;bestModelAux, &amp;AssignNDArrayMap, &amp;args, &amp;auxiliaryState ]()
+	{
+		AssignNDArrayMap( args, bestModelArgs );
+		AssignNDArrayMap( auxiliaryState, bestModelAux );
+		WaitMap( args );
+		WaitMap( auxiliaryState );
+	};
+                            //copy
+	SaveAsBestModel();  //a -&gt; b
+	LoadBestModel();    //b -&gt; a
+		
+	//Data in args/auxiliaryState is now corrupt!
+}
+&lt;/denchmark-code&gt;
+
+If this is the intended behaviour there needs to be several big, bold warnings, for example on the NDArray API docs page.
+Waiting with WaitAll() works around the problem(see code above).
+	</description>
+	<comments>
+		<comment id='1' author='kostayScr' date='2019-07-16T07:42:21Z'>
+		Hey, this is the MXNet Label Bot.
+Thank you for submitting the issue! I will try and suggest some labels so that the appropriate MXNet community members can help resolve it.
+Here are my recommended labels: Bug, C++
+		</comment>
+		<comment id='2' author='kostayScr' date='2019-07-16T07:47:40Z'>
+		&lt;denchmark-link:https://github.com/mxnet-label-bot&gt;@mxnet-label-bot&lt;/denchmark-link&gt;
+ add [Bug, C++]
+		</comment>
+		<comment id='3' author='kostayScr' date='2019-07-17T04:59:52Z'>
+		&lt;denchmark-link:https://github.com/ZhennanQin&gt;@ZhennanQin&lt;/denchmark-link&gt;
+ could you help take a look for this ?
+		</comment>
+		<comment id='4' author='kostayScr' date='2019-07-17T07:26:35Z'>
+		&lt;denchmark-link:https://github.com/kostayScr&gt;@kostayScr&lt;/denchmark-link&gt;
+ I can't reproduce the crash on my linux box. Probably because:
+&lt;denchmark-code&gt;        ArgMap args;
+	ArgMap auxiliaryState;
+	ArgMap bestModelArgs;
+	ArgMap bestModelAux;
+&lt;/denchmark-code&gt;
+
+are all empty in your case, so no copy actually happen. Can you provide a real case that can reproduce this issue?
+		</comment>
+		<comment id='5' author='kostayScr' date='2019-07-17T08:57:33Z'>
+		Hello, thanks for looking into it.
+Here is more complete code:
+&lt;denchmark-code&gt;void TestWaitMapMXNetBug()
+{
+	using namespace mxnet::cpp;
+	using ArgMap = map&lt;string, NDArray&gt;;
+
+	const size_t testDataSz = 10 * 1024 * 1024;
+
+	float *testDataOnes = new float[testDataSz];
+	float *testDataZeroes = new float[testDataSz];
+	for ( size_t i = 0; i &lt; testDataSz; i++ )
+	{
+		testDataOnes[i] = 1.0f;
+	}
+	for ( size_t i = 0; i &lt; testDataSz; i++ )
+	{
+		testDataZeroes[i] = 0.0f;
+	}
+	//NDArray testOnes( testDataOnes, testDataSz ); //crash
+	//NDArray testZeroes( testDataZeroes, testDataSz );
+	NDArray testOnes( testDataOnes, Shape( testDataSz ), Context::cpu() );
+	NDArray testZeroes( testDataZeroes, Shape( testDataSz ), Context::cpu() );
+
+	auto CheckNDArrayValues = []( const NDArray &amp;arr, const float val ) //check that all values in array equal to val
+	{
+		auto arrData = arr.GetData();
+		for ( size_t i = 0; i &lt; arr.Size(); i++ )
+		{
+			if ( arrData[i] != val )
+				return false;
+		}
+		return true;
+	};
+
+	ArgMap args;
+	ArgMap auxiliaryState;
+	ArgMap bestModelArgs;
+	ArgMap bestModelAux;
+		
+	auto testName = "testName"s;
+	args[testName] = testOnes;
+	bestModelArgs[testName] = testZeroes;
+
+	//initial test
+	std::cout &lt;&lt; CheckNDArrayValues( args[testName], 1.0f );
+	std::cout &lt;&lt; CheckNDArrayValues( bestModelArgs[testName], 0.0f );
+
+	auto AssignNDArrayMap = []( decltype( args ) &amp;lhs, const decltype( args ) &amp;rhs )
+	{
+		for ( auto &amp;[k, arr] : rhs )
+			arr.CopyTo( &amp;lhs.at( k ) );
+	};
+	auto WaitMap = []( auto &amp;map )
+	{
+		return; //Workaround - commenting this return statement fixes the problem
+		for ( auto &amp;[k, v] : map )
+		{
+			v.WaitAll();
+			v.WaitToRead();
+			v.WaitToWrite();
+		}
+	};
+	auto SaveAsBestModel = [ &amp;WaitMap, &amp;bestModelArgs, &amp;bestModelAux, &amp;AssignNDArrayMap, &amp;args, &amp;auxiliaryState ]()
+	{
+		AssignNDArrayMap( bestModelArgs, args );
+		AssignNDArrayMap( bestModelAux, auxiliaryState );
+		WaitMap( bestModelArgs );
+		WaitMap( bestModelAux );
+	};
+	auto LoadBestModel = [ &amp;WaitMap, &amp;bestModelArgs, &amp;bestModelAux, &amp;AssignNDArrayMap, &amp;args, &amp;auxiliaryState ]()
+	{
+		AssignNDArrayMap( args, bestModelArgs );
+		AssignNDArrayMap( auxiliaryState, bestModelAux );
+		WaitMap( args );
+		WaitMap( auxiliaryState );
+	};
+	//copy
+	SaveAsBestModel();  //a -&gt; b
+	LoadBestModel();	//b -&gt; a
+
+	//Data in args/auxiliaryState is now Corrupt!
+	//test for corruption, now both must contain ones
+	std::cout &lt;&lt; CheckNDArrayValues( bestModelArgs[testName], 1.0f );
+	std::cout &lt;&lt; CheckNDArrayValues( args[testName], 1.0f );
+
+	//bestModelArgs got corrupt, maybe it's all zeroes?
+	std::cout &lt;&lt; CheckNDArrayValues( bestModelArgs[testName], 0.0f );
+}
+&lt;/denchmark-code&gt;
+
+Works(fails the check) only in Release build mode for me.
+Correct output:
+&lt;denchmark-code&gt;true
+true
+true
+true
+false
+&lt;/denchmark-code&gt;
+
+Factual output:
+&lt;denchmark-code&gt;true
+true
+false
+true
+false
+&lt;/denchmark-code&gt;
+
+Enabling the waiting on the NDArrays fixes it.
+I also want to clarify that there is no crash - just data corruption.
+		</comment>
+		<comment id='6' author='kostayScr' date='2019-07-18T02:08:17Z'>
+		&lt;denchmark-link:https://github.com/kostayScr&gt;@kostayScr&lt;/denchmark-link&gt;
+ Thanks for providing this case. Confirm that this is reproducible on my linux box. I'm trying to root cause this problem. I also found that naive engine doesn't have this problem, so for workaround, you can switch to naive engine by
+&lt;denchmark-code&gt;export MXNET_ENGINE_TYPE=NaiveEngine
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='7' author='kostayScr' date='2019-07-18T07:21:45Z'>
+		&lt;denchmark-link:https://github.com/kostayScr&gt;@kostayScr&lt;/denchmark-link&gt;
+ After some analysis, I think it's not a bug, but a engine feature. Actually, the order of a-&gt;b and b-&gt;a is guaranteed by engine, but as  is executed asynchronously, you shouldn't access a NDArray until all operations are done which are pending on it. So inside , you need to add  for the checked NDArray. The code would be like
+&lt;denchmark-code&gt;  auto CheckNDArrayValues = [](const NDArray &amp;arr, const float val) {
+    arr.WaitAll();
+    auto arrData = arr.GetData();
+    for (size_t i = 0; i &lt; arr.Size(); i++) {
+      if (arrData[i] != val) return false;
+    }
+    return true;
+  };
+&lt;/denchmark-code&gt;
+
+With this change, you can remove WaitMap and get expected result.
+In summary, you don't need to wait between a-&gt;b and b-a as engine can make the guarantee. But you need to wait for all operations are finished before accessing a.
+		</comment>
+		<comment id='8' author='kostayScr' date='2019-07-18T09:40:43Z'>
+		&lt;denchmark-link:https://github.com/ZhennanQin&gt;@ZhennanQin&lt;/denchmark-link&gt;
+ I see. But the original problem was with Forward/SyncCopyToCpu() rather than GetData(). I had the impression that GetData() will wait as well, like it does in Python I believe. So I just used it instead without checking(it was shorter). It probably needs a large font warning about waiting before calling it.
+Trying to make a reproduction snippet currently. It might be more complex than this, in the original code, the 'b' bunch of NDarrays went out of scope at the end, maybe that's it.
+		</comment>
+		<comment id='9' author='kostayScr' date='2019-07-19T13:00:01Z'>
+		&lt;denchmark-link:https://github.com/ZhennanQin&gt;@ZhennanQin&lt;/denchmark-link&gt;
+ I think I managed to pin it down:
+&lt;denchmark-code&gt;auto ConvBlock = []( const Symbol &amp;data, int num, int filterCount = 16, int dilation = 1 )
+{
+	auto convWeight = Symbol::Variable( "weight_conv" + std::to_string( num ) );
+	auto convBias = Symbol::Variable( "bias_conv" + std::to_string( num ) );
+	//stride can help perf w/o hurting performance much
+	Symbol net = Convolution( data, convWeight, convBias, Shape( 1, 5 ), filterCount, Shape(), Shape( 1, dilation ) );
+	net = Activation( net, ActivationActType::kRelu );
+	return net;
+};
+void TestWaitMapMXNetBug()
+{
+	using namespace mxnet::cpp;
+	using ArgMap = map&lt;string, NDArray&gt;;
+
+	const size_t testDataSz = 1 * 1024 * 1024;
+
+	float *testDataFirst = new float[testDataSz];
+	float *testDataSecond = new float[testDataSz];
+	for ( size_t i = 0; i &lt; testDataSz; i++ ) //fill test data with pattern to later verify
+	{
+		testDataFirst[i] = i;
+	}
+	for ( size_t i = 0; i &lt; testDataSz; i++ )
+	{
+		testDataSecond[i] = testDataSz - i - 1;
+	}
+	//NDArray testOnes( testDataOnes, testDataSz ); //crash
+	//compare array to the first arr.Size() elements of pattern
+	auto CheckNDArrayValuesPattern = []( NDArray &amp;arr, const float *pattern, size_t patternSz )
+	{
+		//auto arrData = arr.GetData();
+		std::unique_ptr&lt;float[]&gt; arrData( new float[arr.Size()] );
+		arr.SyncCopyToCPU( arrData.get(), arr.Size() ); //Synchronous copy - calls WaitToRead on NDArray,
+		assert( arr.Size() &lt;= patternSz );
+		auto res = memcmp( arrData.get(), pattern, arr.Size() * sizeof( float ) );
+		return res == 0;
+	};
+	auto CheckNDArrMapValsPattern = [ &amp;CheckNDArrayValuesPattern ]( auto &amp;map_, const float *pattern, size_t patternSz )
+	{
+		for ( auto &amp;[k, arr] : map_ )
+		{
+			if ( !CheckNDArrayValuesPattern( arr, pattern, patternSz ) )
+				return false;
+		}
+		return true;
+	};
+
+	ArgMap args;
+	ArgMap auxiliaryState;
+	ArgMap bestModelArgs;
+	ArgMap bestModelAux;
+		
+
+	auto SetMapPattern = []( auto &amp;map_, const float *pattern, size_t patternSz )
+	{
+		for ( auto &amp;[k, arr] : map_ )
+		{
+			if ( patternSz &lt; arr.Size() )
+				throw std::logic_error( __FUNCSIG__ );
+			arr.SyncCopyFromCPU( pattern, arr.Size() );
+		}
+	};
+
+	auto ctx = Context::cpu();
+	args["X"] = NDArray( Shape( 200, 1, 1, 1024 * 1), ctx ); //dummy, (batch_size, channel, height, width)
+	Symbol data = Symbol::Variable( "X" );
+	auto net = ConvBlock( data, 0, 16 );
+	net = ConvBlock( net, 1, 16 );
+	net = ConvBlock( net, 2, 16 );
+	net.InferArgsMap( ctx, &amp;args, args );
+	auto exec = net.SimpleBind( ctx, args );
+	SetMapPattern( args, testDataFirst, testDataSz );
+
+	for ( auto &amp;[k, v] : args )
+		bestModelArgs[k] = NDArray( v.GetShape(), ctx );
+	SetMapPattern( bestModelArgs, testDataSecond, testDataSz );
+
+	qDebug() &lt;&lt; CheckNDArrMapValsPattern( args, testDataFirst, testDataSz );
+	qDebug() &lt;&lt; CheckNDArrMapValsPattern( bestModelArgs, testDataSecond, testDataSz );
+
+	auto AssignNDArrayMap = []( decltype( args ) &amp;lhs, const decltype( args ) &amp;rhs )
+	{
+		for ( auto &amp;[k, arr] : rhs )
+			arr.CopyTo( &amp;lhs.at( k ) );
+	};
+	auto WaitMap = []( auto &amp;map )
+	{
+		return; //Workaround - commenting this return statement fixes the problem
+		for ( auto &amp;[k, v] : map )
+		{
+			v.WaitAll();
+			v.WaitToRead();
+			v.WaitToWrite();
+		}
+	};
+	auto SaveAsBestModel = [ &amp;WaitMap, &amp;bestModelArgs, &amp;bestModelAux, &amp;AssignNDArrayMap, &amp;args, &amp;auxiliaryState ]()
+	{
+		AssignNDArrayMap( bestModelArgs, args );
+		AssignNDArrayMap( bestModelAux, auxiliaryState );
+		WaitMap( bestModelArgs );
+		WaitMap( bestModelAux );
+	};
+	auto LoadBestModel = [ &amp;WaitMap, &amp;bestModelArgs, &amp;bestModelAux, &amp;AssignNDArrayMap, &amp;args, &amp;auxiliaryState ]()
+	{
+		AssignNDArrayMap( args, bestModelArgs );
+		AssignNDArrayMap( auxiliaryState, bestModelAux );
+		WaitMap( args );
+		WaitMap( auxiliaryState );
+	};
+
+	for ( int i = 0; i &lt; 1000; ++i )
+		exec-&gt;Forward( false );
+	{
+		//to make NDArray change it's storage type to the MKLDNN one
+		vector&lt;float&gt; dummy( exec-&gt;outputs[0].Size() );
+		exec-&gt;outputs[0].SyncCopyToCPU(&amp;dummy);
+	}
+
+	//copy
+	SaveAsBestModel();  //a -&gt; b
+
+
+	for ( auto &amp;[k, v] : args )
+	{
+		//uncommenting this line must cause an exception:
+		//qDebug() &lt;&lt; k.c_str() &lt;&lt; v.GetData();
+
+		//exception info:
+		//ndarray.cc:751
+		//#if MXNET_USE_MKLDNN == 1
+		//CHECK(!IsMKLDNNData()) &lt;&lt; "We can't generate TBlob for MKLDNN data. "
+		//&lt;&lt; "Please use Reorder2Default() to generate a new NDArray first";
+		//#endif
+	}
+	//auto dataPtr1 = bestModelArgs.at( "0" ).GetData();
+	LoadBestModel();	//b -&gt; a
+
+	//Data in args/auxiliaryState is now Corrupt!
+	//test for corruption
+	qDebug() &lt;&lt; CheckNDArrMapValsPattern( args, testDataFirst, testDataSz );
+	qDebug() &lt;&lt; CheckNDArrMapValsPattern( bestModelArgs, testDataFirst, testDataSz );
+}
+&lt;/denchmark-code&gt;
+
+Output should be all true, but it's:
+&lt;denchmark-code&gt;true
+true
+false
+false
+&lt;/denchmark-code&gt;
+
+It seems to be related to the data format (storage type) of the NDArrays. See comment in the code about exception - it's what hinted me at how to reproduce. I checked quite a few things before I got it reproducing, here is the uncleaned code, maybe it'll save some time: &lt;denchmark-link:https://pastebin.com/RcHb6kdb&gt;https://pastebin.com/RcHb6kdb&lt;/denchmark-link&gt;
+ (the commented code didn't reproduce the bug).
+		</comment>
+		<comment id='10' author='kostayScr' date='2019-07-22T09:08:30Z'>
+		&lt;denchmark-link:https://github.com/kostayScr&gt;@kostayScr&lt;/denchmark-link&gt;
+ Thanks for providing such detailed case. I can reproduce it locally. Some experiment shows that it's another unexpected behavior about .  Quote out it from mkldnn_convolution.cc can fix this issue, but inference speed will drop especially for small batch size. I'm trying to fix this without performance impact. Maybe need more days.
+		</comment>
+		<comment id='11' author='kostayScr' date='2019-07-22T11:55:41Z'>
+		&lt;denchmark-link:https://github.com/ZhennanQin&gt;@ZhennanQin&lt;/denchmark-link&gt;
+ Yeah it was a slippery one, many pre-conditions(that's why the code is so long). The WaitMap function works fine as a workaround for me. Doesn't affect performance and results seem to be stable.
+		</comment>
+		<comment id='12' author='kostayScr' date='2019-07-23T07:09:09Z'>
+		&lt;denchmark-link:https://github.com/kostayScr&gt;@kostayScr&lt;/denchmark-link&gt;
+ I filed a PR to fix this: &lt;denchmark-link:https://github.com/apache/incubator-mxnet/pull/15637&gt;#15637&lt;/denchmark-link&gt;
+. Local test works for me. But as you know, the problem is a bit complicated and random, so I wish you can have a try for your  real case to see if problem is really resolved. Thanks in advance.
+		</comment>
+		<comment id='13' author='kostayScr' date='2019-07-23T10:46:15Z'>
+		&lt;denchmark-link:https://github.com/ZhennanQin&gt;@ZhennanQin&lt;/denchmark-link&gt;
+ I applied the patch manually, then tried to reproduce the bug in my code(ran it 5 times). The bug didn't pop up so hopefully it is fixed now. Should I close the issue?
+		</comment>
+		<comment id='14' author='kostayScr' date='2019-07-24T01:57:41Z'>
+		&lt;denchmark-link:https://github.com/kostayScr&gt;@kostayScr&lt;/denchmark-link&gt;
+ Thanks for the try. It's up to you that whether you want to trace the bug to be fixed from master:)
+		</comment>
+	</comments>
+</bug>

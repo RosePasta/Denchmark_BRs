@@ -1,0 +1,209 @@
+<bug id='9367' author='pgplus1628' open_date='2017-04-21T15:10:33Z' closed_time='2017-04-25T01:31:01Z'>
+	<summary>[XLA] Ptxas Error when TF_CPP_MIN_VLOG_LEVEL=2</summary>
+	<description>
+&lt;denchmark-h:h3&gt;System Information&lt;/denchmark-h&gt;
+
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow)?: yes
+OS Platform and Distribution (i.e. Linux Ubuntu 16.0): Linux Ubuntu 14.04
+TensorFlow installed from (source or binary)?: source
+TensorFlow version (use command below): ('v1.1.0-rc2-219-g623dd83', '1.1.0-rc2')
+Bazel version (if compiling from source): 0.4.5-jdk7
+CUDA/cuDNN version: 7.5/5
+GPU Model and Memory: GeForce GTX TitanX
+Exact command to reproduce: python test.py --batch_size 16 --step 20
+
+&lt;denchmark-h:h3&gt;Describe the problem clearly&lt;/denchmark-h&gt;
+
+To make tensorflow print the logs in VLOG(2), I set the TF_CPP_MIN_VLOG_LEVEL=2. After doing that, the program throws a fatal error. It seems that there's something wrong when compiling xla hlo_instruction to ptx.
+
+2017-04-21 14:35:23.158362: I tensorflow/compiler/xla/service/gpu/gpu_compiler.cc:219] ptxas fatal   : SM version specified by .target is higher than default SM version assumed
+2017-04-21 14:35:23.158423: F tensorflow/compiler/xla/service/gpu/gpu_compiler.cc:221] Invalid PTX. See the error message above for reasons.
+
+&lt;denchmark-h:h3&gt;Source Code / Logs&lt;/denchmark-h&gt;
+
+Full log can be found &lt;denchmark-link:https://gist.github.com/pgplus1628/b257901de5af4bdd88fd78adab084177&gt;here&lt;/denchmark-link&gt;
+
+Reproduce with command 
+Code:
+&lt;denchmark-code&gt;from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
+import os
+os.environ['TF_CPP_MIN_VLOG_LEVEL'] = '2' # enable logging debug info
+import inspect
+import numpy as np
+import tensorflow as tf
+
+
+flags = tf.flags
+logging = tf.logging
+flags.DEFINE_integer("batch_size", 1, "inference batch size")
+flags.DEFINE_integer("step", 1, "step size for infernece")
+FLAGS = flags.FLAGS
+
+
+def data_type():
+    return tf.float32
+
+
+class InputData(object):
+    
+    def __init__(self, config):
+        self.batch_size = batch_size = config.batch_size
+        self.num_steps = num_steps = config.num_steps
+        self.hidden_size = hidden_size = config.hidden_size
+        self.input_data = tf.placeholder(data_type(), [batch_size, num_steps, hidden_size], name = 'input_data')
+
+
+class Config(object):
+    num_layers = 1
+    num_steps = 20
+    hidden_size = 256
+    batch_size = 20
+    vocab_size = 10000
+    init_scale = 0.1
+    num_iter = 50
+    warm_iter = 2
+
+
+class LSTMModel(object):
+    """ Only forward, No Embedding
+    """
+
+    def __init__(self, config, input_):
+        self._input = input_
+        self._input_data = self._input.input_data
+        
+        batch_size = input_.batch_size
+        num_steps =  input_.num_steps
+        size = config.hidden_size
+        vocab_size = config.vocab_size
+
+        def lstm_cell():
+            if 'reuse' in inspect.getargspec(
+              tf.contrib.rnn.BasicLSTMCell.__init__).args:
+                print("reuse")
+                return tf.contrib.rnn.BasicLSTMCell(
+                    size, forget_bias=0., state_is_tuple=True,
+                    reuse = tf.get_variable_scope().reuse)
+            else:
+                print("not reuse")
+                return tf.contrib.rnn.BasicLSTMCell(
+                    size, forget_bias=0.0, state_is_tuple=True)
+
+        attn_cell = lstm_cell
+        cell = tf.contrib.rnn.MultiRNNCell(
+            [attn_cell() for _ in range(config.num_layers)], state_is_tuple=True)
+
+        self._initial_state = cell.zero_state(batch_size, data_type())
+
+        outputs = []
+        state = self._initial_state
+        with tf.variable_scope("RNN"):
+            for time_step in range(num_steps):
+                if time_step &gt; 0 : tf.get_variable_scope().reuse_variables()
+                (cell_output, state) = cell(self._input.input_data[:, time_step, :], state)
+                outputs.append(cell_output)
+        
+        self._output = tf.reshape(tf.concat(axis=1, values=outputs), [-1, size])
+        self._final_state = state
+        softmax_w = tf.get_variable(
+            "softmax_w", [size, vocab_size], dtype=data_type())
+        softmax_b = tf.get_variable("softmax_b", [vocab_size], dtype=data_type())
+        self._logits = tf.matmul(self._output, softmax_w) + softmax_b
+
+        return
+
+    @property
+    def initial_state(self):
+        return self._initial_state
+
+    @property
+    def logits(self):
+        return self._logits
+  
+    @property
+    def input_data(self):
+        return self._input_data
+
+
+def run_inference(session, model, input_data, sv) :
+    # initialize with a clean state
+    state = session.run(model.initial_state)
+
+    fetches = {}
+    fetches['logit'] = model.logits
+
+    feed_dict = {}
+    feed_dict[model.input_data] = input_data
+    for i, (c, h) in enumerate(model.initial_state):
+        feed_dict[c] = state[i].c
+        feed_dict[h] = state[i].h
+
+    session.run(fetches, feed_dict)
+
+
+def main(_):
+    # config
+    eval_config = Config()
+    eval_config.num_steps = FLAGS.step
+    eval_config.batch_size = FLAGS.batch_size
+
+    # generate random data
+    input_data = np.random.rand(eval_config.batch_size, eval_config.num_steps, eval_config.hidden_size).astype(np.float32)
+
+    with tf.Graph().as_default():
+        initializer = tf.random_uniform_initializer(-eval_config.init_scale, 
+                                                    eval_config.init_scale)
+        with tf.name_scope('Inference'):
+            _input = InputData(eval_config)
+            with tf.variable_scope('Model', reuse=None, initializer=initializer):
+                model = LSTMModel(config=eval_config, input_=_input)
+
+        sv = tf.train.Supervisor()
+        sess_config = tf.ConfigProto(allow_soft_placement=True,
+                                     log_device_placement=False)
+        # enable xla
+        sess_config.graph_options.optimizer_options.global_jit_level = tf.OptimizerOptions.ON_1
+
+        # run inference
+        with sv.managed_session(config=sess_config) as session:
+            run_inference(session, model, input_data, sv)
+
+if __name__ == '__main__':
+    tf.app.run()
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='pgplus1628' date='2017-04-21T15:28:14Z'>
+		I guess this error is caused by the code in tensorflow/tensorflow/compiler/service/gpu/gpu_compier.cc
+&lt;denchmark-code&gt;  ptxas_info_dumper.SetProgram(ptxas_path, {ptxas_path, ptx_path, "-o",
+                                            "/dev/null", "-v", "-arch=sm_35"});
+&lt;/denchmark-code&gt;
+
+because the ptx generated by xla has the target  of sm_52.
+&lt;denchmark-code&gt;//
+// Generated by LLVM NVPTX Back-End
+//
+
+.version 4.2
+.target sm_52
+.address_size 64
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='2' author='pgplus1628' date='2017-04-22T18:07:21Z'>
+		&lt;denchmark-link:https://github.com/tatatodd&gt;@tatatodd&lt;/denchmark-link&gt;
+ could you suggest a fix?
+		</comment>
+		<comment id='3' author='pgplus1628' date='2017-04-24T02:38:06Z'>
+		Nice debugging &lt;denchmark-link:https://github.com/pgplus1628&gt;@pgplus1628&lt;/denchmark-link&gt;
+
+As a short-term workaround, which you've probably already done, you can change the -arch=sm_35 to the appropriate value (e.g. in your case -arch=sm_52), and recompile and run.
+We'll figure out a better fix moving forward.
+		</comment>
+	</comments>
+</bug>

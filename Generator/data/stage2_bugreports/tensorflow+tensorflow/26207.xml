@@ -1,0 +1,357 @@
+<bug id='26207' author='JohnSouth8' open_date='2019-02-28T12:55:43Z' closed_time='2019-05-20T01:34:34Z'>
+	<summary>MirroredStrategy returns AssertionError when run with custom Estimator</summary>
+	<description>
+Please make sure that this is a bug. As per our GitHub Policy, we only address code/doc bugs, performance issues, feature requests and build/installation issues on GitHub. tag:bug_template
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow):
+Yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04):
+Linux Ubuntu 18.04
+Mobile device (e.g. iPhone 8, Pixel 2, Samsung Galaxy) if the issue happens on mobile device:
+No
+TensorFlow installed from (source or binary):
+source
+TensorFlow version (use command below):
+1.12
+Python version:
+3.6
+Bazel version (if compiling from source):
+0.17.2
+GCC/Compiler version (if compiling from source):
+7.3
+CUDA/cuDNN version:
+CUDA 10.0
+cuDNN 7.4
+GPU model and memory:
+nVidia Geforce GTX 1060 Ti
+
+Describe the current behavior
+Estimator model fails if passed a tf.contrib.distribute.MirroredStrategy as a parameter to the RunConfig object.
+Describe the expected behavior
+I am trying to parallelize an Estimator model built from keras model via tf.keras.estimator.model_to_estimator, which works fine unless I pass the train_distribute parameter (of RunConfig) a MirroredStrategy when creating the model. See below, the working RunConfig is commented out, the non-working one not so. My goal is to run the model on the google cloud platform on a couple of GPUs at once, but first I need to get the code running locally. I want to use the mirrored strategy to parallelize the training by splitting the batches across the GPUs.
+The input is a tfrecord file with greyscale images of 40x40x1 and 3-class labels. I am intending to use a CNN and RNN on this data but distributed doesn't work with this simple example of a MLP. Any help?
+Code to reproduce the issue
+`
+&lt;denchmark-code&gt;import tensorflow as tf
+from tensorflow import keras as K
+import argparse
+import random
+
+
+def _parse_function(proto):
+
+    # define constants for images
+    imsize = 40
+    num_channels = 1
+
+    # define your tfrecord feature keys
+    keys_to_features = {'X': tf.FixedLenFeature([imsize, imsize, num_channels], tf.float32),  # image height, image width, num_channels
+                        'Y': tf.FixedLenFeature([], tf.int64)}
+    # Load one example
+    parsed_features = tf.parse_single_example(proto, keys_to_features)
+
+    # extract image and label
+    image = parsed_features['X']
+    label = tf.cast( parsed_features['Y'], tf.int32 )
+    label = tf.add( label, tf.constant( 1, tf.int32 ) )   # add 1 to transform interval [-1,1] to categorical interval [0,2]
+    label = tf.one_hot( label, depth=3 )                  # one hot encoding
+
+    return image, label
+
+
+def create_dataset( filepath, shuffle_buffer, batch_size, n_epochs, random_seed, num_parall_calls ):
+
+    dataset = tf.data.TFRecordDataset( filepath )
+    # Maps the parser on every filepath in the array. You can set the number of parallel loaders here
+    dataset = dataset.map( _parse_function, num_parallel_calls=num_parall_calls )
+    # Set the number of datapoints you want to load and shuffle
+    dataset = dataset.shuffle( shuffle_buffer, random_seed ).repeat( n_epochs )
+    # Set the batchsize
+    dataset = dataset.batch( batch_size )
+    # prefetch
+    dataset.prefetch( batch_size )
+
+    return dataset
+
+
+def SimpleModel( in_shape=(40, 40, 1), n_out=3, dropout_rate=0.3 ):
+
+    model = K.models.Sequential()
+
+    # fully connected layer
+    model.add( K.layers.Flatten( input_shape=in_shape ) )
+
+    model.add( K.layers.Dense( 1024, activation='tanh', kernel_regularizer=K.regularizers.l2( 0.01 ) ) )
+    model.add( K.layers.Dropout( dropout_rate ) )
+
+    model.add( K.layers.Dense( 128, activation='tanh', kernel_regularizer=K.regularizers.l2( 0.01 ) ) )
+    model.add( K.layers.Dropout( dropout_rate ) )
+
+    # in the end add another dense layer and an output layer
+    model.add( K.layers.Dense( 32, activation='tanh', kernel_regularizer=K.regularizers.l2( 0.01 ) ) )
+    model.add( K.layers.Dropout( dropout_rate ) )
+    model.add( K.layers.Dense( n_out, activation='softmax' ) )
+
+    return model
+
+
+if __name__ == "__main__":
+
+    # get parameters
+    parser = argparse.ArgumentParser( description='Keras GC example NN test.' )
+    parser.add_argument( '--job-dir', type=str, help='GCS location to write checkpoints and export models' )
+    parser.add_argument( '--train_file', type=str, help='GCS location of train data .tfrecord file location.' )
+    parser.add_argument( '--vali_file', type=str, help='GCS location validation data .tfrecord file location.' )
+    parser.add_argument( '--n_CPU', type=int, help='Number of processes used for reading and parsing the data for model input.' )
+    parser.add_argument( '--n_GPU', type=int, help='Number of GPUs used for training the model.' )
+    args = parser.parse_args()
+
+    # arguments
+    n_gpus = args.n_GPU
+    num_parallel_processes = args.n_CPU
+
+    train_file = args.train_file
+    vali_file = args.vali_file
+
+    # parameters
+    dropout = 0.5
+    num_classes = 3  # -1, 0, 1
+    image_size = 40
+    num_channel = 1
+    learning_rate = 0.0001
+    epochs = 3
+    shuffle_buffer = 50000      # number of samples from which it will sample
+    batch_size = 100
+    input_size = (image_size, image_size, num_channel)
+    checkpoint_steps = 2000
+    rseed = int( random.random() * (2 ** 16) )
+
+    # number of samples
+    num_sets = 6310
+    num_sets_vali = 550
+    set_length = 1000
+    num_samples = num_sets * set_length
+    steps_per_epoch = num_samples // batch_size
+    num_samples_vali = num_sets_vali * set_length
+    steps_per_epoch_vali = num_samples_vali // batch_size
+
+    # assemble the model
+    train_model = SimpleModel( in_shape=input_size, n_out=num_classes, dropout_rate=dropout )
+    optim = tf.train.AdamOptimizer( learning_rate=learning_rate )
+    train_model.compile( optimizer=optim,
+                         loss='categorical_crossentropy',
+                         metrics=['accuracy'] )
+
+    tf.logging.set_verbosity( tf.logging.INFO )
+    strategy = tf.contrib.distribute.MirroredStrategy( num_gpus=n_gpus )
+    runconfig = tf.estimator.RunConfig( model_dir=args.job_dir, save_checkpoints_steps=checkpoint_steps, train_distribute=strategy )
+    # runconfig = tf.estimator.RunConfig( model_dir=args.job_dir, save_checkpoints_steps=checkpoint_steps )
+
+    # transform model to estimator
+    est_train_model = tf.keras.estimator.model_to_estimator( keras_model=train_model, config=runconfig )
+
+    train_spec = tf.estimator.TrainSpec( input_fn=lambda: create_dataset( train_file,
+                                                                          shuffle_buffer,
+                                                                          batch_size,
+                                                                          epochs,
+                                                                          rseed,
+                                                                          num_parallel_processes ),
+                                         max_steps=epochs * steps_per_epoch )
+
+    eval_spec = tf.estimator.EvalSpec( input_fn=lambda: create_dataset( vali_file,
+                                                                        shuffle_buffer,
+                                                                        batch_size,
+                                                                        epochs,
+                                                                        rseed,
+                                                                        num_parallel_processes ),
+                                       steps=steps_per_epoch_vali,
+                                       throttle_secs=10 )
+
+    tf.estimator.train_and_evaluate( est_train_model, train_spec, eval_spec )
+&lt;/denchmark-code&gt;
+
+`
+Other info / logs
+INFO:tensorflow:Initializing RunConfig with distribution strategies.
+INFO:tensorflow:Not using Distribute Coordinator.
+INFO:tensorflow:Using the Keras model provided.
+2019-02-28 13:39:21.467595: I tensorflow/stream_executor/cuda/cuda_gpu_executor.cc:964] successful NUMA node read from SysFS had negative value (-1), but there must be at least one NUMA node, so returning NUMA node zero
+2019-02-28 13:39:21.467913: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1432] Found device 0 with properties:
+name: GeForce GTX 1060 6GB major: 6 minor: 1 memoryClockRate(GHz): 1.7715
+pciBusID: 0000:01:00.0
+totalMemory: 5.93GiB freeMemory: 5.37GiB
+2019-02-28 13:39:21.467921: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1511] Adding visible gpu devices: 0
+2019-02-28 13:39:21.621140: I tensorflow/core/common_runtime/gpu/gpu_device.cc:982] Device interconnect StreamExecutor with strength 1 edge matrix:
+2019-02-28 13:39:21.621157: I tensorflow/core/common_runtime/gpu/gpu_device.cc:988]      0
+2019-02-28 13:39:21.621160: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1001] 0:   N
+2019-02-28 13:39:21.621270: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1115] Created TensorFlow device (/job:localhost/replica:0/task:0/device:GPU:0 with 5139 MB memory) -&gt; physical GPU (device: 0, name: GeForce GTX 1060 6GB, pci bus id: 0000:01:00.0, compute capability: 6.1)
+INFO:tensorflow:Using config: {'_model_dir': 'output/try1', '_tf_random_seed': None, '_save_summary_steps': 100, '_save_checkpoints_steps': 2000, '_save_checkpoints_secs': None, '_session_config': allow_soft_placement: true
+graph_options {
+rewrite_options {
+meta_optimizer_iterations: ONE
+}
+}
+, '_keep_checkpoint_max': 5, '_keep_checkpoint_every_n_hours': 10000, '_log_step_count_steps': 100, '_train_distribute': &lt;tensorflow.contrib.distribute.python.mirrored_strategy.MirroredStrategy object at 0x7f970c25bba8&gt;, '_device_fn': None, '_protocol': None, '_eval_distribute': None, '_experimental_distribute': None, '_service': None, '_cluster_spec': &lt;tensorflow.python.training.server_lib.ClusterSpec object at 0x7f970c25bcc0&gt;, '_task_type': 'worker', '_task_id': 0, '_global_id_in_cluster': 0, '_master': '', '_evaluation_master': '', '_is_chief': True, '_num_ps_replicas': 0, '_num_worker_replicas': 1, '_distribute_coordinator_mode': None}
+INFO:tensorflow:Not using Distribute Coordinator.
+INFO:tensorflow:Running training and evaluation locally (non-distributed).
+INFO:tensorflow:Start train and evaluate loop. The evaluate will happen after every checkpoint. Checkpoint frequency is determined based on RunConfig arguments: save_checkpoints_steps 2000 or save_checkpoints_secs None.
+2019-02-28 13:39:21.625686: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1511] Adding visible gpu devices: 0
+2019-02-28 13:39:21.625718: I tensorflow/core/common_runtime/gpu/gpu_device.cc:982] Device interconnect StreamExecutor with strength 1 edge matrix:
+2019-02-28 13:39:21.625721: I tensorflow/core/common_runtime/gpu/gpu_device.cc:988]      0
+2019-02-28 13:39:21.625724: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1001] 0:   N
+2019-02-28 13:39:21.625814: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1115] Created TensorFlow device (/device:GPU:0 with 5139 MB memory) -&gt; physical GPU (device: 0, name: GeForce GTX 1060 6GB, pci bus id: 0000:01:00.0, compute capability: 6.1)
+INFO:tensorflow:Device is available but not used by distribute strategy: /device:CPU:0
+INFO:tensorflow:Device is available but not used by distribute strategy: /device:XLA_CPU:0
+INFO:tensorflow:Device is available but not used by distribute strategy: /device:XLA_GPU:0
+INFO:tensorflow:Configured nccl all-reduce.
+2019-02-28 13:39:21.651311: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1511] Adding visible gpu devices: 0
+2019-02-28 13:39:21.651333: I tensorflow/core/common_runtime/gpu/gpu_device.cc:982] Device interconnect StreamExecutor with strength 1 edge matrix:
+2019-02-28 13:39:21.651337: I tensorflow/core/common_runtime/gpu/gpu_device.cc:988]      0
+2019-02-28 13:39:21.651339: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1001] 0:   N
+2019-02-28 13:39:21.651435: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1115] Created TensorFlow device (/job:localhost/replica:0/task:0/device:GPU:0 with 5139 MB memory) -&gt; physical GPU (device: 0, name: GeForce GTX 1060 6GB, pci bus id: 0000:01:00.0, compute capability: 6.1)
+INFO:tensorflow:Calling model_fn.
+INFO:tensorflow:Error reported to Coordinator:
+Traceback (most recent call last):
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/python/training/coordinator.py", line 297, in stop_on_exception
+yield
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/contrib/distribute/python/mirrored_strategy.py", line 795, in run
+self.main_result = self.main_fn(*self.main_args, **self.main_kwargs)
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/python/estimator/estimator.py", line 1195, in _call_model_fn
+model_fn_results = self._model_fn(features=features, **kwargs)
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/python/estimator/keras.py", line 278, in model_fn
+labels)
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/python/estimator/keras.py", line 201, in _clone_and_build_model
+optimizer_iterations=global_step)
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/python/keras/models.py", line 476, in clone_and_build_model
+target_tensors=target_tensors)
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/python/training/checkpointable/base.py", line 474, in _method_wrapper
+method(self, *args, **kwargs)
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/python/keras/engine/training.py", line 634, in compile
+for loss_tensor in self.losses:
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/python/keras/engine/network.py", line 667, in losses
+losses = self._unfiltered_losses
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/python/keras/engine/network.py", line 571, in _unfiltered_losses
+losses += layer.losses
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/python/keras/engine/base_layer.py", line 377, in losses
+loss_tensor = regularizer()
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/python/keras/engine/base_layer.py", line 434, in _tag_unconditional
+loss = loss()
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/python/keras/engine/base_layer.py", line 629, in _loss_for_variable
+with ops.colocate_with(v):
+File "/usr/lib/python3.6/contextlib.py", line 81, in enter
+return next(self.gen)
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/python/framework/ops.py", line 4094, in _colocate_with_for_gradient
+with self.colocate_with(op, ignore_existing):
+File "/usr/lib/python3.6/contextlib.py", line 81, in enter
+return next(self.gen)
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/python/framework/ops.py", line 4146, in colocate_with
+op = internal_convert_to_tensor_or_indexed_slices(op, as_ref=True).op
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/python/framework/ops.py", line 1307, in internal_convert_to_tensor_or_indexed_slices
+value, dtype=dtype, name=name, as_ref=as_ref)
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/python/framework/ops.py", line 1146, in internal_convert_to_tensor
+ret = conversion_func(value, dtype=dtype, name=name, as_ref=as_ref)
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/contrib/distribute/python/values.py", line 439, in _tensor_conversion_mirrored
+assert not as_ref
+AssertionError
+Traceback (most recent call last):
+File "/home/aibox/.local/lib/python3.6/site-packages/IPython/core/interactiveshell.py", line 3267, in run_code
+exec(code_obj, self.user_global_ns, self.user_ns)
+File "", line 1, in 
+runfile('/home/aibox/Documents/ast-research-dev/R5/R5_nn_emotional_valence_liquid_data/gcloud_trainer/mirroredTest.py', args='--job-dir=output/try1 --train_file=/mnt/DATA/R5_DATA_AI/R5_liquid_tfrecord/R5_6310x1000x40x40_train_data.tfrecords --vali_file=/mnt/DATA/R5_DATA_AI/R5_liquid_tfrecord/R5_550x1000x40x40_vali_data.tfrecords --n_CPU=6 --n_GPU=1', wdir='/home/aibox/Documents/ast-research-dev/R5/R5_nn_emotional_valence_liquid_data/gcloud_trainer')
+File "/opt/pycharm-community-2018.3.1/helpers/pydev/_pydev_bundle/pydev_umd.py", line 198, in runfile
+pydev_imports.execfile(filename, global_vars, local_vars)  # execute the script
+File "/opt/pycharm-community-2018.3.1/helpers/pydev/_pydev_imps/_pydev_execfile.py", line 18, in execfile
+exec(compile(contents+"\n", file, 'exec'), glob, loc)
+File "/home/aibox/Documents/ast-research-dev/R5/R5_nn_emotional_valence_liquid_data/gcloud_trainer/mirroredTest.py", line 138, in 
+tf.estimator.train_and_evaluate( est_train_model, train_spec, eval_spec )
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/python/estimator/training.py", line 471, in train_and_evaluate
+return executor.run()
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/python/estimator/training.py", line 610, in run
+return self.run_local()
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/python/estimator/training.py", line 711, in run_local
+saving_listeners=saving_listeners)
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/python/estimator/estimator.py", line 354, in train
+loss = self._train_model(input_fn, hooks, saving_listeners)
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/python/estimator/estimator.py", line 1205, in _train_model
+return self._train_model_distributed(input_fn, hooks, saving_listeners)
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/python/estimator/estimator.py", line 1316, in _train_model_distributed
+self.config)
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/python/training/distribute.py", line 721, in call_for_each_tower
+return self._call_for_each_tower(fn, *args, **kwargs)
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/contrib/distribute/python/mirrored_strategy.py", line 556, in _call_for_each_tower
+return _call_for_each_tower(self, fn, *args, **kwargs)
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/contrib/distribute/python/mirrored_strategy.py", line 183, in _call_for_each_tower
+coord.join(threads)
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/python/training/coordinator.py", line 389, in join
+six.reraise(*self._exc_info_to_raise)
+File "/home/aibox/.local/lib/python3.6/site-packages/six.py", line 693, in reraise
+raise value
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/python/training/coordinator.py", line 297, in stop_on_exception
+yield
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/contrib/distribute/python/mirrored_strategy.py", line 795, in run
+self.main_result = self.main_fn(*self.main_args, **self.main_kwargs)
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/python/estimator/estimator.py", line 1195, in _call_model_fn
+model_fn_results = self._model_fn(features=features, **kwargs)
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/python/estimator/keras.py", line 278, in model_fn
+labels)
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/python/estimator/keras.py", line 201, in _clone_and_build_model
+optimizer_iterations=global_step)
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/python/keras/models.py", line 476, in clone_and_build_model
+target_tensors=target_tensors)
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/python/training/checkpointable/base.py", line 474, in _method_wrapper
+method(self, *args, **kwargs)
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/python/keras/engine/training.py", line 634, in compile
+for loss_tensor in self.losses:
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/python/keras/engine/network.py", line 667, in losses
+losses = self._unfiltered_losses
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/python/keras/engine/network.py", line 571, in _unfiltered_losses
+losses += layer.losses
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/python/keras/engine/base_layer.py", line 377, in losses
+loss_tensor = regularizer()
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/python/keras/engine/base_layer.py", line 434, in _tag_unconditional
+loss = loss()
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/python/keras/engine/base_layer.py", line 629, in _loss_for_variable
+with ops.colocate_with(v):
+File "/usr/lib/python3.6/contextlib.py", line 81, in enter
+return next(self.gen)
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/python/framework/ops.py", line 4094, in _colocate_with_for_gradient
+with self.colocate_with(op, ignore_existing):
+File "/usr/lib/python3.6/contextlib.py", line 81, in enter
+return next(self.gen)
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/python/framework/ops.py", line 4146, in colocate_with
+op = internal_convert_to_tensor_or_indexed_slices(op, as_ref=True).op
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/python/framework/ops.py", line 1307, in internal_convert_to_tensor_or_indexed_slices
+value, dtype=dtype, name=name, as_ref=as_ref)
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/python/framework/ops.py", line 1146, in internal_convert_to_tensor
+ret = conversion_func(value, dtype=dtype, name=name, as_ref=as_ref)
+File "/home/aibox/.local/lib/python3.6/site-packages/tensorflow/contrib/distribute/python/values.py", line 439, in _tensor_conversion_mirrored
+assert not as_ref
+AssertionError
+	</description>
+	<comments>
+		<comment id='1' author='JohnSouth8' date='2019-04-15T22:11:49Z'>
+		Is this still an issue in 1.13?  Could you please check?
+		</comment>
+		<comment id='2' author='JohnSouth8' date='2019-04-15T22:13:19Z'>
+		Also, could you please try &lt;denchmark-link:https://www.tensorflow.org/api_docs/python/tf/keras/optimizers/Adam&gt;https://www.tensorflow.org/api_docs/python/tf/keras/optimizers/Adam&lt;/denchmark-link&gt;
+?
+		</comment>
+		<comment id='3' author='JohnSouth8' date='2019-05-17T13:24:40Z'>
+		It has been 14 days with no activity and the awaiting response label was assigned. Is this still an issue?
+		</comment>
+		<comment id='4' author='JohnSouth8' date='2019-05-19T13:38:59Z'>
+		It worked for some reason on another machine and I did not look further into why it did not work at first. I did not try it again in tf 1.13.
+		</comment>
+		<comment id='5' author='JohnSouth8' date='2019-05-20T01:34:35Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=26207&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=26207&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='6' author='JohnSouth8' date='2019-05-27T13:01:42Z'>
+		The tf 1.13 still has this problem...
+		</comment>
+	</comments>
+</bug>

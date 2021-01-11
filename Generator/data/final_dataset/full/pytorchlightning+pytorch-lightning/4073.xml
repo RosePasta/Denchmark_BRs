@@ -1,0 +1,559 @@
+<bug_data>
+<bug id='4073' author='willprice' open_date='2020-10-11T11:59:57Z' closed_time='2020-12-04T18:10:08Z'>
+ 	<summary>Data Parallel bug (return outputs not being moved to same device)</summary>
+ 	<description>
+ &lt;denchmark-h:h2&gt;🐛 Bug&lt;/denchmark-h&gt;
+ 
+ Under backend='dp' doesn't handle reduction of the loss across multiple GPUs correctly. This is present in v0.10--v1.0.0rc4
+ &lt;denchmark-h:h3&gt;To Reproduce&lt;/denchmark-h&gt;
+ 
+ &lt;denchmark-h:h4&gt;Code sample&lt;/denchmark-h&gt;
+ 
+ import torch
+ import pytorch_lightning as ptl
+ from pytorch_lightning import LightningModule
+ from torch.utils.data import Dataset
+ 
+ 
+ class RandomDictDataset(Dataset):
+     def __init__(self, size, length):
+         self.len = length
+         self.data = torch.randn(length, size)
+ 
+     def __getitem__(self, index):
+         a = self.data[index]
+         b = a + 2
+         return {"a": a, "b": b}
+ 
+     def __len__(self):
+         return self.len
+ 
+ 
+ class RandomDictStringDataset(Dataset):
+     def __init__(self, size, length):
+         self.len = length
+         self.data = torch.randn(length, size)
+ 
+     def __getitem__(self, index):
+         return {"id": str(index), "x": self.data[index]}
+ 
+     def __len__(self):
+         return self.len
+ 
+ 
+ class RandomDataset(Dataset):
+     def __init__(self, size, length):
+         self.len = length
+         self.data = torch.randn(length, size)
+ 
+     def __getitem__(self, index):
+         return self.data[index]
+ 
+     def __len__(self):
+         return self.len
+ 
+ 
+ class BoringModel(LightningModule):
+     def __init__(self):
+         """
+         Testing PL Module
+         Use as follows:
+         - subclass
+         - modify the behavior for what you want
+         class TestModel(BaseTestModel):
+             def training_step(...):
+                 # do your own thing
+         or:
+         model = BaseTestModel()
+         model.training_epoch_end = None
+         """
+         super().__init__()
+         self.layer = torch.nn.Linear(32, 2)
+ 
+     def forward(self, x):
+         return self.layer(x)
+ 
+     def loss(self, batch, prediction):
+         # An arbitrary loss to have a loss that updates the model weights during `Trainer.fit` calls
+         return torch.nn.functional.cross_entropy(
+             prediction,
+             torch.ones(len(prediction), dtype=torch.long, device=prediction.device),
+         )
+ 
+     def training_step(self, batch, batch_idx):
+         output = self.layer(batch)
+         loss = self.loss(batch, output)
+         self.log("loss", loss)
+         return loss
+ 
+     def validation_step(self, batch, batch_idx):
+         output = self.layer(batch)
+         loss = self.loss(batch, output)
+         self.log("loss", loss)
+         return loss
+ 
+     def test_step(self, batch, batch_idx):
+         output = self.layer(batch)
+         loss = self.loss(batch, output)
+         return loss
+ 
+     def configure_optimizers(self):
+         optimizer = torch.optim.SGD(self.layer.parameters(), lr=0.1)
+         lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
+         return [optimizer], [lr_scheduler]
+ 
+     def train_dataloader(self):
+         return torch.utils.data.DataLoader(RandomDataset(32, 64), batch_size=16)
+ 
+     def val_dataloader(self):
+         return torch.utils.data.DataLoader(RandomDataset(32, 64), batch_size=16)
+ 
+     def test_dataloader(self):
+         return torch.utils.data.DataLoader(RandomDataset(32, 64), batch_size=16)
+ 
+ 
+ def main():
+     model = BoringModel()
+     trainer = ptl.Trainer(
+         distributed_backend="dp",
+         gpus=4,
+     )
+     trainer.fit(model)
+ 
+ 
+ if __name__ == "__main__":
+     main()
+ Produces the following
+ &lt;denchmark-code&gt;GPU available: True, used: True
+ TPU available: False, using: 0 TPU cores
+ LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0,1,2,3]
+ 
+ | Name  | Type   | Params
+ ---------------------------------
+ 0 | layer | Linear | 66
+ /home/user/.conda/envs/env/lib/python3.8/site-packages/pytorch_lightning/utilities/distributed.py:45: UserWarning: The dataloader, val dataloader 0, does not have many workers which may be a bottleneck. Consider increasing the value of the `num_workers` argument` (try 104 which is the number of cpus on this machine) in the `DataLoader` init to improve performance.
+ warnings.warn(*args, **kwargs)
+ Validation sanity check: 0it [00:00, ?it/s]/home/user/.conda/envs/env/lib/python3.8/site-packages/torch/nn/parallel/_functions.py:61: UserWarning: Was asked to gather along dimension 0, but all input tensors were scalars; will instead unsqueeze and return a vector.
+ warnings.warn('Was asked to gather along dimension 0, but all '
+ /home/user/.conda/envs/env/lib/python3.8/site-packages/pytorch_lightning/utilities/distributed.py:45: UserWarning: The dataloader, train dataloader, does not have many workers which may be a bottleneck. Consider increasing the value of the `num_workers` argument` (try 104 which is the number of cpus on this machine) in the `DataLoader` init to improve performance.
+ warnings.warn(*args, **kwargs)
+ Epoch 1:  50%|████████████████Traceback (most recent call last):████████████████████████████████████                                                                                      | 4/8 [00:00&lt;00:00, 184.41it/s, loss=0.497, v_num=53]
+ File "dp_bug.py", line 118, in &lt;module&gt;
+ main()
+ File "dp_bug.py", line 114, in main
+ trainer.fit(model)
+ File "/home/user/.conda/envs/env/lib/python3.8/site-packages/pytorch_lightning/trainer/trainer.py", line 440, in fit
+ results = self.accelerator_backend.train()
+ File "/home/user/.conda/envs/env/lib/python3.8/site-packages/pytorch_lightning/accelerators/dp_accelerator.py", line 97, in train
+ results = self.train_or_test()
+ File "/home/user/.conda/envs/env/lib/python3.8/site-packages/pytorch_lightning/accelerators/accelerator.py", line 53, in train_or_test
+ results = self.trainer.train()
+ File "/home/user/.conda/envs/env/lib/python3.8/site-packages/pytorch_lightning/trainer/trainer.py", line 483, in train
+ self.train_loop.run_training_epoch()
+ File "/home/user/.conda/envs/env/lib/python3.8/site-packages/pytorch_lightning/trainer/training_loop.py", line 557, in run_training_epoch
+ self.trainer.run_evaluation(test_mode=False)
+ File "/home/user/.conda/envs/env/lib/python3.8/site-packages/pytorch_lightning/trainer/trainer.py", line 599, in run_evaluation
+ eval_loop_results = self.evaluation_loop.log_epoch_metrics(deprecated_eval_results, epoch_logs, test_mode)
+ File "/home/user/.conda/envs/env/lib/python3.8/site-packages/pytorch_lightning/trainer/evaluation_loop.py", line 210, in log_epoch_metrics
+ eval_loop_results = self.trainer.logger_connector.on_evaluation_epoch_end(
+ File "/home/user/.conda/envs/env/lib/python3.8/site-packages/pytorch_lightning/trainer/connectors/logger_connector.py", line 113, in on_evaluation_epoch_end
+ self._log_on_evaluation_epoch_end_metrics(epoch_logs)
+ File "/home/user/.conda/envs/env/lib/python3.8/site-packages/pytorch_lightning/trainer/connectors/logger_connector.py", line 178, in _log_on_evaluation_epoch_end_metrics
+ reduced_epoch_metrics = dl_metrics[0].__class__.reduce_on_epoch_end(dl_metrics)
+ File "/home/user/.conda/envs/env/lib/python3.8/site-packages/pytorch_lightning/core/step_result.py", line 433, in reduce_on_epoch_end
+ recursive_stack(result)
+ File "/home/user/.conda/envs/env/lib/python3.8/site-packages/pytorch_lightning/core/step_result.py", line 552, in recursive_stack
+ result[k] = collate_tensors(v)
+ File "/home/user/.conda/envs/env/lib/python3.8/site-packages/pytorch_lightning/core/step_result.py", line 574, in collate_tensors
+ return torch.stack(items)
+ RuntimeError: All input tensors must be on the same device. Received cuda:3 and cuda:1
+ Exception ignored in: &lt;function tqdm.__del__ at 0x7fcf54050a60&gt;
+ Traceback (most recent call last):
+ File "/home/user/.conda/envs/env/lib/python3.8/site-packages/tqdm/std.py", line 1087, in __del__
+ File "/home/user/.conda/envs/env/lib/python3.8/site-packages/tqdm/std.py", line 1294, in close
+ File "/home/user/.conda/envs/env/lib/python3.8/site-packages/tqdm/std.py", line 1472, in display
+ File "/home/user/.conda/envs/env/lib/python3.8/site-packages/tqdm/std.py", line 1090, in __repr__
+ File "/home/user/.conda/envs/env/lib/python3.8/site-packages/tqdm/std.py", line 1434, in format_dict
+ TypeError: cannot unpack non-iterable NoneType object
+ &lt;/denchmark-code&gt;
+ 
+ Specifically note the line saying
+ &lt;denchmark-code&gt;RuntimeError: All input tensors must be on the same device. Received cuda:3 and cuda:1
+ &lt;/denchmark-code&gt;
+ 
+ &lt;denchmark-h:h3&gt;Expected behavior&lt;/denchmark-h&gt;
+ 
+ &lt;denchmark-h:h3&gt;Environment&lt;/denchmark-h&gt;
+ 
+ 
+ PyTorch Version (e.g., 1.0): 1.6.0
+ OS (e.g., Linux): Ubuntu 18.04
+ How you installed PyTorch (conda, pip, source): conda
+ Build command you used (if compiling from source): N/A
+ Python version: 3.8.5
+ CUDA/cuDNN version: 11.0
+ GPU models and configuration: 8 GPU (RTX 2080Ti)
+ Any other relevant information:
+ 
+ &lt;denchmark-h:h3&gt;Additional context&lt;/denchmark-h&gt;
+ 
+ This works on v0.9.0:
+ import torch
+ import pytorch_lightning as ptl
+ from pytorch_lightning import LightningModule
+ from torch.utils.data import Dataset
+ 
+ 
+ class RandomDictDataset(Dataset):
+     def __init__(self, size, length):
+         self.len = length
+         self.data = torch.randn(length, size)
+ 
+     def __getitem__(self, index):
+         a = self.data[index]
+         b = a + 2
+         return {"a": a, "b": b}
+ 
+     def __len__(self):
+         return self.len
+ 
+ 
+ class RandomDictStringDataset(Dataset):
+     def __init__(self, size, length):
+         self.len = length
+         self.data = torch.randn(length, size)
+ 
+     def __getitem__(self, index):
+         return {"id": str(index), "x": self.data[index]}
+ 
+     def __len__(self):
+         return self.len
+ 
+ 
+ class RandomDataset(Dataset):
+     def __init__(self, size, length):
+         self.len = length
+         self.data = torch.randn(length, size)
+ 
+     def __getitem__(self, index):
+         return self.data[index]
+ 
+     def __len__(self):
+         return self.len
+ 
+ 
+ class BoringModel(LightningModule):
+     def __init__(self):
+         """
+         Testing PL Module
+         Use as follows:
+         - subclass
+         - modify the behavior for what you want
+         class TestModel(BaseTestModel):
+             def training_step(...):
+                 # do your own thing
+         or:
+         model = BaseTestModel()
+         model.training_epoch_end = None
+         """
+         super().__init__()
+         self.layer = torch.nn.Linear(32, 2)
+ 
+     def forward(self, x):
+         return self.layer(x)
+ 
+     def loss(self, batch, prediction):
+         # An arbitrary loss to have a loss that updates the model weights during `Trainer.fit` calls
+         return torch.nn.functional.cross_entropy(
+             prediction,
+             torch.ones(len(prediction), dtype=torch.long, device=prediction.device),
+         )
+ 
+     def training_step(self, batch, batch_idx):
+         output = self.layer(batch)
+         loss = self.loss(batch, output)
+         return {"loss": loss}
+ 
+     def validation_step(self, batch, batch_idx):
+         output = self.layer(batch)
+         loss = self.loss(batch, output)
+         return {"val_loss": loss}
+ 
+     def test_step(self, batch, batch_idx):
+         output = self.layer(batch)
+         loss = self.loss(batch, output)
+         return {"test_loss": loss}
+ 
+     def configure_optimizers(self):
+         optimizer = torch.optim.SGD(self.layer.parameters(), lr=0.1)
+         lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
+         return [optimizer], [lr_scheduler]
+ 
+     def train_dataloader(self):
+         return torch.utils.data.DataLoader(RandomDataset(32, 64), batch_size=16)
+ 
+     def val_dataloader(self):
+         return torch.utils.data.DataLoader(RandomDataset(32, 64), batch_size=16)
+ 
+     def test_dataloader(self):
+         return torch.utils.data.DataLoader(RandomDataset(32, 64), batch_size=16)
+ 
+ 
+ def main():
+     model = BoringModel()
+     trainer = ptl.Trainer(
+         distributed_backend="dp",
+         gpus=4,
+         # log_every_n_steps=5,
+         # flush_logs_every_n_steps=20,
+         # benchmark=True,
+         # gradient_clip_val=20,
+     )
+     trainer.fit(model)
+ 
+ 
+ if __name__ == "__main__":
+     main()
+ but causes this error under v1.0.0rc4
+ &lt;denchmark-code&gt;GPU available: True, used: True
+ TPU available: False, using: 0 TPU cores
+ LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0,1,2,3]
+ 
+ | Name  | Type   | Params
+ ---------------------------------
+ 0 | layer | Linear | 66    
+ /home/user/.conda/envs/env/lib/python3.8/site-packages/pytorch_lightning/utilities/distributed.py:45: UserWarning: The dataloader, val dataloader 0, does not have many workers which may be a bottleneck. Consider increasing the value of the `num_workers` argument` (try 104 which is the number of cpus on this machine) in the `DataLoader` init to improve performance.
+ warnings.warn(*args, **kwargs)
+ /home/user/.conda/envs/env/lib/python3.8/site-packages/pytorch_lightning/utilities/distributed.py:45: UserWarning: The dataloader, train dataloader, does not have many workers which may be a bottleneck. Consider increasing the value of the `num_workers` argument` (try 104 which is the number of cpus on this machine) in the `DataLoader` init to improve performance.
+ warnings.warn(*args, **kwargs)
+ Epoch 0:   0%|                                                                                                                                                                                                          | 0/8 [00:00&lt;?, ?it/s]Traceback (most recent call last):
+ File "dp_bug.py", line 116, in &lt;module&gt;
+ main()
+ File "dp_bug.py", line 112, in main
+ trainer.fit(model)
+ File "/home/user/.conda/envs/env/lib/python3.8/site-packages/pytorch_lightning/trainer/trainer.py", line 440, in fit
+ results = self.accelerator_backend.train()
+ File "/home/user/.conda/envs/env/lib/python3.8/site-packages/pytorch_lightning/accelerators/dp_accelerator.py", line 97, in train
+ results = self.train_or_test()
+ File "/home/user/.conda/envs/env/lib/python3.8/site-packages/pytorch_lightning/accelerators/accelerator.py", line 53, in train_or_test
+ results = self.trainer.train()
+ File "/home/user/.conda/envs/env/lib/python3.8/site-packages/pytorch_lightning/trainer/trainer.py", line 483, in train
+ self.train_loop.run_training_epoch()
+ File "/home/user/.conda/envs/env/lib/python3.8/site-packages/pytorch_lightning/trainer/training_loop.py", line 529, in run_training_epoch
+ batch_output = self.run_training_batch(batch, batch_idx, dataloader_idx)
+ File "/home/user/.conda/envs/env/lib/python3.8/site-packages/pytorch_lightning/trainer/training_loop.py", line 661, in run_training_batch
+ opt_closure_result = self.training_step_and_backward(
+ File "/home/user/.conda/envs/env/lib/python3.8/site-packages/pytorch_lightning/trainer/training_loop.py", line 753, in training_step_and_backward
+ self.backward(result, optimizer, opt_idx)
+ File "/home/user/.conda/envs/env/lib/python3.8/site-packages/pytorch_lightning/trainer/training_loop.py", line 767, in backward
+ result.closure_loss = self.trainer.accelerator_backend.backward(
+ File "/home/user/.conda/envs/env/lib/python3.8/site-packages/pytorch_lightning/accelerators/accelerator.py", line 83, in backward
+ model.backward(closure_loss, optimizer, opt_idx)
+ File "/home/user/.conda/envs/env/lib/python3.8/site-packages/pytorch_lightning/core/lightning.py", line 1077, in backward
+ loss.backward()
+ File "/home/user/.conda/envs/env/lib/python3.8/site-packages/torch/tensor.py", line 185, in backward
+ torch.autograd.backward(self, gradient, retain_graph, create_graph)
+ File "/home/user/.conda/envs/env/lib/python3.8/site-packages/torch/autograd/__init__.py", line 121, in backward
+ grad_tensors = _make_grads(tensors, grad_tensors)
+ File "/home/user/.conda/envs/env/lib/python3.8/site-packages/torch/autograd/__init__.py", line 47, in _make_grads
+ raise RuntimeError("grad can be implicitly created only for scalar outputs")
+ RuntimeError: grad can be implicitly created only for scalar outputs
+ Exception ignored in: &lt;function tqdm.__del__ at 0x7fed7b0c1a60&gt;
+ Traceback (most recent call last):
+ File "/home/user/.conda/envs/env/lib/python3.8/site-packages/tqdm/std.py", line 1087, in __del__
+ File "/home/user/.conda/envs/env/lib/python3.8/site-packages/tqdm/std.py", line 1294, in close
+ File "/home/user/.conda/envs/env/lib/python3.8/site-packages/tqdm/std.py", line 1472, in display
+ File "/home/user/.conda/envs/env/lib/python3.8/site-packages/tqdm/std.py", line 1090, in __repr__
+ File "/home/user/.conda/envs/env/lib/python3.8/site-packages/tqdm/std.py", line 1434, in format_dict
+ TypeError: cannot unpack non-iterable NoneType object
+ 
+ &lt;/denchmark-code&gt;
+ 
+ 	</description>
+ 	<comments>
+ 		<comment id='1' author='willprice' date='2020-10-12T11:08:58Z'>
+ 		import torch
+ 
+ # this is what is happening in will's code:
+ 
+ prediction = torch.rand(8, 2, requires_grad=True)
+ 
+ # device 0 computes:
+ x = torch.nn.functional.cross_entropy(
+     prediction,
+     torch.ones(len(prediction), dtype=torch.long, device=prediction.device),
+ )
+ 
+ # devices 1 computes:
+ y = torch.nn.functional.cross_entropy(
+     prediction,
+     torch.ones(len(prediction), dtype=torch.long, device=prediction.device),
+ )
+ 
+ # dp backend calls backward on stacked tensor
+ l = torch.stack((x, y))
+ l.backward()  # backward on a non-scalar
+ Here is the pytorch code that shows the problem. Gives the same error as reported by &lt;denchmark-link:https://github.com/willprice&gt;@willprice&lt;/denchmark-link&gt;
+ 
+ &lt;denchmark-code&gt;  File "/home/adrian/repositories/imagenet-optical-flow/asdf.py", line 19, in &lt;module&gt;
+     l.backward()
+   File "/home/adrian/bin/anaconda3/envs/lightning-0.7.1/lib/python3.7/site-packages/torch/tensor.py", line 185, in backward
+     torch.autograd.backward(self, gradient, retain_graph, create_graph)
+   File "/home/adrian/bin/anaconda3/envs/lightning-0.7.1/lib/python3.7/site-packages/torch/autograd/__init__.py", line 121, in backward
+     grad_tensors = _make_grads(tensors, grad_tensors)
+   File "/home/adrian/bin/anaconda3/envs/lightning-0.7.1/lib/python3.7/site-packages/torch/autograd/__init__.py", line 47, in _make_grads
+     raise RuntimeError("grad can be implicitly created only for scalar outputs")
+ RuntimeError: grad can be implicitly created only for scalar outputs
+ &lt;/denchmark-code&gt;
+ 
+ Conclusion: Somewhere in the dp backend the losses get stacked and backward is called on a non-scalar tensor.
+ Have limited time rn, so dropping this info here for now to pick it up later
+ 		</comment>
+ 		<comment id='2' author='willprice' date='2020-10-14T09:20:31Z'>
+ 		&lt;denchmark-link:https://github.com/willprice&gt;@willprice&lt;/denchmark-link&gt;
+  can you check the fix fro &lt;denchmark-link:https://github.com/PyTorchLightning/pytorch-lightning/pull/4138&gt;#4138&lt;/denchmark-link&gt;
+  ? For me this worked on the reproduction script.
+ 		</comment>
+ 		<comment id='3' author='willprice' date='2020-11-12T15:37:25Z'>
+ 		&lt;denchmark-link:https://github.com/willprice&gt;@willprice&lt;/denchmark-link&gt;
+  friendly ping :)
+ 		</comment>
+ 		<comment id='4' author='willprice' date='2020-11-12T17:32:45Z'>
+ 		Hey &lt;denchmark-link:https://github.com/edenlightning&gt;@edenlightning&lt;/denchmark-link&gt;
+ , I can confirm that this is fixed for me on the reproduction script and my own codebase. Although I did run into &lt;denchmark-link:https://github.com/PyTorchLightning/pytorch-lightning/issues/2350&gt;this issue&lt;/denchmark-link&gt;
+  when testing out &lt;denchmark-link:https://github.com/PyTorchLightning/pytorch-lightning/pull/4138&gt;#4138&lt;/denchmark-link&gt;
+  on my codebase (I have  set on my ).
+ 		</comment>
+ 		<comment id='5' author='willprice' date='2020-12-03T10:44:11Z'>
+ 		I think I rediscovered this bug in our examples:
+ 
+ I will try to help with the PR &lt;denchmark-link:https://github.com/justusschock&gt;@justusschock&lt;/denchmark-link&gt;
+  has still open so we can also finish &lt;denchmark-link:https://github.com/PyTorchLightning/pytorch-lightning/pull/4764&gt;#4764&lt;/denchmark-link&gt;
+ 
+ 		</comment>
+ 	</comments>
+ </bug>
+<commit id='f23f5e56480d1a4784fc7829d014590fe4ca1454' author='Justus Schock' date='2020-12-04 19:10:07+01:00'>
+ 	<dmm_unit complexity='0.5178571428571429' interfacing='0.75' size='0.5892857142857143'></dmm_unit>
+ 	<modification change_type='MODIFY' old_name='CHANGELOG.md' new_name='CHANGELOG.md'>
+ 		<file_info nloc='None' complexity='None' token_count='None'></file_info>
+ 		<modified_lines>
+ 			<added_lines>106</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='pytorch_lightning\core\step_result.py' new_name='pytorch_lightning\core\step_result.py'>
+ 		<file_info nloc='677' complexity='197' token_count='4611'></file_info>
+ 		<method name='to' parameters='self,args,kwargs'>
+ 				<method_info nloc='4' complexity='3' token_count='50' nesting_level='1' start_line='403' end_line='407'></method_info>
+ 			<added_lines>403,404,407</added_lines>
+ 			<deleted_lines>403,404,407</deleted_lines>
+ 		</method>
+ 		<method name='cpu' parameters='self'>
+ 				<method_info nloc='2' complexity='1' token_count='17' nesting_level='1' start_line='409' end_line='411'></method_info>
+ 			<added_lines>409,410,411</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines>408</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='pytorch_lightning\trainer\connectors\logger_connector\epoch_result_store.py' new_name='pytorch_lightning\trainer\connectors\logger_connector\epoch_result_store.py'>
+ 		<file_info nloc='425' complexity='87' token_count='2616'></file_info>
+ 		<method name='cache_result' parameters='self'>
+ 				<method_info nloc='30' complexity='6' token_count='176' nesting_level='1' start_line='372' end_line='418'></method_info>
+ 			<added_lines>407,408</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines>20,21</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='pytorch_lightning\trainer\connectors\logger_connector\logger_connector.py' new_name='pytorch_lightning\trainer\connectors\logger_connector\logger_connector.py'>
+ 		<file_info nloc='392' complexity='110' token_count='2804'></file_info>
+ 		<method name='log_train_epoch_end_metrics' parameters='self,epoch_output,checkpoint_accumulator,early_stopping_accumulator,num_optimizers'>
+ 				<method_info nloc='5' complexity='1' token_count='13' nesting_level='1' start_line='391' end_line='395'></method_info>
+ 			<added_lines>391,392,393,394</added_lines>
+ 			<deleted_lines>391,392,393,394,395</deleted_lines>
+ 		</method>
+ 		<method name='_track_callback_metrics' parameters='self,eval_results,using_eval_result'>
+ 				<method_info nloc='34' complexity='14' token_count='283' nesting_level='1' start_line='291' end_line='331'></method_info>
+ 			<added_lines>292</added_lines>
+ 			<deleted_lines>292,293,294,295</deleted_lines>
+ 		</method>
+ 		<method name='log_train_epoch_end_metrics' parameters='self,epoch_output,checkpoint_accumulator,early_stopping_accumulator,num_optimizers'>
+ 				<method_info nloc='6' complexity='1' token_count='12' nesting_level='1' start_line='388' end_line='393'></method_info>
+ 			<added_lines>388,389,390,391,392,393</added_lines>
+ 			<deleted_lines>391,392,393</deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines>18</added_lines>
+ 			<deleted_lines>18</deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='tests\trainer\logging\test_logger_connector.py' new_name='tests\trainer\logging\test_logger_connector.py'>
+ 		<file_info nloc='324' complexity='54' token_count='2168'></file_info>
+ 		<method name='test_epoch_results_cache_dp.test_step' parameters='self,args,kwargs'>
+ 				<method_info nloc='4' complexity='1' token_count='48' nesting_level='2' start_line='422' end_line='425'></method_info>
+ 			<added_lines>422,423,424,425</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<method name='test_epoch_results_cache_dp.training_step_end' parameters='self,training_step_outputs'>
+ 				<method_info nloc='3' complexity='1' token_count='19' nesting_level='2' start_line='405' end_line='407'></method_info>
+ 			<added_lines>405,406,407</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<method name='test_epoch_results_cache_dp.validation_epoch_end' parameters='self,outputs'>
+ 				<method_info nloc='3' complexity='2' token_count='33' nesting_level='2' start_line='418' end_line='420'></method_info>
+ 			<added_lines>418,419,420</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<method name='test_epoch_results_cache_dp.val_dataloader' parameters='self'>
+ 				<method_info nloc='2' complexity='1' token_count='19' nesting_level='2' start_line='434' end_line='435'></method_info>
+ 			<added_lines>434,435</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<method name='test_epoch_results_cache_dp.test_dataloader' parameters='self'>
+ 				<method_info nloc='2' complexity='1' token_count='19' nesting_level='2' start_line='437' end_line='438'></method_info>
+ 			<added_lines>437,438</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<method name='test_epoch_results_cache_dp.test_epoch_end' parameters='self,outputs'>
+ 				<method_info nloc='3' complexity='2' token_count='33' nesting_level='2' start_line='427' end_line='429'></method_info>
+ 			<added_lines>427,428,429</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<method name='test_epoch_results_cache_dp' parameters='tmpdir'>
+ 				<method_info nloc='24' complexity='1' token_count='91' nesting_level='0' start_line='394' end_line='450'></method_info>
+ 			<added_lines>394,395,396,397,398,399,400,401,402,403,404,405,406,407,408,409,410,411,412,413,414,415,416,417,418,419,420,421,422,423,424,425,426,427,428,429,430,431,432,433,434,435,436,437,438,439,440,441,442,443,444,445,446,447,448,449,450</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<method name='test_epoch_results_cache_dp.training_epoch_end' parameters='self,outputs'>
+ 				<method_info nloc='3' complexity='2' token_count='36' nesting_level='2' start_line='409' end_line='411'></method_info>
+ 			<added_lines>409,410,411</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<method name='test_epoch_results_cache_dp.train_dataloader' parameters='self'>
+ 				<method_info nloc='2' complexity='1' token_count='19' nesting_level='2' start_line='431' end_line='432'></method_info>
+ 			<added_lines>431,432</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<method name='test_epoch_results_cache_dp.validation_step' parameters='self,args,kwargs'>
+ 				<method_info nloc='4' complexity='1' token_count='48' nesting_level='2' start_line='413' end_line='416'></method_info>
+ 			<added_lines>413,414,415,416</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<method name='test_epoch_results_cache_dp.training_step' parameters='self,args,kwargs'>
+ 				<method_info nloc='4' complexity='1' token_count='46' nesting_level='2' start_line='400' end_line='403'></method_info>
+ 			<added_lines>400,401,402,403</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines>23,391,392,393</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ </commit>
+</bug_data>

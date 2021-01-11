@@ -1,0 +1,175 @@
+<bug id='1431' author='Keepmoving-ZXY' open_date='2019-10-08T13:12:41Z' closed_time='2019-10-15T06:09:00Z'>
+	<summary>Horovod hang when running cpu training in two nodes</summary>
+	<description>
+Environment:
+
+Framework: (TensorFlow, Keras, PyTorch, MXNet)TensorFlow
+Framework version:1.14.0
+Horovod version:0.18.1
+MPI version:3.1.3
+CUDA version:N/A
+NCCL version:N/A
+Python version:2.7.16
+OS and version:CentOS Linux release 7.5.1804 (Core)
+GCC version:7.3.0
+
+Hi, these days I run distributed cpu training with horovod and intel mkl support in two cpu nodes, the base environment is Anaconda 2.  After I install Anaconda2, I install tensorflow and horovod using below command in the two cpu nodes:
+&lt;denchmark-code&gt;# faster anaconda source
+conda config --add channels https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/free/
+conda config --add channels https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main/
+conda config --set show_channel_urls yes
+
+# install tensorflow with mkl support.
+conda install tensorflow
+
+# upgrade gcc to 7.
+scl enable devtoolset-7 bash
+
+# compile horovod.
+export PATH=$PATH:/usr/lib64/openmpi3/bin
+export LD_LIBRARY_PATH=/usr/lib64/openmpi3/lib:$LD_LIBRARY_PATH
+
+pip uninstall horovod
+conda install gcc_linux-64 gxx_linux-64
+conda run pip install --no-cache-dir horovod
+&lt;/denchmark-code&gt;
+
+After install, I run horovod train with below command:
+&lt;denchmark-code&gt;#!/bin/bash
+
+# set -e
+# set -x
+
+LOG_BASE="/root/tensorflow_log"
+DATE=`date '+%Y-%m-%d'`
+LOG_DIR="${LOG_BASE}/${DATE}"
+
+if [ ! -d "${LOG_DIR}" ]; then
+    mkdir -p ${LOG_DIR}
+else
+    echo "LOG DIR ${LOG_DIR} already exist"
+fi
+
+# log file
+PID=$$
+DATE=`date '+%H-%M-%S'`
+FILE_NAME="horovod_${PID}_${DATE}.txt"
+LOG_FILE="${LOG_DIR}/${FILE_NAME}"
+echo "LOG_FILE: $LOG_FILE"
+
+start=$(date +%s)
+echo "start: $start"
+
+echo 1 &gt; /proc/sys/vm/compact_memory
+echo 3 &gt; /proc/sys/vm/drop_caches
+echo 100 &gt; /sys/devices/system/cpu/intel_pstate/min_perf_pct
+echo 0 &gt; /sys/devices/system/cpu/intel_pstate/no_turbo
+echo 0 &gt; /proc/sys/kernel/numa_balancing
+export HOROVOD_FUSION_THRESHOLD=134217728
+export OMP_NUM_THREADS=8
+
+COMMON_ARGS="\
+        --batch_size=128 \
+        --model=resnet50 \
+        --display_every=5 \
+        --data_format=NCHW \
+        --optimizer=momentum \
+        --device=cpu \
+        --mkl=TRUE \
+        --variable_update=horovod \
+        --horovod_device=cpu \
+        --local_parameter_device=cpu \
+        --kmp_blocktime=1"
+
+/usr/lib64/openmpi3/bin/mpirun -np 8 --allow-run-as-root \
+        -H 192.168.1.137,192.168.1.138 \
+        --map-by ppr:2:socket,pe=${OMP_NUM_THREADS} \
+        --report-bindings \
+        --oversubscribe \
+        -x HOROVOD_MPI_THREADS_DISABLE=1 \
+        -x HOROVOD_GLOO_IFACE=eno1 \
+        -x HOROVOD_FUSION_THRESHOLD \
+        -x LD_LIBRARY_PATH \
+        -x PATH \
+        -x OMP_NUM_THREADS \
+        /root/anaconda2/bin/python2 /root/zls/benchmarks/scripts/tf_cnn_benchmarks/tf_cnn_benchmarks.py  $COMMON_ARGS \
+        --num_intra_threads=${OMP_NUM_THREADS} 2&gt;&amp;1 | tee ${LOG_FILE}
+
+end=$(date +%s)
+echo "end: $end"
+
+elapse=$((end-start))
+
+echo "TRAINING TIME: $elapse seconds"
+
+echo "" &gt;&gt; ${LOG_FILE}
+echo "TRAINING TIME: $elapse seconds" &gt;&gt; ${LOG_FILE}
+echo "LOG SAVES TO: ${LOG_FILE}"
+&lt;/denchmark-code&gt;
+
+after run this script, openmpi create 8 processes, 4 in 192.168.1.137 and 4 in 192.168.1.138. I find that any process in 192.168.1.137  hang all the time, below is stack when hang occurs:
+&lt;denchmark-code&gt;#0  0x00007f1fc1fbdf3d in nanosleep () from /lib64/libpthread.so.0
+#1  0x00007f1f7ed53ca5 in horovod::common::(anonymous namespace)::InitializeHorovodOnce(int const*, int) ()
+   from /root/anaconda2/lib/python2.7/site-packages/horovod/tensorflow/mpi_lib.so
+#2  0x00007f1fba4f5ec0 in ffi_call_unix64 () from /root/anaconda2/lib/python2.7/lib-dynload/../../libffi.so.6
+#3  0x00007f1fba4f587d in ffi_call () from /root/anaconda2/lib/python2.7/lib-dynload/../../libffi.so.6
+#4  0x00007f1fba70c99e in _ctypes_callproc () from /root/anaconda2/lib/python2.7/lib-dynload/_ctypes.so
+#5  0x00007f1fba702b61 in PyCFuncPtr_call () from /root/anaconda2/lib/python2.7/lib-dynload/_ctypes.so
+#6  0x00007f1fc2255b73 in PyObject_Call () from /root/anaconda2/bin/../lib/libpython2.7.so.1.0
+#7  0x00007f1fc22ec119 in PyEval_EvalFrameEx () from /root/anaconda2/bin/../lib/libpython2.7.so.1.0
+#8  0x00007f1fc22f1a99 in PyEval_EvalCodeEx () from /root/anaconda2/bin/../lib/libpython2.7.so.1.0
+#9  0x00007f1fc22eef68 in PyEval_EvalFrameEx () from /root/anaconda2/bin/../lib/libpython2.7.so.1.0
+#10 0x00007f1fc22f1a99 in PyEval_EvalCodeEx () from /root/anaconda2/bin/../lib/libpython2.7.so.1.0
+#11 0x00007f1fc22eef68 in PyEval_EvalFrameEx () from /root/anaconda2/bin/../lib/libpython2.7.so.1.0
+#12 0x00007f1fc22f1a99 in PyEval_EvalCodeEx () from /root/anaconda2/bin/../lib/libpython2.7.so.1.0
+#13 0x00007f1fc22eef68 in PyEval_EvalFrameEx () from /root/anaconda2/bin/../lib/libpython2.7.so.1.0
+#14 0x00007f1fc22f1a99 in PyEval_EvalCodeEx () from /root/anaconda2/bin/../lib/libpython2.7.so.1.0
+#15 0x00007f1fc22eef68 in PyEval_EvalFrameEx () from /root/anaconda2/bin/../lib/libpython2.7.so.1.0
+#16 0x00007f1fc22f1a99 in PyEval_EvalCodeEx () from /root/anaconda2/bin/../lib/libpython2.7.so.1.0
+#17 0x00007f1fc22eef68 in PyEval_EvalFrameEx () from /root/anaconda2/bin/../lib/libpython2.7.so.1.0
+#18 0x00007f1fc22f1a99 in PyEval_EvalCodeEx () from /root/anaconda2/bin/../lib/libpython2.7.so.1.0
+#19 0x00007f1fc22f1cba in PyEval_EvalCode () from /root/anaconda2/bin/../lib/libpython2.7.so.1.0
+#20 0x00007f1fc230b01d in run_mod () from /root/anaconda2/bin/../lib/libpython2.7.so.1.0
+#21 0x00007f1fc230c1c8 in PyRun_FileExFlags () from /root/anaconda2/bin/../lib/libpython2.7.so.1.0
+#22 0x00007f1fc230d3e8 in PyRun_SimpleFileExFlags () from /root/anaconda2/bin/../lib/libpython2.7.so.1.0
+#23 0x00007f1fc231f67c in Py_Main () from /root/anaconda2/bin/../lib/libpython2.7.so.1.0
+#24 0x00007f1fc14fb445 in __libc_start_main () from /lib64/libc.so.6
+#25 0x000055a65f53d07f in _start () at ../sysdeps/x86_64/elf/start.S:103
+&lt;/denchmark-code&gt;
+
+after I checkout code of InitializeHorovodOnce, I think horovod is hanging on initialize of openmpi. and I find another thread has stack as below:
+&lt;denchmark-code&gt;#0  0x00007f994e69756d in nanosleep () from /lib64/libc.so.6
+#1  0x00007f994e6c8404 in usleep () from /lib64/libc.so.6
+#2  0x00007f990b92f824 in ompi_mpi_init () from /usr/lib64/openmpi3/lib/libmpi.so.40
+#3  0x00007f990b959561 in PMPI_Init_thread () from /usr/lib64/openmpi3/lib/libmpi.so.40
+#4  0x00007f990be76345 in horovod::common::MPIContextManager::EnvInitialize(int) () from /root/anaconda2/lib/python2.7/site-packages/horovod/tensorflow/mpi_lib.so
+#5  0x00007f990be76b11 in horovod::common::MPIContext::Initialize(std::vector&lt;int, std::allocator&lt;int&gt; &gt; const&amp;, horovod::common::MPIContextManager&amp;) ()
+   from /root/anaconda2/lib/python2.7/site-packages/horovod/tensorflow/mpi_lib.so
+#6  0x00007f990be47a05 in horovod::common::(anonymous namespace)::BackgroundThreadLoop(horovod::common::HorovodGlobalState&amp;) ()
+   from /root/anaconda2/lib/python2.7/site-packages/horovod/tensorflow/mpi_lib.so
+#7  0x00007f9925308408 in std::execute_native_thread_routine (__p=0x5612794a9350)
+    at /opt/conda/conda-bld/compilers_linux-64_1534514838838/work/.build/x86_64-conda_cos6-linux-gnu/src/gcc/libstdc++-v3/src/c++11/thread.cc:80
+#8  0x00007f994f0afe25 in start_thread () from /lib64/libpthread.so.0
+#9  0x00007f994e6d0bad in clone () from /lib64/libc.so.6
+&lt;/denchmark-code&gt;
+
+it seems that this thread will sleep forever which case InitializeHorovodOnce hang all the time. how can I deal with this problem? thank you.
+	</description>
+	<comments>
+		<comment id='1' author='Keepmoving-ZXY' date='2019-10-11T11:30:36Z'>
+		Just a stab in the dark have you confirmed connectivity to and from all hosts via ssh AND tcp ports? Hanging in my experience(On AWS) was either SSH connectivity isn't working for horovod run or in my case only port 22 was open and not additional tcp ports for MPI
+		</comment>
+		<comment id='2' author='Keepmoving-ZXY' date='2019-10-11T15:48:23Z'>
+		Hey &lt;denchmark-link:https://github.com/Keepmoving-ZXY&gt;@Keepmoving-ZXY&lt;/denchmark-link&gt;
+, as &lt;denchmark-link:https://github.com/marcfielding1&gt;@marcfielding1&lt;/denchmark-link&gt;
+ said, I would look into SSH connectivity between hosts first.  I would also suggest trying to run  instead of  at first, as the former takes care of a lot of the interface resolution and arg setting for you.  Finally, I would suggest trying to run one of our examples from our repo to verify everything is working correctly.
+		</comment>
+		<comment id='3' author='Keepmoving-ZXY' date='2019-10-11T16:56:02Z'>
+		&lt;denchmark-link:https://github.com/Keepmoving-ZXY&gt;@Keepmoving-ZXY&lt;/denchmark-link&gt;
+ Oh when you do horovodrun make sure you add --verbose as the first flag it'll help debug any issues!
+		</comment>
+		<comment id='4' author='Keepmoving-ZXY' date='2019-10-15T06:08:57Z'>
+		selinux blocks openmpi, thank you for help.
+		</comment>
+	</comments>
+</bug>

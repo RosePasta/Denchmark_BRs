@@ -1,0 +1,173 @@
+<bug id='8205' author='pmacalpine' open_date='2020-04-27T21:39:04Z' closed_time='2020-11-25T21:09:50Z'>
+	<summary>Error "ray.tune.error.TuneError: Unknown trainable" after shutting down and restarting ray to run second experiment</summary>
+	<description>
+&lt;denchmark-h:h3&gt;What is the problem?&lt;/denchmark-h&gt;
+
+After I run an experiment, shutdown ray, and then restart ray and try and run another experiment I get the following error:
+&lt;denchmark-code&gt;Traceback (most recent call last):
+  File "examples/custom_env.py", line 90, in &lt;module&gt;
+    "corridor_length": 5,
+  File "/data/home/patmac/ray/python/ray/tune/tune.py", line 266, in run
+    restore=restore)
+  File "/data/home/patmac/ray/python/ray/tune/experiment.py", line 121, in __init__
+    _raise_on_durable(self._run_identifier, sync_to_driver, upload_dir)
+  File "/data/home/patmac/ray/python/ray/tune/experiment.py", line 32, in _raise_on_durable
+    trainable_cls = get_trainable_cls(trainable_name)
+  File "/data/home/patmac/ray/python/ray/tune/registry.py", line 28, in get_trainable_cls
+    validate_trainable(trainable_name)
+  File "/data/home/patmac/ray/python/ray/tune/registry.py", line 38, in validate_trainable
+    raise TuneError("Unknown trainable: " + trainable_name)
+ray.tune.error.TuneError: Unknown trainable: PPO
+&lt;/denchmark-code&gt;
+
+I'm just trying to rerun the same experiment in a loop, and ray should know the PPO trainable name (I see this same error with other trainable names too such as A2C).  I also see this same error in ray 0.8.4.
+From what I can tell rllib/init.py is not being run the second time that ray.init() is called after being shutdown, and thus _register_all() is not being called to register the algorithms again to the global registry.
+Ray version and other system information (Python version, TensorFlow version, OS):
+Running on Azure NC6s_v2 machine
+ray: 0.9.0.dev0 (latest wheels installed on 4/27/20)
+python: 3.7.6
+tensorflow: 2.1
+torch: 1.4.0
+OS: Ubuntu 16.04.6 LTS
+&lt;denchmark-h:h3&gt;Reproduction (REQUIRED)&lt;/denchmark-h&gt;
+
+Please provide a script that can be run to reproduce the issue. The script should have no external library dependencies (i.e., use fake or mock data / environments):
+I'm just running a modified version of examples/custom_env.py to run the experiment twice in a loop.
+"""Example of a custom gym environment and model. Run this for a demo.
+
+This example shows:
+  - using a custom environment
+  - using a custom model
+  - using Tune for grid search
+
+You can visualize experiment results in ~/ray_results using TensorBoard.
+"""
+
+import numpy as np
+import gym
+from ray.rllib.models import ModelCatalog
+from ray.rllib.models.tf.tf_modelv2 import TFModelV2
+from ray.rllib.models.tf.fcnet_v2 import FullyConnectedNetwork
+from gym.spaces import Discrete, Box
+
+import ray
+from ray import tune
+from ray.rllib.utils import try_import_tf
+from ray.tune import grid_search
+
+tf = try_import_tf()
+
+
+class SimpleCorridor(gym.Env):
+    """Example of a custom env in which you have to walk down a corridor.
+
+    You can configure the length of the corridor via the env config."""
+
+    def __init__(self, config):
+        self.end_pos = config["corridor_length"]
+        self.cur_pos = 0
+        self.action_space = Discrete(2)
+        self.observation_space = Box(
+            0.0, self.end_pos, shape=(1, ), dtype=np.float32)
+
+    def reset(self):
+        self.cur_pos = 0
+        return [self.cur_pos]
+
+    def step(self, action):
+        assert action in [0, 1], action
+        if action == 0 and self.cur_pos &gt; 0:
+            self.cur_pos -= 1
+        elif action == 1:
+            self.cur_pos += 1
+        done = self.cur_pos &gt;= self.end_pos
+        return [self.cur_pos], 1 if done else 0, done, {}
+
+
+class CustomModel(TFModelV2):
+    """Example of a custom model that just delegates to a fc-net."""
+
+    def __init__(self, obs_space, action_space, num_outputs, model_config,
+                 name):
+        super(CustomModel, self).__init__(obs_space, action_space, num_outputs,
+                                          model_config, name)
+        self.model = FullyConnectedNetwork(obs_space, action_space,
+                                           num_outputs, model_config, name)
+        self.register_variables(self.model.variables())
+
+    def forward(self, input_dict, state, seq_lens):
+        return self.model.forward(input_dict, state, seq_lens)
+
+    def value_function(self):
+        return self.model.value_function()
+
+
+if __name__ == "__main__":
+    # Can also register the env creator function explicitly with:
+    # register_env("corridor", lambda config: SimpleCorridor(config))
+    for _ in range(2):
+        ray.init()
+        ModelCatalog.register_custom_model("my_model", CustomModel)
+        tune.run(
+            "PPO",
+            stop={
+                "timesteps_total": 10000,
+            },
+            config={
+                "env": SimpleCorridor,  # or "corridor" if registered above
+                "model": {
+                    "custom_model": "my_model",
+                },
+                "vf_share_layers": True,
+                "lr": grid_search([1e-2, 1e-4, 1e-6]),  # try different lrs
+                "num_workers": 1,  # parallelism
+                "env_config": {
+                    "corridor_length": 5,
+                },
+            },
+        )
+        ray.shutdown()
+If we cannot run your script, we cannot fix your issue.
+
+ I have verified my script runs in a clean environment and reproduces the issue.
+ I have verified the issue also occurs with the latest wheels.
+
+	</description>
+	<comments>
+		<comment id='1' author='pmacalpine' date='2020-04-27T23:07:46Z'>
+		Ah, can you try running:
+&lt;denchmark-code&gt;from ray.rllib import _register_all
+_register_all()
+&lt;/denchmark-code&gt;
+
+We should maybe do this in Tune all the time.
+		</comment>
+		<comment id='2' author='pmacalpine' date='2020-04-27T23:14:37Z'>
+		Yes, manually running _register_all() after shutting down ray and before running tune again is a workaround that fixes the error.  It would be good if that functionality were put in to tune.
+		</comment>
+		<comment id='3' author='pmacalpine' date='2020-06-29T16:01:56Z'>
+		I just had the same problem and tried fixing the problem for about an hour before I gave up. It would be really nice if this bug would be fixed, especially since the fix doesn't seem to involve too much work.
+Another workaround is to set ignore_reinit_error=True when calling tune. Apparently, ray.init() is a no-op if it is called with the same settings as before.
+		</comment>
+		<comment id='4' author='pmacalpine' date='2020-11-11T20:24:47Z'>
+		Hi, I'm a bot from the Ray team :)
+To help human contributors to focus on more relevant issues, I will automatically add the stale label to issues that have had no activity for more than 4 months.
+If there is no further activity in the 14 days, the issue will be closed!
+
+If you'd like to keep the issue open, just leave any comment, and the stale label will be removed!
+If you'd like to get more attention to the issue, please tag one of Ray's contributors.
+
+You can always ask for help on our &lt;denchmark-link:https://discuss.ray.io/&gt;discussion forum&lt;/denchmark-link&gt;
+ or &lt;denchmark-link:https://github.com/ray-project/ray#getting-involved&gt;Ray's public slack channel&lt;/denchmark-link&gt;
+.
+		</comment>
+		<comment id='5' author='pmacalpine' date='2020-11-25T21:09:49Z'>
+		Hi again! The issue will be closed because there has been no more activity in the 14 days since the last message.
+Please feel free to reopen or open a new issue if you'd still like it to be addressed.
+Again, you can always ask for help on our &lt;denchmark-link:https://discuss.ray.io&gt;discussion forum&lt;/denchmark-link&gt;
+ or &lt;denchmark-link:https://github.com/ray-project/ray#getting-involved&gt;Ray's public slack channel&lt;/denchmark-link&gt;
+.
+Thanks again for opening the issue!
+		</comment>
+	</comments>
+</bug>

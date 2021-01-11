@@ -1,0 +1,143 @@
+<bug id='31055' author='damienpontifex' open_date='2019-07-26T04:40:03Z' closed_time='2019-08-16T00:11:17Z'>
+	<summary>Saved model and serving preprocessing</summary>
+	<description>
+Using: tensorflow2.0.0-beta1
+OS: macOS 10.14.6
+python: 3.7
+This might be a docs or feature request - not sure, so please forgive my general posting of the issue.
+I used to use estimator.export_savedmodel('export', serving_input_receiver_fn) which would allow me to define serving_input_receiver_fn  where I could transform my inputs. Such transformations in my case were decode jpeg, convert to float, resize.
+With Keras being the recommended high-level API with 2.0, I'm looking for information on how to do this.
+An example model is:
+mobilenet_url = 'https://tfhub.dev/google/tf2-preview/mobilenet_v2/feature_vector/4'
+
+input = l.Input(shape=(224,224,3), name='input_image')
+
+mobilenet = hub.KerasLayer(mobilenet_url)(input)
+logits = l.Dense(units=1, activation=tf.nn.sigmoid, name='prediction')(mobilenet)
+
+model = tf.keras.Model(inputs=input, outputs=logits)
+Train and then:
+tf.saved_model.save(model, 'export/mobilenet_finetuned')
+Currently the read, decode, resize is being done in tf.data.Dataset map functions. I can only see a way to provide TensorSpec describing the input, but no way to provide a preprocessing function when saving the model here for serving.
+
+Is this a documentation issue? If so, guidance on how it's done would be nice and I'd be happy to contribute to the docs.
+Is it not possible to do this preprocessing with the saved model with Keras and if I want to do this, stick to Estimators?
+
+	</description>
+	<comments>
+		<comment id='1' author='damienpontifex' date='2019-07-26T16:45:13Z'>
+		You can do this now by calling the model inside a function and exporting the function as a signature. There's some discussion of this in &lt;denchmark-link:https://github.com/tensorflow/community/blob/master/rfcs/20181116-saved-model.md#protos-in-serving-signatures-re-exporting&gt;the SavedModel RFC&lt;/denchmark-link&gt;
+. So the exported function takes whatever you'd like to pass when serving, transforms it to inputs the model takes, calls the model, and does any post-processing on the model's outputs.
+I think there was some thought around providing a higher-level Keras way to do this too. &lt;denchmark-link:https://github.com/k-w-w&gt;@k-w-w&lt;/denchmark-link&gt;
+ may know more about plans for that.
+		</comment>
+		<comment id='2' author='damienpontifex' date='2019-07-27T09:10:13Z'>
+		Thank you for the insights &lt;denchmark-link:https://github.com/allenlavoie&gt;@allenlavoie&lt;/denchmark-link&gt;
+
+I'm now trying this
+@tf.function(input_signature=[tf.TensorSpec(shape=[None], dtype=tf.string)])
+def serving(input_image):
+    def _input_to_feature(img):
+        img = tf.io.decode_jpeg(img, channels=3)
+        img = tf.image.convert_image_dtype(img, tf.float32)
+        return img
+    img = tf.map_fn(_input_to_feature, input_image)
+    img = tf.image.resize_with_pad(img, 224, 224)
+    return model.predict({ 'input_image': img })
+
+tf.saved_model.save(model, export_dir='export/transformed_for_serving', signatures=serving)
+But get the error:
+&lt;denchmark-code&gt;in converted code:
+:11 predict  *
+img = tf.map_fn(_input_to_feature, input_image)
+
+stack trace here:
+
+ValueError: Trying to read from list with wrong element dtype. List has type uint8 but expected type string for 'map/TensorArrayV2Stack/TensorListStack' (op: 'TensorListStack') with input shapes: [], [3].
+&lt;/denchmark-code&gt;
+
+I've also tried wrapping this up in a tf.Module subclass that has the Keras model as a member property and then has a member function to predict but similar error.
+For more context, this is the example I'm trying to set up: &lt;denchmark-link:https://github.com/damienpontifex/mobilenet-classifier-transfer&gt;https://github.com/damienpontifex/mobilenet-classifier-transfer&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='3' author='damienpontifex' date='2019-07-29T15:57:14Z'>
+		Yeah I think you just need to pass  to  to specify the output type. Otherwise it &lt;denchmark-link:https://www.tensorflow.org/api_docs/python/tf/map_fn#args&gt;defaults to the input type&lt;/denchmark-link&gt;
+.
+		</comment>
+		<comment id='4' author='damienpontifex' date='2019-07-29T23:58:14Z'>
+		Thank you &lt;denchmark-link:https://github.com/allenlavoie&gt;@allenlavoie&lt;/denchmark-link&gt;
+
+I ended up with this which I verified using the saved_model_cli run command
+@tf.function(input_signature=[tf.TensorSpec(shape=[None], dtype=tf.string)])
+def serving(input_image):
+
+    # Convert bytes of jpeg input to float32 tensor for model
+    def _input_to_feature(img):
+        img = tf.io.decode_jpeg(img, channels=3)
+        img = tf.image.convert_image_dtype(img, tf.float32)
+        img = tf.image.resize_with_pad(img, 224, 224)
+        return img
+    img = tf.map_fn(_input_to_feature, input_image, dtype=tf.float32)
+
+    # Predict
+    predictions = model(img)
+
+    with open('export/idx2class.pkl', 'rb') as f:
+        class_names = pickle.load(f)
+        class_names = tf.constant(class_names, dtype=tf.string)
+
+    # Single output for model so collapse final axis for vector output
+    predictions = tf.squeeze(predictions, axis=-1)
+
+    # Predictions are output from sigmoid so float32 in range 0 -&gt; 1
+    # Round to integers for predicted class and string lookup for class name
+    prediction_integers = tf.cast(tf.math.round(predictions), tf.int32)
+    predicted_classes = tf.map_fn(lambda idx: class_names[idx], prediction_integers, dtype=tf.string)
+
+    # Convert sigmoid output for probability
+    # 1 (dog) will remain at logit output
+    # 0 (cat) will be 1.0 - logit to give probability
+    def to_probability(logit):
+        if logit &lt; 0.5:
+            return 1.0 - logit
+        else:
+            return logit
+    class_probability = tf.map_fn(to_probability, predictions, dtype=tf.float32)
+
+    return {
+        'classes': predicted_classes,
+        'probabilities': class_probability
+    }
+
+tf.saved_model.save(model, export_dir='export/transformed_for_serving', signatures=serving)
+Also here &lt;denchmark-link:https://github.com/damienpontifex/mobilenet-classifier-transfer/blob/master/binary_classifier_train.py#L129-L170&gt;https://github.com/damienpontifex/mobilenet-classifier-transfer/blob/master/binary_classifier_train.py#L129-L170&lt;/denchmark-link&gt;
+
+Is there some documentation pieces I can update through a PR that might make this clearer. for others?
+		</comment>
+		<comment id='5' author='damienpontifex' date='2019-07-30T01:05:47Z'>
+		Sure, if you have something you want to add you could append to the &lt;denchmark-link:https://github.com/tensorflow/docs/blob/master/site/en/r2/guide/saved_model.ipynb&gt;SavedModel guide&lt;/denchmark-link&gt;
+, one of the docstrings, or potentially the &lt;denchmark-link:https://github.com/tensorflow/docs/blob/master/site/en/r2/guide/keras/saving_and_serializing.ipynb&gt;Keras saving guide&lt;/denchmark-link&gt;
+. Right now we have a 1.x/2.x distinction which makes the 2.x guides somewhat hard to find, which will presumably be fixed once we release 2.x.
+		</comment>
+		<comment id='6' author='damienpontifex' date='2019-08-15T16:52:28Z'>
+		&lt;denchmark-link:https://github.com/damienpontifex&gt;@damienpontifex&lt;/denchmark-link&gt;
+ Is this issue resolved? Did you open any PR to update the docs as you mentioned? Please close the issue if it was resolved. Thanks!
+		</comment>
+		<comment id='7' author='damienpontifex' date='2019-08-16T00:11:17Z'>
+		Thanks, yes it was resolved. I haven’t yet opened the PR but will follow it up.
+		</comment>
+		<comment id='8' author='damienpontifex' date='2019-08-16T00:11:19Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=31055&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=31055&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='9' author='damienpontifex' date='2020-09-22T22:39:42Z'>
+		Just to share a tutorial in case someone wants to expand with a PR the Guides mentioned by &lt;denchmark-link:https://github.com/allenlavoie&gt;@allenlavoie&lt;/denchmark-link&gt;
+:
+&lt;denchmark-link:https://sayak.dev/tf.keras/preprocessing/2020/04/13/embedding-image-preprocessing-functions.html&gt;https://sayak.dev/tf.keras/preprocessing/2020/04/13/embedding-image-preprocessing-functions.html&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

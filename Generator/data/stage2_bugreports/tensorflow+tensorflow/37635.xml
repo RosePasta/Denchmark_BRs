@@ -1,0 +1,146 @@
+<bug id='37635' author='hgaiser' open_date='2020-03-16T12:42:43Z' closed_time='2020-03-26T06:51:00Z'>
+	<summary>Class type changes after saving and loading</summary>
+	<description>
+Please make sure that this is a bug. As per our GitHub Policy, we only address code/doc bugs, performance issues, feature requests and build/installation issues on GitHub. tag:bug_template
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): Yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Arch Linux
+Mobile device (e.g. iPhone 8, Pixel 2, Samsung Galaxy) if the issue happens on mobile device:
+TensorFlow installed from (source or binary): binary
+TensorFlow version (use command below): 2.1.0
+Python version: 3.8.1
+Bazel version (if compiling from source): N/A
+GCC/Compiler version (if compiling from source): N/A
+CUDA/cuDNN version: N/A
+GPU model and memory: N/A
+
+Describe the current behavior
+Creating a model containing a certain layer class (in my case tf.keras.layers.BatchNormalization) changes after saving and loading the model.
+Before loading it is of type
+tensorflow.python.keras.layers.normalization_v2.BatchNormalization
+Which is the same as tf.keras.layers.BatchNormalization, but after loading it is of type:
+tensorflow.python.keras.layers.normalization.BatchNormalization
+Which is not the same.
+Describe the expected behavior
+Expected behavior is that the type of the layer remains unchanged after saving and loading.
+Standalone code to reproduce the issue
+import tensorflow as tf
+
+model = tf.keras.Sequential([
+	tf.keras.layers.BatchNormalization()
+])
+model.build(input_shape=(1,))
+model.save('/tmp/model.h5')
+
+loaded_model = tf.keras.models.load_model('/tmp/model.h5')
+
+# True
+print(isinstance(model.layers[0], tf.keras.layers.BatchNormalization))
+
+# False
+print(isinstance(loaded_model.layers[0], tf.keras.layers.BatchNormalization))
+
+# AttributeError: module 'tensorflow' has no attribute 'python'
+import tensorflow.python.keras.layers.normalization
+print(isinstance(loaded_model.layers[0], tensorflow.python.keras.layers.normalization.BatchNormalization))
+Other info / logs Include any logs or source code that would be helpful to diagnose the problem. If including tracebacks, please include the full traceback. Large logs and files should be attached.
+The reason I want to do this is because I want to freeze updating of the batch normalization weights, which can be done by setting layer.training = False. My goal is to do something like this:
+for l in model.layers:
+    if isinstance(l, tf.keras.layers.BatchNormalization):
+        l.training = False
+	</description>
+	<comments>
+		<comment id='1' author='hgaiser' date='2020-03-16T16:33:57Z'>
+		I've dug a bit deeper into this issue.
+It seems to come from the issue that there are two versions of BatchNormalization. There is a normalization_v2.BatchNormalization and a normalization.BatchNormalization. If tf2 is enabled, v2 should be used; if tf1 is enabled, v1 should be used.
+This check should be implemented here: 
+
+
+tensorflow/tensorflow/python/keras/layers/serialization.py
+
+
+        Lines 51 to 54
+      in
+      0d7620c
+
+
+
+
+
+
+ if tf2.enabled(): 
+
+
+
+ from tensorflow.python.keras.layers.normalization_v2 import * # pylint: disable=g-import-not-at-top 
+
+
+
+ from tensorflow.python.keras.layers.recurrent_v2 import * # pylint: disable=g-import-not-at-top 
+
+
+
+ from tensorflow.python.keras.layers.preprocessing.normalization import * # pylint: disable=g-import-not-at-top 
+
+
+
+
+
+If tf2 is enabled, it imports from normalization_v2, therefore overriding the global class BatchNormalization with the one from normalization_v2.BatchNormalization. The problem is that even though tf2 is enabled, the code path here thinks tf2 is disabled. The cause is the order in which code is executed. It currently happens like this:
+
+tensorflow_core/__init__.py is called at some point for the first time, which indirectly imports tensorflow/python/keras/layers/serialization.py.
+tensorflow/python/keras/layers/serialization.py checks to see if tf2 is enabled using tensorflow/python/tf2.py, which checks TF2_BEHAVIOR environment flag, which defaults to False, so it returns False, so the modules are imported as if tf2 is disabled.
+Later on in tensorflow_core/__init__.py, tf2 functionality is enabled.
+
+The same problem presumably holds for the other layers in the same code block (recurrent_v2 and preprocessing.normalization).
+I see two workarounds for now.
+
+By far the easiest is to prefix the command with TF2_BEHAVIOUR=1 so that the environment variable already enables TF2 before anything is imported. This is the one I'll be using for now.
+Load models using tf.keras.models.load_model(path, custom_objects={'BatchNormalization': tf.keras.layers.BatchNormalization}, but this is a bit less convenient.
+
+		</comment>
+		<comment id='2' author='hgaiser' date='2020-03-17T11:40:12Z'>
+		&lt;denchmark-link:https://github.com/hgaiser&gt;@hgaiser&lt;/denchmark-link&gt;
+,
+I was able to reproduce the issue with &lt;denchmark-link:https://colab.research.google.com/gist/amahendrakar/d51763911edd48c97e8c28050d8ebd18/37635.ipynb&gt;TF2.1&lt;/denchmark-link&gt;
+. However the issue seems to be fixed in &lt;denchmark-link:https://colab.research.google.com/gist/amahendrakar/e5eb5193e41a38359d52fbe0d226240d/37635-tf-nightly.ipynb&gt;TF-nightly&lt;/denchmark-link&gt;
+. Please find the attached gist. Thanks!
+		</comment>
+		<comment id='3' author='hgaiser' date='2020-03-17T11:50:55Z'>
+		Hey &lt;denchmark-link:https://github.com/amahendrakar&gt;@amahendrakar&lt;/denchmark-link&gt;
+ , thank you for your response. The  isn't the issue, the issue is that after saving and loading a model the type of the layer has changed. Expected output of the code you executed should be:
+True
+True
+False
+Note that this also goes wrong with creating models via tf.keras.applications:
+import tensorflow as tf
+
+model = tf.keras.applications.resnet50.ResNet50()
+assert(isinstance(model.layers[3], tf.keras.layers.BatchNormalization)), f"Layer is {model.layers[3]}, but expected {tf.keras.layers.BatchNormalization}."
+The default BatchNormalization should be the one from tf2. This is broken both in TF2.1 and TF-nightly. This outputs:
+&lt;denchmark-code&gt;Traceback (most recent call last):
+  File "test.py", line 4, in &lt;module&gt;
+    assert(isinstance(model.layers[3], tf.keras.layers.BatchNormalization)), f"Layer is {model.layers[3]}, but expected {tf.keras.layers.BatchNormalization}."
+AssertionError: Layer is &lt;tensorflow.python.keras.layers.normalization.BatchNormalization object at 0x7f8ba5971a60&gt;, but expected &lt;class 'tensorflow.python.keras.layers.normalization_v2.BatchNormalization'&gt;.
+&lt;/denchmark-code&gt;
+
+Note the subtle difference of normalization vs normalization_v2.
+		</comment>
+		<comment id='4' author='hgaiser' date='2020-03-26T04:19:45Z'>
+		&lt;denchmark-link:https://github.com/hgaiser&gt;@hgaiser&lt;/denchmark-link&gt;
+  this is similiar to &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/36700&gt;#36700&lt;/denchmark-link&gt;
+, a fix is underway and should be available in the next rc candidate of TF 2.2.0
+		</comment>
+		<comment id='5' author='hgaiser' date='2020-03-26T06:51:00Z'>
+		Yes seems identical, I will close this issue then. Thanks !
+		</comment>
+		<comment id='6' author='hgaiser' date='2020-03-26T06:51:02Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/37635&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/37635&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

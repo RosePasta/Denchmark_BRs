@@ -1,0 +1,208 @@
+<bug id='43710' author='andrescodas' open_date='2020-10-01T20:12:34Z' closed_time='2020-10-02T03:35:45Z'>
+	<summary>executing vectorized_map on batches triggers retracing</summary>
+	<description>
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): dockerhub container 'latest' Digest: c57fb9628d80
+TensorFlow version:tf.version.GIT_VERSION=v2.3.0-54-gfcc4b966f1 tf.version.VERSION=2.3.1
+Python version: 3.6.9
+
+Describe the current behavior
+Repeatedly calling vectorized_map on the same function with parameters of same shape and dtype triggers retracing.
+It seems that vectorized_map allocates memory to run all iterations simultaneously and this is causing OOM. Therefore, I separated the execution on batches to reduce the memory allocation of the function.  If there is a better way to do this, please let me know.
+Describe the expected behavior
+No retracing
+Standalone code to reproduce the issue
+import tensorflow as tf
+import time
+
+print('tf.version.GIT_VERSION={}'.format(tf.version.GIT_VERSION))
+print('tf.version.VERSION={}'.format(tf.version.VERSION))
+
+
+def _jvp(f, primals, tangents):
+    with tf.autodiff.ForwardAccumulator(primals, tangents) as acc:
+        primals_out = f(*primals)
+    return primals_out, acc.jvp(
+        primals_out, unconnected_gradients=tf.UnconnectedGradients.ZERO)
+
+def f(x, z, t, c, v1, v2, v3, v4):
+
+    p = tf.concat([x, z, t], axis=1)
+    pe = p[:, :, None]
+    ce = tf.transpose(a=c[:, :, None], perm=[2, 1, 0])
+    d = ce - pe
+    r = tf.reduce_sum(input_tensor=tf.square(d), axis=1)
+    G = tf.exp(-r / 2)
+
+    p = tf.reduce_sum(input_tensor=G * v1, axis=1, keepdims=True)
+    b = tf.reduce_sum(input_tensor=G * v2, axis=1, keepdims=True)
+    u = tf.reduce_sum(input_tensor=G * v3, axis=1, keepdims=True)
+    w = tf.reduce_sum(input_tensor=G * v4, axis=1, keepdims=True)
+
+    return p, b, u, w
+
+def g(x, z, t, c, v1, v2, v3, v4):
+
+    tf.print('tf.print shapes', *[tf.shape(w) for w in (x, z, t, c, v1, v2, v3, v4)])
+    tf.print('tf.print dtypes', *[w.dtype for w in (x, z, t, c, v1, v2, v3, v4)])
+    #print('py.print x.shape', tf.shape(x))
+
+    fx = lambda xi: f(xi, z, t, c, v1, v2, v3, v4)
+    with tf.autodiff.ForwardAccumulator(primals=[x], tangents=[tf.ones_like(x)]) as fwd_outer:
+        [dpdx, dbdx, dudx, dwdx] = _jvp(fx, [x], [tf.ones_like(x)])[1]
+    [d2bd2x, d2ud2x, d2wd2x] = fwd_outer.jvp([dbdx, dudx, dwdx], tf.UnconnectedGradients.ZERO)
+
+    fz = lambda zi: f(x, zi, t, c, v1, v2, v3, v4)
+    with tf.autodiff.ForwardAccumulator(primals=[z], tangents=[tf.ones_like(z)]) as fwd_outer:
+        [dpdz, dbdz, dudz, dwdz] = _jvp(fz, [z], [tf.ones_like(z)])[1]
+    [d2bd2z, d2ud2z, d2wd2z] = fwd_outer.jvp([dbdz, dudz, dwdz], tf.UnconnectedGradients.ZERO)
+
+    ft = lambda ti: f(x, z, ti, c, v1, v2, v3, v4)
+    [p, b, u, w], [dpdt, dbdt, dudt, dwdt] = _jvp(ft, [t], [tf.ones_like(t)])
+
+    return dudx, dudz, dudt, dwdx, dwdz, dwdt, dbdx, dbdz, dbdt, dpdx, dpdz, d2ud2x, d2ud2z, d2wd2x, d2wd2z, d2bd2x, d2bd2z,
+
+
+n = 7500
+x = tf.random.uniform((n, 1), dtype=tf.float64)
+z = tf.random.uniform((n, 1), dtype=tf.float64)
+t = tf.random.uniform((n, 1), dtype=tf.float64)
+
+c = tf.random.uniform((n,3), dtype=tf.float64)
+
+v1 = tf.random.uniform((1, n), dtype=tf.float64)
+v2 = tf.random.uniform((1, n), dtype=tf.float64)
+v3 = tf.random.uniform((1, n), dtype=tf.float64)
+v4 = tf.random.uniform((1, n), dtype=tf.float64)
+
+
+def batched_execution(fb, args, batch_size):
+    batch_size = tf.cast(batch_size, tf.int32)
+    n = tf.shape(args[0])[0]
+    i0 = tf.constant(0, dtype=tf.int32)
+    souts = []
+    while tf.less_equal(i0 + batch_size, n):
+        tf.print('tf print batch iteration batch_size={}'.format(batch_size))
+        il = i0 + batch_size
+        bsargs = [a[i0:il] for a in args]
+        bouts = fb(bsargs)
+        souts.append(bouts)
+        i0 = il
+    if tf.less(i0, n):
+        tf.print('tf print last batch iteration batch_size={}'.format(n-i0))
+        bsargs = [a[i0:n] for a in args]
+        bouts = fb(bsargs)
+        souts.append(bouts)
+
+    souts = [tf.concat([o[i] for o in souts], axis=0) for i in range(len(souts[0]))]
+    return souts
+
+def shaped_vectorized_map(fv, args, axis=2):
+    sargs = [tf.expand_dims(a, axis=axis) for a in args]
+    outs = batched_execution(lambda args: tf.vectorized_map(fv, args, fallback_to_while_loop=False), sargs, batch_size=1000)
+    souts = [tf.squeeze(o, axis=[axis]) for o in outs]
+    return souts
+
+start_time = time.clock()
+e2v = shaped_vectorized_map(lambda args: g(*args, c, v1, v2, v3, v4), (x, z, t))
+delta_time = time.clock() - start_time
+print('running with batched vectorized_map took {:f} seconds'.format(delta_time))
+Other info / logs
+&lt;denchmark-code&gt;tf.version.GIT_VERSION=v2.3.0-54-gfcc4b966f1
+tf.version.VERSION=2.3.1
+tf print batch iteration batch_size=1000
+tf.print shapes [1 1] [1 1] [1 1] [7500 3] [1 7500] [1 7500] [1 7500] [1 7500]
+tf.print dtypes tf.float64 tf.float64 tf.float64 tf.float64 tf.float64 tf.float64 tf.float64 tf.float64
+tf print batch iteration batch_size=1000
+tf.print shapes [1 1] [1 1] [1 1] [7500 3] [1 7500] [1 7500] [1 7500] [1 7500]
+tf.print dtypes tf.float64 tf.float64 tf.float64 tf.float64 tf.float64 tf.float64 tf.float64 tf.float64
+tf print batch iteration batch_size=1000
+tf.print shapes [1 1] [1 1] [1 1] [7500 3] [1 7500] [1 7500] [1 7500] [1 7500]
+tf.print dtypes tf.float64 tf.float64 tf.float64 tf.float64 tf.float64 tf.float64 tf.float64 tf.float64
+tf print batch iteration batch_size=1000
+tf.print shapes [1 1] [1 1] [1 1] [7500 3] [1 7500] [1 7500] [1 7500] [1 7500]
+tf.print dtypes tf.float64 tf.float64 tf.float64 tf.float64 tf.float64 tf.float64 tf.float64 tf.float64
+tf print batch iteration batch_size=1000
+tf.print shapes [1 1] [1 1] [1 1] [7500 3] [1 7500] [1 7500] [1 7500] [1 7500]
+tf.print dtypes tf.float64 tf.float64 tf.float64 tf.float64 tf.float64 tf.float64 tf.float64 tf.float64
+WARNING:tensorflow:5 out of the last 5 calls to &lt;function pfor.&lt;locals&gt;.f at 0x7f54481b3620&gt; triggered tf.function retracing. Tracing is expensive and the excessive number of tracings could be due to (1) creating @tf.function repeatedly in a loop, (2) passing tensors with different shapes, (3) passing Python objects instead of tensors. For (1), please define your @tf.function outside of the loop. For (2), @tf.function has experimental_relax_shapes=True option that relaxes argument shapes that can avoid unnecessary retracing. For (3), please refer to https://www.tensorflow.org/tutorials/customization/performance#python_or_tensor_args and https://www.tensorflow.org/api_docs/python/tf/function for  more details.
+tf print batch iteration batch_size=1000
+tf.print shapes [1 1] [1 1] [1 1] [7500 3] [1 7500] [1 7500] [1 7500] [1 7500]
+tf.print dtypes tf.float64 tf.float64 tf.float64 tf.float64 tf.float64 tf.float64 tf.float64 tf.float64
+WARNING:tensorflow:6 out of the last 6 calls to &lt;function pfor.&lt;locals&gt;.f at 0x7f54402c4620&gt; triggered tf.function retracing. Tracing is expensive and the excessive number of tracings could be due to (1) creating @tf.function repeatedly in a loop, (2) passing tensors with different shapes, (3) passing Python objects instead of tensors. For (1), please define your @tf.function outside of the loop. For (2), @tf.function has experimental_relax_shapes=True option that relaxes argument shapes that can avoid unnecessary retracing. For (3), please refer to https://www.tensorflow.org/tutorials/customization/performance#python_or_tensor_args and https://www.tensorflow.org/api_docs/python/tf/function for  more details.
+tf print batch iteration batch_size=1000
+tf.print shapes [1 1] [1 1] [1 1] [7500 3] [1 7500] [1 7500] [1 7500] [1 7500]
+tf.print dtypes tf.float64 tf.float64 tf.float64 tf.float64 tf.float64 tf.float64 tf.float64 tf.float64
+WARNING:tensorflow:7 out of the last 7 calls to &lt;function pfor.&lt;locals&gt;.f at 0x7f54407a37b8&gt; triggered tf.function retracing. Tracing is expensive and the excessive number of tracings could be due to (1) creating @tf.function repeatedly in a loop, (2) passing tensors with different shapes, (3) passing Python objects instead of tensors. For (1), please define your @tf.function outside of the loop. For (2), @tf.function has experimental_relax_shapes=True option that relaxes argument shapes that can avoid unnecessary retracing. For (3), please refer to https://www.tensorflow.org/tutorials/customization/performance#python_or_tensor_args and https://www.tensorflow.org/api_docs/python/tf/function for  more details.
+tf print last batch iteration batch_size=500
+tf.print shapes [1 1] [1 1] [1 1] [7500 3] [1 7500] [1 7500] [1 7500] [1 7500]
+tf.print dtypes tf.float64 tf.float64 tf.float64 tf.float64 tf.float64 tf.float64 tf.float64 tf.float64
+WARNING:tensorflow:8 out of the last 8 calls to &lt;function pfor.&lt;locals&gt;.f at 0x7f54400c17b8&gt; triggered tf.function retracing. Tracing is expensive and the excessive number of tracings could be due to (1) creating @tf.function repeatedly in a loop, (2) passing tensors with different shapes, (3) passing Python objects instead of tensors. For (1), please define your @tf.function outside of the loop. For (2), @tf.function has experimental_relax_shapes=True option that relaxes argument shapes that can avoid unnecessary retracing. For (3), please refer to https://www.tensorflow.org/tutorials/customization/performance#python_or_tensor_args and https://www.tensorflow.org/api_docs/python/tf/function for  more details.
+running with batched vectorized_map took 119.087042 seconds
+&lt;/denchmark-code&gt;
+
+related issues: &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/42835&gt;#42835&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/43252&gt;#43252&lt;/denchmark-link&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='andrescodas' date='2020-10-01T22:11:40Z'>
+		/cc &lt;denchmark-link:https://github.com/allenlavoie&gt;@allenlavoie&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='2' author='andrescodas' date='2020-10-01T22:28:18Z'>
+		Unfortunately tf.vectorized_map is actually tracing the function in its argument each time (it doesn't yet support eager op-by-op vectorization), so the warning is informative in this case. I'd put @tf.function on def shaped_vectorized_map and all of the tracing will be cached.
+cc &lt;denchmark-link:https://github.com/agarwal-ashish&gt;@agarwal-ashish&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='3' author='andrescodas' date='2020-10-02T03:35:45Z'>
+		Yes, tf.vectorized_map API does not try to do any caching on its own. The call retraces and performs vectorization as well. Its usage should be wrapped in tf.function, as suggested by &lt;denchmark-link:https://github.com/allenlavoie&gt;@allenlavoie&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='4' author='andrescodas' date='2020-10-02T03:35:48Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/43710&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/43710&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='5' author='andrescodas' date='2020-10-02T17:55:54Z'>
+		Hi &lt;denchmark-link:https://github.com/allenlavoie&gt;@allenlavoie&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/agarwal-ashish&gt;@agarwal-ashish&lt;/denchmark-link&gt;
+, thanks for the suggestion.  Simply wrapping  with  triggers other error:
+&lt;denchmark-code&gt;    InaccessibleTensorError: The tensor 'Tensor("while/loop_body/PartitionedCall_29/pfor/PartitionedCall:0", shape=(None, 1, 1), dtype=float64)' cannot be accessed here: it is defined in another function or code block. Use return values, explicit Python locals or TensorFlow collections to access it. Defined in: FuncGraph(name=while_body_87742, id=140105979881960); accessed from: FuncGraph(name=function_wrapped_shaped_vectorized_map, id=140105966842880).
+
+&lt;/denchmark-code&gt;
+
+you may check the details on &lt;denchmark-link:https://colab.research.google.com/drive/1H6kuQ8E66NbRi8V42V58OkLmSodzkt1i?usp=sharing&gt;this notebook in collab&lt;/denchmark-link&gt;
+.  I'm trying to fix it without success.  Any further advise would be appreciated.  Should I open a new issue?
+		</comment>
+		<comment id='6' author='andrescodas' date='2020-10-02T18:18:21Z'>
+		Ah, I didn't realize there was tensor-dependent control flow in batched_execution. That might be an Autograph bug, or maybe just a case that isn't supported (yet? there was some question about the wisdom of re-writing Python lists as TensorLists, cc &lt;denchmark-link:https://github.com/mdanatg&gt;@mdanatg&lt;/denchmark-link&gt;
+ ). Filing sounds reasonable.
+To get the vectorized graph cached you only need @tf.function around lambda args: tf.vectorized_map(fv, args, fallback_to_while_loop=False), limiting it to that sounds like a reasonable workaround. May need a bit of refactoring so you're not re-creating the tf.function every time the outer function runs.
+Passing a new lambda to tf.function each time will cause that to retrace, so you may want to hang onto a single lambda if you end up benchmarking execution in a loop.
+		</comment>
+		<comment id='7' author='andrescodas' date='2020-10-02T18:36:14Z'>
+		The "Inaccessible tensor" error usually happens when you try to append to a Python list from within TF control flow. That's indeed not supported right now. I recommend using TensorArray or RaggedTensor instead of Python lists (for example the one used by souts).
+		</comment>
+		<comment id='8' author='andrescodas' date='2020-10-02T18:43:24Z'>
+		&lt;denchmark-link:https://github.com/mdanatg&gt;@mdanatg&lt;/denchmark-link&gt;
+  Do you think that we can interecept this case with a better error message untill it will be supported?
+		</comment>
+		<comment id='9' author='andrescodas' date='2020-10-02T18:56:23Z'>
+		thank you all for your suggestions.  I did this:
+
+To get the vectorized graph cached you only need @tf.function around lambda args: tf.vectorized_map(fv, args, fallback_to_while_loop=False), limiting it to that sounds like a reasonable workaround. May need a bit of refactoring so you're not re-creating the tf.function every time the outer function runs.
+
+and I could get 4x speed up in &lt;denchmark-link:https://colab.research.google.com/drive/1H6kuQ8E66NbRi8V42V58OkLmSodzkt1i?usp=sharing#scrollTo=g107jX-qowJa&gt;this updated notebook&lt;/denchmark-link&gt;
+.  I will try to scale up my solutions in this way and avoid the technicalities of TensorArray.
+		</comment>
+		<comment id='10' author='andrescodas' date='2020-10-02T21:02:00Z'>
+		&lt;denchmark-link:https://github.com/bhack&gt;@bhack&lt;/denchmark-link&gt;
+ Yep, there is a fix in the works to do that.
+		</comment>
+	</comments>
+</bug>

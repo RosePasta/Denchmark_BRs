@@ -1,0 +1,214 @@
+<bug id='16943' author='xiangyubo' open_date='2019-04-17T06:58:54Z' closed_time='2020-05-22T10:19:04Z'>
+	<summary>fluid.io.save_persistables 保存中间结果后读取出来重新存为fluid.io.save_inference_model 参数大小不对</summary>
+	<description>
+
+版本、环境信息：
+   1）PaddlePaddle版本：1.3.2 训练
+   3）GPU：v100训练
+4）系统环境：windows7， python 3.5.0，Paddle 1.3.0 加载并转成预测
+
+使用1.3.2的 paddle 训练，然后使用 save_persistables 保存成单文件。之后希望读取中间结果，保存成一个预测模型。在 windows 机器上，paddle 1.3.0 版本，用 save_inference_model 保存，不指定模型名字。
+保存之后，发现参数的大小可能不对。我第一个卷积层的参数是 3x3x3x16，共432个浮点数，应该占用1728字节。但是保存下来之后只有1049个字节。
+后来尝试切换到1.3.2 的 paddle 版本做中间结果转换，依然大小不对。
+转存代码
+&lt;denchmark-h:h1&gt;-- coding: UTF-8 --&lt;/denchmark-h&gt;
+
+"""
+将训练完成的YOLOv3模型固化
+"""
+from future import absolute_import
+from future import division
+from future import print_function
+import paddle.fluid as fluid
+from paddle.fluid.initializer import MSRA
+from paddle.fluid.param_attr import ParamAttr
+from paddle.fluid.regularizer import L2Decay
+target_size = [3, 256, 256]
+nms_threshold = 0.45
+confs_threshold = 0.5
+path = "./yolo-model"
+class_dim = 21
+anchors = [10, 14, 23, 27, 37, 58, 81, 82, 135, 169, 344, 319]
+anchor_mask = [[3, 4, 5], [0, 1, 2]]
+class YOLOv3Tiny(object):
+def init(self, class_num, anchors, anchor_mask):
+self.outputs = []
+self.downsample_ratio = 1
+self.anchor_mask = anchor_mask
+self.anchors = anchors
+self.class_num = class_num
+&lt;denchmark-code&gt;    self.yolo_anchors = []
+    self.yolo_classes = []
+    for mask_pair in self.anchor_mask:
+        mask_anchors = []
+        for mask in mask_pair:
+            mask_anchors.append(self.anchors[2 * mask])
+            mask_anchors.append(self.anchors[2 * mask + 1])
+        self.yolo_anchors.append(mask_anchors)
+        self.yolo_classes.append(class_num)
+
+def name(self):
+    return 'YOLOv3-tiny'
+
+def get_downsample_ratio(self):
+    return self.downsample_ratio
+
+def get_yolo_anchors(self):
+    return self.yolo_anchors
+
+def get_yolo_classes(self):
+    return self.yolo_classes
+
+def conv_bn(self,
+            input,
+            num_filters,
+            filter_size,
+            stride,
+            padding,
+            num_groups=1,
+            act='relu',
+            use_cudnn=True):
+    conv = fluid.layers.conv2d(
+        input=input,
+        num_filters=num_filters,
+        filter_size=filter_size,
+        stride=stride,
+        padding=padding,
+        act=None,
+        groups=num_groups,
+        use_cudnn=use_cudnn,
+        param_attr=ParamAttr(initializer=fluid.initializer.Normal(0., 0.02)),
+        bias_attr=False)
+
+    # batch_norm中的参数不需要参与正则化，所以主动使用正则系数为0的正则项屏蔽掉
+    out = fluid.layers.batch_norm(
+        input=conv, act=act, 
+        param_attr=ParamAttr(initializer=fluid.initializer.Normal(0., 0.02), regularizer=L2Decay(0.)),
+        bias_attr=ParamAttr(initializer=fluid.initializer.Constant(0.0), regularizer=L2Decay(0.)))
+
+    return out
+
+def depthwise_conv_bn(self, input, filter_size=3, stride=1, padding=1):
+    num_filters = input.shape[1]
+    return self.conv_bn(input, 
+            num_filters=num_filters, 
+            filter_size=filter_size, 
+            stride=stride, 
+            padding=padding, 
+            num_groups=num_filters)
+
+def downsample(self, input, pool_size=2, pool_stride=2):
+    self.downsample_ratio *= 2
+    return fluid.layers.pool2d(input=input, pool_type='max', pool_size=pool_size,
+                                pool_stride=pool_stride)
+
+def basicblock(self, input, num_filters):
+    conv1 = self.conv_bn(input, num_filters, filter_size=3, stride=1, padding=1)
+    out = self.downsample(conv1)
+    return out
+
+
+def upsample(self, input, scale=2):
+    # get dynamic upsample output shape
+    shape_nchw = fluid.layers.shape(input)
+    shape_hw = fluid.layers.slice(shape_nchw, axes=[0], starts=[2], ends=[4])
+    shape_hw.stop_gradient = True
+    in_shape = fluid.layers.cast(shape_hw, dtype='int32')
+    out_shape = in_shape * scale
+    out_shape.stop_gradient = True
+
+    # reisze by actual_shape
+    out = fluid.layers.resize_nearest(
+        input=input,
+        scale=scale,
+        actual_shape=out_shape)
+    return out
+
+def yolo_detection_block(self, input, num_filters):
+    route = self.conv_bn(input, num_filters, filter_size=1, stride=1, padding=0)
+    tip = self.conv_bn(route, num_filters * 2, filter_size=3, stride=1, padding=1)
+    return route, tip
+
+def net(self, img): 
+    # darknet-tiny
+    stages = [16, 32, 64, 128, 256, 512]
+    assert len(self.anchor_mask) &lt;= len(stages), "anchor masks can't bigger than downsample times"
+    # 256x256
+    downsample_ = self.basicblock(img, stages[0])
+    blocks = []
+
+    for i, stage_count in enumerate(stages):
+        if i == 0:
+            continue
+        if i == len(stages) - 1:
+            block = self.conv_bn(downsample_, stage_count, filter_size=3, stride=1, padding=1)
+            blocks.append(block)
+            block = self.depthwise_conv_bn(blocks[-1])
+            block = self.depthwise_conv_bn(blocks[-1])
+            block = self.conv_bn(blocks[-1], stage_count * 2, filter_size=1, stride=1, padding=0)
+            blocks.append(block)
+        else:
+            downsample_ = self.basicblock(downsample_, stage_count)
+            blocks.append(downsample_)
+    
+    blocks = blocks[-1:-5:-3]   # 取倒数两层，并且逆序，后面跨层级联需要
+
+    # yolo detector
+    for i, block in enumerate(blocks):
+        # yolo 中跨视域链接
+        if i &gt; 0:
+            block = fluid.layers.concat(input=[route, block], axis=1)
+        if i &lt; 1:
+            route, tip = self.yolo_detection_block(block, num_filters=256 // (2**i))
+        else:
+            tip = self.conv_bn(block, num_filters=256, filter_size=3, stride=1, padding=1)
+        block_out = fluid.layers.conv2d(
+            input=tip,
+            num_filters=len(self.anchor_mask[i]) * (self.class_num + 5),      # 5 elements represent x|y|h|w|score
+            filter_size=1,
+            stride=1,
+            padding=0,
+            act=None,
+            param_attr=ParamAttr(initializer=fluid.initializer.Normal(0., 0.02)),
+            bias_attr=ParamAttr(initializer=fluid.initializer.Constant(0.0), regularizer=L2Decay(0.)))
+        self.outputs.append(block_out)
+        # 为了跨视域链接，差值方式提升特征图尺寸
+        if i &lt; len(blocks) - 1:
+            route = self.conv_bn(route, 128 // (2**i), filter_size=1, stride=1, padding=0)
+            route = self.upsample(route)
+
+    return self.outputs
+&lt;/denchmark-code&gt;
+
+def freeze_model():
+&lt;denchmark-code&gt;exe = fluid.Executor(fluid.CPUPlace())
+image = fluid.layers.data(name='image', shape=target_size, dtype='float32')
+model = YOLOv3Tiny(class_dim, anchors, anchor_mask)
+pred = model.net(image)
+
+freeze_program = fluid.default_main_program()
+fluid.io.load_persistables(exe, '.', freeze_program, 'yolo-v3-tiny')
+freeze_program = freeze_program.clone(for_test=True)
+
+fluid.io.save_inference_model(path, ['image'], pred, exe, freeze_program)
+&lt;/denchmark-code&gt;
+
+if name == 'main':
+freeze_model()
+	</description>
+	<comments>
+		<comment id='1' author='xiangyubo' date='2019-04-17T12:51:18Z'>
+		后来猜测是但文件存储时候的问题，于是 load_persistables 刚刚的参数重训，但是 exe.run 报错。
+之后尝试 save_persistables 的时候不指定文件名，保存成多文件形式。此时 load_persistables 加载重训和转化成 inference 模型都正常，并且可以正常预测。
+		</comment>
+		<comment id='2' author='xiangyubo' date='2019-04-17T12:53:44Z'>
+		需要排查 load_persistables 为一个文件时恢复的问题
+		</comment>
+		<comment id='3' author='xiangyubo' date='2020-05-22T10:19:04Z'>
+		Since you haven't replied for more than a year, we have closed this issue/pr.
+If the problem is not solved or there is a follow-up one, please reopen it at any time and we will continue to follow up.
+由于您超过一年未回复，我们将关闭这个issue/pr。
+若问题未解决或有后续问题，请随时重新打开，我们会继续跟进。
+		</comment>
+	</comments>
+</bug>

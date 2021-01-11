@@ -1,0 +1,199 @@
+<bug id='30324' author='tjume' open_date='2019-07-02T19:55:51Z' closed_time='2019-11-12T20:36:31Z'>
+	<summary>Memory leak in eager mode when creating keras model in loop</summary>
+	<description>
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): Yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Arch Linux
+Mobile device (e.g. iPhone 8, Pixel 2, Samsung Galaxy) if the issue happens on mobile device: not tested
+TensorFlow installed from (source or binary): binary
+TensorFlow version (use command below): v1.12.1-5259-ge703239 1.15.0-dev20190629
+Python version: 3.7.3
+Bazel version (if compiling from source): not compiled from source
+GCC/Compiler version (if compiling from source): not compiled from source
+CUDA/cuDNN version: using CPU
+GPU model and memory: using CPU
+
+Describe the current behavior
+In eager execution, when creating a tf.keras.Sequential model inside a loop and discarding it immediately, the memory increases over time. The following code shows this by printing the used memory at each iteration.
+import psutil
+import tensorflow as tf
+
+tf.compat.v1.enable_eager_execution()
+
+for _ in range(100):
+    tf.keras.Sequential([tf.keras.layers.Dense(3000, input_dim=3000)])
+    print(psutil.virtual_memory().used / 2 ** 30)
+Output:
+&lt;denchmark-code&gt;1.0170440673828125
+1.0506706237792969
+1.0841865539550781
+1.1179122924804688
+[...]
+4.285423278808594
+4.318950653076172
+4.35223388671875
+&lt;/denchmark-code&gt;
+
+The same result happens when using the Functional API or Model subclassing API. Adding tf.keras.backend.clear_session() in the loop solves the leak in all cases like in graph mode. To see this effect better, one should additionally use gc.collect() in the loop.
+Describe the expected behavior
+While adding  to the loop helps, this should not be necessary because in eager execution there is no graph to clear, which according to the &lt;denchmark-link:https://www.tensorflow.org/api_docs/python/tf/keras/backend/clear_session&gt;documentation&lt;/denchmark-link&gt;
+ seems to be the only thing this function does:
+
+Destroys the current TF graph and creates a new one.
+
+Therefore it is also suprising that this function helps at all during eager execution. The expected behavior is that there is no memory leak even without tf.keras.backend.clear_session().
+Code to reproduce the issue
+Code is in description above.
+Other info / logs
+Nothing here.
+	</description>
+	<comments>
+		<comment id='1' author='tjume' date='2019-07-03T01:02:07Z'>
+		Does
+del model
+Help?
+		</comment>
+		<comment id='2' author='tjume' date='2019-07-03T02:58:47Z'>
+		
+Does
+del model
+Help?
+
+It doesn‘t work!&lt;denchmark-link:https://github.com/bionicles&gt;@bionicles&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='3' author='tjume' date='2019-07-03T02:59:33Z'>
+		A similar situation, if I train the model in the main thread and load the model in another thread AT THE SAME TIME. All things are in a loop. However,  I test  and  , and  why??? amazing tensorflow!!! I think that clear_session shouldn't be necessary. &lt;denchmark-link:https://github.com/bionicles&gt;@bionicles&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/tjume&gt;@tjume&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='4' author='tjume' date='2019-07-03T07:52:08Z'>
+		
+if I use clear_session() method in one thread, the code in another thread won't work!!!
+
+That is purely logical. Threads share memory, thus if you call clear_session to swipe a model out of memory in a thread, don't expect other threads to access the now-deleted memory...
+&lt;denchmark-h:hr&gt;&lt;/denchmark-h&gt;
+
+Now, I do agree (after reproducing the issue, which is all the more present in TF 2.0 with Eager execution enabled by default) that the absence of implicit garbage collection inside the loop is a bit annoying. Note that if you use clear_session (without gc.collect), the garbage collector will take out the past models from memory every few seconds (which shows if you add some time.sleep instruction in the loop), so I guess there are two things at stake in what you raise:
+
+keras models created in a given scope are not swiped out when they go out of scope (causing more or less of a memory leak) - this indeed probably requires either fixing or documenting (so that users will either use clear_session or not need it)
+the python garbage collector can take some time before deallocating the memory taken by those models once their clearing has been ordered (which I don't think tensorflow developers can do much about)
+
+My humble opinion, however is that it really is not an amazing effort from your end as a programmer to add a couple of memory-freeing instructions now and then in your code... This is actually pretty common, in my experience, when you are creating stuff faster than the garbage collector will take care of. But that will be up to the developers/maintainers to decide!
+		</comment>
+		<comment id='5' author='tjume' date='2019-07-03T08:24:42Z'>
+		Maybe I didn't make it clear. I mean if I train model A in the main thread and load  model B and predict  in another thread AT THE SAME TIME. All things are in a loop. However,  if I use clear_session() method in one thread (to clear model A, e.g), BUT the model B in another thread  doesn't work(DOESN'T predict).  why??? That isn't logical. &lt;denchmark-link:https://github.com/pandrey-fr&gt;@pandrey-fr&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='6' author='tjume' date='2019-07-03T10:32:38Z'>
+		
+It seems that clearing model A can influence model B
+
+Oh, I see! Thanks for clarifying the issue. From my understanding (but I might be wrong - I am just a tensorflow user, not an expert, let alone a developer), tf.keras.backend.clear_session clears all graphs that have not been called yet. So, if you declare models A and B, then clear_session will remove all those whose predict (or evaluate, or fit, etc.) method has not yet been called. On the other hand, once you have called such a method, the model cannot be deleted using clear_session, but can be so using del &lt;my_instance&gt;. In either cases, using gc.collect ensures the freed memory is effectively deallocated (otherwise it will be done once the garbage collector's routine check on it).
+Examples:
+&lt;denchmark-code&gt;import numpy as np
+import tensorflow as tf
+
+# Enable Eager execution, if required (i.e. using TF 1.x).
+if hasattr(tf, 'enable_eager_execution'):
+    tf.enable_eager_execution()
+
+# Make some dummy input data.
+inputs = np.random.normal(size=(1, 3000))
+
+# Declare two models.
+model_a = tf.keras.Sequential([tf.keras.layers.Dense(3000, input_dim=3000)])
+model_b = tf.keras.Sequential([tf.keras.layers.Dense(3000, input_dim=3000)])
+
+# This will clear BOTH models (i.e. the underlying graph will be cleared out).
+tf.keras.backend.clear_session()
+# Both those lines are going to fail:
+model_a.predict(inputs)
+model_b.predict(inputs)
+
+
+# Declare two models (again).
+model_a = tf.keras.Sequential([tf.keras.layers.Dense(3000, input_dim=3000)])
+model_b = tf.keras.Sequential([tf.keras.layers.Dense(3000, input_dim=3000)])
+
+# Use model B.
+model_b.predict(inputs)
+# This will discard the graph underlying model A ONLY.
+tf.keras.backend.clear_session()
+# This will fail.
+model_a.predict(inputs)
+# This will work.
+model_b.predict(inputs)
+
+# Discard model B (now that is has been called).
+del model_b
+
+# Note that using gc.collect() enforces garbage collection at wanted points.
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='7' author='tjume' date='2019-07-03T10:34:16Z'>
+		That being cleared, I now agree with you that it could be useful to dispose of a generic function to clear out a specific keras model without having to worry about its having been used or not. Let's wait for somebody from the mainteance / development team to actually pick up this issue!
+		</comment>
+		<comment id='8' author='tjume' date='2019-07-03T11:12:05Z'>
+		OK. Thanks in advance &lt;denchmark-link:https://github.com/pandrey-fr&gt;@pandrey-fr&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='9' author='tjume' date='2019-09-11T23:23:15Z'>
+		Why is this not fixed in all the github threads I’ve come across? Seems pretty useless to be unable to call model.predict() in a loop without eventually maxing out your memory and dumping the whole thing
+Looks like I may have to switch to pytorch
+		</comment>
+		<comment id='10' author='tjume' date='2019-09-12T08:11:35Z'>
+		&lt;denchmark-link:https://github.com/brandonbell11&gt;@brandonbell11&lt;/denchmark-link&gt;
+
+
+Why is this not fixed in all the github threads I’ve come across?
+
+There has been some (great) improvement on those issues, notably in 2.0-rc0, and we can expect some more with the upcoming actual 2.0 (and 1.15) release(s). The issue arises from Eager execution triggering the creation of (sometimes usefully) redundant back-end graphs, which sometimes end up not being properly discarded. It seems to no longer happen when using tf.data.Dataset objects (which feels logical to me: Datasets ensure the homogeneity of samples' specification, hence making it safe to re-use the same back-end graph), but there still are some issues when feeding individual EagerTensors.
+I would hope it will be fixed at some point, but you have to understand that Eager execution is a big turn compared to how TensorFlow's back-end works, which used to be the normal way of writing TF code until not so long ago. It is therefore bound to take a little time fixing everything, and to be honest I am personally amazed by how fast it is going - when I moved to using Eager a few months ago, I felt like it was a terrible choice leading to huge performance drops and memory leaks issues, while today the former have mostly vanished and the latter are progressively solved. So, my point is, we, as users, have to show a little patience.
+
+Seems pretty useless to be unable to call model.predict() in a loop without eventually maxing out your memory and dumping the whole thing
+
+The problem is honestly not that great, but yes, in some cases such a problematic behaviour arises. Note, however, that you can work it around, notably by using a Dataset object - and I can hear that this is an effort you would rather not have to make. You could also stick with 1.14 and Eager disabled.
+
+Looks like I may have to switch to pytorch
+
+Honestly, I do not believe anyone "has to" switch to PyTorch - but nor to TensorFlow. You should pick up the framework that suits you best at a given point, and be opened to change when relevant (which is less and less hard as their high-level APIs look more and more similar). If you feel like PyTorch works better for you, switch to it, but please do not look at it as a forced thing nor as being part of a "choose your holy side and be verbose about it" decision. Both frameworks' devs are doing their best, they disagree on some points, and there is something of a competition for users between them, but in my humble opinion we, as users, actually tend to benefit from it. Eager is clearly a response to PyTorch having a similar behaviour, but TF devs have also shown their ability to make it great while preserving the back-end specifics of TF, and not just make it a façade filled with bugs (which it kind of felt like in the beginning). So, what I am saying is, if you want to move to PyTorch, do it, but please do not make it sound like TF devs are not doing there job - this is rather disrespectful, and pointless since it is easy to see that they are actually working on solving issues (and rather succeeding to do so).
+		</comment>
+		<comment id='11' author='tjume' date='2019-09-12T09:16:10Z'>
+		
+Seems pretty useless to be unable to call model.predict() in a loop without eventually maxing out your memory and dumping the whole thing
+
+I don't follow. Creating models in a loop will increase memory; this is a known issue with the way the keras backend manages state. However I don't see any leak when calling predict in a loop: &lt;denchmark-link:https://colab.sandbox.google.com/gist/robieta/cc5e2ccb179d97441e08fab3220ca5bf/predict_leak_test.ipynb&gt;https://colab.sandbox.google.com/gist/robieta/cc5e2ccb179d97441e08fab3220ca5bf/predict_leak_test.ipynb&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='12' author='tjume' date='2019-09-12T09:58:45Z'>
+		&lt;denchmark-link:https://github.com/robieta&gt;@robieta&lt;/denchmark-link&gt;
+ When I run a similar test (on tf2.0-rc0), I can actually see (using psutils, as in the code initially provided by the person who opened the issue) a small RAM usage increase unless calling  and  explicitly in the loop. I do agree that this feels like a very minor problem though, and I never run into GPU memory exhaustion (which I do in the models in-loop creation issue, which as you mentioned is a well-known one).
+		</comment>
+		<comment id='13' author='tjume' date='2019-09-12T16:48:47Z'>
+		&lt;denchmark-link:https://github.com/robieta&gt;@robieta&lt;/denchmark-link&gt;
+
+Apologies I should have mentioned this is specific to my use case, and perhaps should make another thread. The models I use are only loaded in and build once.
+In short, I am having this issue when implementing a monte-carlo rollout policy implemented in seqGAN(&lt;denchmark-link:https://arxiv.org/pdf/1609.05473.pdf&gt;https://arxiv.org/pdf/1609.05473.pdf&lt;/denchmark-link&gt;
+), which requires me to complete a sentence N times, i.e. N*sentence_length calls to model.predict() to get the next word, as well as model2.predict() to get the score for that sentence.
+If I have a sentence of length 30 tokens, and I want 20 example for each word, I end up having to make 9280 total calls to model.predict() to get the rewards I need. Using tf.keras.backend.clear_session() and gc.collect() at the end of each loop doesn't prevent the GPU ram from gradually being filled up.
+I cannot even make it through one complete iteration without everything dumping and getting an OOM error.
+Is the only fix for this at the moment just rolling back to TF-1.15?
+		</comment>
+		<comment id='14' author='tjume' date='2019-11-01T18:17:47Z'>
+		I'm using TensorFlow 2.0.0 and Keras 2.3.1 and still having the same issue.
+		</comment>
+		<comment id='15' author='tjume' date='2019-11-12T20:36:31Z'>
+		I'm going to close this since the original issue (growth from model creation) has been addressed as a known issue and now the thread is kind of drifting. We have also recently made a fix to the internals of TF that eliminates a leak when invoking model.predict many, many times. If you are still seeing issues with predict, feel free to open a new issue with a repro.. Thanks for all of the feedback.
+		</comment>
+		<comment id='16' author='tjume' date='2019-11-12T20:36:32Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/30324&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/30324&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

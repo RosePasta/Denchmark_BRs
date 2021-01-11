@@ -1,0 +1,519 @@
+<bug id='9410' author='fedorzh' open_date='2018-01-13T01:55:26Z' closed_time='2018-08-21T19:10:19Z'>
+	<summary>Training with the same parameters and seed gets significantly different results</summary>
+	<description>
+Train with the same parameters and seeds, get different results. Repro:
+&lt;denchmark-code&gt;
+# coding: utf-8
+
+# In[1]:
+
+
+import mxnet as mx
+from mxnet import nd, gluon, autograd, ndarray
+import numpy as np
+import random
+
+def transform(data, label):
+    return [dat.astype(np.float32) for dat in data], [lab.astype(np.float32) for lab in label]
+
+
+train_cifar_gluon = gluon.data.vision.CIFAR10(train=True, transform=transform)
+test_cifar_gluon = gluon.data.vision.CIFAR10(train=False, transform=transform)
+
+def convert_gluon_dataset_to_numpy(data):
+    ds = data[:][0][0].shape
+    X = np.empty((len(data[:][0]), ds[2], ds[0], ds[1]), dtype=np.float32)
+    for i, example in enumerate(data[:][0]):
+        X[i, :] = np.rollaxis(example.asnumpy(),2)
+    y = np.array(data[:][1])
+    return X, y
+
+X, y = convert_gluon_dataset_to_numpy(train_cifar_gluon)
+X_test, y_test = convert_gluon_dataset_to_numpy(test_cifar_gluon)
+
+
+# In[2]:
+
+
+def predict_scores(net, X_, batch_size, context):
+    scores = None
+    test_loaded = gluon.data.DataLoader(mx.nd.array(X_), batch_size, shuffle=False)
+    for data in test_loaded:
+        data = data.as_in_context(context)
+        output = net(data).asnumpy()
+        if scores is None:
+            scores = output
+        else:
+            scores = np.append(scores, output, axis=0)
+    return scores
+
+
+# In[3]:
+
+
+gpu_count = 1
+_ctx_list = [mx.gpu(i) for i in range(gpu_count)]
+_batch_size=64
+epochs=1
+_seed=42
+_optimizer='sgd'
+_learning_rate=0.1
+_xavier_magnitude=2.
+_momentum=0.9
+_wd=0.0001
+_nclasses=10
+
+
+# ### Try 1
+
+# In[4]:
+
+
+random.seed(_seed)
+mx.random.seed(_seed)
+np.random.seed(_seed)
+
+
+# In[5]:
+
+
+net = gluon.model_zoo.vision.get_model('resnet34_v2', pretrained=False, classes=_nclasses, ctx=_ctx_list)
+
+loss = gluon.loss.SoftmaxCrossEntropyLoss()
+
+
+# In[6]:
+
+
+net.collect_params().initialize(mx.init.Xavier(magnitude=_xavier_magnitude), ctx=_ctx_list, force_reinit=True)
+
+trainer = gluon.Trainer(net.collect_params(), _optimizer,
+                        optimizer_params=dict(learning_rate=_learning_rate, momentum=_momentum,
+                                              wd=_wd),
+                        kvstore='device' if len(_ctx_list) &gt; 0 else 'local')
+
+train_data = mx.io.NDArrayIter(X, label=y, batch_size=_batch_size)
+for e in range(epochs):
+    train_data.reset()
+    for batch in train_data:
+        cur_contexts = _ctx_list
+        if batch.data[0].shape[0] &lt; len(_ctx_list):
+            cur_contexts = cur_contexts[:batch.data[0].shape[0]]
+        data = gluon.utils.split_and_load(batch.data[0], ctx_list=cur_contexts, batch_axis=0, even_split=False)
+        label = gluon.utils.split_and_load(batch.label[0], ctx_list=cur_contexts, batch_axis=0, even_split=False)
+        Ls = []
+        with autograd.record():  # Start recording the derivatives
+            for x_cur, y_cur in zip(data, label):
+                L = loss(net(x_cur), y_cur)
+                # store the loss and do backward after we have done forward
+                # on all GPUs for better speed on multiple GPUs.
+                Ls.append(L)
+            for L in Ls:
+                L.backward()
+        trainer.step(batch.data[0].shape[0])
+        
+    scores_test = predict_scores(net, X_test, _batch_size, _ctx_list[0])
+    predictions_test = np.argmax(scores_test, axis=1)
+    accuracy = np.mean(predictions_test == y_test)
+    print('[Epoch %d] accuracy=%f' % (e, accuracy))
+
+
+# ### Try 2
+
+# In[7]:
+
+
+random.seed(_seed)
+mx.random.seed(_seed)
+np.random.seed(_seed)
+
+
+# In[8]:
+
+
+net = gluon.model_zoo.vision.get_model('resnet34_v2', pretrained=False, classes=_nclasses, ctx=_ctx_list)
+
+loss = gluon.loss.SoftmaxCrossEntropyLoss()
+
+
+# In[9]:
+
+
+net.collect_params().initialize(mx.init.Xavier(magnitude=_xavier_magnitude), ctx=_ctx_list, force_reinit=True)
+
+trainer = gluon.Trainer(net.collect_params(), _optimizer,
+                        optimizer_params=dict(learning_rate=_learning_rate, momentum=_momentum,
+                                              wd=_wd),
+                        kvstore='device' if len(_ctx_list) &gt; 0 else 'local')
+
+train_data = mx.io.NDArrayIter(X, label=y, batch_size=_batch_size)
+for e in range(epochs):
+    train_data.reset()
+    for batch in train_data:
+        cur_contexts = _ctx_list
+        if batch.data[0].shape[0] &lt; len(_ctx_list):
+            cur_contexts = cur_contexts[:batch.data[0].shape[0]]
+        data = gluon.utils.split_and_load(batch.data[0], ctx_list=cur_contexts, batch_axis=0, even_split=False)
+        label = gluon.utils.split_and_load(batch.label[0], ctx_list=cur_contexts, batch_axis=0, even_split=False)
+        Ls = []
+        with autograd.record():  # Start recording the derivatives
+            for x_cur, y_cur in zip(data, label):
+                L = loss(net(x_cur), y_cur)
+                # store the loss and do backward after we have done forward
+                # on all GPUs for better speed on multiple GPUs.
+                Ls.append(L)
+            for L in Ls:
+                L.backward()
+        trainer.step(batch.data[0].shape[0])
+        
+    scores_test = predict_scores(net, X_test, _batch_size, _ctx_list[0])
+    predictions_test = np.argmax(scores_test, axis=1)
+    accuracy = np.mean(predictions_test == y_test)
+    print('[Epoch %d] accuracy=%f' % (e, accuracy))
+&lt;/denchmark-code&gt;
+
+Output:
+&lt;denchmark-code&gt;[Epoch 0] accuracy=0.346900
+[Epoch 0] accuracy=0.281900
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='fedorzh' date='2018-01-13T02:09:15Z'>
+		I use Python 2 so the Issue &lt;denchmark-link:https://github.com/apache/incubator-mxnet/issues/8658&gt;#8658&lt;/denchmark-link&gt;
+ shouldn't influence.
+		</comment>
+		<comment id='2' author='fedorzh' date='2018-01-13T02:10:34Z'>
+		I think only one script is needed. We could run it multiple times to see if the results are the same.
+		</comment>
+		<comment id='3' author='fedorzh' date='2018-01-13T02:19:43Z'>
+		To make sure this is not the initialization issue, I made mx.init.One(). With this, I wasn't able to reproduce on the whole dataset, but I was able to reproduce if trained on a subset:
+&lt;denchmark-code&gt;n_batch=5000
+random_selector = np.random.RandomState(0)
+confidences = random_selector.rand(X.shape[0])
+cert_idx = np.argsort(confidences)
+selected_indices = cert_idx[:n_batch]
+selected_indices = np.sort(selected_indices)
+&lt;/denchmark-code&gt;
+
+and
+&lt;denchmark-code&gt;train_data = mx.io.NDArrayIter(X[selected_indices, :], label=y[selected_indices], batch_size=_batch_size)
+&lt;/denchmark-code&gt;
+
+It is faster (only 5K examples to train on) and more clear (initialization should be deterministic) to work with this version
+Output:
+&lt;denchmark-code&gt;[Epoch 0] accuracy=0.100000
+[Epoch 0] accuracy=0.110100
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='4' author='fedorzh' date='2018-02-27T21:15:31Z'>
+		&lt;denchmark-link:https://github.com/sandeep-krishnamurthy&gt;@sandeep-krishnamurthy&lt;/denchmark-link&gt;
+ please kindly add label: Gluon, Autograd, Bug, thanks!
+		</comment>
+		<comment id='5' author='fedorzh' date='2018-03-12T22:35:26Z'>
+		If I run the script by itself, without the second training run, I get the same result every time:
+[Epoch 0] accuracy=0.100000
+		</comment>
+		<comment id='6' author='fedorzh' date='2018-03-12T22:36:35Z'>
+		Modified script per your second code comment (smaller test set):
+import mxnet as mx
+from mxnet import nd, gluon, autograd, ndarray
+import numpy as np
+import random
+from mxnet import profiler
+
+# profiler.set_config(profile_symbolic=True, aggregate_stats=True, continuous_dump=True)
+# profiler.set_state('run')
+
+def transform(data, label):
+    return [dat.astype(np.float32) for dat in data], [lab.astype(np.float32) for lab in label]
+
+
+train_cifar_gluon = gluon.data.vision.CIFAR10(train=True, transform=transform)
+test_cifar_gluon = gluon.data.vision.CIFAR10(train=False, transform=transform)
+
+def convert_gluon_dataset_to_numpy(data):
+    ds = data[:][0][0].shape
+    X = np.empty((len(data[:][0]), ds[2], ds[0], ds[1]), dtype=np.float32)
+    for i, example in enumerate(data[:][0]):
+        X[i, :] = np.rollaxis(example.asnumpy(),2)
+    y = np.array(data[:][1])
+    return X, y
+
+X, y = convert_gluon_dataset_to_numpy(train_cifar_gluon)
+X_test, y_test = convert_gluon_dataset_to_numpy(test_cifar_gluon)
+
+
+# In[2]:
+
+
+def predict_scores(net, X_, batch_size, context):
+    scores = None
+    test_loaded = gluon.data.DataLoader(mx.nd.array(X_), batch_size, shuffle=False)
+    for data in test_loaded:
+        data = data.as_in_context(context)
+        output = net(data).asnumpy()
+        if scores is None:
+            scores = output
+        else:
+            scores = np.append(scores, output, axis=0)
+    return scores
+
+
+# In[3]:
+
+
+gpu_count = 1
+_ctx_list = [mx.gpu(i) for i in range(gpu_count)]
+_batch_size=64
+epochs=1
+_seed=42
+_optimizer='sgd'
+_learning_rate=0.1
+_xavier_magnitude=2.
+_momentum=0.9
+_wd=0.0001
+_nclasses=10
+
+
+n_batch=5000
+#n_batch=_batch_size * 2
+random_selector = np.random.RandomState(0)
+confidences = random_selector.rand(X.shape[0])
+cert_idx = np.argsort(confidences)
+selected_indices = cert_idx[:n_batch]
+selected_indices = np.sort(selected_indices)
+
+# ### Try 1
+
+# In[4]:
+
+
+random.seed(_seed)
+mx.random.seed(_seed)
+np.random.seed(_seed)
+
+
+# In[5]:
+
+
+net = gluon.model_zoo.vision.get_model('resnet34_v2', pretrained=False, classes=_nclasses, ctx=_ctx_list)
+
+loss = gluon.loss.SoftmaxCrossEntropyLoss()
+
+
+# In[6]:
+
+
+net.collect_params().initialize(mx.init.Xavier(magnitude=_xavier_magnitude), ctx=_ctx_list, force_reinit=True)
+
+trainer = gluon.Trainer(net.collect_params(), _optimizer,
+                        optimizer_params=dict(learning_rate=_learning_rate, momentum=_momentum,
+                                              wd=_wd),
+                        kvstore='device' if len(_ctx_list) &gt; 0 else 'local')
+
+#train_data = mx.io.NDArrayIter(X, label=y, batch_size=_batch_size)
+train_data = mx.io.NDArrayIter(X[selected_indices, :], label=y[selected_indices], batch_size=_batch_size)
+
+for e in range(epochs):
+    train_data.reset()
+    for batch in train_data:
+        cur_contexts = _ctx_list
+        if batch.data[0].shape[0] &lt; len(_ctx_list):
+            cur_contexts = cur_contexts[:batch.data[0].shape[0]]
+        data = gluon.utils.split_and_load(batch.data[0], ctx_list=cur_contexts, batch_axis=0, even_split=False)
+        label = gluon.utils.split_and_load(batch.label[0], ctx_list=cur_contexts, batch_axis=0, even_split=False)
+        Ls = []
+        with autograd.record():  # Start recording the derivatives
+            for x_cur, y_cur in zip(data, label):
+                L = loss(net(x_cur), y_cur)
+                # store the loss and do backward after we have done forward
+                # on all GPUs for better speed on multiple GPUs.
+                Ls.append(L)
+            for L in Ls:
+                L.backward()
+        trainer.step(batch.data[0].shape[0])
+
+    scores_test = predict_scores(net, X_test, _batch_size, _ctx_list[0])
+    predictions_test = np.argmax(scores_test, axis=1)
+    accuracy = np.mean(predictions_test == y_test)
+    print('[Epoch %d] accuracy=%f' % (e, accuracy))
+
+
+# ### Try 2
+
+# In[7]:
+# profiler.set_state('stop')
+# print(profiler.dumps(True))
+
+random.seed(_seed)
+mx.random.seed(_seed)
+np.random.seed(_seed)
+
+
+# In[8]:
+
+
+net = gluon.model_zoo.vision.get_model('resnet34_v2', pretrained=False, classes=_nclasses, ctx=_ctx_list)
+
+loss = gluon.loss.SoftmaxCrossEntropyLoss()
+
+
+# In[9]:
+
+
+net.collect_params().initialize(mx.init.Xavier(magnitude=_xavier_magnitude), ctx=_ctx_list, force_reinit=True)
+
+trainer = gluon.Trainer(net.collect_params(), _optimizer,
+                        optimizer_params=dict(learning_rate=_learning_rate, momentum=_momentum,
+                                              wd=_wd),
+                        kvstore='device' if len(_ctx_list) &gt; 0 else 'local')
+
+#train_data = mx.io.NDArrayIter(X, label=y, batch_size=_batch_size)
+train_data = mx.io.NDArrayIter(X[selected_indices, :], label=y[selected_indices], batch_size=_batch_size)
+
+for e in range(epochs):
+    train_data.reset()
+    for batch in train_data:
+        cur_contexts = _ctx_list
+        if batch.data[0].shape[0] &lt; len(_ctx_list):
+            cur_contexts = cur_contexts[:batch.data[0].shape[0]]
+        data = gluon.utils.split_and_load(batch.data[0], ctx_list=cur_contexts, batch_axis=0, even_split=False)
+        label = gluon.utils.split_and_load(batch.label[0], ctx_list=cur_contexts, batch_axis=0, even_split=False)
+        Ls = []
+        with autograd.record():  # Start recording the derivatives
+            for x_cur, y_cur in zip(data, label):
+                L = loss(net(x_cur), y_cur)
+                # store the loss and do backward after we have done forward
+                # on all GPUs for better speed on multiple GPUs.
+                Ls.append(L)
+            for L in Ls:
+                L.backward()
+        trainer.step(batch.data[0].shape[0])
+
+    scores_test = predict_scores(net, X_test, _batch_size, _ctx_list[0])
+    predictions_test = np.argmax(scores_test, axis=1)
+    accuracy = np.mean(predictions_test == y_test)
+    print('[Epoch %d] accuracy=%f' % (e, accuracy))
+		</comment>
+		<comment id='7' author='fedorzh' date='2018-03-12T22:37:25Z'>
+		I get the following (one GPU):
+[Epoch 0] accuracy=0.100000
+[Epoch 0] accuracy=0.100000
+		</comment>
+		<comment id='8' author='fedorzh' date='2018-03-12T22:38:03Z'>
+		Can you please supply build parameters that you use? ie CUDA, yes? CUDNN? MKL? etc.
+		</comment>
+		<comment id='9' author='fedorzh' date='2018-03-12T22:53:58Z'>
+		Amazon p2.xlarge instance, cuda 9, cudnn7, no mkl
+		</comment>
+		<comment id='10' author='fedorzh' date='2018-03-12T22:54:57Z'>
+		Also, is this done with the latest build?
+		</comment>
+		<comment id='11' author='fedorzh' date='2018-03-12T22:56:42Z'>
+		I didn't have CUDNN enabled. Trying that now...
+		</comment>
+		<comment id='12' author='fedorzh' date='2018-03-12T23:13:47Z'>
+		Ok, I can reproduce with CUDNN enabled...
+[Epoch 0] accuracy=0.101000
+[Epoch 0] accuracy=0.119300
+		</comment>
+		<comment id='13' author='fedorzh' date='2018-04-02T23:36:36Z'>
+		Is this supposed to take a really long time to run?  It takes many minutes...
+		</comment>
+		<comment id='14' author='fedorzh' date='2018-04-03T01:27:54Z'>
+		&lt;denchmark-link:https://github.com/cjolivier01&gt;@cjolivier01&lt;/denchmark-link&gt;
+
+The function  which converts gluon dataset to numpy takes awhile.
+		</comment>
+		<comment id='15' author='fedorzh' date='2018-08-20T22:51:05Z'>
+		I see that weights initialized are different for each run. To reproduce running below initialization and viewing the weights yields different weights.
+Taking a look.
+&lt;denchmark-code&gt;net.collect_params().initialize(mx.init.Xavier(magnitude=_xavier_magnitude), ctx=_ctx_list, force_reinit=True)
+
+net.collect_params()['resnetv21_conv0_weight'].data()
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-code&gt;[[[[  1.89611092e-02  -1.63955986e-02  -1.63183715e-02 ...,
+     -3.77857126e-03  -6.12869300e-03  -5.09519130e-04]
+   [  1.08407550e-02  -9.70634259e-03  -9.24655981e-03 ...,
+      7.88253173e-03   6.32613525e-03   5.58372587e-03]
+   [  1.66305602e-02  -3.11831571e-02   1.71868391e-02 ...,
+      1.45371221e-02  -2.16977187e-02   1.16131082e-03]
+   ..., 
+   [  8.47874209e-03  -1.09105334e-02   2.11738199e-02 ...,
+     -7.37845525e-03  -2.88667846e-02   5.60590997e-03]
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-code&gt;net.collect_params().initialize(mx.init.Xavier(magnitude=_xavier_magnitude), ctx=_ctx_list, force_reinit=True)
+
+net.collect_params()['resnetv21_conv0_weight'].data()
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-code&gt;[[[[  2.48766877e-02  -2.38284618e-02   2.93936618e-02 ...,
+     -2.53108982e-02   7.16960430e-03   3.47280316e-02]
+   [ -2.72196699e-02  -3.16641107e-03  -2.53057741e-02 ...,
+      2.93160938e-02  -2.12305132e-02   2.46996880e-02]
+   [ -1.13223270e-02   2.28771083e-02   4.12302464e-03 ...,
+      3.26776169e-02  -7.82233290e-03  -1.84644368e-02]
+   ..., 
+   [ -1.44652370e-02   4.28056717e-03   2.71088779e-02 ...,
+     -2.38894150e-02  -3.23100463e-02   1.61664635e-02]
+   [ -1.10932998e-02   2.97400393e-02  -2.46300120e-02 ...,
+      1.50449201e-03   2.24774107e-02   2.15285458e-02]
+   [ -2.22768262e-03  -1.62917320e-02   2.92964391e-02 ...,
+     -1.20998956e-02  -1.78815369e-02  -1.03423744e-03]]
+
+  [[  8.84681195e-03   2.98257805e-02  -1.20900013e-02 ...,
+      3.42116766e-02   2.25740559e-02  -1.45227127e-02]
+   [ -1.05716512e-02   2.59525068e-02  -2.16498077e-02 ...,
+     -2.18278579e-02   6.06125221e-03  -2.86707170e-02]
+   [  1.39616653e-02   7.52510503e-03  -2.09881701e-02 ...,
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='16' author='fedorzh' date='2018-08-21T18:33:20Z'>
+		Please ignore my previous comment. Thanks to Sina, for letting me know that seeding should happen just before the weight initialization to have deterministic behavior.
+I verified that the initial state of all parameters across both the runs are same.
+Sample code:
+&lt;denchmark-h:h2&gt;Run 1&lt;/denchmark-h&gt;
+
+&lt;denchmark-code&gt;mx.random.seed(42)
+w = gluon.parameter.Parameter('weight', shape = (3,3))
+w.initialize(init=mx.initializer.Xavier(magnitude=2.0), ctx=mx.gpu(0))
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-code&gt;[[ 0.53740764  0.4047128   0.09500974]
+ [ 0.10734546  0.21412051  0.81077886]
+ [ 0.39387202  0.0689261  -0.65652549]]
+&lt;NDArray 3x3 @cpu(0)&gt;
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h2&gt;Run 2&lt;/denchmark-h&gt;
+
+&lt;denchmark-code&gt;mx.random.seed(42)
+w.initialize(init=mx.initializer.Xavier(magnitude=2.0), ctx=mx.gpu(0), force_reinit=True)
+w.data()
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-code&gt;[[ 0.53740764  0.4047128   0.09500974]
+ [ 0.10734546  0.21412051  0.81077886]
+ [ 0.39387202  0.0689261  -0.65652549]]
+&lt;NDArray 3x3 @gpu(0)&gt;
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='17' author='fedorzh' date='2018-08-21T19:10:19Z'>
+		Verified that the non-determinism is brought in by cuDNN backward algorithms for Conv and Pooling operators. Results are consistent on CPU and GPU without cuDNN.
+This is expected behavior as per current MXNet implementation.
+See here for an open issue where there is discussion on providing an option for determinism - &lt;denchmark-link:https://github.com/apache/incubator-mxnet/issues/11341&gt;#11341&lt;/denchmark-link&gt;
+
+Please note that, enabling deterministic cuDNN algorithm significantly slows the computation - &lt;denchmark-link:https://docs.nvidia.com/deeplearning/sdk/cudnn-developer-guide/index.html#reproducibility&gt;https://docs.nvidia.com/deeplearning/sdk/cudnn-developer-guide/index.html#reproducibility&lt;/denchmark-link&gt;
+
+Resolving the issue here in favor of new feature request tracked at &lt;denchmark-link:https://github.com/apache/incubator-mxnet/issues/11341&gt;#11341&lt;/denchmark-link&gt;
+
+Please reopen if closed in error.
+		</comment>
+	</comments>
+</bug>

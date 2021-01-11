@@ -1,0 +1,165 @@
+<bug id='36430' author='dathudeptrai' open_date='2020-02-03T06:52:54Z' closed_time='2020-03-06T00:17:08Z'>
+	<summary>Bugs padding on Tensorflow Lite Converter</summary>
+	<description>
+System information
+
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Ubuntu 18.04, GPU GTX 1660
+TensorFlow installed from (source or binary): pip
+TensorFlow version (or github SHA if from source): 2.1.0
+
+Command used to run the converter or code if you’re using the Python API
+&lt;denchmark-code&gt;import torch
+import torch.nn.functional as F
+from torch.nn.utils import weight_norm
+import torch.nn as nn
+import numpy as np
+import os
+import tensorflow as tf
+import time
+
+# tf.compat.v1.disable_eager_execution()
+
+class TFReflectionPad1d(tf.keras.layers.Layer):
+    def __init__(self, padding_size):
+        super(TFReflectionPad1d, self).__init__()
+        self.padding_size = padding_size
+    
+    def call(self, x):
+        return tf.pad(x, [[0,0],[self.padding_size,self.padding_size],[0,0]], "REFLECT")
+    
+
+class TFUpsampleConv1d(tf.keras.layers.Layer):
+    def __init__(self, upsample_factor, filters, kernel_size,
+                 padding='same'):
+        super(TFUpsampleConv1d, self).__init__()
+        self.upsample1d = tf.keras.layers.UpSampling1D(size=upsample_factor)
+        self.conv1d = tf.keras.layers.Conv1D(filters=filters, kernel_size=kernel_size, padding=padding)
+    
+    def call(self, x):
+        x = self.upsample1d(x)
+        return self.conv1d(x)
+    
+    
+class TFResnetBlock(tf.keras.layers.Layer):
+    def __init__(self, dim, dilation=1):
+        super(TFResnetBlock, self).__init__()
+        self.block = [
+            tf.keras.layers.LeakyReLU(0.2),
+            TFReflectionPad1d(dilation),
+            tf.keras.layers.Conv1D(filters=dim, kernel_size=3, dilation_rate=dilation),
+            tf.keras.layers.LeakyReLU(0.2),
+            tf.keras.layers.Conv1D(filters=dim, kernel_size=1),
+        ]
+        self.shortcut = tf.keras.layers.Conv1D(filters=dim, kernel_size=1)
+    
+    def call(self, x):
+        _x = tf.identity(x)
+        for layer in self.block:
+            _x = layer(_x)
+        return self.shortcut(x) + _x
+
+class TFMelGANGenerator(tf.keras.layers.Layer):
+    def __init__(self, ngf, n_residual_layers):
+        super(TFMelGANGenerator, self).__init__()
+        ratios = [8,8,2,2]
+        self.hop_length = np.prod(ratios)
+        mult = int(2 ** len(ratios))
+        
+        model = [
+            TFReflectionPad1d(3),
+            tf.keras.layers.Conv1D(filters=mult * ngf, kernel_size=7, padding='valid')
+        ]
+        
+        for i, r in enumerate(ratios):
+            model += [
+                tf.keras.layers.LeakyReLU(0.2),
+                TFUpsampleConv1d(
+                    upsample_factor=r,
+                    filters=mult * ngf // 2,
+                    kernel_size=r * 2 - 1,
+                    padding='same'
+                )
+            ]
+            
+            for j in range(n_residual_layers):
+                model += [TFResnetBlock(dim=mult * ngf // 2, dilation=3 ** j)]
+            
+            mult //= 2
+
+        model += [
+            tf.keras.layers.LeakyReLU(0.2),
+            TFReflectionPad1d(3),
+            tf.keras.layers.Conv1D(filters=1, kernel_size=7, padding='valid'),
+            tf.keras.layers.Activation('tanh')
+        ]
+        self.model = tf.keras.models.Sequential(model)
+    
+    def call(self, x):
+        return self.model(x)
+
+inputs = tf.keras.Input(shape=[241, 80], dtype=tf.float32)
+audio = TFMelGANGenerator(ngf=32, n_residual_layers=3)(inputs)
+tf_melgan = tf.keras.models.Model(inputs, audio)
+
+converter = tf.lite.TFLiteConverter.from_keras_model(tf_melgan)
+converter.optimizations = [tf.lite.Optimize.OPTIMIZE_FOR_SIZE]
+converter.post_training_quantize = True
+converter.experimental_new_converter = True
+tflite_model = converter.convert()
+
+&lt;/denchmark-code&gt;
+
+Any other info / logs
+&lt;denchmark-code&gt;---------------------------------------------------------------------------
+ConverterError                            Traceback (most recent call last)
+&lt;ipython-input-58-d738e01cc59a&gt; in &lt;module&gt;()
+      3 converter.post_training_quantize = True
+      4 #converter.experimental_new_converter = True
+----&gt; 5 tflite_model = converter.convert()
+
+2 frames
+/usr/local/lib/python3.6/dist-packages/tensorflow_core/lite/python/convert.py in toco_convert_protos(model_flags_str, toco_flags_str, input_data_str, debug_info_str, enable_mlir_converter)
+    198       stdout = _try_convert_to_unicode(stdout)
+    199       stderr = _try_convert_to_unicode(stderr)
+--&gt; 200       raise ConverterError("See console for info.\n%s\n%s\n" % (stdout, stderr))
+    201   finally:
+    202     # Must manually cleanup files.
+
+ConverterError: See console for info.
+2020-02-03 06:48:15.223818: I tensorflow/lite/toco/graph_transformations/graph_transformations.cc:39] Before Removing unused ops: 303 operators, 48921 arrays (0 quantized)
+2020-02-03 06:48:17.886590: I tensorflow/lite/toco/graph_transformations/graph_transformations.cc:39] Before general graph transformations: 303 operators, 48921 arrays (0 quantized)
+2020-02-03 06:48:18.761673: I tensorflow/lite/toco/graph_transformations/identify_dilated_conv.cc:202] Replaced sub-network with Dilated Conv2D op outputting "model_4/tf_mel_gan_generator_4/sequential_4/tf_resnet_block_41/conv1d_149/conv1d".
+2020-02-03 06:48:18.783229: F tensorflow/lite/toco/graph_transformations/propagate_fixed_sizes.cc:118] Check failed: dim_x == dim_y (1928 vs. 1934)Dimensions must match
+Fatal Python error: Aborted
+
+Current thread 0x00007f7e2a8b8780 (most recent call first):
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow_core/lite/toco/python/toco_from_protos.py", line 52 in execute
+  File "/usr/local/lib/python3.6/dist-packages/absl/app.py", line 250 in _run_main
+  File "/usr/local/lib/python3.6/dist-packages/absl/app.py", line 299 in run
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow_core/python/platform/app.py", line 40 in run
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow_core/lite/toco/python/toco_from_protos.py", line 89 in main
+  File "/usr/local/bin/toco_from_protos", line 8 in &lt;module&gt;
+Aborted (core dumped)
+
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='dathudeptrai' date='2020-02-03T06:54:53Z'>
+		Hi, the bug happened when audio = TFMelGANGenerator(ngf=32, n_residual_layers=3)(inputs). But when n_residual_layers=1, it's still ok to convert. So i guess that there is a problem with dilation or tf.pad
+		</comment>
+		<comment id='2' author='dathudeptrai' date='2020-02-05T10:50:47Z'>
+		&lt;denchmark-link:https://github.com/jvishnuvardhan&gt;@jvishnuvardhan&lt;/denchmark-link&gt;
+ any update?
+		</comment>
+		<comment id='3' author='dathudeptrai' date='2020-03-05T21:18:16Z'>
+		&lt;denchmark-link:https://github.com/dathudeptrai&gt;@dathudeptrai&lt;/denchmark-link&gt;
+ I think this was resolved in recent . Can you please check the &lt;denchmark-link:https://colab.sandbox.google.com/gist/jvishnuvardhan/f734059f02e2d2aad44327775e0f8686/36430.ipynb&gt;gist here&lt;/denchmark-link&gt;
+. When I ran your code with , I cannot reproduce the error.
+Please run yourself and let us know whether it resolved for you or not. If it was resolved, please feel free to close the issue. thanks!
+		</comment>
+		<comment id='4' author='dathudeptrai' date='2020-03-06T00:17:05Z'>
+		Thanks, it fixed.
+		</comment>
+	</comments>
+</bug>

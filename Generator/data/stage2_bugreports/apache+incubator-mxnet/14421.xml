@@ -1,0 +1,161 @@
+<bug id='14421' author='jmerkow' open_date='2019-03-13T18:58:52Z' closed_time='2019-06-27T01:47:28Z'>
+	<summary>Updating mxnet from 1.0.0, networks give different outputs</summary>
+	<description>
+I am working in a production environment, where have some networks implemented in mxnet 1.0.0. I am working updating our systems and trying to push to the latest mxnet (1.4.x as of now) but when we upgrade our networks produce different outputs.
+We are using symbols saved to json files and arg/aux_params stored in .params files. these were all produced by mxnet 1.0.0 or earlier.
+When using the latest mxnet (or 1.4.x) we are getting different outputs for the same inputs, with our saved models. I have been trying to use git bisect or slowly upgrading versions to figure out where this breaking change occurred but there are issues with your git history and/or some strange (compiler??) incompatibilities which prevent getting a clean checkout/build for nearly all of the intermediate versions…
+These are VERY different outputs, im rounding to about the 5 decimal point, or higher, so these aren’t numerical differences.
+And we are using modules, not gluons (part of the point is upgrade and move towards gluons)
+Does anyone have any idea what could be causing this? Or what to look into to solve it?
+	</description>
+	<comments>
+		<comment id='1' author='jmerkow' date='2019-03-13T18:58:56Z'>
+		Hey, this is the MXNet Label Bot.
+Thank you for submitting the issue! I will try and suggest some labels so that the appropriate MXNet community members can help resolve it.
+Here are my recommended labels: Bug
+		</comment>
+		<comment id='2' author='jmerkow' date='2019-03-14T00:30:41Z'>
+		Do you have a sample model which can be shared to reproduce this? There is a backwards compatibility checker for models as part of the nightly pipeline. It trains models on earlier releases and checks for consistency on the latest builds. It's possible there is an edge case which is being missed.
+&lt;denchmark-link:https://github.com/mxnet-label-bot&gt;@mxnet-label-bot&lt;/denchmark-link&gt;
+ add [Pending Requestor Info, Bug]
+		</comment>
+		<comment id='3' author='jmerkow' date='2019-03-17T19:37:03Z'>
+		Could I run the tool and pass the output instead?
+I need to run down some checks first as well...  I want to:
+
+make sure the weights are the same after being loaded
+that there were no changes to any of the functions used for batch transform on the MXNet side (i.e. resize_short, center_crop, etc).
+
+		</comment>
+		<comment id='4' author='jmerkow' date='2019-03-19T05:51:28Z'>
+		How do you use your model to inference? If you are using mx.module, please make sure the parameter for_training is set to be 0.
+		</comment>
+		<comment id='5' author='jmerkow' date='2019-04-11T19:44:03Z'>
+		&lt;denchmark-link:https://github.com/jmerkow&gt;@jmerkow&lt;/denchmark-link&gt;
+ The tool does save and load the same weights and checks the forward pass on the model.
+It does not check in the intermediate layers in the model graph.
+		</comment>
+		<comment id='6' author='jmerkow' date='2019-05-20T16:22:39Z'>
+		Ok I am working on this again.
+I've checked that the parameter files are the same. i.e. something like this:
+&lt;denchmark-code&gt;## in a docker with mx1.4.0 loaded
+np_arg_params = {key: value.asnumpy() for key, value in arg_params.items()}
+np.save('mx140.npy', np_arg_params)
+...
+
+## in another docker with mx100 loaded
+import numpy as np
+np_arg_params2 = np.load('../140/mx140.npy')[()]
+assert set(np_arg_params2.keys()).difference(np_arg_params.keys()) == set()
+assert set(np_arg_params.keys()).difference(np_arg_params2.keys()) == set()
+assert all((np_arg_params[k]-np_arg_params2[k]).sum() ==0 for k in np_arg_params.keys())
+&lt;/denchmark-code&gt;
+
+I double checked that the actual input to the image is the same (after transforms etc).
+We use the module doing something like this:
+&lt;denchmark-code&gt;        mod.forward(batch) # batch is basically a named tuple with an NDArray at batch.data
+        output = mod.get_outputs()[0].asnumpy() 
+&lt;/denchmark-code&gt;
+
+EDIT: Ok I went through and save the outputs of each layer, and I tracked down the first output that has a difference and its a run-of-the-mill 2D convolution layer:
+&lt;denchmark-code&gt;[{u'attr': {u'kernel': u'(3, 3)',
+   u'no_bias': u'True',
+   u'num_filter': u'96',
+   u'pad': u'(0, 0)',
+   u'stride': u'(1, 1)'},
+  u'inputs': [[42, 0, 0], [43, 0, 0]],
+  u'name': u'in_stem_conv6_3*3_conv2d',
+  u'op': u'Convolution'}]
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-link:https://github.com/Piyush3dB&gt;@Piyush3dB&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/andrewfayres&gt;@andrewfayres&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='7' author='jmerkow' date='2019-05-20T17:54:16Z'>
+		Doing some more analysis, it looks like there are some differences at the convolution layer described above, but the changes are relatively minor. However, there is a global pooling layer at the end of the network which seems to have a VERY VERY large difference.  I'm using the following to calculate error:
+&lt;denchmark-code&gt;for n in layers:
+    x, y = output[n], mx140_outputs[n]
+    print(n, np.mean([np.abs(((xi-yi)/(xi+1e-10)).sum()) for xi, yi in zip(x,y)]))
+&lt;/denchmark-code&gt;
+
+the error values are all less than 0.1, except after the global pooling layer i get global_avgpool_output 8.13365e+11
+Was there some change to global pooling that would cause this?
+&lt;denchmark-code&gt;{u'attr': {u'global_pool': u'True',
+   u'kernel': u'(8, 8)',
+   u'pad': u'(1, 1)',
+   u'pool_type': u'avg'},
+  u'inputs': [[1229, 0, 0]],
+  u'name': u'global_avgpool',
+  u'op': u'Pooling'}
+&lt;/denchmark-code&gt;
+
+Also looking at the network itself, the layer going into the global pool is 5x5, but the kernel is set to 8x8.
+		</comment>
+		<comment id='8' author='jmerkow' date='2019-05-20T18:58:03Z'>
+		Ok I may have figured it out.
+It appears that now global pooling ignores padding (including Pooling_v1). If i set padding=0 on the global pooling layer i get the same values (incorrect) in mx 1.0.0 as mx 1.4.0.  Is there a way to prevent this?
+I'd like pooling to use the padding values when calculating the global pool.
+&lt;denchmark-link:https://github.com/Piyush3dB&gt;@Piyush3dB&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/andrewfayres&gt;@andrewfayres&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='9' author='jmerkow' date='2019-05-20T19:37:45Z'>
+		Here is a small example that you can use to reproduce the issue:
+Code:
+&lt;denchmark-code&gt;import mxnet as mx
+class Batch(object):
+    def __init__(self, data):
+        self.data = data
+    def get_batch_shape(self):
+        return tuple(self.data[0].shape)
+
+data = mx.sym.Variable('data')
+gpool = mx.sym.Pooling(data, name='gpooling', global_pool=True, pad=(1,1), pool_type='avg', kernel=(8,8))
+mod = mx.mod.Module(gpool, context=mx.gpu(0), label_names=[])
+data = Batch([mx.ndarray.ones((1, 3, 5, 5))])
+mod.bind(for_training=True, force_rebind=True, data_shapes=[('data', data.get_batch_shape())],)
+mod.init_params()
+mod.forward(data)
+print(mod.get_outputs()[0].asnumpy().squeeze().tolist())
+&lt;/denchmark-code&gt;
+
+MX 1.0.0 output:
+
+[0.6399999856948853, 0.6399999856948853, 0.6399999856948853]
+
+MX 1.4.0 output:
+
+[1.0, 1.0, 1.0]
+
+This appears to be a bug with &lt;denchmark-link:https://github.com/apache/incubator-mxnet/pull/9730&gt;#9730&lt;/denchmark-link&gt;
+...
+		</comment>
+		<comment id='10' author='jmerkow' date='2019-06-14T20:47:06Z'>
+		So the correct behaviour is the new behaviour, are you requesting a flag to have the option to use the old incorrect behaviour?
+		</comment>
+		<comment id='11' author='jmerkow' date='2019-06-14T22:01:54Z'>
+		I think this is the correct behaviour for global average pooling. I don't see why you would want to use global average pooling with the buggy behaviour. After looking into this,  I would suggest to close this issue. Also per the documentation using global pooling with reset the kernel size to the full image. Also padding is not considered with using global pooling.
+		</comment>
+		<comment id='12' author='jmerkow' date='2019-06-17T18:14:51Z'>
+		I think this is the first paper that proposed global pooling. &lt;denchmark-link:https://arxiv.org/abs/1312.4400&gt;https://arxiv.org/abs/1312.4400&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='13' author='jmerkow' date='2019-06-17T18:22:46Z'>
+		&lt;denchmark-link:https://github.com/larroy&gt;@larroy&lt;/denchmark-link&gt;
+. It’s not about correct behavior. Networks already trained with the buggy behavior will not work after updating. I was looking for a work around so we could update and without retraining. We have a number of networks trained with the buggy behavior in production. So this is effectively blocking us from upgrading. If you want to close the PR that’s fine, unless there is a reason to it might be good to leave around so people can use it if they have the same issues
+		</comment>
+		<comment id='14' author='jmerkow' date='2019-06-17T22:34:22Z'>
+		I understand your problem, I'm sorry that this bug caused you problems when updating to more recent versions, I haven't had notice of other users being affected by this. Would you be willing to make a contribution to support having the old behavior? This could be a path forward for your case. Unfortunately like every resource, our energy is limited and we have to pick our battles, this seems like a corner case and how unfortunate as is I don't think we can dedicate efforts in supporting a past buggy behaviour for such an old version. If I may ask, why can't you retrain with a more recent version?
+		</comment>
+		<comment id='15' author='jmerkow' date='2019-06-18T20:09:06Z'>
+		&lt;denchmark-link:https://github.com/larroy&gt;@larroy&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/apache/incubator-mxnet/pull/15026&gt;#15026&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='16' author='jmerkow' date='2019-06-27T01:47:28Z'>
+		Closing this issue as discussed in the PR &lt;denchmark-link:https://github.com/apache/incubator-mxnet/pull/15026&gt;#15026&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

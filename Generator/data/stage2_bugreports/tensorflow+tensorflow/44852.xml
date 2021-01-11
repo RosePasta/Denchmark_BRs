@@ -1,0 +1,102 @@
+<bug id='44852' author='Sidong-Wei' open_date='2020-11-13T18:06:58Z' closed_time='2020-12-09T14:07:05Z'>
+	<summary>`GetIntPtr` in `tensorflow/lite/tools/verifier.cc` do not get correct value on Big Endian machine</summary>
+	<description>
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): N
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Linux Ubuntu 20.04
+Mobile device (e.g. iPhone 8, Pixel 2, Samsung Galaxy) if the issue happens on mobile device: N/A
+TensorFlow installed from (source or binary): source
+TensorFlow version (use command below): 2.3.1
+Python version: 3.8.5
+Bazel version (if compiling from source): 3.1.0
+GCC/Compiler version (if compiling from source): gcc (Ubuntu 9.3.0-17ubuntu1~20.04) 9.3.0
+CUDA/cuDNN version: N/A
+GPU model and memory: N/A
+
+
+The &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/master/tensorflow/lite/tools/verifier.cc#L53&gt;GetIntPtr&lt;/denchmark-link&gt;
+ in  is retrieving the  value from a typed  buffer. However, since flatbuffers always stores the data in Little Endian format regardless of host machine endianness, the direct  call will retrieve the wrong value on Big Endian platforms (as  will assume the data is in host endianness), so the retrieved value needs to be byte-swapped.
+Describe the expected behavior
+GetIntPtr function should byteswap the value on Big Endian platform.
+Standalone code to reproduce the issue
+&lt;denchmark-code&gt;bazel test --host_javabase="@local_jdk//:jdk" --cache_test_results=no --build_tests_only --test_output=errors -- //tensorflow/lite/tools:verifier_test
+&lt;/denchmark-code&gt;
+
+This test will fail due to this reason on Big Endian systems.
+Other info / logs
+Usually, to solve this issue we could simply add a guard for __ORDER_BIG_ENDIAN__ and byteswap accordingly. The issue here is that the input type is const char* and the output type is const uint32_t*. Apparently, we do not want to make the change in-place, so at least we need to get a copy of the data then byteswap it and return it. Also, since we need to return a pointer, we have to allocate a new variable then return the address of it. The change could look like:
+diff --git a/tensorflow/lite/tools/verifier.cc b/tensorflow/lite/tools/verifier.cc
+index 1d0b813a2c..063246dcf2 100644
+--- a/tensorflow/lite/tools/verifier.cc
++++ b/tensorflow/lite/tools/verifier.cc
+@@ -40,7 +40,13 @@ void ReportError(ErrorReporter* error_reporter, const char* format, ...) {
+ 
+ // Returns the int32_t value pointed by ptr.
+ const uint32_t* GetIntPtr(const char* ptr) {
++#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
++  uint32_t ret_val = flatbuffers::EndianScalar(*reinterpret_cast&lt;const uint32_t*&gt;(ptr));
++  const uint32_t ret = &amp;ret_val;
++  return ret;
++#else
+   return reinterpret_cast&lt;const uint32_t*&gt;(ptr);
++#endif
+ }
+ 
+ // Verifies flatbuffer format of the model contents and returns the in-memory
+The problem with this approach is the local variable ret_val will not live long enough for its value to be retrieved - so what we can get from *GetIntPtr(buffer_ptr) is basically a deallocated memory space. Since it is unavoidable that we need to allocate new memory space, we have to make it outlive the function call. I also tried static uint32_t ret_val, and it worked for the first function call but fail for the following ones. Seems like the const uint32_t* return type makes the compiler believe static uint32_t ret_val is const after the first call.
+Due to these reasons, seems like we could not make a simple modification to the function GetIntPtr() to fix the issue; it seems that we have to take care of the issue every time the function is called (by either create a new static variable for each function call or simply deal with the value manually after the function returns) if we keep the current signature of the function.
+However, I do have another solution here, which is to change the return type from const uint32_t* to const uint32_t. This change is applicable because this function is only used within verifier.cc, and every time it is called we simply need the value of it (i.e. we only need *GetIntPtr(buffer_ptr)). So it actually does not incur any issue if we make the change. The endianness issue will also be easily solved by something like this (plus change from *GetIntPtr to GetIntPtr wherever it is called):
+diff --git a/tensorflow/lite/tools/verifier.cc b/tensorflow/lite/tools/verifier.cc
+index 1d0b813a2c..bb71f1228e 100644
+--- a/tensorflow/lite/tools/verifier.cc
++++ b/tensorflow/lite/tools/verifier.cc
+@@ -39,8 +39,12 @@ void ReportError(ErrorReporter* error_reporter, const char* format, ...) {
+ }
+ 
+ // Returns the int32_t value pointed by ptr.
+-const uint32_t* GetIntPtr(const char* ptr) {
+-  return reinterpret_cast&lt;const uint32_t*&gt;(ptr);
++const uint32_t GetIntPtr(const char* ptr) {
++#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
++  return flatbuffers::EndianScalar(*reinterpret_cast&lt;const uint32_t*&gt;(ptr));
++#else
++  return *reinterpret_cast&lt;const uint32_t*&gt;(ptr);
++#endif
+ }
+ 
+ // Verifies flatbuffer format of the model contents and returns the in-memory
+I could submit a PR for such a change if it is considered valid, and I will appreciate it if there are any other simple solutions or suggestions.
+	</description>
+	<comments>
+		<comment id='1' author='Sidong-Wei' date='2020-11-14T12:44:10Z'>
+		I think that a PR is ok.
+		</comment>
+		<comment id='2' author='Sidong-Wei' date='2020-11-16T16:32:14Z'>
+		Hi Sidong,
+I think the second approach makes sense. A PR will be appreciated.
+Thanks,
+Tiezhen
+		</comment>
+		<comment id='3' author='Sidong-Wei' date='2020-11-16T16:38:08Z'>
+		Thanks for the feedback, I will initiate a PR shortly after.
+		</comment>
+		<comment id='4' author='Sidong-Wei' date='2020-11-25T15:26:03Z'>
+		This issue has been automatically marked as stale because it has not had recent activity. It will be closed if no further activity occurs. Thank you.
+		</comment>
+		<comment id='5' author='Sidong-Wei' date='2020-11-25T15:37:13Z'>
+		PR has been initiated: &lt;denchmark-link:https://github.com/tensorflow/tensorflow/pull/45010&gt;#45010&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='6' author='Sidong-Wei' date='2020-12-09T14:07:05Z'>
+		Close the issue as PR has been merged.
+		</comment>
+		<comment id='7' author='Sidong-Wei' date='2020-12-09T14:07:07Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/44852&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/44852&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

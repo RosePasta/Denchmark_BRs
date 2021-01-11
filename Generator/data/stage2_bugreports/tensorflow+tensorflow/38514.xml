@@ -1,0 +1,332 @@
+<bug id='38514' author='goyalankit' open_date='2020-04-14T01:15:52Z' closed_time='2020-08-21T07:38:05Z'>
+	<summary>tf.keras.callbacks.ModelCheckpoint fails in distributed Parameter Server Strategy</summary>
+	<description>
+System information
+
+Have I written custom code (as opposed to using a stock
+example script provided in TensorFlow): Yes
+OS Platform and Distribution (e.g.,
+Linux Ubuntu 16.04): Linux RHEL 7
+TensorFlow installed from (source or
+binary): - TensorFlow version (use command below): 2.1
+
+Describe the current behavior
+tf.keras.callbacks.ModelCheckpoint callback fails to save the model if the parameter server doesn't have access to the checkpoint location of other workers. And the location for workers other than chief worker, cannot be configured to a remote filesystem (e.g., hdfs)
+Describe the expected behavior
+The callback should be able to save the model if running on different machines using shared storage. I am not sure if the shared storage should be a requirement either.
+Standalone code to reproduce the issue
+
+Create model.py provided below
+Run the model.py in two terminals.
+
+Terminal 1: Simply execute the model.py with the shown args.
+Terminal 2: Run the unshare command to separate the mount namespace.
+optional:
+Instead of running on the same machine, you can also run the given script on two separate machines. All you'd have to do this is change TF_CONFIG in the model.py. Then you wouldn't need to separate the mount namespace.
+
+
+
+model.py
+import os
+import pprint
+import sys
+import json
+import tensorflow as tf
+import tensorflow_datasets as tfds
+
+tf.compat.v1.disable_eager_execution()
+
+node_attr = sys.argv[1]
+name = node_attr[:-1]
+index = node_attr[-1]
+os.environ['CUDA_VISIBLE_DEVICES']='-1'
+
+os.environ['TF_CONFIG'] = json.dumps({"cluster": {"worker": ["localhost:5773"], "ps": ["localhost:5711"]}, "task": {"type": name, "index": int(index)}})
+strategy = tf.distribute.experimental.ParameterServerStrategy()
+
+# Uncomment below for multi worker mirror strategy.
+#os.environ['TF_CONFIG'] = json.dumps({"cluster": {"worker": ["localhost:5773", "localhost:6778"]}, "task": {"type": name, "index": int(index)}})
+#strategy = tf.distribute.experimental.MultiWorkerMirroredStrategy()
+
+mnist = tf.keras.datasets.mnist
+
+(x_train, y_train), (x_test, y_test) = mnist.load_data()
+x_train, x_test = x_train / 255.0, x_test / 255.0
+
+def input_fn(mode):
+    datasets, info = tfds.load(name='mnist', with_info=True, as_supervised=True)
+    mnist_dataset = (
+        datasets['train'] if mode == 'train' else datasets['test']
+    )
+    def scale(image, label):
+        image = tf.cast(image, tf.float32)
+        image /= 255
+        return image, label
+
+    return mnist_dataset.map(scale).cache().repeat(2).shuffle(10000).batch(4)
+
+def build_and_compile_cnn_model():
+    model = tf.keras.Sequential([
+        tf.keras.layers.Conv2D(32, 3, activation='relu', input_shape=(28, 28, 1)),
+        tf.keras.layers.MaxPooling2D(),
+        tf.keras.layers.Flatten(),
+        tf.keras.layers.Dense(64, activation='relu'),
+        tf.keras.layers.Dense(10)
+    ])
+    model.compile(
+        loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+        optimizer=tf.keras.optimizers.SGD(learning_rate=0.001),
+        metrics=['accuracy'])
+    return model
+
+def main():
+    tf_config = json.loads(os.environ['TF_CONFIG'])
+    job_name = tf_config['task']['type']
+    job_index = tf_config['task']['index']
+
+    if job_name == 'ps':
+        server = tf.distribute.Server(
+            tf_config['cluster'], job_name=job_name, task_index=job_index
+        )
+        server.join()
+    else:
+      train_dataset = input_fn('train')
+      ckpt_full_path = os.path.join(sys.argv[2], 'model.ckpt-{epoch:04d}')
+      callbacks = [
+          tf.keras.callbacks.ModelCheckpoint(ckpt_full_path, save_weights_only=True, verbose=1, save_freq=1),
+      ]
+
+      options = tf.data.Options()
+      options.experimental_distribute.auto_shard_policy = tf.data.experimental.AutoShardPolicy.OFF
+      train_datasets_no_auto_shard = train_dataset.with_options(options)
+
+      with strategy.scope():
+        model = build_and_compile_cnn_model()
+      model.fit(x=train_datasets_no_auto_shard, epochs=3,steps_per_epoch=3, callbacks=callbacks)
+
+if __name__ == '__main__':
+    main()
+Steps to reproduce:
+1st terminal
+&lt;denchmark-code&gt;$ python model.py worker0 /tmp
+WARNING:tensorflow:`eval_fn` is not passed in. The `worker_fn` will be used if an "evaluator" task exists in the cluster.
+WARNING:tensorflow:`eval_fn` is not passed in. The `worker_fn` will be used if an "evaluator" task exists in the cluster.
+WARNING:tensorflow:`eval_strategy` is not passed in. No distribution strategy will be used for evaluation.
+WARNING:tensorflow:`eval_strategy` is not passed in. No distribution strategy will be used for evaluation.
+2020-04-13 18:11:00.844880: I tensorflow/core/distributed_runtime/worker.cc:204] Cancellation requested for RunGraph.
+Train on 3 steps
+Epoch 1/3
+
+Epoch 00001: saving model to /tmp/checkpoints/model.ckpt-0001
+Traceback (most recent call last):
+  File "/home/angoyal/ws/scratch/myvenv/lib/python3.7/site-packages/tensorflow_core/python/client/session.py", line 1367, in _do_call
+    return fn(*args)
+  File "/home/angoyal/ws/scratch/myvenv/lib/python3.7/site-packages/tensorflow_core/python/client/session.py", line 1352, in _run_fn
+    target_list, run_metadata)
+  File "/home/angoyal/ws/scratch/myvenv/lib/python3.7/site-packages/tensorflow_core/python/client/session.py", line 1445, in _call_tf_sessionrun
+    run_metadata)
+tensorflow.python.framework.errors_impl.NotFoundError: From /job:ps/replica:0/task:0:
+/tmp/checkpoints/model.ckpt-0001_temp_8b7417c3f79f449f87c2218bde68999d; No such file or directory
+	 [[{{node SaveV2}}]]
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "model.py", line 87, in &lt;module&gt;
+    main()
+  File "model.py", line 83, in main
+    model.fit(x=train_datasets_no_auto_shard, epochs=3,steps_per_epoch=3, callbacks=callbacks)
+  File "/home/angoyal/ws/scratch/myvenv/lib/python3.7/site-packages/tensorflow_core/python/keras/engine/training.py", line 819, in fit
+    use_multiprocessing=use_multiprocessing)
+  File "/home/angoyal/ws/scratch/myvenv/lib/python3.7/site-packages/tensorflow_core/python/keras/engine/training_distributed.py", line 790, in fit
+    *args, **kwargs)
+  File "/home/angoyal/ws/scratch/myvenv/lib/python3.7/site-packages/tensorflow_core/python/keras/engine/training_distributed.py", line 777, in wrapper
+    mode=dc.CoordinatorMode.INDEPENDENT_WORKER)
+  File "/home/angoyal/ws/scratch/myvenv/lib/python3.7/site-packages/tensorflow_core/python/distribute/distribute_coordinator.py", line 853, in run_distribute_coordinator
+    task_id, session_config, rpc_layer)
+  File "/home/angoyal/ws/scratch/myvenv/lib/python3.7/site-packages/tensorflow_core/python/distribute/distribute_coordinator.py", line 360, in _run_single_worker
+    return worker_fn(strategy)
+  File "/home/angoyal/ws/scratch/myvenv/lib/python3.7/site-packages/tensorflow_core/python/keras/engine/training_distributed.py", line 772, in _worker_fn
+    return method(model, **kwargs)
+  File "/home/angoyal/ws/scratch/myvenv/lib/python3.7/site-packages/tensorflow_core/python/keras/engine/training_distributed.py", line 685, in fit
+    steps_name='steps_per_epoch')
+  File "/home/angoyal/ws/scratch/myvenv/lib/python3.7/site-packages/tensorflow_core/python/keras/engine/training_arrays.py", line 352, in model_iteration
+    callbacks._call_batch_hook(mode, 'end', step, batch_logs)
+  File "/home/angoyal/ws/scratch/myvenv/lib/python3.7/site-packages/tensorflow_core/python/keras/callbacks.py", line 239, in _call_batch_hook
+    batch_hook(batch, logs)
+  File "/home/angoyal/ws/scratch/myvenv/lib/python3.7/site-packages/tensorflow_core/python/keras/callbacks.py", line 528, in on_train_batch_end
+    self.on_batch_end(batch, logs=logs)
+  File "/home/angoyal/ws/scratch/myvenv/lib/python3.7/site-packages/tensorflow_core/python/keras/callbacks.py", line 977, in on_batch_end
+    self._save_model(epoch=self._current_epoch, logs=logs)
+  File "/home/angoyal/ws/scratch/myvenv/lib/python3.7/site-packages/tensorflow_core/python/keras/callbacks.py", line 1038, in _save_model
+    self.model.save_weights(filepath, overwrite=True)
+  File "/home/angoyal/ws/scratch/myvenv/lib/python3.7/site-packages/tensorflow_core/python/keras/engine/network.py", line 1123, in save_weights
+    self._trackable_saver.save(filepath, session=session)
+  File "/home/angoyal/ws/scratch/myvenv/lib/python3.7/site-packages/tensorflow_core/python/training/tracking/util.py", line 1177, in save
+    return session.run(save_path, feed_dict=feed_dict)
+  File "/home/angoyal/ws/scratch/myvenv/lib/python3.7/site-packages/tensorflow_core/python/client/session.py", line 960, in run
+    run_metadata_ptr)
+  File "/home/angoyal/ws/scratch/myvenv/lib/python3.7/site-packages/tensorflow_core/python/client/session.py", line 1183, in _run
+    feed_dict_tensor, options, run_metadata)
+  File "/home/angoyal/ws/scratch/myvenv/lib/python3.7/site-packages/tensorflow_core/python/client/session.py", line 1361, in _do_run
+    run_metadata)
+  File "/home/angoyal/ws/scratch/myvenv/lib/python3.7/site-packages/tensorflow_core/python/client/session.py", line 1386, in _do_call
+    raise type(e)(node_def, op, message)
+tensorflow.python.framework.errors_impl.NotFoundError: From /job:ps/replica:0/task:0:
+/tmp/checkpoints/model.ckpt-0001_temp_8b7417c3f79f449f87c2218bde68999d; No such file or directory
+	 [[node SaveV2 (defined at model.py:83) ]]
+
+Errors may have originated from an input operation.
+Input Source operations connected to node SaveV2:
+ dense/kernel/Read/ReadVariableOp (defined at model.py:48)	
+ training/SGD/decay/Read/ReadVariableOp (defined at /export/apps/python/3.7/lib/python3.7/threading.py:926)
+
+Original stack trace for 'SaveV2':
+  File "model.py", line 87, in &lt;module&gt;
+    main()
+  File "model.py", line 83, in main
+    model.fit(x=train_datasets_no_auto_shard, epochs=3,steps_per_epoch=3, callbacks=callbacks)
+  File "/home/angoyal/ws/scratch/myvenv/lib/python3.7/site-packages/tensorflow_core/python/keras/engine/training.py", line 819, in fit
+    use_multiprocessing=use_multiprocessing)
+  File "/home/angoyal/ws/scratch/myvenv/lib/python3.7/site-packages/tensorflow_core/python/keras/engine/training_distributed.py", line 790, in fit
+    *args, **kwargs)
+  File "/home/angoyal/ws/scratch/myvenv/lib/python3.7/site-packages/tensorflow_core/python/keras/engine/training_distributed.py", line 777, in wrapper
+    mode=dc.CoordinatorMode.INDEPENDENT_WORKER)
+  File "/home/angoyal/ws/scratch/myvenv/lib/python3.7/site-packages/tensorflow_core/python/distribute/distribute_coordinator.py", line 853, in run_distribute_coordinator
+    task_id, session_config, rpc_layer)
+  File "/home/angoyal/ws/scratch/myvenv/lib/python3.7/site-packages/tensorflow_core/python/distribute/distribute_coordinator.py", line 360, in _run_single_worker
+    return worker_fn(strategy)
+  File "/home/angoyal/ws/scratch/myvenv/lib/python3.7/site-packages/tensorflow_core/python/keras/engine/training_distributed.py", line 772, in _worker_fn
+    return method(model, **kwargs)
+  File "/home/angoyal/ws/scratch/myvenv/lib/python3.7/site-packages/tensorflow_core/python/keras/engine/training_distributed.py", line 685, in fit
+    steps_name='steps_per_epoch')
+  File "/home/angoyal/ws/scratch/myvenv/lib/python3.7/site-packages/tensorflow_core/python/keras/engine/training_arrays.py", line 352, in model_iteration
+    callbacks._call_batch_hook(mode, 'end', step, batch_logs)
+  File "/home/angoyal/ws/scratch/myvenv/lib/python3.7/site-packages/tensorflow_core/python/keras/callbacks.py", line 239, in _call_batch_hook
+    batch_hook(batch, logs)
+  File "/home/angoyal/ws/scratch/myvenv/lib/python3.7/site-packages/tensorflow_core/python/keras/callbacks.py", line 528, in on_train_batch_end
+    self.on_batch_end(batch, logs=logs)
+  File "/home/angoyal/ws/scratch/myvenv/lib/python3.7/site-packages/tensorflow_core/python/keras/callbacks.py", line 977, in on_batch_end
+    self._save_model(epoch=self._current_epoch, logs=logs)
+  File "/home/angoyal/ws/scratch/myvenv/lib/python3.7/site-packages/tensorflow_core/python/keras/callbacks.py", line 1038, in _save_model
+    self.model.save_weights(filepath, overwrite=True)
+  File "/home/angoyal/ws/scratch/myvenv/lib/python3.7/site-packages/tensorflow_core/python/keras/engine/network.py", line 1123, in save_weights
+    self._trackable_saver.save(filepath, session=session)
+  File "/home/angoyal/ws/scratch/myvenv/lib/python3.7/site-packages/tensorflow_core/python/training/tracking/util.py", line 1168, in save
+    file_prefix=file_prefix_tensor, object_graph_tensor=object_graph_tensor)
+  File "/home/angoyal/ws/scratch/myvenv/lib/python3.7/site-packages/tensorflow_core/python/training/tracking/util.py", line 1116, in _save_cached_when_graph_building
+    save_op = saver.save(file_prefix)
+  File "/home/angoyal/ws/scratch/myvenv/lib/python3.7/site-packages/tensorflow_core/python/training/saving/functional_saver.py", line 230, in save
+    sharded_saves.append(saver.save(shard_prefix))
+  File "/home/angoyal/ws/scratch/myvenv/lib/python3.7/site-packages/tensorflow_core/python/training/saving/functional_saver.py", line 72, in save
+    return io_ops.save_v2(file_prefix, tensor_names, tensor_slices, tensors)
+  File "/home/angoyal/ws/scratch/myvenv/lib/python3.7/site-packages/tensorflow_core/python/ops/gen_io_ops.py", line 1717, in save_v2
+    name=name)
+  File "/home/angoyal/ws/scratch/myvenv/lib/python3.7/site-packages/tensorflow_core/python/framework/op_def_library.py", line 742, in _apply_op_helper
+    attrs=attr_protos, op_def=op_def)
+  File "/home/angoyal/ws/scratch/myvenv/lib/python3.7/site-packages/tensorflow_core/python/framework/ops.py", line 3322, in _create_op_internal
+    op_def=op_def)
+  File "/home/angoyal/ws/scratch/myvenv/lib/python3.7/site-packages/tensorflow_core/python/framework/ops.py", line 1756, in __init__
+    self._traceback = tf_stack.extract_stack()
+
+Exception ignored in: &lt;function Server.__del__ at 0x7f4457191320&gt;
+Traceback (most recent call last):
+  File "/home/angoyal/ws/scratch/myvenv/lib/python3.7/site-packages/tensorflow_core/python/training/server_lib.py", line 158, in __del__
+AttributeError: 'NoneType' object has no attribute 'UnimplementedError'
+&lt;/denchmark-code&gt;
+
+2nd terminal
+&lt;denchmark-code&gt;# isolate the mount namespace
+$ unshare --mount
+$ mkdir newtmp; mount --bind ./newtmp /tmp
+$ python model.py ps0 /tmp
+...
+...
+2020-04-13 18:04:37.871417: I tensorflow/core/distributed_runtime/rpc/grpc_channel.cc:300] Initialize GrpcChannelCache for job ps -&gt; {0 -&gt; localhost:5711}
+2020-04-13 18:04:37.871485: I tensorflow/core/distributed_runtime/rpc/grpc_channel.cc:300] Initialize GrpcChannelCache for job worker -&gt; {0 -&gt; localhost:5773}
+2020-04-13 18:04:37.872330: I tensorflow/core/distributed_runtime/rpc/grpc_server_lib.cc:390] Started server with target: grpc://localhost:5711
+2020-04-13 18:09:31.762295: W tensorflow/core/framework/op_kernel.cc:1655] OP_REQUIRES failed at save_restore_v2_ops.cc:109 : Not found: /tmp/checkpoints/model.ckpt-0001_temp_64dd8f8a454a4a28b378ce888c66219e; No such file or directory
+&lt;/denchmark-code&gt;
+
+Other info / logs Include any logs or source code that would be helpful to
+diagnose the problem. If including tracebacks, please include the full
+traceback. Large logs and files should be attached.
+
+It works fine with MultiWorkerMirrorStrategy
+Even if we wanted to give shared access through HDFS, It doesn't work. It tries to write to a /tmp location on workers other than chief.
+It does work if all the workers and ps are running on the same machine with local filesystem access.
+
+	</description>
+	<comments>
+		<comment id='1' author='goyalankit' date='2020-04-15T05:08:08Z'>
+		Are you saying that
+python model.py worker0 [shared localtion]
+python model.py ps0 [shared localtion]
+doesn't work? For ParameterServer the location needs to be a shared one among all workers + ps.
+		</comment>
+		<comment id='2' author='goyalankit' date='2020-04-22T20:08:32Z'>
+		This issue has been automatically marked as stale because it has not had recent activity. It will be closed if no further activity occurs. Thank you.
+		</comment>
+		<comment id='3' author='goyalankit' date='2020-04-22T22:12:53Z'>
+		&lt;denchmark-link:https://github.com/crccw&gt;@crccw&lt;/denchmark-link&gt;
+ My apologies for the late response on this.
+Thank you for confirming that shared location is a requirement in Parameter Strategy.
+To answer your question, if there's only 1 worker (worker0), the training works as expected. However, if there are more workers and the shared location is an hdfs location it doesn't work.
+Reason being that worker1 is trying to write at a temporary location that is local to that worker.
+For example:
+I setup hdfs locally and this is how I started the training:
+&lt;denchmark-code&gt;python model.py ps0 hdfs://172.18.0.2/data/p1
+.... &lt;truncated ps logs&gt; ....
+&lt;/denchmark-code&gt;
+
+On worker0, I see that the model is being saved to the hdfs location:
+&lt;denchmark-code&gt;python model.py worker0 hdfs://172.18.0.2/data/p1
+...
+Epoch 00002: saving model to hdfs://172.18.0.2/data/p1/model.ckpt-0002
+...
+&lt;/denchmark-code&gt;
+
+However on worker1, the model is being saved to the tmp location:
+&lt;denchmark-code&gt;python model.py worker1 hdfs://172.18.0.2/data/p1
+...
+Epoch 00007: saving model to /tmp/tmppcu_cwk9/temp.ckpt-{epoch:04d}
+...
+&lt;/denchmark-code&gt;
+
+Since worker1 is trying to write at a /tmp location and if the ps is running on a different machine, this location is not accessible. So it fails with an error.
+		</comment>
+		<comment id='4' author='goyalankit' date='2020-04-22T23:17:07Z'>
+		FWIW, it works as expected in the nightly release.
+worker1: seems to be writing at a temporary location in hdfs. At least based on the logs.
+&lt;denchmark-code&gt;Epoch 00001: saving model to hdfs://172.18.0.2/data/workertemp_1/model.ckpt-0001
+&lt;/denchmark-code&gt;
+
+However, It'll take me some time to run this in our cluster to verify.
+The version I tested:
+&lt;denchmark-code&gt;(tf-2.2-venv) $ python
+Python 3.7.7 (default, Mar 10 2020, 23:11:38)
+[GCC 4.8.5 20150623 (Red Hat 4.8.5-36)] on linux
+Type "help", "copyright", "credits" or "license" for more information.
+&gt;&gt;&gt; import tensorflow as tf
+2020-04-22 15:31:12.809176: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamic library libcudart.so.10.1
+&gt;&gt;&gt;
+&gt;&gt;&gt;
+&gt;&gt;&gt; tf.__version__
+'2.2.0-dev20200422'
+&lt;/denchmark-code&gt;
+
+However, I am unable to point out the exact commit that fixed it. I'd be curious to learn what fixed the issue.
+		</comment>
+		<comment id='5' author='goyalankit' date='2020-08-21T07:38:05Z'>
+		&lt;denchmark-link:https://github.com/goyalankit&gt;@goyalankit&lt;/denchmark-link&gt;
+   Closing this issue since it is working as expected on tf-nightly. please reopen the issue if you have any concern. Thanks!
+		</comment>
+		<comment id='6' author='goyalankit' date='2020-08-21T07:38:07Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/38514&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/38514&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

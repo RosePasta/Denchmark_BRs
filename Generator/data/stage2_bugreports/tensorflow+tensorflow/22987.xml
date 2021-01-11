@@ -1,0 +1,147 @@
+<bug id='22987' author='BigBang0072' open_date='2018-10-15T13:41:23Z' closed_time='2019-02-11T21:42:14Z'>
+	<summary>Segmentation Fault (SIGSEGV) in middle of Training due to Runtime-statistics calculation ops.</summary>
+	<description>
+&lt;denchmark-h:h3&gt;System information&lt;/denchmark-h&gt;
+
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow):
+Custom code. The full code can be accessed here at GitHub
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04):
+CentOS Linux release 7.5.1804 (Core)
+Mobile device (e.g. iPhone 8, Pixel 2, Samsung Galaxy) if the issue happens on mobile device:
+TensorFlow installed from (source or binary):
+Binary
+TensorFlow version (use command below):
+('v1.8.0-0-g93bc2e2072', '1.8.0')
+Python version:
+Python 2.7.5 (default, Apr 11 2018, 07:36:10)
+Bazel version (if compiling from source):
+GCC/Compiler version (if compiling from source):
+CUDA/cuDNN version:
+cuda-9.0-cudnn-7
+GPU model and memory:
+2 Tesla V100 Nvidia GPUs, ~15 Gb each
+Exact command to reproduce:
+Please go through this instruction here to run the code.
+The training runs without error on small dataset. The problem arises when number of minibatches are
+more per epoch keeping the batch size constant. (i.e more number of sess.run call per epoch)
+
+&lt;denchmark-h:h3&gt;Describe the problem&lt;/denchmark-h&gt;
+
+The training crashes with the error Segmentation Fault (Core Dumped) in the middle of the training after around 14-18 epochs (with ~800 minibatches in each) even though I have sufficient RAM (~12-20% utilization holding steadily before crash).
+&lt;denchmark-link:https://user-images.githubusercontent.com/17550410/46916113-c4b44e00-cfd3-11e8-842b-686a42b2c486.png&gt;&lt;/denchmark-link&gt;
+
+Possible Memory Leak Checked
+Initially, I suspected a memory leak due to the addition of new ops after each iteration, so I finalized the graph in the training session. But this was not the source of the problem. No new nodes were added at each iteration.
+
+After that, I ran the training on gdb (see the stack trace in logs section) and along with some commenting of the code I have almost pinpointed the source of error.
+Currently every 30 minibatch training I am saving the summary here in the code. The full code can be found &lt;denchmark-link:https://github.com/grasseau/HAhRD/blob/master/GSOC18/train_multi_gpu.py#L406&gt;here&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://user-images.githubusercontent.com/17550410/46916189-c29ebf00-cfd4-11e8-9a94-08f67c12198d.png&gt;&lt;/denchmark-link&gt;
+
+The train_track_op in line number 415 is a list of which looks like this:
+[gradient_update_op, loss_GPU1, loss_GPU2, merged_summary_op]
+If I comment out the section in lines 406-438 the training runs without error.
+Attempt 3: Exact Location
+Now I comment out line 422 to 438,(the part where I save timeline and summary). I have checked there is no problem due to these lines.
+Now if, I run merged_summary op along with rest of the training op and . And if I leave these two lines uncommented the Segfault comes back.
+&lt;denchmark-link:https://user-images.githubusercontent.com/17550410/46951781-93588280-d0a6-11e8-8173-f52dfce1c3c6.png&gt;&lt;/denchmark-link&gt;
+
+So, It seems some memory is being leaked when calculating the runtime statistics using  run_options and run_metadata when doing the full trace of the graph.
+&lt;denchmark-h:h3&gt;Source code / logs&lt;/denchmark-h&gt;
+
+Stack Trace
+Program received signal SIGSEGV, Segmentation fault.
+[Switching to Thread 0x7ff2d3fff700 (LWP 138819)]
+0x00007ff2b8b00d6f in ?? () from /usr/local/cuda-9.0/extras/CUPTI/lib64/libcupti.so.9.0
+(gdb) backtrace
+#0  0x00007ff2b8b00d6f in ?? () from /usr/local/cuda-9.0/extras/CUPTI/lib64/libcupti.so.9.0
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/1&gt;#1&lt;/denchmark-link&gt;
+  0x00007ff2b8b04fd0 in ?? () from /usr/local/cuda-9.0/extras/CUPTI/lib64/libcupti.so.9.0
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/2&gt;#2&lt;/denchmark-link&gt;
+  0x00007ff2b8d10c39 in ?? () from /usr/local/cuda-9.0/extras/CUPTI/lib64/libcupti.so.9.0
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/3&gt;#3&lt;/denchmark-link&gt;
+  0x00007ffff77fae25 in start_thread () from /lib64/libpthread.so.0
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/4&gt;#4&lt;/denchmark-link&gt;
+  0x00007ffff6e1bbad in clone () from /lib64/libc.so.6
+	</description>
+	<comments>
+		<comment id='1' author='BigBang0072' date='2018-11-07T18:59:10Z'>
+		CC &lt;denchmark-link:https://github.com/nluehr&gt;@nluehr&lt;/denchmark-link&gt;
+
+This looks like an issue with CUPTI. Nathan, could you help us triage this issue?
+Thanks in advance!
+		</comment>
+		<comment id='2' author='BigBang0072' date='2018-11-14T17:41:50Z'>
+		&lt;denchmark-link:https://github.com/azaks2&gt;@azaks2&lt;/denchmark-link&gt;
+ The bug is not related to CUPTI.
+The problem is that ExecutorState caches a raw pointer to the TraceCollector &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/master/tensorflow/core/common_runtime/executor.cc#L1369&gt;here&lt;/denchmark-link&gt;
+. The cached copy then outlives the owning unique_ptr created in &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/master/tensorflow/core/common_runtime/direct_session.cc#L550&gt;DirectSession::RunInternal()&lt;/denchmark-link&gt;
+.
+Either a shared_ptr should be used (if multiple TraceCollectors can coexist) or a mutex is needed to keep direction_session from destroying the TraceCollector while it is in use by ExecutorState.
+		</comment>
+		<comment id='3' author='BigBang0072' date='2018-11-16T18:04:01Z'>
+		I'm having the exact same problem with run_options and run_metadata on tensorflow-gpu==1.12.0 (pip), CUDA 9.0, cuDNN 7.1, CentOS Linux release 7.4.1708, Python 3.6.2.
+		</comment>
+		<comment id='4' author='BigBang0072' date='2018-11-16T19:09:29Z'>
+		&lt;denchmark-link:https://github.com/nluehr&gt;@nluehr&lt;/denchmark-link&gt;
+  thanks for debugging this. I see your point that things are horribly broken when there are concurrent RunInternal() calls. However, with one RunInternal() call things should work since RunInternal() waits for all executors to finish.
+&lt;denchmark-link:https://github.com/BigBang0072&gt;@BigBang0072&lt;/denchmark-link&gt;
+ do you have concurrent session runs?
+		</comment>
+		<comment id='5' author='BigBang0072' date='2018-11-16T22:21:53Z'>
+		Not sure I see synchronization of runners in RunInternal.
+In TF 1.12 I add two prints: one of  in ~DeviceTracerImpl() after &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/v1.12.0/tensorflow/core/platform/default/device_tracer.cc#L400&gt;https://github.com/tensorflow/tensorflow/blob/v1.12.0/tensorflow/core/platform/default/device_tracer.cc#L400&lt;/denchmark-link&gt;
+ and the second of  after &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/v1.12.0/tensorflow/core/common_runtime/executor.cc#L1578&gt;https://github.com/tensorflow/tensorflow/blob/v1.12.0/tensorflow/core/common_runtime/executor.cc#L1578&lt;/denchmark-link&gt;
+.
+Then I run  provided above and the following output is generated before triggering a SEGFAULT at &lt;denchmark-link:https://github.com/grasseau/HAhRD/blob/master/GSOC18/train_multi_gpu.py#L443-L447&gt;https://github.com/grasseau/HAhRD/blob/master/GSOC18/train_multi_gpu.py#L443-L447&lt;/denchmark-link&gt;
+.
+&lt;denchmark-code&gt;Using trace_collector=0x12d87c380 at tensorflow/core/common_runtime/executor.cc:1585
+Using trace_collector=0x12d87c380 at tensorflow/core/common_runtime/executor.cc:1585
+Using trace_collector=0x12d87c380 at tensorflow/core/common_runtime/executor.cc:1585
+Using trace_collector=0x12d87c380 at tensorflow/core/common_runtime/executor.cc:1585
+Using trace_collector=0x12d87c380 at tensorflow/core/common_runtime/executor.cc:1585
+Using trace_collector=0x12d87c380 at tensorflow/core/common_runtime/executor.cc:1585
+Destroying DeviceTracerImpl=0x12d87c380 at tensorflow/core/platform/default/device_tracer.cc:404
+Using trace_collector=0x12d87c380 at tensorflow/core/common_runtime/executor.cc:1585
+Using trace_collector=0x12d87c380 at tensorflow/core/common_runtime/executor.cc:1585
+Using trace_collector=0x12d87c380 at tensorflow/core/common_runtime/executor.cc:1585
+Using trace_collector=0x12d87c380 at tensorflow/core/common_runtime/executor.cc:1585
+Using trace_collector=0x12d87c380 at tensorflow/core/common_runtime/executor.cc:1585
+Using trace_collector=0x12d87c380 at tensorflow/core/common_runtime/executor.cc:1585
+Using trace_collector=0x12d87c380 at tensorflow/core/common_runtime/executor.cc:1585
+Using trace_collector=0x12d87c380 at tensorflow/core/common_runtime/executor.cc:1585
+Using trace_collector=0x12d87c380 at tensorflow/core/common_runtime/executor.cc:1585
+&lt;/denchmark-code&gt;
+
+So the destructor seems to be called before the executor has completed.
+		</comment>
+		<comment id='6' author='BigBang0072' date='2018-11-17T06:46:47Z'>
+		&lt;denchmark-link:https://github.com/azaks2&gt;@azaks2&lt;/denchmark-link&gt;
+ No, I just initiate one session while training.
+You can see this here:
+&lt;denchmark-link:url&gt;https://github.com/grasseau/HAhRD/blob/7eacc002672da28a1f53015227497469eb2af69d/GSOC18/train_multi_gpu.py#L368&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='7' author='BigBang0072' date='2018-11-21T22:30:12Z'>
+		I was able to reproduce the problem and have a fix. The problem was the data pipeline running concurrently with the training steps.
+		</comment>
+		<comment id='8' author='BigBang0072' date='2018-11-22T06:05:25Z'>
+		Thanks for all your time.
+But we have to run the data pipeline concurrently with the training. Otherwise, it will critically slow down our performance. Also, how is data pipeline affecting the tracing of the tensorflow graph?
+Apart from that, if I just remove the tracing I don't get any Segmentation Fault even with the concurrent data pipeline running.
+Maybe I am missing something. Could you please elaborate on what you have found?
+Thanks again for your help and time.
+		</comment>
+		<comment id='9' author='BigBang0072' date='2019-02-11T21:42:14Z'>
+		I just fixed the lifetime of internal profiling related objects so they do not get GCed at the end of session.run
+		</comment>
+		<comment id='10' author='BigBang0072' date='2019-03-29T13:38:26Z'>
+		I'm encountering a really similar issue with multi gpu (replicate_model_fn) training and a parallel data pipeline. Several hours into the training loop, and with no warning/error message, we get a segmentation fault from tf, and the training halts. Is this a known issue and if so, is it solved in a newer release?
+		</comment>
+		<comment id='11' author='BigBang0072' date='2019-03-29T17:34:52Z'>
+		Dont log metadata for now, or log it very infrequently (mostly when you want to debug).
+I dont know about the newer release, but this will temporarily fix the problem.
+		</comment>
+	</comments>
+</bug>

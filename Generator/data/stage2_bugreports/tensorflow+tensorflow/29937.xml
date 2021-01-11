@@ -1,0 +1,373 @@
+<bug id='29937' author='rb-determined-ai' open_date='2019-06-18T23:18:49Z' closed_time='2019-10-21T04:23:07Z'>
+	<summary>Iterator restoring hangs with `inter_op_parallelism_threads=1`</summary>
+	<description>
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): Yes; I have included a small example file below.
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Arch Linux
+TensorFlow installed from (source or binary): binary
+TensorFlow version (use command below): b'v1.13.1-0-g6612da8951' 1.13.1
+Python version: 3.6.8
+CUDA/cuDNN version: 10.1.168/7.6.0.64 (installed via pacman)
+GPU model and memory: Quadro P2000
+
+You can collect some of this information using our environment capture
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/tree/master/tools/tf_env_collect.sh&gt;script&lt;/denchmark-link&gt;
+
+You can also obtain the TensorFlow version with: 1. TF 1.0:  2. TF 2.0: 
+Describe the current behavior
+If I set inter_op_parallelism_threads=1 when I configure a session, I am unable to restore an Iterator from a basic tensorflow_datasets dataset; the restore operation hangs.
+Describe the expected behavior
+If the iterator can run with inter_op_parallelism_threads=1 then it should also be able to restore without issue.
+Code to reproduce the issue
+&lt;denchmark-code&gt;import tensorflow as tf
+import numpy as np
+import tensorflow_datasets as tfds
+from sys import stderr
+
+# save/restore an iterator from a toy dataset
+mnist = tfds.image.MNIST()
+mnist.download_and_prepare()
+ds = mnist.as_dataset()["train"]
+ds = ds.map(lambda x: x["image"])
+
+# # Can't reproduce the issue using interleave/map/prefetch
+# ds = tf.data.Dataset.range(10)  # using this dataset makes it not hang
+# ds = ds.interleave(lambda x: tf.data.Dataset.from_tensors(x),
+#         cycle_length=64, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+# ds = ds.map(lambda x: x, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+# ds = ds.prefetch(tf.data.experimental.AUTOTUNE)
+
+i = ds.make_one_shot_iterator()
+
+# create the operation
+next_item = i.get_next()
+
+# create the savable and the saver
+saveable = tf.data.experimental.make_saveable_from_iterator(i)
+saver = tf.train.Saver({'iterator':saveable})
+
+# create a session config
+config = tf.ConfigProto(
+    inter_op_parallelism_threads=1, # this line makes saver.restore() hang.
+                                    # Also, 2 works fine, only 1 is a problem
+)
+
+with tf.Session(config=config) as sess:
+    # print the first five elements with a checksum
+    print('first five', file=stderr)
+    for _ in range(5):
+        image = sess.run(next_item)
+        print(np.sum(image*image), file=stderr)
+
+    # save the iterator
+    saver.save(sess, 'chkpt')
+
+    # restore the iterator
+    print('restoring', file=stderr)
+    saver.restore(sess, 'chkpt')
+
+    # (this line never prints:)
+    print('done restoring', file=stderr)
+
+
+    print('second five', file=stderr)
+    for _ in range(5):
+        # print the second five elements with a checksum
+        image = sess.run(next_item)
+        print(np.sum(image*image), file=stderr)
+&lt;/denchmark-code&gt;
+
+Other info / logs
+Runtime output:
+&lt;denchmark-code&gt;WARNING:tensorflow:From /home/rb/.virtualenvs/pedl/lib/python3.6/site-packages/tensorflow/python/ops/control_flow_ops.py:423: colocate_with (from tensorflow.python.framework.ops) is deprecated and will be removed in a future version.
+Instructions for updating:
+Colocations handled automatically by placer.
+WARNING: Logging before flag parsing goes to stderr.
+W0618 16:01:19.861267 140558393956032 deprecation.py:323] From /home/rb/.virtualenvs/pedl/lib/python3.6/site-packages/tensorflow/python/ops/control_flow_ops.py:423: colocate_with (from tensorflow.python.framework.ops) is deprecated and will be removed in a future version.
+Instructions for updating:
+Colocations handled automatically by placer.
+2019-06-18 16:01:19.945928: I tensorflow/core/platform/cpu_feature_guard.cc:141] Your CPU supports instructions that this TensorFlow binary was not compiled to use: AVX2 FMA
+2019-06-18 16:01:19.965483: I tensorflow/core/platform/profile_utils/cpu_utils.cc:94] CPU Frequency: 2905000000 Hz
+2019-06-18 16:01:19.966181: I tensorflow/compiler/xla/service/service.cc:150] XLA service 0x55d1be28d870 executing computations on platform Host. Devices:
+2019-06-18 16:01:19.966199: I tensorflow/compiler/xla/service/service.cc:158]   StreamExecutor device (0): &lt;undefined&gt;, &lt;undefined&gt;
+first five
+13301
+9638
+11128
+11245
+11787
+restoring
+WARNING:tensorflow:From /home/rb/.virtualenvs/pedl/lib/python3.6/site-packages/tensorflow/python/training/saver.py:1266: checkpoint_exists (from tensorflow.python.training.checkpoint_management) is deprecated and will be removed in a future version.
+Instructions for updating:
+Use standard file APIs to check for files with this prefix.
+W0618 16:01:20.062302 140558393956032 deprecation.py:323] From /home/rb/.virtualenvs/pedl/lib/python3.6/site-packages/tensorflow/python/training/saver.py:1266: checkpoint_exists (from tensorflow.python.training.checkpoint_management) is deprecated and will be removed in a future version.
+Instructions for updating:
+Use standard file APIs to check for files with this prefix.
+&lt;/denchmark-code&gt;
+
+(now the process hangs indefinitely)
+	</description>
+	<comments>
+		<comment id='1' author='rb-determined-ai' date='2019-06-20T04:07:22Z'>
+		I think I have isolated the problem to the TFRecordDataset.  I can reproduce the behavior with the following code:
+&lt;denchmark-code&gt;import tensorflow as tf
+from sys import stderr
+
+# tfrecord was created by tensorflow_dataset.image.MNIST().as_dataset()
+ds = tf.data.TFRecordDataset("mnist-train.tfrecord-00000-of-00010")
+
+i = ds.make_one_shot_iterator()
+
+# create the operation
+next_item = i.get_next()
+
+# create the savable and the saver
+saveable = tf.data.experimental.make_saveable_from_iterator(i)
+saver = tf.train.Saver({'iterator':saveable})
+
+# create a session config
+config = tf.ConfigProto(
+    inter_op_parallelism_threads=1, # this line makes saver.restore() hang.
+                                    # Also, 2 works fine, only 1 is a problem
+)
+
+with tf.Session(config=config) as sess:
+    # print the first five elements with a checksum
+    print('first item', file=stderr)
+    print(sess.run(next_item), file=stderr)
+
+    # save the iterator
+    saver.save(sess, 'checkpoint/chkpt')
+
+    # restore the iterator will hang
+    print('restoring', file=stderr)
+    saver.restore(sess, 'checkpoint/chkpt')
+
+    # (this line never prints:)
+    print('done restoring', file=stderr)
+
+    print('second item', file=stderr)
+    print(sess.run(next_item), file=stderr)
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='2' author='rb-determined-ai' date='2019-06-21T01:04:53Z'>
+		I can reproduce this in 1.14 as well.
+		</comment>
+		<comment id='3' author='rb-determined-ai' date='2019-06-21T02:17:19Z'>
+		I have a workaround which sets a default thread pool of size &gt; 1 with an alternative thread pool that is of size 1.  This works but it is very awkward because you have to pass a new RunOptions argument to every call to session.run():
+&lt;denchmark-code&gt;import tensorflow as tf
+from sys import stderr
+from tensorflow.core.protobuf import config_pb2
+
+# tfrecord was created by tensorflow_dataset.image.MNIST().as_dataset()
+ds = tf.data.TFRecordDataset("mnist-train.tfrecord-00000-of-00010")
+
+i = ds.make_one_shot_iterator()
+
+# create the operation
+next_item = i.get_next()
+
+# create the savable and the saver
+saveable = tf.data.experimental.make_saveable_from_iterator(i)
+saver = tf.train.Saver({'iterator':saveable})
+
+single_pool = config_pb2.ThreadPoolOptionProto(num_threads=1)
+multi_pool = config_pb2.ThreadPoolOptionProto(num_threads=2)
+
+# create a session config
+config = tf.ConfigProto(
+    # it would be nice if saver.restore() supported a run_options keyword,
+    # rather than having to make the multi_pool the default pool and then
+    # specify single_runopts with every call to sess.run()
+    session_inter_op_thread_pool=[multi_pool, single_pool],
+)
+
+# inter_op_thread_pool is just an index into session_inter_op_thread_pool
+single_runopts = tf.RunOptions(inter_op_thread_pool=1)
+
+with tf.Session(config=config) as sess:
+
+    print('first item', file=stderr)
+    print(sess.run(next_item, options=single_runopts), file=stderr)
+
+    saver.save(sess, 'checkpoint/chkpt')
+
+    print('second item', file=stderr)
+    print(sess.run(next_item, options=single_runopts), file=stderr)
+
+    # this will use the default (first) pool from session_inter_op_thread_pool
+    saver.restore(sess, 'checkpoint/chkpt')
+
+    print('second item again?', file=stderr)
+    print(sess.run(next_item, options=single_runopts), file=stderr)
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='4' author='rb-determined-ai' date='2019-06-28T10:41:22Z'>
+		&lt;denchmark-link:https://github.com/rb-determined-ai&gt;@rb-determined-ai&lt;/denchmark-link&gt;
+  I tried executing the above with Tf 1.13.1 but it throws error as . Please help us to reproduce the issue. Thanks!
+		</comment>
+		<comment id='5' author='rb-determined-ai' date='2019-06-28T20:04:45Z'>
+		&lt;denchmark-link:https://github.com/gadagashwini&gt;@gadagashwini&lt;/denchmark-link&gt;
+,
+Ah, I had a comment explaining where the file was from, but I see now that it wasn't quite correct.  First, make sure you have the tensorflow_datasets package.  (tensorflow_datasets is only required to download a TFRecord file)
+&lt;denchmark-code&gt;pip3 install tensorflow_datasets
+&lt;/denchmark-code&gt;
+
+You can get the file by running the following command from the command line:
+&lt;denchmark-code&gt;python -c "import tensorflow_datasets as tfds; tfds.image.MNIST().download_and_prepare()"
+&lt;/denchmark-code&gt;
+
+After that, you should have the file in the place where tensorflow_datasets caches datasets.  In linux or mac, the following command should create copy the file to your current directory:
+&lt;denchmark-code&gt;cp ~/tensorflow_datasets/mnist/1.0.0/mnist-train.tfrecord-00000-of-00010 .
+&lt;/denchmark-code&gt;
+
+Then if you run the second script I included from the same directory, it should demonstrate the problem.
+Also, the first script I attached should demonstrate the problem in either case, since it uses tensorflow_datasets to download and to access the TFRecord file.
+		</comment>
+		<comment id='6' author='rb-determined-ai' date='2019-07-01T05:14:46Z'>
+		&lt;denchmark-link:https://github.com/rb-determined-ai&gt;@rb-determined-ai&lt;/denchmark-link&gt;
+ I executed the above code on my system by downloading tensorflow_datasets I got the following result. Is this expected result? Thanks!
+&lt;denchmark-link:https://user-images.githubusercontent.com/48476109/60412018-39c0c580-9bed-11e9-8402-9777ab97dcdf.png&gt;&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='7' author='rb-determined-ai' date='2019-07-09T06:30:47Z'>
+		Automatically closing due to lack of recent activity. Please update the issue when new information becomes available, and we will reopen the issue. Thanks!
+		</comment>
+		<comment id='8' author='rb-determined-ai' date='2019-07-09T06:30:48Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=29937&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=29937&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='9' author='rb-determined-ai' date='2019-07-09T18:54:04Z'>
+		&lt;denchmark-link:https://github.com/gadagashwini&gt;@gadagashwini&lt;/denchmark-link&gt;
+ please reopen, I was on vacation last week.
+Ok, the screenshot you sent me was what to be expected based on what you ran.  The first element out of the dataset is a blob of binary data, followed by another blob, and the third blob is a copy of the second blob (which is correct).  The reason that it works is you ran my script which includes a workaround for the bug I reported.
+There are three scripts that I have posted so far:
+
+The first script was in the original post, and it demonstrates the bug but I didn't know the best way to demonstrate the bug.  If you run it, it will hang.
+The second script was when I isolated the bug to TFRecordDataset and that script did not import tensorflow_datasets.  If you run it, it will hang.
+The third script was when I posted a workaround for the bug.  It was the script where I call from tensorflow.core.protobuf import config_pb2 near the top.  The workaround is that I do the tf.train.Saver.restore() operation using a different thread pool than the thread pool I use for every other call to tf.Session.run().  If you run that script, it will not hang.  That appears to be the script that you ran when in the screenshot you sent.
+
+The second script is the best example to demonstrate the bug, please focus on that one.
+		</comment>
+		<comment id='10' author='rb-determined-ai' date='2019-09-24T23:26:54Z'>
+		&lt;denchmark-link:https://github.com/rb-determined-ai&gt;@rb-determined-ai&lt;/denchmark-link&gt;
+ Thanks for the detailed analysis. I was able to reproduce your issue in TF 1.13.1
+However I tried your script (2nd) in TF 1.15.0-rc1 version and it executed successfully.
+May be you want to give it a try. Thanks!
+		</comment>
+		<comment id='11' author='rb-determined-ai' date='2019-09-27T18:08:38Z'>
+		&lt;denchmark-link:https://github.com/ymodak&gt;@ymodak&lt;/denchmark-link&gt;
+ I have confirmed that the bug is not fixed with TF 1.15.0-rc1.  These were the steps I took to reproduce:
+&lt;denchmark-code&gt;mkvirtualenv --python /usr/bin/python3.6 --no-site-packages tf15
+pip install tensorflow==1.15.0-rc1
+python --version  # prints "Python 3.6.9"
+python -c "import tensorflow; print(tensorflow.__version__)"  # prints "1.15.0-rc1"
+
+cp ~/tensorflow_datasets/mnist/1.0.0/mnist-train.tfrecord-00000-of-00010 .
+
+# I'll feed the script in via stdin so there's no confusion which one got ran:
+echo '
+import tensorflow as tf
+from sys import stderr
+
+# tfrecord was created by tensorflow_dataset.image.MNIST().as_dataset()
+ds = tf.data.TFRecordDataset("mnist-train.tfrecord-00000-of-00010")
+
+i = ds.make_one_shot_iterator()
+
+# create the operation
+next_item = i.get_next()
+
+# create the savable and the saver
+saveable = tf.data.experimental.make_saveable_from_iterator(i)
+saver = tf.train.Saver({"iterator":saveable})
+
+# create a session config
+config = tf.ConfigProto(
+    inter_op_parallelism_threads=1, # this line makes saver.restore() hang.
+                                    # Also, 2 works fine, only 1 is a problem
+)
+
+with tf.Session(config=config) as sess:
+    # print the first five elements with a checksum
+    print("first item", file=stderr)
+    print(sess.run(next_item), file=stderr)
+
+    # save the iterator
+    saver.save(sess, "checkpoint/chkpt")
+
+    # restore the iterator will hang
+    print("restoring", file=stderr)
+    saver.restore(sess, "checkpoint/chkpt")
+
+    # (this line never prints:)
+    print("done restoring", file=stderr)
+
+    print("second item", file=stderr)
+    print(sess.run(next_item), file=stderr)
+' | python
+&lt;/denchmark-code&gt;
+
+This is my output (same as before, the line "done restoring" never prints):
+&lt;denchmark-code&gt;WARNING:tensorflow:From loader_bug.py:7: DatasetV1.make_one_shot_iterator (from tensorflow.python.data.ops.dataset_ops) is deprecated and will be removed in a future version.
+Instructions for updating:
+Use `for ... in dataset:` to iterate over a dataset. If using `tf.estimator`, return the `Dataset` object directly from your input function. As a last resort, you can use `tf.compat.v1.data.make_one_shot_iterator(dataset)`.
+WARNING:tensorflow:From loader_bug.py:14: The name tf.train.Saver is deprecated. Please use tf.compat.v1.train.Saver instead.
+
+WARNING:tensorflow:From loader_bug.py:17: The name tf.ConfigProto is deprecated. Please use tf.compat.v1.ConfigProto instead.
+
+2019-09-27 11:54:37.965504: I tensorflow/core/platform/cpu_feature_guard.cc:142] Your CPU supports instructions that this TensorFlow binary was not compiled to use: AVX2 FMA
+2019-09-27 11:54:37.984166: I tensorflow/core/platform/profile_utils/cpu_utils.cc:94] CPU Frequency: 2905000000 Hz
+2019-09-27 11:54:37.985072: I tensorflow/compiler/xla/service/service.cc:168] XLA service 0x555c9ec73930 initialized for platform Host (this does not guarantee that XLA will be used). Devices:
+2019-09-27 11:54:37.985106: I tensorflow/compiler/xla/service/service.cc:176]   StreamExecutor device (0): Host, Default Version
+2019-09-27 11:54:37.990081: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamic library libcuda.so.1
+2019-09-27 11:54:38.046077: I tensorflow/stream_executor/cuda/cuda_gpu_executor.cc:983] successful NUMA node read from SysFS had negative value (-1), but there must be at least one NUMA node, so returning NUMA node zero
+2019-09-27 11:54:38.046347: I tensorflow/compiler/xla/service/service.cc:168] XLA service 0x555c9ef32c30 initialized for platform CUDA (this does not guarantee that XLA will be used). Devices:
+2019-09-27 11:54:38.046360: I tensorflow/compiler/xla/service/service.cc:176]   StreamExecutor device (0): Quadro P2000, Compute Capability 6.1
+2019-09-27 11:54:38.046498: I tensorflow/stream_executor/cuda/cuda_gpu_executor.cc:983] successful NUMA node read from SysFS had negative value (-1), but there must be at least one NUMA node, so returning NUMA node zero
+2019-09-27 11:54:38.046727: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1618] Found device 0 with properties:
+name: Quadro P2000 major: 6 minor: 1 memoryClockRate(GHz): 1.468
+pciBusID: 0000:01:00.0
+2019-09-27 11:54:38.046803: W tensorflow/stream_executor/platform/default/dso_loader.cc:55] Could not load dynamic library 'libcudart.so.10.0'; dlerror: libcudart.so.10.0: cannot open shared object file: No such file or directory
+2019-09-27 11:54:38.046862: W tensorflow/stream_executor/platform/default/dso_loader.cc:55] Could not load dynamic library 'libcublas.so.10.0'; dlerror: libcublas.so.10.0: cannot open shared object file: No such file or directory
+2019-09-27 11:54:38.046896: W tensorflow/stream_executor/platform/default/dso_loader.cc:55] Could not load dynamic library 'libcufft.so.10.0'; dlerror: libcufft.so.10.0: cannot open shared object file: No such file or directory
+2019-09-27 11:54:38.046929: W tensorflow/stream_executor/platform/default/dso_loader.cc:55] Could not load dynamic library 'libcurand.so.10.0'; dlerror: libcurand.so.10.0: cannot open shared object file: No such file or directory
+2019-09-27 11:54:38.046961: W tensorflow/stream_executor/platform/default/dso_loader.cc:55] Could not load dynamic library 'libcusolver.so.10.0'; dlerror: libcusolver.so.10.0: cannot open shared object file: No such file or directory
+2019-09-27 11:54:38.046994: W tensorflow/stream_executor/platform/default/dso_loader.cc:55] Could not load dynamic library 'libcusparse.so.10.0'; dlerror: libcusparse.so.10.0: cannot open shared object file: No such file or directory
+2019-09-27 11:54:38.050035: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamic library libcudnn.so.7
+2019-09-27 11:54:38.050053: W tensorflow/core/common_runtime/gpu/gpu_device.cc:1641] Cannot dlopen some GPU libraries. Please make sure the missing libraries mentioned above are installed properly if you would like to use GPU. Follow the guide at https://www.tensorflow.org/install/gpu for how to download and setup the required libraries for your platform.
+Skipping registering GPU devices...
+2019-09-27 11:54:38.050087: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1159] Device interconnect StreamExecutor with strength 1 edge matrix:
+2019-09-27 11:54:38.050106: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1165]      0
+2019-09-27 11:54:38.050109: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1178] 0:   N
+first item
+b'\n\xad\x02\n\x0e\n\x05label\x12\x05\x1a\x03\n\x01\x03\n\x9a\x02\n\x05image\x12\x90\x02\n\x8d\x02\n\x8a\x02\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x1c\x00\x00\x00\x1c\x08\x00\x00\x00\x00Wf\x80H\x00\x00\x00\xd1IDAT(\x91c`\x18\x9a@\x7f\xce\x87\x7f\xff?\xd8`\x93b\xaf\xfa\xfa\xf7\xc7\xf5G\x7f\xa7b\x91\x93_\xf6\xf7g\xb3\x11\x83\xfaG\x14I\x16\x08%\xc6\xdd\xb5\xf1\x04\x03\x03\x1b3\x03\x16\xc9\xd3\xfe\x0c\x0c\x0c\x0c\x0c^\x9c(\x92L(&lt;\r\x86\x9f\xb8]\xfc\xe8\xaf\x05N\xb9\x82\x7f\x87QLBv\x01K\xa7\xdcM9\xa5\x17_\xb1jt\xf8\xfb\xef\xef\xdf\xbf\xf7\x85\xb0J\xde\xfc\xf7\xffl\xfc\x86\x7f=\xd8\xe4R~\xfe\x9d#\xc1\xa0\xfa\xf9\x016\xc9;\x7f{\x19\x18\x18\x18\x16\xfe\xb0\x86;\x02!\x19\xa6t\x88\x81\x81\x81\xe1\r\xab\x00\x16\xc9s\xe7\xd0\xcdbB\x17``\xc7\xeaX(x\xfdM\x1f\xa7\x9c\xee\xd7\xab\xcc\xb8\xe4\x84\x1f\xff\xc5\x9a\x18\x18\x18\x18\x18\x18\xba\xfeN\xe1\xc1g)\x91\x00\x00\xf4/?R\xed\xc3\xb43\x00\x00\x00\x00IEND\xaeB`\x82'
+restoring
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='12' author='rb-determined-ai' date='2019-10-01T00:09:42Z'>
+		Please take a look at this &lt;denchmark-link:https://colab.sandbox.google.com/gist/ymodak/bf49fe37b52e5fc9caab053a6d8fc395/github_issue29937.ipynb&gt;GitHub Gist&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='13' author='rb-determined-ai' date='2019-10-15T12:38:30Z'>
+		It has been 14 days with no activity and the awaiting response label was assigned. Is this still an issue?
+		</comment>
+		<comment id='14' author='rb-determined-ai' date='2019-10-21T04:23:07Z'>
+		Automatically closing due to lack of recent activity. Please update the issue when new information becomes available, and we will reopen the issue. Thanks!
+		</comment>
+		<comment id='15' author='rb-determined-ai' date='2019-10-21T04:23:08Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/29937&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/29937&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

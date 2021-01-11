@@ -1,0 +1,215 @@
+<bug id='27043' author='sndnyang' open_date='2019-03-22T18:23:21Z' closed_time='2019-04-27T18:32:18Z'>
+	<summary>In Eager mode,  batch norm doesn't support Second order derivative</summary>
+	<description>
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow):
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): CentOS Linux release 7.4.1708
+Mobile device (e.g. iPhone 8, Pixel 2, Samsung Galaxy) if the issue happens on mobile device:
+TensorFlow installed from (source or binary): binary
+TensorFlow version (use command below):  1.12.0  and  1.10.1
+Python version:  3.6
+Bazel version (if compiling from source):
+GCC/Compiler version (if compiling from source):
+CUDA/cuDNN version: CUDA 9.0, cuDNN - 7
+GPU model and memory:  TITAN Xp
+
+Describe the current behavior
+I wanted to implement an eager mode version of the large margin code from google-research &lt;denchmark-link:https://github.com/google-research/google-research/tree/master/large_margin&gt;code&lt;/denchmark-link&gt;
+.
+In other words, I computed a second order derivative. If my model/network didn't contain/enable the batch norm layers, it was fine.
+But if I enabled the batch norm layer, it said that
+"tf.gradients is not supported when eager execution is enabled. Use tf.GradientTape instead." however I didn't use tf.gradients and other layers didn't raise such an error.
+The static/graph code work fine on both cases(with or without batch normalization)
+Code to reproduce the issue
+Provide a reproducible test case that is the bare minimum necessary to generate the problem.
+&lt;denchmark-code&gt;import os
+import numpy as np
+import tensorflow as tf
+
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = '2'
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+os.environ['CUDA_VISIBLE_DEVICES'] = ""
+
+tf_config = tf.ConfigProto()
+tf_config.gpu_options.allow_growth = True
+tf.enable_eager_execution(tf_config)
+
+EPS = 1e-5
+MOMENTUM = 0.9
+
+class ConfigDict(object):
+    def __init__(self):
+        self.num_classes = 10
+
+        # List of tuples specify (kernel_size, number of filters) for each layer.
+        self.filter_sizes_conv_layers = [(5, 32), (5, 64)]
+        # Dictionary of pooling type ("max"/"average", size and stride).
+        self.pool_params = {"type": "max", "size": 2, "stride": 2}
+        self.num_units_fc_layers = [512]
+        self.dropout_rate = 0
+        self.batch_norm = True
+        self.activation = tf.nn.relu
+    
+def pool2d_layer(inputs, pool_type, pool_size=2, pool_stride=2):
+    if pool_type == "max":
+        # Max pooling layer
+        return tf.layers.max_pooling2d(
+            inputs, pool_size=[pool_size] * 2, strides=pool_stride)
+    
+    
+class MNISTNetwork(tf.keras.Model):
+    """MNIST model. """
+
+    def __init__(self, config):
+        super(MNISTNetwork, self).__init__()
+        self.num_classes = config.num_classes
+        self.var_list = []
+        self.init_ops = None
+        self.activation = config.activation
+        self.filter_sizes_conv_layers = config.filter_sizes_conv_layers
+        self.num_units_fc_layers = config.num_units_fc_layers
+        self.pool_params = config.pool_params
+        self.dropout_rate = config.dropout_rate
+        self.batch_norm = config.batch_norm
+        self.conv_layers = []
+        self.bn_layers = []
+        in_channel = 1
+        for i, filter_size in enumerate(self.filter_sizes_conv_layers):
+            f_size = filter_size[0]
+            conv_layer = tf.layers.Conv2D(kernel_size=filter_size[0], filters=filter_size[1], 
+                                          strides=(1, 1), padding="same",
+                                          activation=self.activation, 
+                                          use_bias=not self.batch_norm)
+            self.conv_layers.append(conv_layer)
+            batch_norm_layer = tf.keras.layers.BatchNormalization(momentum=MOMENTUM, epsilon=EPS)
+            self.bn_layers.append(batch_norm_layer)
+            in_channel = filter_size[1]
+            
+        self.fc_layers = []
+        in_shape = 64 * 7 * 7
+        for i, num_units in enumerate(self.num_units_fc_layers):
+            fc_layer = tf.layers.Dense(num_units, activation=self.activation)
+            self.fc_layers.append(fc_layer)
+            in_shape = num_units
+        self.output_layer = tf.layers.Dense(self.num_classes, activation=None)
+
+    def __call__(self, images, is_training=False):
+        """Builds model."""
+        net = images
+        for i in range(len(self.filter_sizes_conv_layers)):
+            net = self.conv_layers[i](net)
+
+            if self.pool_params:
+                net = pool2d_layer(net, pool_type=self.pool_params["type"], pool_size=self.pool_params["size"]
+                                   , pool_stride=self.pool_params["stride"])
+            if self.dropout_rate &gt; 0:
+                net = tf.layers.dropout(net, rate=self.dropout_rate, training=is_training)
+                
+            if self.batch_norm:
+                # net = tf.layers.batch_normalization(net, training=is_training, epsilon=EPS, momentum=MOMENTUM)
+                net = self.bn_layers[i](net, training=is_training)
+            
+        net = tf.layers.flatten(net)
+
+        for i in range(len(self.num_units_fc_layers)):
+            net = self.fc_layers[i](net)
+        logits = self.output_layer(net)
+        return logits
+    
+
+config = ConfigDict()
+
+# enable/disable batch norm
+config.batch_norm = True
+
+model = MNISTNetwork(config)
+
+images = np.random.uniform(0, 1, (3, 28, 28, 1))
+images = tf.convert_to_tensor(images, dtype=np.float32)
+# images = tf.Variable(images)
+print("data %.5f" % images.numpy().sum())
+
+with tf.GradientTape(persistent=True) as t:
+    with tf.GradientTape(persistent=True) as t2:
+        logits = model(images, is_training=True)
+        m = tf.reduce_sum(logits)
+        print(logits.numpy().sum())
+        dp_dx = t2.gradient(m, model.variables)
+    print("first", dp_dx[0].numpy().sum())
+    d2y_dx2 = t.gradient(dp_dx[0], model.variables)
+    print("second order", d2y_dx2[0].numpy().sum())
+&lt;/denchmark-code&gt;
+
+Other info / logs
+&lt;denchmark-code&gt;RuntimeError                              Traceback (most recent call last)
+&lt;ipython-input-86-44f63511f093&gt; in &lt;module&gt;
+     20         dp_dx = t2.gradient(m, model.variables)
+     21     print("first", dp_dx[0].numpy().sum())
+---&gt; 22     d2y_dx2 = t.gradient(dp_dx[0], model.variables)
+     23     print("second order", d2y_dx2[0].numpy().sum())
+
+~/software/miniconda3/envs/dllib3/lib/python3.6/site-packages/tensorflow/python/eager/backprop.py in gradient(self, target, sources, output_gradients)
+    899         nest.flatten(target),
+    900         flat_sources,
+--&gt; 901         output_gradients=output_gradients)
+    902 
+    903     if not self._persistent:
+
+~/software/miniconda3/envs/dllib3/lib/python3.6/site-packages/tensorflow/python/eager/imperative_grad.py in imperative_grad(tape, target, sources, output_gradients)
+     62       target,
+     63       sources,
+---&gt; 64       output_gradients)
+
+~/software/miniconda3/envs/dllib3/lib/python3.6/site-packages/tensorflow/python/eager/backprop.py in _gradient_function(op_name, attr_tuple, num_inputs, inputs, outputs, out_grads)
+    115     return [None] * num_inputs
+    116 
+--&gt; 117   return grad_fn(mock_op, *out_grads)
+    118 
+    119 
+
+~/software/miniconda3/envs/dllib3/lib/python3.6/site-packages/tensorflow/python/ops/nn_grad.py in _FusedBatchNormGradGrad(op, *grad)
+    938   grad_initial = [grad_grad_x, grad_grad_scale, grad_grad_offset]
+    939   grad_grad_y, grad_x, grad_scale = gradients_impl.gradients(
+--&gt; 940       [grad_x, grad_scale, grad_offset], [grad_y, x, scale], grad_initial)
+    941   return grad_grad_y, grad_x, grad_scale, None, None
+    942 
+
+~/software/miniconda3/envs/dllib3/lib/python3.6/site-packages/tensorflow/python/ops/gradients_impl.py in gradients(ys, xs, grad_ys, name, colocate_gradients_with_ops, gate_gradients, aggregation_method, stop_gradients)
+    628   with ops.get_default_graph()._mutation_lock():  # pylint: disable=protected-access
+    629     return _GradientsHelper(ys, xs, grad_ys, name, colocate_gradients_with_ops,
+--&gt; 630                             gate_gradients, aggregation_method, stop_gradients)
+    631 
+    632 
+
+~/software/miniconda3/envs/dllib3/lib/python3.6/site-packages/tensorflow/python/ops/gradients_impl.py in _GradientsHelper(ys, xs, grad_ys, name, colocate_gradients_with_ops, gate_gradients, aggregation_method, stop_gradients, src_graph)
+    642   """Implementation of gradients()."""
+    643   if context.executing_eagerly():
+--&gt; 644     raise RuntimeError("tf.gradients is not supported when eager execution "
+    645                        "is enabled. Use tf.GradientTape instead.")
+    646   if src_graph is None:
+
+RuntimeError: tf.gradients is not supported when eager execution is enabled. Use tf.GradientTape instead.
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='sndnyang' date='2019-04-26T21:12:57Z'>
+		This appears to be working as of the latest tf-nightly
+		</comment>
+		<comment id='2' author='sndnyang' date='2019-04-27T02:55:55Z'>
+		Great! I installed the tf-nightly and this bug has been solved. Perfect!
+Thank you!
+		</comment>
+		<comment id='3' author='sndnyang' date='2019-04-27T18:32:18Z'>
+		Glad to hear it!
+		</comment>
+		<comment id='4' author='sndnyang' date='2019-04-27T18:32:19Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=27043&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=27043&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

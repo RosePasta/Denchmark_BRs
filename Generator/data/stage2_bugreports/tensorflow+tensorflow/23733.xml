@@ -1,0 +1,576 @@
+<bug id='23733' author='galeone' open_date='2018-11-14T11:18:42Z' closed_time='2019-04-26T21:28:58Z'>
+	<summary>Memory leak in tf.train.Example/tf.train.Features/tf.gfile</summary>
+	<description>
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): no
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Archlinux
+TensorFlow installed from (source or binary): repository
+TensorFlow version (use command below): 1.12
+Python version: 3.7
+CUDA/cuDNN version: cuda 10, cudnn 7
+GPU model and memory: nvidia 1080ti
+
+Describe the current behavior
+The system goes OOM and I have 64 GiB of memory.
+Describe the expected behavior
+I should be able to create a dataset converting files I read from Google Cloud to local tfrecords.
+I'm debugging the memory usage of python and as you can see below, the usage is around 670K - hence the memory allocation should be outside of python, and the only library I'm using is Tensorflow.
+Code to reproduce the issue
+import subprocess
+import multiprocessing
+from glob import glob
+import tensorflow as tf
+from tensorflow import keras as k
+import json
+import os
+import logging
+from typing import Pattern, List, Tuple, Callable
+import linecache
+import tracemalloc
+
+
+def display_top(snapshot, key_type="lineno", limit=10):
+    snapshot = snapshot.filter_traces(
+        (
+            tracemalloc.Filter(False, "&lt;frozen importlib._bootstrap&gt;"),
+            tracemalloc.Filter(False, "&lt;unknown&gt;"),
+        )
+    )
+    top_stats = snapshot.statistics(key_type)
+
+    print("Top %s lines" % limit)
+    for index, stat in enumerate(top_stats[:limit], 1):
+        frame = stat.traceback[0]
+        # replace "/path/to/module/file.py" with "module/file.py"
+        filename = os.sep.join(frame.filename.split(os.sep)[-2:])
+        print(
+            "#%s: %s:%s: %.1f KiB" % (index, filename, frame.lineno, stat.size / 1024)
+        )
+        line = linecache.getline(frame.filename, frame.lineno).strip()
+        if line:
+            print("    %s" % line)
+
+    other = top_stats[limit:]
+    if other:
+        size = sum(stat.size for stat in other)
+        print("%s other: %.1f KiB" % (len(other), size / 1024))
+    total = sum(stat.size for stat in top_stats)
+    print("Total allocated size: %.1f KiB" % (total / 1024))
+
+
+tracemalloc.start()
+
+CACHE = os.path.join(os.getcwd(), ".data")
+ROWS_PER_RECORD = 32
+SPLITS = ("train", "validation", "test")
+
+LOG = logging.Logger(__name__)
+LOG.setLevel(logging.INFO)
+
+
+def _int64_feature(value):
+    return tf.train.Feature(int64_list=tf.train.Int64List(value=[value]))
+
+
+def _float_feature(value):
+    return tf.train.Feature(float_list=tf.train.FloatList(value=[value]))
+
+
+def _bytes_feature(value):
+    return tf.train.Feature(bytes_list=tf.train.BytesList(value=[value]))
+
+
+def rows_in_tfrecord(path):
+    """Count the number of elements in a tfrecord file.
+    Args:
+        path: The path of the TFRecord file
+    Return:
+        The number of examples in the TFRecord
+    """
+    return sum(1 for _ in tf.io.tf_record_iterator(path))
+
+
+def _is_dir(path: str):
+    """Determines if path is a directory only looking at the filename.
+    It's ugly, but is the only way to get a decent speed.
+    Args:
+        path: The input path
+    Return:
+        value: True if the path looks like a directory
+    """
+    return path.endswith("/") or not "." in path.split("/")[-1]
+
+
+def list_dir(root):
+    """Recursively list a directory and returns the list of all the files.
+    Args:
+        root: The path of the root directory
+    Return:
+        List of all the files found in this directory and its subfolders.
+    """
+    ret = []
+    for full_path in tf.gfile.Glob(os.path.join(root, "*")):
+        if _is_dir(full_path):
+            return ret + list_dir(full_path)
+        else:
+            ret.append(full_path)
+    return ret
+
+
+def _gs2tfrecord(gs_paths: List[str], patterns: List[Pattern], cache: str = CACHE):
+    """Fetch images from google cloud storage, conver to tf_record and
+    properly handle cache.
+
+    Args:
+        gs_paths: list of paths on google cloud storage
+        patterns: list of compiled regex to fiter the data on each gs_paths
+        cache: local cache/dataset folder
+    """
+    gcloud_auth = os.path.join(
+        os.path.expanduser("~"),
+        ".config",
+        "gcloud",
+        "application_default_credentials.json",
+    )
+    if not os.path.exists(gcloud_auth):
+        subprocess.check_call(["gcloud", "auth", "application-default", "login"])
+
+    meta_file = os.path.join(cache, "meta.json")
+    dataset_path = os.path.join(cache, "dataset")
+    if not os.path.exists(cache):
+        os.makedirs(dataset_path)
+        for split in SPLITS:
+            os.makedirs(os.path.join(dataset_path, split))
+        meta = {"local_files": {path: [] for path in gs_paths}}
+    else:
+        with open(meta_file, "r") as fp:
+            meta = json.load(fp)
+
+    for remote_path, pattern in zip(gs_paths, patterns):
+        remote_files = set()
+        for name in list_dir(remote_path):
+            if pattern.search(name.replace(remote_path, "")):
+                remote_files.add(name)
+
+        local_files = set(meta["local_files"][remote_path])
+
+        diff = remote_files - local_files
+        LOG.warn("New remote elements: {}".format(len(diff)))
+        if diff:
+            # Check the current tfrecords, find the last one created
+            # Fill the empty spaces in this one (rewriting it completely)
+            # And create the other ones
+            record_id = sum(
+                len(glob(os.path.join(dataset_path, split, "*.tfrecord")))
+                for split in SPLITS
+            )
+
+            last_tf_record = os.path.join(dataset_path, "train", "1.tfrecord")
+            for split in SPLITS:
+                last_path = os.path.join(dataset_path, split, f"{record_id}.tfrecord")
+                if os.path.exists(last_path):
+                    last_tf_record = last_path
+                    break
+
+            examples = []
+            if os.path.exists(last_tf_record):
+                rows_in_last = rows_in_tfrecord(last_tf_record)
+                if rows_in_last &lt; ROWS_PER_RECORD:
+                    # read all rows in the last tfrecord
+                    # we're going to add the last one
+                    # and recreate it
+                    for row in tf.io.tf_record_iterator(last_tf_record):
+                        example = tf.train.Example()
+                        examples.append(example.ParseFromString(row))
+                else:
+                    record_id += 1
+
+            # fetch new files and update the tfrecords
+            tot_new_elements = len(diff)
+            for idx, new_element in enumerate(diff):
+                LOG.warn(f"File: {new_element}")
+                with tf.gfile.GFile(new_element, "rb") as fp:
+                    img = fp.read()
+                remote_meta = os.path.join(os.path.realpath(new_element), "meta.json")
+                if not tf.gfile.Exists(remote_meta):
+                    example_meta = {
+                        "count": _int64_feature(1),
+                        "feature1": _float_feature(1076),
+                        "feature2": _float_feature(100),
+                        "f3": _float_feature(1076),
+                        "f4": _float_feature(100),
+                        "f5": _bytes_feature("mango".encode("UTF-8")),
+                        "f7": _bytes_feature(
+                            "banana".encode("UTF-8")
+                        ),
+                    }
+                else:
+                    with tf.gfile.GFile(remote_meta, "r") as fp:
+                        example_meta = json.loads(fp.read())
+
+                # TODO: check if image is an old style image and convert to new format
+                example_meta["img"] = _bytes_feature(img)
+                examples.append(
+                    tf.train.Example(features=tf.train.Features(feature=example_meta))
+                )
+
+                if len(examples) == ROWS_PER_RECORD or idx == tot_new_elements - 1:
+                    # write (always in the training dataset) and reset examples buffer
+                    filename = os.path.join(
+                        dataset_path, "train", f"{record_id}.tfrecord"
+                    )
+                    with tf.io.TFRecordWriter(filename) as writer:
+                        for example in examples:
+                            writer.write(example.SerializeToString())
+                    # Reset example buffer
+                    examples.clear()
+                    # Increment tfrecord id
+                    record_id += 1
+                    LOG.warn(f"TFRecord: {filename} written")
+                    snapshot = tracemalloc.take_snapshot()
+                    display_top(snapshot)
+                    # break
+Just use the _gs2tfrecord function. I'm using it to fetch data from Google Cloud Storage, but since I'm using tf.gfile a local path can be used too.
+My guess is that leak can be somewhere in tf.train.Example or in tf.train.Feature since those are the only 2 functions I call in a loop.
+UPDATE
+I've created another function that just download the images from Google Cloud and store them locally. It goes out of memory in the same way.
+Maybe the leak is in tf.gfile?
+Here's the function
+def _gs2folder(
+    gs_paths: List[str], patterns: List[Pattern], names: List[str], cache: str = CACHE
+):
+    """Fetch images from google cloud storage, conver to tf_record and
+    properly handle cache.
+
+    Args:
+        gs_paths: list of paths on google cloud storage
+        patterns: list of compiled regex to fiter the data on each gs_paths
+        names: list of dataset name
+        cache: local cache/dataset folder
+    """
+    assert len(gs_paths) == len(patterns) and len(patterns) == len(names)
+
+    gcloud_auth = os.path.join(
+        os.path.expanduser("~"),
+        ".config",
+        "gcloud",
+        "application_default_credentials.json",
+    )
+    if not os.path.exists(gcloud_auth):
+        subprocess.check_call(["gcloud", "auth", "application-default", "login"])
+
+    for remote_path, pattern, name in zip(gs_paths, patterns, names):
+        meta_file = os.path.join(cache, name, "meta.json")
+        dataset_path = os.path.join(cache, name, "original")
+        if not os.path.exists(cache):
+            os.makedirs(dataset_path)
+            meta = {"local_files": {path: [] for path in gs_paths}}
+        else:
+            with open(meta_file, "r") as fp:
+                meta = json.load(fp)
+
+        remote_files = set()
+        for file_name in list_dir(remote_path):
+            if pattern.search(file_name.replace(remote_path, "")):
+                remote_files.add(file_name)
+
+        local_files = set(meta["local_files"][remote_path])
+        diff = remote_files - local_files
+        LOG.warning("New remote elements: {}".format(len(diff)))
+        last_id = len(local_files) + 1
+        if diff:
+            # fetch new files and store them
+            tot_new_elements = len(diff)
+
+            for idx, new_element in enumerate(diff):
+                LOG.warning(f"File: {new_element}")
+                with tf.gfile.GFile(new_element, "rb") as fp:
+                    img_bytes = fp.read()
+
+                image = Image.open(io.BytesIO(img_bytes))
+                image = np.array(image)
+                if image.shape[-1] == 4:
+                    # remove transparency
+                    image = image[..., :3]
+                remote_meta = os.path.join(os.path.realpath(new_element), "meta.json")
+                if not tf.gfile.Exists(remote_meta):
+                    example_meta = {
+                        "count": 1
+                    }
+                else:
+                    with tf.gfile.GFile(remote_meta, "r") as fp:
+                        example_meta = json.loads(fp.read())
+
+                image = Image.fromarray(image)
+                # Just save the image file with its meta info
+                image.save(os.path.join(dataset_path, f"{last_id}.png"))
+                with open(os.path.join(dataset_path, f"{last_id}.json"), "w") as fp:
+                    json.dump(example_meta, fp)
+                last_id += 1
+
+        meta["local_files"][remote_path] = remote_files
+
+    with open(meta, "w") as fp:
+        json.dump(meta, fp)
+Other info / logs
+This is the output of a display_top invocation:
+&lt;denchmark-code&gt;Top 10 lines
+#1: python3.7/linecache.py:137: 246.9 KiB
+    lines = fp.readlines()
+#2: util/compat.py:80: 150.0 KiB
+    return bytes_or_text.decode(encoding)
+#3: datasets/floorplans.py:143: 64.2 KiB
+    diff = remote_files - local_files
+#4: datasets/floorplans.py:139: 32.0 KiB
+    remote_files.add(name)
+#5: internal/python_message.py:475: 21.6 KiB
+    self._oneofs = {}
+#6: internal/python_message.py:425: 15.5 KiB
+    result = message_type._concrete_class()
+#7: python3.7/tracemalloc.py:185: 13.4 KiB
+    self._frames = tuple(reversed(frames))
+#8: internal/python_message.py:472: 12.0 KiB
+    self._fields = {}
+#9: internal/python_message.py:1402: 10.3 KiB
+    self._parent_message_weakref = weakref.proxy(parent_message)
+#10: internal/python_message.py:1155: 5.1 KiB
+    for field, value in list(self._fields.items()):  # dict can change size!
+228 other: 104.0 KiB
+Total allocated size: 675.1 KiB
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='galeone' date='2018-11-14T14:55:09Z'>
+		Update: probably the leak is in tf.gfile since I can see that the memory grows every time I run the line:
+                with tf.gfile.GFile(new_element, "rb") as fp:
+                    img_bytes = fp.read()
+In the loop.
+I've also tried to change it to:
+fp = tf.gfile.GFile(new_element, "rb")
+img_bytes = fp.read()
+fp.close()
+fp = None
+But every time I read() the memory is never released
+		</comment>
+		<comment id='2' author='galeone' date='2018-11-14T15:56:48Z'>
+		Another update: the problem is related to the tensorflow package I'm using, that's the one shipped by the Archlinux devs.
+If I create a virtualenv with python3.6 and I use the tensorflow package installed via pip, it works correctly.
+		</comment>
+		<comment id='3' author='galeone' date='2018-11-20T06:53:32Z'>
+		&lt;denchmark-link:https://github.com/galeone&gt;@galeone&lt;/denchmark-link&gt;
+ : Thanks for all the details. I wanted to confirm the state after all your digging and investigation.
+Is it accurate to say that there is no problem observed in the official TensorFlow release binaries and you're only seeing this in a package built by the Archlinux folks?
+		</comment>
+		<comment id='4' author='galeone' date='2018-11-20T07:26:45Z'>
+		&lt;denchmark-link:https://github.com/asimshankar&gt;@asimshankar&lt;/denchmark-link&gt;
+ Yes, I confirm.
+If I create a virtualenv with everything official inside, there is no leak.
+However, compiling tensorflow is straightforward, hence probably is something is worth investigating, since in future Tensorflow could be used with CUDA 10 and python 3.7 (and those are the only differences between the official and the Archlinux version)
+		</comment>
+		<comment id='5' author='galeone' date='2018-11-20T16:54:47Z'>
+		Update: the same happen with Tensorflow installed from conda
+&lt;denchmark-link:#&gt;…&lt;/denchmark-link&gt;
+
+
+On Tue, Nov 20, 2018, 07:57 Asim Shankar ***@***.*** wrote:
+ @galeone &lt;https://github.com/galeone&gt; : Thanks for all the details. I
+ wanted to confirm the state after all your digging and investigation.
+
+ Is it accurate to say that there is no problem observed in the official
+ TensorFlow release binaries and you're only seeing this in a package built
+ by the Archlinux folks?
+
+ —
+ You are receiving this because you were mentioned.
+ Reply to this email directly, view it on GitHub
+ &lt;#23733 (comment)&gt;,
+ or mute the thread
+ &lt;https://github.com/notifications/unsubscribe-auth/AICZDHYP41NCNOScE9tk9eetFP2xRzqCks5uw6fRgaJpZM4YdiX7&gt;
+ .
+
+
+
+		</comment>
+		<comment id='6' author='galeone' date='2018-12-04T09:34:35Z'>
+		&lt;denchmark-link:https://github.com/galeone&gt;@galeone&lt;/denchmark-link&gt;
+ : With "conda" - still Python 3.7? (Just trying to understand the environment)
+		</comment>
+		<comment id='7' author='galeone' date='2018-12-04T10:15:38Z'>
+		No, with Python 3.6.7 and tensorflow-gpu (1.12) installed using conda into the conda environement.
+Here's the detail:
+
+cuda toolkit: 9.2
+cudnn: 7.2.1
+conda version: 4.3.27
+cupti: 9.2.148
+cuda version: 9.0.176
+
+		</comment>
+		<comment id='8' author='galeone' date='2019-02-08T13:50:17Z'>
+		The same problem exists on the official Cloud Deep Learning VM Image (TF 1.12, CUDA 10). It runs out of memory within a few minutes when training data on gs://. Runs perfectly fine when the bucket is mounted to the local fs.
+		</comment>
+		<comment id='9' author='galeone' date='2019-04-08T18:48:23Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=23733&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=23733&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='10' author='galeone' date='2019-04-08T19:48:10Z'>
+		&lt;denchmark-link:https://github.com/ygoncharov&gt;@ygoncharov&lt;/denchmark-link&gt;
+, I am able to reproduce the problem as you described. Thanks for the detailed instructions. One strange thing I noted is that the memory leak problem does not happen if I use tensorflow-gpu (1.13.1) installed on the host without using the nivida docker image for both python2 and python3. Can you please confirm that is the case? If so, the problem probably comes from how Nvidia built the docker image.
+		</comment>
+		<comment id='11' author='galeone' date='2019-04-09T08:20:25Z'>
+		&lt;denchmark-link:https://github.com/jing-dong&gt;@jing-dong&lt;/denchmark-link&gt;
+ Glad that you were able to reproduce the issue. Indeed it seems the issue does not repro in some environments, but I cannot pinpoint the exact reason for that. I don't think that the problem is in the docker image since I (and it seems other people in this thread) had this problem in a docker-less environment before.
+		</comment>
+		<comment id='12' author='galeone' date='2019-04-09T19:01:35Z'>
+		&lt;denchmark-link:https://github.com/ygoncharov&gt;@ygoncharov&lt;/denchmark-link&gt;
+ I tried the following setup that seems to work:
+
+Env: nvcr.io/nvidia/tensorflow:19.02-py2 running on GC v100  (note the version is 19.02)
+Inside the docker container, create python virtualenv
+pip install tensorflow-gpu==1.13.1
+The test script runs without memory leak
+
+Can you please try this out to see if this works for you?
+The default installed tensorflow in the docker image also has the memory leak issue as you noticed. It suggests that the problem comes from how nvidia built the tensorflow for the docker image. If you can reproduce the memory leak issue without using the nvidia docker image, we can investigate further on this. If not, can you please report the problem to nvidia to investigate further?
+		</comment>
+		<comment id='13' author='galeone' date='2019-04-09T20:58:19Z'>
+		&lt;denchmark-link:https://github.com/ygoncharov&gt;@ygoncharov&lt;/denchmark-link&gt;
+ There seems to be a related problem reported in the nvidia developer forum:
+&lt;denchmark-link:https://devtalk.nvidia.com/default/topic/1046985/docker-and-nvidia-docker/tensorflow-model-memory-issues-with-new-docker-version-19-01/&gt;https://devtalk.nvidia.com/default/topic/1046985/docker-and-nvidia-docker/tensorflow-model-memory-issues-with-new-docker-version-19-01/&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='14' author='galeone' date='2019-04-10T08:40:42Z'>
+		&lt;denchmark-link:https://github.com/jing-dong&gt;@jing-dong&lt;/denchmark-link&gt;
+ sounds good, I will try those steps to verify your conclusion
+		</comment>
+		<comment id='15' author='galeone' date='2019-04-12T16:35:50Z'>
+		&lt;denchmark-link:https://github.com/ygoncharov&gt;@ygoncharov&lt;/denchmark-link&gt;
+ How does the workaround work for you? Were you able to reproduce the memory leak outside of the nvidia docker image?
+		</comment>
+		<comment id='16' author='galeone' date='2019-04-16T16:35:35Z'>
+		&lt;denchmark-link:https://github.com/ygoncharov&gt;@ygoncharov&lt;/denchmark-link&gt;
+ I will close this ticket for now. If you still have any issues, please feel free to re-open this ticket.
+		</comment>
+		<comment id='17' author='galeone' date='2019-04-16T16:35:40Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=23733&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=23733&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='18' author='galeone' date='2019-04-18T09:01:16Z'>
+		&lt;denchmark-link:https://github.com/jing-dong&gt;@jing-dong&lt;/denchmark-link&gt;
+ I did a similar experiment: run the script on an official GC deep learning image and then pip installed tensorflow-gpu==1.13.1 in a clean virtualenv. I got the same result: memory leak in the first case and no memory leak in the second.
+		</comment>
+		<comment id='19' author='galeone' date='2019-04-18T14:03:53Z'>
+		Hi everybody, I'm joining to the memory leaking club.
+Environment:
+Docker container base: FROM python:3.7-stretch
+Tensorflow: conda install -c conda-forge tensorflow  (tried pip install tensorflow=1.13.1 as well)
+= using CPU
+Use case:
+Running loading from GCS using GFile in callback on message from pubsub (sending messages 1 by one for testing) - I can see that data is not released,
+File1:
+9    196.6 MiB    196.6 MiB   &lt;denchmark-link:https://github.com/Profile&gt;@Profile&lt;/denchmark-link&gt;
+
+10                                             def read(filename):
+11    196.6 MiB      0.0 MiB            with tf.gfile.GFile(filename, 'rb') as dicom_file_obj:
+12    327.9 MiB    131.3 MiB              return dicom_file_obj.read()
+File 2:
+11    328.0 MiB      0.0 MiB       with tf.gfile.GFile(filename, 'rb') as dicom_file_obj:
+12    715.7 MiB    387.8 MiB           return dicom_file_obj.read()
+File 3:
+11    715.8 MiB      0.0 MiB       with tf.gfile.GFile(filename, 'rb') as dicom_file_obj:
+12    973.6 MiB    257.8 MiB           return dicom_file_obj.read()
+and just grows with every file, first I though it it's pubsub problem but I removed everything from the pubsub callback and I only read the file and return and finish. Memory still grows.
+Any ideas?
+Follow up info:
+Python3.6-stretch works without problems, so it's combination of TF1.13.1 and Python3.7
+		</comment>
+		<comment id='20' author='galeone' date='2019-04-18T16:46:36Z'>
+		&lt;denchmark-link:https://github.com/Luxas98&gt;@Luxas98&lt;/denchmark-link&gt;
+ Can you please post a minimal Dockerfile and sample script here that I can use to reproduce the problem? I will try to see what I can do from there.
+&lt;denchmark-link:https://github.com/ygoncharov&gt;@ygoncharov&lt;/denchmark-link&gt;
+ Can you please clarify what the "official GC deep learning image" refers to? Is it  nvcr.io/nvidia/tensorflow:19.03-py2 that you used earlier?
+		</comment>
+		<comment id='21' author='galeone' date='2019-04-18T17:51:45Z'>
+		&lt;denchmark-link:https://github.com/jing-dong&gt;@jing-dong&lt;/denchmark-link&gt;
+ no, it was not a docker image. It is an official Google Cloud image preconfigured for Tensorflow from &lt;denchmark-link:https://cloud.google.com/deep-learning-vm/&gt;https://cloud.google.com/deep-learning-vm/&lt;/denchmark-link&gt;
+
+The link to the current marketplace image is below, but please note that in my test I used the previous version (the one that came with tensorflow 1.12).
+&lt;denchmark-link:https://console.cloud.google.com/marketplace/details/click-to-deploy-images/deeplearning?_ga=2.212830999.-2046381496.1540473489&gt;https://console.cloud.google.com/marketplace/details/click-to-deploy-images/deeplearning?_ga=2.212830999.-2046381496.1540473489&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='22' author='galeone' date='2019-04-19T08:17:21Z'>
+		&lt;denchmark-link:https://github.com/jing-dong&gt;@jing-dong&lt;/denchmark-link&gt;
+ Hi, check example of leak and no leak in &lt;denchmark-link:https://github.com/Luxas98/tensorflow-gfile-memory-leak&gt;https://github.com/Luxas98/tensorflow-gfile-memory-leak&lt;/denchmark-link&gt;
+
+Please let me know when you are done so I can remove the service account secrets and gs files :-)
+		</comment>
+		<comment id='23' author='galeone' date='2019-04-19T21:14:56Z'>
+		&lt;denchmark-link:https://github.com/Luxas98&gt;@Luxas98&lt;/denchmark-link&gt;
+ Thanks for the simple examples for reproducing the memory leaks. I am able to reproduce the same problem as you described. I will look into the problem and update here if there is any findings.
+		</comment>
+		<comment id='24' author='galeone' date='2019-04-19T21:23:02Z'>
+		Setting the following environment variable prevents the memory leak problem in Python 3.7 for me.
+export ENV GCS_READ_CACHE_MAX_SIZE_MB=0
+Can you please give it a try and see if this works for you? In the mean time, I will look into the root cause for the problem.
+		</comment>
+		<comment id='25' author='galeone' date='2019-04-26T20:35:27Z'>
+		We identified the root cause of the memory leak problem and will cherry-pick the fix to TF 1.14 soon. For earlier versions, you can continue to use "export GCS_READ_CACHE_MAX_SIZE_MB=0" as the workaround for this problem.
+		</comment>
+		<comment id='26' author='galeone' date='2019-04-26T21:28:58Z'>
+		The fix has been cherry-picked to TF 1.14 (&lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/66d4f9e6d8f65c56eda1091384c4f0967abd0fdf&gt;66d4f9e&lt;/denchmark-link&gt;
+). Please feel free to re-open the ticket if there are further issues related to this bug.
+		</comment>
+		<comment id='27' author='galeone' date='2019-04-26T21:29:00Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=23733&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=23733&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='28' author='galeone' date='2019-04-26T22:34:36Z'>
+		Great!
+&lt;denchmark-link:#&gt;…&lt;/denchmark-link&gt;
+
+
+On Fri, Apr 26, 2019, 22:41 Jing Dong ***@***.***&gt; wrote:
+ We identified the root cause of the memory leak problem and will
+ cherry-pick the fix to TF 1.14 soon. For earlier versions, you can continue
+ to use "export GCS_READ_CACHE_MAX_SIZE_MB=0" as the workaround for this
+ problem.
+
+ —
+ You are receiving this because you were mentioned.
+ Reply to this email directly, view it on GitHub
+ &lt;#23733 (comment)&gt;,
+ or mute the thread
+ &lt;https://github.com/notifications/unsubscribe-auth/ACAJSDHQFFR2QISXCTGOVODPSNSIVANCNFSM4GDWEX5Q&gt;
+ .
+
+
+
+		</comment>
+		<comment id='29' author='galeone' date='2019-07-14T15:03:39Z'>
+		Thank you for fixing this. I can confirm export ENV GCS_READ_CACHE_MAX_SIZE_MB=0 fixes the leak for me in 1.13.1 and it works in 1.14.0 without setting that.
+I spent a day tracking down the memory leak since it does not show up in python profiling with tracemalloc. Is there any way to profile how much memory tensorflow is using to help with isolating future memory leaks?
+		</comment>
+		<comment id='30' author='galeone' date='2019-07-14T18:02:45Z'>
+		One tool that I found helpful is the heap profiler in Gperftools (&lt;denchmark-link:https://gperftools.github.io/gperftools/heapprofile.html&gt;https://gperftools.github.io/gperftools/heapprofile.html&lt;/denchmark-link&gt;
+). You may want to try it out next time when you suspect there are memory leaks.
+		</comment>
+		<comment id='31' author='galeone' date='2019-07-14T19:00:03Z'>
+		Thank you &lt;denchmark-link:https://github.com/jing-dong&gt;@jing-dong&lt;/denchmark-link&gt;
+ I will try that next time 
+		</comment>
+		<comment id='32' author='galeone' date='2019-07-19T04:37:46Z'>
+		Is there a way to pass this flag when running on TPUs?
+		</comment>
+	</comments>
+</bug>

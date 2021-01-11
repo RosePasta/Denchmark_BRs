@@ -1,0 +1,798 @@
+<bug id='7970' author='volvador' open_date='2017-03-01T11:30:04Z' closed_time='2018-02-23T18:49:40Z'>
+	<summary>SyncReplicasOptimizer race condition strange behavior?</summary>
+	<description>
+It seems there is a strange race condition in SyncReplicasOptimizer leading to strange behaviour. I include below an example code to reproduce what seems to be a bug (hopefully in my code) as well as the commands to reproduce it (pretty much the same code as in mnist_replica.py).
+I am trying to implement  synchronized SGD using SyncReplicasOptimizer, I also used the queue trick to make the parameter server stop gracefully when all workers are done. I have 4 workers and 1 parameter server. Worker 0 is the chief worker.
+Please bear with me for the long explanation of the different issues (they depend on the order in which processes are launched)
+**** First kind of issue ****
+launch the processes in this order
+&lt;denchmark-code&gt;python test.py --job_name ps
+python test.py --job_name worker --taks_index 0
+python test.py --job_name worker --taks_index 1
+python test.py --job_name worker --taks_index 2
+python test.py --job_name worker --taks_index 3
+&lt;/denchmark-code&gt;
+
+The last worker throws the following error :
+&lt;denchmark-code&gt;I tensorflow/core/distributed_runtime/master_session.cc:909] DeregisterGraph error: Unavailable: {"created":"@1488366991.043859719","description":"OS Error","errno":104,"file":"external/grpc/src/core/lib/iomgr/tcp_posix.c","file_line":229,"grpc_status":14,"os_error":"Connection reset by peer","syscall":"recvmsg"}
+&lt;/denchmark-code&gt;
+
+and quits, and it happens also that it hangs (not realising that the variable epoch is greater than 4, triggering the break from the training loop, and the enqueue operation to let the ps stop gracefully).
+It also happen that all is fine, and the execution terminates without any errors.
+**** Second kind of issue ****
+launch the processes in this order
+&lt;denchmark-code&gt;python test.py --job_name ps
+python test.py --job_name worker --taks_index 3
+python test.py --job_name worker --taks_index 2
+python test.py --job_name worker --taks_index 1
+python test.py --job_name worker --taks_index 0
+&lt;/denchmark-code&gt;
+
+The chief here being launched at last.
+Strangely, the chief completes the loop and quits ( I thought with SyncReplicasOptimizer it had to wait for the other workers to complete each step).
+As for the other workers, I had all sort of results when doing the same experiment many times
+
+
+Some workers simply hang and do not execute a single step in the while true training loop
+
+
+Some execute some steps, then simply hang, apparently they lose contact with the chief, and do not realise that the variable epoch is greater than 4, triggering the `break from the training loop.
+
+
+Thank you for help with this issue.
+Below is the code of test.py
+&lt;denchmark-code&gt;import os
+import shutil
+import tempfile
+import numpy as np
+import pandas as pd
+import argparse
+
+from keras.models import Sequential
+from keras.layers.core import Dense
+from keras.regularizers import l2
+import tensorflow as tf
+import keras
+
+nb_samples = 50
+nb_features = 5
+X_train = np.random.randn(nb_samples * nb_features).reshape((nb_samples, nb_features))
+Y_train = np.random.randn(nb_samples).reshape((nb_samples, 1))
+
+def build_keras_model(input_dim):
+  hidden_dim = 10
+
+  model = Sequential()
+  model.add(Dense(input_dim = input_dim,
+                  output_dim=hidden_dim,
+                  activation='tanh'
+                  ))
+
+  model.add(Dense(output_dim=1, activation='linear'))
+
+  model.compile(loss='mse', optimizer='adam')
+  
+  return model
+
+
+
+
+################################################
+# DISTRIBUTE
+################################################
+
+parser = argparse.ArgumentParser(description='tensorflow')
+parser.add_argument('--job_name', dest='job_name')
+parser.add_argument('--task_index', dest='task_index', default=0)
+args = parser.parse_args()
+
+
+ps_hosts = ['localhost:2222']
+worker_hosts = ['localhost:2223', 'localhost:2224', 'localhost:2225', 'localhost:2226']
+job_name = args.job_name
+task_index = int(args.task_index)
+
+# Create a cluster from the parameter server and worker hosts.
+cluster = tf.train.ClusterSpec({"ps": ps_hosts, "worker": worker_hosts})
+  
+server = tf.train.Server(cluster,
+                         job_name=job_name,
+                         task_index=task_index,
+                         config=tf.ConfigProto(log_device_placement=True,
+                                               inter_op_parallelism_threads=1,
+                                               intra_op_parallelism_threads=1))
+
+
+if job_name =='ps':
+  with tf.device("/job:ps/task:0"):
+    queue = tf.FIFOQueue(len(worker_hosts), tf.int32, shared_name="done_queue")
+  sess = tf.Session(server.target)
+  # wait until all workers are done
+  for i in range(len(worker_hosts)):
+    sess.run(queue.dequeue())
+else:
+  with tf.device(tf.train.replica_device_setter(
+                              worker_device="/job:worker/task:%d" % task_index,
+                              cluster=cluster)):
+
+    keras.backend.set_learning_phase(1)
+    keras.backend.manual_variable_initialization(True)
+
+    model = build_keras_model(nb_features)
+    preds = model.output
+    targets = tf.placeholder(tf.float32, [None, 1])
+    total_loss = tf.reduce_mean(
+                        keras.objectives.mean_squared_error(targets, preds))
+
+    global_step = tf.Variable(0, name="global_step", trainable=False)
+    # For early stopping management
+    epoch = tf.Variable(0, name="epoch", trainable=False)
+    inc_epoch_op = tf.assign_add(epoch, 1)
+
+    is_chief=(task_index == 0)
+
+    opt = tf.train.AdamOptimizer()
+    num_workers = len(worker_hosts)
+    replicas_to_aggregate = num_workers
+    opt = tf.train.SyncReplicasOptimizer(
+                                         opt,
+                                         replicas_to_aggregate=replicas_to_aggregate,
+                                         total_num_replicas=num_workers,
+                                         name="sync_replicas")
+
+    train_op = opt.minimize(total_loss, global_step=global_step)
+    local_init_op = opt.local_step_init_op
+    if is_chief:
+      local_init_op = opt.chief_init_op
+    ready_for_local_init_op = opt.ready_for_local_init_op
+
+    # Initial token and chief queue runners required by the sync_replicas mode
+    chief_queue_runner = opt.get_chief_queue_runner()
+    sync_init_op = opt.get_init_tokens_op()
+
+    init_op = tf.global_variables_initializer()
+    with tf.device("/job:ps/task:0"):
+      queue = tf.FIFOQueue(len(worker_hosts), tf.int32, shared_name="done_queue")
+      enqueue_op = queue.enqueue(1)
+ 
+    train_dir = tempfile.mkdtemp(prefix = 'worker_%d' % task_index)
+    sv = tf.train.Supervisor(
+                             is_chief=is_chief,
+                             logdir=train_dir,
+                             init_op=init_op,
+                             local_init_op=local_init_op,
+                             ready_for_local_init_op=ready_for_local_init_op,
+                             recovery_wait_secs=1,
+                             global_step=global_step)
+    
+    print '######################################### ALL CREATED'
+    sess = sv.prepare_or_wait_for_session(server.target)
+    keras.backend.set_session(sess)
+    print '#######  SESSION OK ********'
+    if is_chief:
+      sess.run(sync_init_op)
+      sv.start_queue_runners(sess, [chief_queue_runner])
+    local_step = 0
+    while True:
+      train_feed = {model.input: X_train, targets: Y_train}
+
+      _, step = sess.run([train_op, global_step], feed_dict=train_feed)
+      loss = sess.run(total_loss, feed_dict = train_feed)
+      if is_chief:
+        sess.run(inc_epoch_op)
+      local_step += 1
+      print '## epoch ', epoch.eval(sess)
+      if epoch.eval(sess) &gt; 4:
+        print '######################  TRYING TO LEAVE'
+        break
+
+    shutil.rmtree(train_dir)
+    print '######################  WHILE LOOP LEFT'
+    sess.run(enqueue_op)
+    print '## ENQUEUE OP DONE'
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='volvador' date='2017-03-02T22:32:09Z'>
+		&lt;denchmark-link:https://github.com/ispirmustafa&gt;@ispirmustafa&lt;/denchmark-link&gt;
+ might have some ideas.
+		</comment>
+		<comment id='2' author='volvador' date='2017-03-08T17:34:50Z'>
+		No charitable tensorflow soul to help with this?
+		</comment>
+		<comment id='3' author='volvador' date='2017-03-08T18:34:10Z'>
+		cc &lt;denchmark-link:https://github.com/jmchen-g&gt;@jmchen-g&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='4' author='volvador' date='2017-03-09T23:46:41Z'>
+		Could you please try with MonitoredSession. worker code should be as follows:
+&lt;denchmark-code&gt;  sync_replicas_hook = opt.make_session_run_hook(is_chief)
+  with tf.train.MonitoredTrainingSession(
+      master=server.target, is_chief=is_chief, checkpoint_dir=train_dir,
+      hooks=[sync_replicas_hook]) as mon_sess:
+    while not mon_sess.should_stop():
+      mon_sess.run(train_op)
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='5' author='volvador' date='2017-03-10T17:38:18Z'>
+		Thanks &lt;denchmark-link:https://github.com/ispirmustafa&gt;@ispirmustafa&lt;/denchmark-link&gt;
+
+I replaced my
+&lt;denchmark-code&gt;sess = sv.prepare_or_wait_for_session(server.target)
+&lt;/denchmark-code&gt;
+
+By the code you suggested. It resulted in the following error:
+&lt;denchmark-code&gt;Traceback (most recent call last):
+File "test.py", line 127, in &lt;module&gt;
+  sync_replicas_hook = opt.make_session_run_hook(is_chief)
+File "../tensorflow-1.0.0/lib/tensorflow/python/training/sync_replicas_optimizer.py", line 431, in make_session_run_hook
+  self.get_init_tokens_op(num_tokens))
+File "../tensorflow-1.0.0/lib/tensorflow/python/training/sync_replicas_optimizer.py", line 418, in get_init_tokens_op
+  tokens = array_ops.fill([num_tokens], self._global_step)
+File "../tensorflow-1.0.0/lib/tensorflow/python/ops/gen_array_ops.py", line 1318, in fill                                                                                                                                                                                                       
+  result = _op_def_lib.apply_op("Fill", dims=dims, value=value, name=name)                                                                                                                                                                                                                                                 
+File "../tensorflow-1.0.0/lib/tensorflow/python/framework/op_def_library.py", line 491, in apply_op                                                                                                                                                                                             
+  preferred_dtype=default_dtype)                                                                                                                                                                                                                                                                                           
+File "../tensorflow-1.0.0/lib/tensorflow/python/framework/ops.py", line 716, in internal_convert_to_tensor                                                                                                                                                                                      
+  ret = conversion_func(value, dtype=dtype, name=name, as_ref=as_ref)                                                                                                                                                                                                                                                      
+File "../tensorflow-1.0.0/lib/tensorflow/python/framework/constant_op.py", line 176, in _constant_tensor_conversion_function                                                                                                                                                                    
+  return constant(v, dtype=dtype, name=name)                                                                                                                                                                                                                                                                               
+File "../tensorflow-1.0.0/lib/tensorflow/python/framework/constant_op.py", line 169, in constant                                                                                                                                                                                                
+  attrs={"value": tensor_value, "dtype": dtype_value}, name=name).outputs[0]                                                                                                                                                                                                                                               
+File "../tensorflow-1.0.0/lib/tensorflow/python/framework/ops.py", line 2354, in create_op                                                                                                                                                                                                      
+  self._check_not_finalized()                                                                                                                                                                                                                                                                                              
+File "../tensorflow-1.0.0/lib/tensorflow/python/framework/ops.py", line 2077, in _check_not_finalized                                                                                                                                                                                           
+  raise RuntimeError("Graph is finalized and cannot be modified.")                                                                                                                                                                                                                                                         
+RuntimeError: Graph is finalized and cannot be modified.                                                      
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='6' author='volvador' date='2017-03-10T18:37:55Z'>
+		This should not happen. Could you please show all the code after your change?
+		</comment>
+		<comment id='7' author='volvador' date='2017-03-10T18:59:28Z'>
+		This is it.. the change is at the end. Thanks for your help. I am sure I am making a silly mistake
+&lt;denchmark-code&gt;import os
+import shutil
+import tempfile
+import numpy as np
+import pandas as pd
+import argparse
+
+from keras.models import Sequential
+from keras.layers.core import Dense
+from keras.regularizers import l2
+import tensorflow as tf
+import keras
+
+nb_samples = 50
+nb_features = 5
+X_train = np.random.randn(nb_samples * nb_features).reshape((nb_samples, nb_features))
+Y_train = np.random.randn(nb_samples).reshape((nb_samples, 1))
+
+def build_keras_model(input_dim):
+  hidden_dim = 10
+
+  model = Sequential()
+  model.add(Dense(input_dim = input_dim,
+                  output_dim=hidden_dim,
+                  activation='tanh'
+                  ))
+
+  model.add(Dense(output_dim=1, activation='linear'))
+
+  model.compile(loss='mse', optimizer='adam')
+  
+  return model
+
+
+
+
+################################################
+# DISTRIBUTE
+################################################
+
+parser = argparse.ArgumentParser(description='tensorflow')
+parser.add_argument('--job_name', dest='job_name')
+parser.add_argument('--task_index', dest='task_index', default=0)
+args = parser.parse_args()
+
+
+ps_hosts = ['localhost:2222']
+worker_hosts = ['localhost:2223', 'localhost:2224', 'localhost:2225', 'localhost:2226']
+job_name = args.job_name
+task_index = int(args.task_index)
+
+# Create a cluster from the parameter server and worker hosts.
+cluster = tf.train.ClusterSpec({"ps": ps_hosts, "worker": worker_hosts})
+  
+server = tf.train.Server(cluster,
+                         job_name=job_name,
+                         task_index=task_index,
+                         config=tf.ConfigProto(log_device_placement=True,
+                                               inter_op_parallelism_threads=1,
+                                               intra_op_parallelism_threads=1))
+
+
+if job_name =='ps':
+  with tf.device("/job:ps/task:0"):
+    queue = tf.FIFOQueue(len(worker_hosts), tf.int32, shared_name="done_queue")
+  sess = tf.Session(server.target)
+  # wait until all workers are done
+  for i in range(len(worker_hosts)):
+    sess.run(queue.dequeue())
+else:
+  with tf.device(tf.train.replica_device_setter(
+                              worker_device="/job:worker/task:%d" % task_index,
+                              cluster=cluster)):
+
+    keras.backend.set_learning_phase(1)
+    keras.backend.manual_variable_initialization(True)
+
+    model = build_keras_model(nb_features)
+    preds = model.output
+    targets = tf.placeholder(tf.float32, [None, 1])
+    total_loss = tf.reduce_mean(
+                        keras.objectives.mean_squared_error(targets, preds))
+
+    global_step = tf.Variable(0, name="global_step", trainable=False)
+    # For stopping management
+    epoch = tf.Variable(0, name="epoch", trainable=False)
+    inc_epoch_op = tf.assign_add(epoch, 1)
+
+    is_chief=(task_index == 0)
+
+    opt = tf.train.AdamOptimizer()
+    num_workers = len(worker_hosts)
+    replicas_to_aggregate = num_workers
+    opt = tf.train.SyncReplicasOptimizer(
+                                         opt,
+                                         replicas_to_aggregate=replicas_to_aggregate,
+                                         total_num_replicas=num_workers,
+                                         name="sync_replicas")
+
+    train_op = opt.minimize(total_loss, global_step=global_step)
+    local_init_op = opt.local_step_init_op
+    if is_chief:
+      local_init_op = opt.chief_init_op
+    ready_for_local_init_op = opt.ready_for_local_init_op
+
+    # Initial token and chief queue runners required by the sync_replicas mode
+    chief_queue_runner = opt.get_chief_queue_runner()
+    sync_init_op = opt.get_init_tokens_op()
+
+    init_op = tf.global_variables_initializer()
+    with tf.device("/job:ps/task:0"):
+      queue = tf.FIFOQueue(len(worker_hosts), tf.int32, shared_name="done_queue")
+      enqueue_op = queue.enqueue(1)
+ 
+    train_dir = tempfile.mkdtemp(prefix = 'worker_%d' % task_index)
+    sv = tf.train.Supervisor(
+                             is_chief=is_chief,
+                             logdir=train_dir,
+                             init_op=init_op,
+                             local_init_op=local_init_op,
+                             ready_for_local_init_op=ready_for_local_init_op,
+                             recovery_wait_secs=1,
+                             global_step=global_step)
+    
+    print '######################################### ALL CREATED'
+    #sess = sv.prepare_or_wait_for_session(server.target)
+    sync_replicas_hook = opt.make_session_run_hook(is_chief)
+    with tf.train.MonitoredTrainingSession(
+               master=server.target, is_chief=is_chief, checkpoint_dir=train_dir,
+                     hooks=[sync_replicas_hook]) as sess:
+      keras.backend.set_session(sess)
+      print '#######  SESSION OK ********'
+      if is_chief:
+        sess.run(sync_init_op)
+        sv.start_queue_runners(sess, [chief_queue_runner])
+      local_step = 0
+      while True:
+        train_feed = {model.input: X_train, targets: Y_train}
+
+        _, step = sess.run([train_op, global_step], feed_dict=train_feed)
+        loss = sess.run(total_loss, feed_dict = train_feed)
+        if is_chief:
+          sess.run(inc_epoch_op)
+        local_step += 1
+        print '## epoch ', epoch.eval(sess)
+        if epoch.eval(sess) &gt; 4:
+          print '######################  TRYING TO LEAVE'
+          break
+
+    shutil.rmtree(train_dir)
+    print '######################  WHILE LOOP LEFT'
+    sess.run(enqueue_op)
+    print '## ENQUEUE OP DONE'
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='8' author='volvador' date='2017-03-10T19:17:24Z'>
+		Please check the documentation of MonitoredSession.
+you need to remove following lines:
+&lt;denchmark-code&gt;local_init_op = opt.local_step_init_op
+    if is_chief:
+      local_init_op = opt.chief_init_op
+    ready_for_local_init_op = opt.ready_for_local_init_op
+
+    # Initial token and chief queue runners required by the sync_replicas mode
+    chief_queue_runner = opt.get_chief_queue_runner()
+    sync_init_op = opt.get_init_tokens_op()
+
+    init_op = tf.global_variables_initializer()
+&lt;/denchmark-code&gt;
+
+Also followings:
+&lt;denchmark-code&gt;   sv = tf.train.Supervisor(
+                             is_chief=is_chief,
+                             logdir=train_dir,
+                             init_op=init_op,
+                             local_init_op=local_init_op,
+                             ready_for_local_init_op=ready_for_local_init_op,
+                             recovery_wait_secs=1,
+                             global_step=global_step)
+    
+    print '######################################### ALL CREATED'
+    #sess = sv.prepare_or_wait_for_session(server.target)
+&lt;/denchmark-code&gt;
+
+Also followings:
+if is_chief:
+sess.run(sync_init_op)
+sv.start_queue_runners(sess, [chief_queue_runner])
+also can you delete train_dir after running enqueue_op.
+		</comment>
+		<comment id='9' author='volvador' date='2017-03-10T19:38:47Z'>
+		Thanks. It still does not work. Only the chief executes the train loop (even if in the code replicas_to_aggregate=nb_workers), and it ends with an exception&gt; I put below the new code as well as the output of the chief worker
+&lt;denchmark-code&gt;import os
+import shutil
+import tempfile
+import numpy as np
+import pandas as pd
+import argparse
+
+from keras.models import Sequential
+from keras.layers.core import Dense
+from keras.regularizers import l2
+import tensorflow as tf
+import keras
+
+nb_samples = 50
+nb_features = 5
+X_train = np.random.randn(nb_samples * nb_features).reshape((nb_samples, nb_features))
+Y_train = np.random.randn(nb_samples).reshape((nb_samples, 1))
+
+def build_keras_model(input_dim):
+  hidden_dim = 10
+
+  model = Sequential()
+  model.add(Dense(input_dim = input_dim,
+                  output_dim=hidden_dim,
+                  activation='tanh'
+                  ))
+
+  model.add(Dense(output_dim=1, activation='linear'))
+
+  model.compile(loss='mse', optimizer='adam')
+  
+  return model
+
+
+
+
+################################################
+# DISTRIBUTE
+################################################
+
+parser = argparse.ArgumentParser(description='tensorflow')
+parser.add_argument('--job_name', dest='job_name')
+parser.add_argument('--task_index', dest='task_index', default=0)
+args = parser.parse_args()
+
+
+ps_hosts = ['localhost:2222']
+worker_hosts = ['localhost:2223', 'localhost:2224', 'localhost:2225', 'localhost:2226']
+job_name = args.job_name
+task_index = int(args.task_index)
+
+# Create a cluster from the parameter server and worker hosts.
+cluster = tf.train.ClusterSpec({"ps": ps_hosts, "worker": worker_hosts})
+  
+server = tf.train.Server(cluster,
+                         job_name=job_name,
+                         task_index=task_index,
+                         config=tf.ConfigProto(log_device_placement=True,
+                                               inter_op_parallelism_threads=1,
+                                               intra_op_parallelism_threads=1))
+
+
+if job_name =='ps':
+  with tf.device("/job:ps/task:0"):
+    queue = tf.FIFOQueue(len(worker_hosts), tf.int32, shared_name="done_queue")
+  sess = tf.Session(server.target)
+  # wait until all workers are done
+  for i in range(len(worker_hosts)):
+    sess.run(queue.dequeue())
+else:
+  with tf.device(tf.train.replica_device_setter(
+                              worker_device="/job:worker/task:%d" % task_index,
+                              cluster=cluster)):
+
+    keras.backend.set_learning_phase(1)
+    keras.backend.manual_variable_initialization(True)
+
+    model = build_keras_model(nb_features)
+    preds = model.output
+    targets = tf.placeholder(tf.float32, [None, 1])
+    total_loss = tf.reduce_mean(
+                        keras.objectives.mean_squared_error(targets, preds))
+
+    global_step = tf.Variable(0, name="global_step", trainable=False)
+    # For stopping management
+    epoch = tf.Variable(0, name="epoch", trainable=False)
+    inc_epoch_op = tf.assign_add(epoch, 1)
+
+    is_chief=(task_index == 0)
+
+    opt = tf.train.AdamOptimizer()
+    num_workers = len(worker_hosts)
+    replicas_to_aggregate = num_workers
+    opt = tf.train.SyncReplicasOptimizer(
+                                         opt,
+                                         replicas_to_aggregate=replicas_to_aggregate,
+                                         total_num_replicas=num_workers,
+                                         name="sync_replicas")
+
+    train_op = opt.minimize(total_loss, global_step=global_step)
+    with tf.device("/job:ps/task:0"):
+      queue = tf.FIFOQueue(len(worker_hosts), tf.int32, shared_name="done_queue")
+      enqueue_op = queue.enqueue(1)
+ 
+    train_dir = tempfile.mkdtemp(prefix = 'worker_%d' % task_index)
+    
+    print '######################################### ALL CREATED'
+    sync_replicas_hook = opt.make_session_run_hook(is_chief)
+    with tf.train.MonitoredTrainingSession(
+               master=server.target, is_chief=is_chief, checkpoint_dir=train_dir,
+                     hooks=[sync_replicas_hook]) as sess:
+      keras.backend.set_session(sess)
+      print '#######  SESSION OK ********'
+      local_step = 0
+      while True:
+        train_feed = {model.input: X_train, targets: Y_train}
+
+        _, step = sess.run([train_op, global_step], feed_dict=train_feed)
+        loss = sess.run(total_loss, feed_dict = train_feed)
+        if is_chief:
+          sess.run(inc_epoch_op)
+        local_step += 1
+        print '## epoch ', epoch.eval(sess)
+        if epoch.eval(sess) &gt; 4:
+          print '######################  TRYING TO LEAVE'
+          break
+
+    print '######################  WHILE LOOP LEFT'
+    sess.run(enqueue_op)
+    print '## ENQUEUE OP DONE'
+    shutil.rmtree(train_dir)
+&lt;/denchmark-code&gt;
+
+and this is the output of the chief worker
+&lt;denchmark-code&gt;#######  SESSION OK ********
+## epoch  1
+## epoch  2
+## epoch  3
+## epoch  4
+## epoch  5
+######################  TRYING TO LEAVE
+Exception in thread Thread-2:
+Traceback (most recent call last):
+  File "/usr/lib64/python2.7/threading.py", line 811, in __bootstrap_inner
+    self.run()
+  File "/usr/lib64/python2.7/threading.py", line 764, in run
+    self.__target(*self.__args, **self.__kwargs)
+  File "../tensorflow-1.0.0/lib/tensorflow/python/training/queue_runner_impl.py", line 250, in _run
+    coord.request_stop(e)
+  File "../tensorflow-1.0.0/lib/tensorflow/python/training/coordinator.py", line 211, in request_stop
+    six.reraise(*sys.exc_info())
+  File "../tensorflow-1.0.0/lib/tensorflow/python/training/queue_runner_impl.py", line 234, in _run
+    sess.run(enqueue_op)
+  File "../tensorflow-1.0.0/lib/tensorflow/python/client/session.py", line 767, in run
+    run_metadata_ptr)
+  File "../tensorflow-1.0.0/lib/tensorflow/python/client/session.py", line 965, in _run
+    feed_dict_string, options, run_metadata)
+  File "../tensorflow-1.0.0/lib/tensorflow/python/client/session.py", line 1015, in _do_run
+    target_list, options, run_metadata)
+  File "../tensorflow-1.0.0/lib/tensorflow/python/client/session.py", line 1035, in _do_call
+    raise type(e)(node_def, op, message)
+CancelledError: RunManyGraphs
+
+Traceback (most recent call last):
+  File "test.py", line 148, in &lt;module&gt;
+    break
+  File "../tensorflow-1.0.0/lib/tensorflow/python/training/monitored_session.py", line 478, in __exit__
+    self._close_internal(exception_type)
+  File "../tensorflow-1.0.0/lib/tensorflow/python/training/monitored_session.py", line 511, in _close_internal
+    self._sess.close()
+  File "../tensorflow-1.0.0/lib/tensorflow/python/training/monitored_session.py", line 739, in close
+    self._sess.close()
+  File "../tensorflow-1.0.0/lib/tensorflow/python/training/monitored_session.py", line 827, in close
+    self._coord.join()
+  File "../tensorflow-1.0.0/lib/tensorflow/python/training/coordinator.py", line 390, in join
+    " ".join(stragglers))
+RuntimeError: Coordinator stopped with threads still running: Thread-2
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='10' author='volvador' date='2017-03-10T22:28:43Z'>
+		&lt;denchmark-link:https://github.com/jmchen-g&gt;@jmchen-g&lt;/denchmark-link&gt;
+ could you please review the code?
+		</comment>
+		<comment id='11' author='volvador' date='2017-03-13T07:06:23Z'>
+		Looks like that the session trains well but couldn't go outside the loop
+because some threads are still running (the queue runner thread in this
+case)...
+&lt;denchmark-link:#&gt;…&lt;/denchmark-link&gt;
+
+
+On Fri, Mar 10, 2017 at 2:29 PM, ispirmustafa ***@***.***&gt; wrote:
+ @jmchen-g &lt;https://github.com/jmchen-g&gt; could you please review the code?
+
+ —
+ You are receiving this because you were mentioned.
+ Reply to this email directly, view it on GitHub
+ &lt;#7970 (comment)&gt;,
+ or mute the thread
+ &lt;https://github.com/notifications/unsubscribe-auth/APD49jfjsRwXleF4iVdQfEeMNio2OIS0ks5rkc7egaJpZM4MPifr&gt;
+ .
+
+
+
+		</comment>
+		<comment id='12' author='volvador' date='2017-03-13T07:53:24Z'>
+		Please confirm that the training went normal during these epocs. Thanks.
+		</comment>
+		<comment id='13' author='volvador' date='2017-03-13T20:37:34Z'>
+		Indeed training goes well, and I see the loss decreasing when I print it in the chief worker. However, the workers could not go outside the loop as you mentioned.
+Another issue is that it seems only the chief is doing the training, even if in the constructor of SyncReplicasOptimizer I have the parameter replicas_to_aggregate=num_workers
+		</comment>
+		<comment id='14' author='volvador' date='2017-03-20T16:34:59Z'>
+		No good samaritan to help with this issue?
+		</comment>
+		<comment id='15' author='volvador' date='2017-03-21T07:34:45Z'>
+		What do you mean by only the chief is doing the training? Only the chief will update the variables through the chief queue runner but it should use the grads from all available workers...
+For the issue that when training finished successfully, the other workers should at least exit via time out unless the time out is set to infinity?
+		</comment>
+		<comment id='16' author='volvador' date='2017-03-21T11:12:31Z'>
+		I mean in the training loop, the print statement
+&lt;denchmark-code&gt; print '## epoch ', epoch.eval(sess)
+&lt;/denchmark-code&gt;
+
+got executed only by the chief.
+If I repeat my experiment several times, it may get executed by the other workers from time to time.
+I thought in SyncReplicasOptimizer the chief was supposed to wait until all the workers are live before beginning the optimization (indeed, replicas_to_aggregate=num_workers in my code)
+		</comment>
+		<comment id='17' author='volvador' date='2017-03-22T00:23:22Z'>
+		The chief is supposed to wait until enough grads are collected so not necessarily from all workers.
+Hmm... You guys are using the tf.train.replica_device_setter(..) which doesn't tell global from local variables (We only notice this recently!)... This is not right and we are trying to fix it. Please wait until that is fixed. Thanks.
+		</comment>
+		<comment id='18' author='volvador' date='2017-03-22T10:04:05Z'>
+		Thank you
+		</comment>
+		<comment id='19' author='volvador' date='2017-05-02T06:15:37Z'>
+		When I use TF 1.1.0,The chief worker throws the following error :
+Exception in thread Thread-7:
+Traceback (most recent call last):
+File "/export/App/anaconda3/envs/py2/lib/python2.7/threading.py", line 801, in __bootstrap_inner
+self.run()
+File "/export/App/anaconda3/envs/py2/lib/python2.7/threading.py", line 754, in run
+self.__target(*self.__args, **self.__kwargs)
+File "/export/App/anaconda3/envs/py2/lib/python2.7/site-packages/tensorflow/python/training/queue_runner_impl.py", line 250, in _run
+coord.request_stop(e)
+File "/export/App/anaconda3/envs/py2/lib/python2.7/site-packages/tensorflow/python/training/coordinator.py", line 211, in request_stop
+six.reraise(*sys.exc_info())
+File "/export/App/anaconda3/envs/py2/lib/python2.7/site-packages/tensorflow/python/training/queue_runner_impl.py", line 234, in _run
+sess.run(enqueue_op)
+File "/export/App/anaconda3/envs/py2/lib/python2.7/site-packages/tensorflow/python/client/session.py", line 778, in run
+run_metadata_ptr)
+File "/export/App/anaconda3/envs/py2/lib/python2.7/site-packages/tensorflow/python/client/session.py", line 982, in _run
+feed_dict_string, options, run_metadata)
+File "/export/App/anaconda3/envs/py2/lib/python2.7/site-packages/tensorflow/python/client/session.py", line 1032, in _do_run
+target_list, options, run_metadata)
+File "/export/App/anaconda3/envs/py2/lib/python2.7/site-packages/tensorflow/python/client/session.py", line 1052, in _do_call
+raise type(e)(node_def, op, message)
+CancelledError: Step was cancelled by an explicit call to Session::Close().
+		</comment>
+		<comment id='20' author='volvador' date='2017-05-24T14:28:33Z'>
+		Hi &lt;denchmark-link:https://github.com/jmchen-g&gt;@jmchen-g&lt;/denchmark-link&gt;
+,
+I'm facing the same kind of issues using tensorflow 1.0.0. In a distributed run, for most of the runs the non-chief workers get stuck and log from time to time:
+
+INFO:tensorflow:Waiting for model to be ready.  Ready_for_local_init_op:  None, ready: Variables not initialized:
+
+In some runs, they start working and print some logs as expected:
+
+INFO:tensorflow:For task_index 1, at step 88714, cost is 0.00616120453924
+
+It might be related to the issue you mentionned as I'm also using
+tf.train.replica_device_setter("/job:worker/task:%d" % FLAGS.task_index)
+I wonder if you could give any insights and/or workarounds on the issue?
+Many thanks,
+		</comment>
+		<comment id='21' author='volvador' date='2017-06-30T18:22:20Z'>
+		&lt;denchmark-link:https://github.com/ispirmustafa&gt;@ispirmustafa&lt;/denchmark-link&gt;
+, any further thoughts about this?
+		</comment>
+		<comment id='22' author='volvador' date='2017-06-30T20:30:29Z'>
+		The device setter issue should have already been fixed in the latest branch. When did you pull?
+		</comment>
+		<comment id='23' author='volvador' date='2017-07-13T14:59:44Z'>
+		Can you let me know the fix commit? What was the problem with replica_device_setter. I experienced same problem, but I just want to modify this solution instead of pulling latest branch.
+		</comment>
+		<comment id='24' author='volvador' date='2017-07-13T19:51:16Z'>
+		The setter issue should have already been fixed in the latest head. Do you
+still have this after syncing?
+&lt;denchmark-link:#&gt;…&lt;/denchmark-link&gt;
+
+
+On Thu, Jul 13, 2017 at 8:01 AM, sj6077 ***@***.***&gt; wrote:
+ Can you let me know the fix commit?
+
+ —
+ You are receiving this because you were mentioned.
+ Reply to this email directly, view it on GitHub
+ &lt;#7970 (comment)&gt;,
+ or mute the thread
+ &lt;https://github.com/notifications/unsubscribe-auth/APD49sZI-jz2GZmFhMepvXG0FCM4P319ks5sNjFBgaJpZM4MPifr&gt;
+ .
+
+
+
+		</comment>
+		<comment id='25' author='volvador' date='2017-07-14T00:58:44Z'>
+		I need to keep the version, so I just want to modify that parts. When was it fixed? The last commit in my repo is May 4. I also want to catch up the reason of the issue.
+		</comment>
+		<comment id='26' author='volvador' date='2017-07-14T02:26:42Z'>
+		I also tested with the latest head, but I still got same error with &lt;denchmark-link:https://github.com/fanlu&gt;@fanlu&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='27' author='volvador' date='2017-11-03T19:11:57Z'>
+		&lt;denchmark-link:https://github.com/npfp&gt;@npfp&lt;/denchmark-link&gt;
+ Hi, I have encountered the same problem. Have you solved that?
+
+"INFO:tensorflow:Waiting for model to be ready. Ready_for_local_init_op: None, ready: Variables not initialized:"
+
+		</comment>
+		<comment id='28' author='volvador' date='2017-12-22T07:47:49Z'>
+		It has been 14 days with no activity and the awaiting tensorflower label was assigned. Please update the label and/or status accordingly.
+		</comment>
+		<comment id='29' author='volvador' date='2018-01-05T19:13:36Z'>
+		Nagging Awaiting TensorFlower: It has been 14 days with no activityand the awaiting tensorflower label was assigned. Please update the label and/or status accordingly.
+		</comment>
+		<comment id='30' author='volvador' date='2018-01-24T13:19:03Z'>
+		Nagging Awaiting TensorFlower: It has been 14 days with no activity and the awaiting tensorflower label was assigned. Please update the label and/or status accordingly.
+		</comment>
+		<comment id='31' author='volvador' date='2018-02-08T00:52:08Z'>
+		is this still an issue with tensorflow? otherwise, please close the issue
+		</comment>
+		<comment id='32' author='volvador' date='2018-02-09T06:14:01Z'>
+		I think it's okay, now. Can you close it?
+		</comment>
+		<comment id='33' author='volvador' date='2018-02-23T14:06:40Z'>
+		Nagging Assignee: It has been 14 days with no activity and this issue has an assignee. Please update the label and/or status accordingly.
+		</comment>
+		<comment id='34' author='volvador' date='2018-07-13T15:14:03Z'>
+		&lt;denchmark-link:https://github.com/sj6077&gt;@sj6077&lt;/denchmark-link&gt;
+
+I am also facing the problem &lt;denchmark-link:https://github.com/fanlu&gt;@fanlu&lt;/denchmark-link&gt;
+ had.  Could you share how you fix that? Thanks.
+		</comment>
+		<comment id='35' author='volvador' date='2018-08-15T08:17:57Z'>
+		Have the similar issue with &lt;denchmark-link:https://github.com/fanlu&gt;@fanlu&lt;/denchmark-link&gt;
+ 's exception after training in .
+		</comment>
+	</comments>
+</bug>

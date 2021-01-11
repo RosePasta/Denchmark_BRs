@@ -1,0 +1,224 @@
+<bug id='7036' author='justinkterry' open_date='2020-02-04T00:33:52Z' closed_time='2020-03-03T15:26:09Z'>
+	<summary>[RLlib] APEX-DQN reproducibly can't initiate across arbitrary environments</summary>
+	<description>
+Here's trying to initialize it with a dummy enviroment
+&lt;denchmark-code&gt;import numpy as np
+import ray
+import ray.rllib
+import gym.spaces
+from ray.rllib.env.multi_agent_env import MultiAgentEnv
+
+class MyEnv(MultiAgentEnv):
+    def __init__(self, env_config):
+        self.num_agents = 2
+        self.agent_ids = list(range(self.num_agents))
+        self.action_space_dict = dict(zip(self.agent_ids, [gym.spaces.Discrete(2)]*self.num_agents))
+        self.observation_space_dict = dict(zip(self.agent_ids, [gym.spaces.Box(low=0, high=1, shape=(1,))]*self.num_agents))
+        
+    def reset(self):
+        return {agent_id: np.array([0]) for agent_id in self.agent_ids}
+    
+    def step(self, action):
+        obs_dict = {agent_id: np.array([0]) for agent_id in self.agent_ids}
+        rewards_dict = {agent_id: 0 for agent_id in self.agent_ids}
+        done_dict = {agent_id: True for agent_id in self.agent_ids}
+        done_dict['__all__'] = True
+        info_dict = {agent_id: {} for agent_id in self.agent_ids}
+        return obs_dict, rewards_dict, done_dict, info_dict
+
+ray.init()
+
+from ray.rllib.utils import try_import_tf
+tf = try_import_tf()
+from ray.rllib.models import Model, ModelCatalog
+class MLPModel(Model):
+    def _build_layers_v2(self, input_dict, num_outputs, options):
+        last_layer = tf.layers.dense(
+                input_dict["obs"], 400, activation=tf.nn.relu, name="fc1")
+        last_layer = tf.layers.dense(
+            last_layer, 300, activation=tf.nn.relu, name="fc2")
+        output = tf.layers.dense(
+            last_layer, num_outputs, activation=None, name="fc_out")
+        return output, last_layer
+
+ModelCatalog.register_custom_model("MLPModel", MLPModel)
+
+obs_space = gym.spaces.Box(low=0, high=1, shape=(1,))
+act_space = gym.spaces.Discrete(2)
+
+def gen_policy(i):
+    config = {
+        "model": {
+            "custom_model": "MLPModel",
+        },
+        "gamma": 0.99,
+    }
+    return (None, obs_space, act_space, config)
+
+
+policies = {"policy_0": gen_policy(0)}
+policy_ids = list(policies.keys())
+
+
+trainer = ray.rllib.agents.dqn.ApexTrainer(
+#trainer = ray.rllib.agents.dqn.DQNTrainer(
+    env=MyEnv,
+    config={
+        "env_config": {},
+
+        # General
+        "log_level": "ERROR",
+        "num_gpus": 1,
+        "num_workers": 2,
+        
+        # Method specific
+        "multiagent": {
+            "policies": policies,
+            "policy_mapping_fn": (
+                lambda agent_id: policy_ids[0]),
+        },
+    },
+)
+
+trainer.train()
+&lt;/denchmark-code&gt;
+
+Here's the error message:
+&lt;denchmark-code&gt;Traceback (most recent call last):
+  File "/home/ananth/miniconda3/envs/parshar/lib/python3.7/site-packages/tensorflow/python/client/session.py", line 1356, in _do_call
+    return fn(*args)
+  File "/home/ananth/miniconda3/envs/parshar/lib/python3.7/site-packages/tensorflow/python/client/session.py", line 1341, in _run_fn
+    options, feed_dict, fetch_list, target_list, run_metadata)
+  File "/home/ananth/miniconda3/envs/parshar/lib/python3.7/site-packages/tensorflow/python/client/session.py", line 1429, in _call_tf_sessionrun
+    run_metadata)
+tensorflow.python.framework.errors_impl.FailedPreconditionError: 2 root error(s) found.
+  (0) Failed precondition: Attempting to use uninitialized value policy_0/target_q_func/fc_out/kernel
+	 [[{{node policy_0/target_q_func/fc_out/kernel/read}}]]
+	 [[policy_0/sub_5/_51]]
+  (1) Failed precondition: Attempting to use uninitialized value policy_0/target_q_func/fc_out/kernel
+	 [[{{node policy_0/target_q_func/fc_out/kernel/read}}]]
+0 successful operations.
+0 derived errors ignored.
+&lt;/denchmark-code&gt;
+
+I'm also using ray 0.9.dev0 pulling from the nightly builds. Could the issue be APEX methods don't actually support multiagent learning like the documentation says they do?
+	</description>
+	<comments>
+		<comment id='1' author='justinkterry' date='2020-02-10T01:36:44Z'>
+		FYI, this is problem doesn't occur with APEX-DDPG
+		</comment>
+		<comment id='2' author='justinkterry' date='2020-02-12T14:21:20Z'>
+		Thanks for opening this. It's on my TODO list now. Will keep you posted.
+		</comment>
+		<comment id='3' author='justinkterry' date='2020-03-03T11:59:53Z'>
+		Would you consider using the ModelV2 interface, instead? We will deprecate Model(V1) very soon as it's not compatible with some of the new features and APIs. I will add this also to the documentation.
+Here is a slightly simplified (TfModelV2) working example:
+&lt;denchmark-code&gt;import numpy as np
+import ray
+import ray.rllib
+import gym.spaces
+from ray.rllib.env.multi_agent_env import MultiAgentEnv
+from ray.rllib.utils import try_import_tf
+from ray.rllib.models.tf.tf_modelv2 import TFModelV2
+from ray.rllib.models import Model, ModelCatalog
+
+tf = try_import_tf()
+
+
+class MyEnv(MultiAgentEnv):
+    def __init__(self, env_config):
+        self.num_agents = 2
+        self.agent_ids = list(range(self.num_agents))
+        self.action_space_dict = dict(
+            zip(self.agent_ids, [gym.spaces.Discrete(2)] * self.num_agents))
+        self.observation_space_dict = dict(zip(self.agent_ids, [
+            gym.spaces.Box(low=0, high=1, shape=(1,))] * self.num_agents))
+    
+    def reset(self):
+        return {agent_id: np.array([0]) for agent_id in self.agent_ids}
+    
+    def step(self, action):
+        obs_dict = {agent_id: np.array([0]) for agent_id in self.agent_ids}
+        rewards_dict = {agent_id: 0 for agent_id in self.agent_ids}
+        done_dict = {agent_id: True for agent_id in self.agent_ids}
+        done_dict['__all__'] = True
+        info_dict = {agent_id: {} for agent_id in self.agent_ids}
+        return obs_dict, rewards_dict, done_dict, info_dict
+
+
+class MLPModelV2(TFModelV2):
+    def __init__(self, obs_space, action_space, num_outputs, model_config,
+                 name="my_model"):
+        super().__init__(obs_space, action_space, num_outputs, model_config,
+                         name)
+        # Simplified to one layer.
+        input = tf.keras.layers.Input(obs_space.shape, dtype=obs_space.dtype)
+        output = tf.keras.layers.Dense(num_outputs, activation=None)
+        self.base_model = tf.keras.models.Sequential([input, output])
+        self.register_variables(self.base_model.variables)
+
+    def forward(self, input_dict, state, seq_lens):
+        return self.base_model(input_dict["obs"]), []
+
+
+class MLPModel(Model):
+    # Using this Model class won't work with APEX-DQN (due to a missing
+    # initializing forward pass?).
+    def _build_layers_v2(self, input_dict, num_outputs, options):
+        last_layer = tf.layers.dense(
+                input_dict["obs"], 400, activation=tf.nn.relu, name="fc1")
+        last_layer = tf.layers.dense(
+            last_layer, 300, activation=tf.nn.relu, name="fc2")
+        output = tf.layers.dense(
+            last_layer, num_outputs, activation=None, name="fc_out")
+        return output, last_layer
+
+
+if __name__ == "__main__":
+    ray.init()
+    ModelCatalog.register_custom_model("MLPModel", MLPModelV2)
+
+    obs_space = gym.spaces.Box(low=0, high=1, shape=(1,))
+    act_space = gym.spaces.Discrete(2)
+
+    def gen_policy(i):
+        config = {
+            "model": {
+                "custom_model": "MLPModel",
+            },
+            "gamma": 0.99,
+        }
+        return (None, obs_space, act_space, config)
+
+    policies = {"policy_0": gen_policy(0)}
+    policy_ids = list(policies.keys())
+
+    trainer = ray.rllib.agents.dqn.ApexTrainer(
+    #trainer = ray.rllib.agents.dqn.DQNTrainer(
+        env=MyEnv,
+        config={
+            "env_config": {},
+
+            # General
+            "log_level": "ERROR",
+            #"num_gpus": 1,
+            "num_workers": 2,
+
+            # Method specific
+            "multiagent": {
+                "policies": policies,
+                "policy_mapping_fn": (
+                    lambda agent_id: policy_ids[0]),
+            },
+        },
+    )
+
+    print(trainer.train())
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='4' author='justinkterry' date='2020-03-03T15:26:09Z'>
+		I'm closing this issue.
+		</comment>
+	</comments>
+</bug>

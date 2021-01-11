@@ -1,0 +1,380 @@
+<bug id='6839' author='stolsvik' open_date='2018-12-11T22:36:11Z' closed_time='2018-12-19T06:52:55Z'>
+	<summary>Implement INDArray.close() semantics.</summary>
+	<description>
+{This was originally an issue about AutoGcWindow being set to 100 ms, but it "derailed" into a discussion of implementing close()-semantics on INDArrays. I moved the original issue to https://github.com/deeplearning4j/deeplearning4j/issues/6846, so that it can be closed without closing the discussion about close() semantics.}
+Original issue was as follows, but the discussion ended up with INDArray.close() semantics.
+
+Given that no-one should ever rely on GC for doing cleanup of external resources (as per every single explanation of resource handling in every manual ever written), and that most of Dl4j is now using explicit cleanup via workspaces, the default AutoGcWindow setting should be looked into.
+I was really hit by the GC-logic of dl4j when trying out something I hadn't done before: Restoring a previously stored network and inferring on it..! The loading took much longer time than saving, but worse, the inferring of some hundreds-of-thousands datapoints, which while training took literally seconds, took hours on this restored network.
+After intense debugging and "triangulating" between different setups, barking up every tree in the forest, whipping out the debugger and profiler, I suddenly looked directly at that one single line which I had in the training code, which I hadn't copied over to the restore-and-infer code:
+Nd4j.getMemoryManager().setAutoGcWindow(600_000); // 600k = Every 10 minutes
+It suddenly hit me that I vaguely remember that one should change this setting if using Workspaces. And I then copied it over. And that made all the difference. When looking into the code, I see that it is set to 100 ms by default (!!), both on the BasicMemoryManager and the CudaMemoryManager. When using a heap of 20GB+, doing GC every 100 ms kinda explains why this was .. not working.
+This default seems pretty strange. Unless there is something extraordinary with my setup, this is what will hit most people unless they dig pretty deep, and I can just see the contours of how many people will wrongfully experience dl4j as a really slow system.
+
+	</description>
+	<comments>
+		<comment id='1' author='stolsvik' date='2018-12-12T08:31:48Z'>
+		BTW, that's intended as a fallback, but yeah I also think 100 ms is pretty bad.
+&lt;denchmark-link:https://github.com/raver119&gt;@raver119&lt;/denchmark-link&gt;
+ Could we have a more reasonable default?
+		</comment>
+		<comment id='2' author='stolsvik' date='2018-12-12T08:34:01Z'>
+		It should be 5000ms as default
+		</comment>
+		<comment id='3' author='stolsvik' date='2018-12-12T08:36:57Z'>
+		It doesn't look that way here:
+&lt;denchmark-link:https://github.com/deeplearning4j/deeplearning4j/blob/master/nd4j/nd4j-backends/nd4j-api-parent/nd4j-api/src/main/java/org/nd4j/linalg/memory/BasicMemoryManager.java#L48&gt;https://github.com/deeplearning4j/deeplearning4j/blob/master/nd4j/nd4j-backends/nd4j-api-parent/nd4j-api/src/main/java/org/nd4j/linalg/memory/BasicMemoryManager.java#L48&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='4' author='stolsvik' date='2018-12-12T08:39:02Z'>
+		Easy fix then.
+		</comment>
+		<comment id='5' author='stolsvik' date='2018-12-12T09:20:51Z'>
+		5 seconds is WAY to often. On a 20GB heap with actual use, the full GC will take several seconds.
+The only real solution here is to not rely on GC. That is the only fundamental solution to this. Otherwise, I've set it to 10 minutes, and that seems to do it for me - as I do not create any "freestanding" NDArrays at all except for what I accidentally get from the framework (I obviously use Workspaces for those that I create, even if I find the API for this to be rather intimidating, with too little documentation to actually give me the full insight into how it is supposed to work).
+I wrote this in the chat, now deleted as it was too rant'y:
+This is obviously an external resource. It might be simpler to think of file handles, or socket handles (really the same thing). An OS typically have pretty limites set of such. And there is .close() on both of them. This is not without reason.
+So lets think of file handles: The clue is that the JVM have NO idea about this pool of severely limited resources. So, the fact that some "random" objects on the heap are VERY special in that they allocate such a resource, there is no way that the GC can give these a preferential treatment. So, you open a couple thousand files, process them, and open some thousand more. The JVM heap is still at a comfortable 100 MB used, so the GC have no intention in the world of starting. Then you read a couple of thousand more. And BAM, you do not have any more file handles. Your app explodes, w/o having GC'ed even once.
+This is pretty obvious. So you think, OK, lets just hammer in a Thread that hits System.gc() every few seconds. But then the file-reading is too fast for that, and you still explode. So you set it down to 100ms. And now this specific case works.
+Problem is, that you now have made a complete mess out of the ENTIRE POINT of using Garbage Collection. Like, litereally - the bare concept of GC is now completely screwed over.
+I am not the only one thinking this (just if I come over as totally unsubstantiated): &lt;denchmark-link:https://stackoverflow.com/a/2414120/39334&gt;https://stackoverflow.com/a/2414120/39334&lt;/denchmark-link&gt;
+ 
+From that SO-answer, there is a link to Sun bug &lt;denchmark-link:https://bugs.java.com/bugdatabase/view_bug.do?bug_id=6668279&gt;https://bugs.java.com/bugdatabase/view_bug.do?bug_id=6668279&lt;/denchmark-link&gt;
+  - which again points to the GC tuning Faq at &lt;denchmark-link:https://www.oracle.com/technetwork/java/gc-tuning-5-138395.html&gt;https://www.oracle.com/technetwork/java/gc-tuning-5-138395.html&lt;/denchmark-link&gt;
+ 
+		</comment>
+		<comment id='6' author='stolsvik' date='2018-12-12T09:23:06Z'>
+		I'm completely agree with you. Please send us PR that accounts memory use in offheap and asynchronous nature of CUDA at the same time, without touching System.gc().
+		</comment>
+		<comment id='7' author='stolsvik' date='2018-12-12T09:23:53Z'>
+		P.s. you still have option to disable periodic calls to gc if your app needs that, and you're sure you're working in workspaces only.
+		</comment>
+		<comment id='8' author='stolsvik' date='2018-12-12T09:24:15Z'>
+		Solution: Have .close() or .free() or similar on NDArray, and let the user be responsible for deleting them. As with files. This is the only solution, and it is a completely approriate one.
+		</comment>
+		<comment id='9' author='stolsvik' date='2018-12-12T09:25:42Z'>
+		Abstract "solution" != PR, sorry.
+		</comment>
+		<comment id='10' author='stolsvik' date='2018-12-12T09:30:30Z'>
+		Workspaces are a very good solution (albeit not documented good enough), and I do think I understand why this handles memory better than .close(): I believe it has to do with continguous regions of memory, and that you'd have very bad fragmentation by relying on .close() semantics for all usages.
+So, what I suggest is "just" to drop the periodic System.gc() totally. Let the user be responsible for the "dangling" NDArrays that pop out of Workspaces. The periodic System.gc() should be an option, as a band-aid, to those that have problems doing cleaning themselves.
+If you could give me a pointer to why this would not fly at least as good as the current approach, I could definitely do a PR. But that would have to be a PR that had some reasonable chance of being accepted.
+		</comment>
+		<comment id='11' author='stolsvik' date='2018-12-12T09:35:23Z'>
+		Yes, workspaces try to avoid fragmentation in dl4j, due to learning mechanics. Memory layout is learnt on first couple of iterations, and then released/allocated all at once after that.
+As for reverted default suggestion. The problem is that there are users with different workloads, some of them do not even touch dl4j, or do not use workspaces due to their own design ideas. That's why the default is set up to work in any way. WIth an option to reduce gc pressure.
+However, it's definitely a good idea to add warning on startup if gc value is small and can be raised.
+		</comment>
+		<comment id='12' author='stolsvik' date='2018-12-12T09:40:50Z'>
+		If the async-ness is a problem (I can see the contours of such a problem), what about something like this: NDArray.close() does not do anything "realtime" (except from shedding the pointer, and marking the array as "unavailable", preferably making every other method on it throw from now on).
+What this does, is to sticks the object into a "to-be-deallocated" Queue or Set, and pings an explicit deallocator thread (i.e. user space, not GC, but a dl4j "system" thread). What this thread does is to handle the async-ness of the off-heap CUDA-stuff, which I assume is that you cannot deallocate the memory if some process is still running on the GPU or somesuch.
+But you do have the "ops", right? If you now could attach an "deallocate-op" to the list of outstanding ops, it would be deallocated literally as-soon-as-possible.
+Since this evidently IS possible to do correctly via the GC, this explicitness should be possible to implement: The user has said that this object is out-of-scope (by invoking .close()). All refs to the backing arrays are thus cleared, and the only thing preventing them from being actually cleared is async processing still going on. Once this processing is finished, it will immediately be freed.
+This is still async, and the library user will still be able to create something so that "flow-wise" in the code, it seems like one should be OK with memory, but due to the async-ness, the actual memory in the backend has not yet been deallocated, making the application explode even if it judging by the code flow shouldn't. However, it is worth noting that this will logically be at least be as effective as GC-every-100ms - there is literally no way that this still-async actual-deallocation will be slower than relying on GC. But you would not have any of the massive side effect that GC gives.
+		</comment>
+		<comment id='13' author='stolsvik' date='2018-12-12T09:59:04Z'>
+		You could also make it so that if a NDArray was allocated within a workspace, it was "effectively closed" once the Workspace was closed. If the throw-if-closed semantics was implemented, the developer could then get a nice exception in his face if he tried using such an workspace-allocated array outside the workspace, unless he had "lifted" it out (don't remember the method name).
+I've implemented a system for memory mgmt myself, which had a crucial requirement of needing explicit free'ing. What I did here, was that on allocation, I created an AllocationPointException (just a normal exception, but with a meaningful name) that I stored on a field. When explicit .close() was invoked, I did the deallocate-and-cleanup code, and also nulled the exception and thus marked it as "explicitly closed". If the object was later GC'ed with the Exception still in place, I logged a massive ERROR, telling the user "This object {object "name" and id} was not explicitly closed. It was instantiated at this point in the code: {AllocationPointException's Stacktrace}. You must find the code path that leads to this situation, and make sure that the object is closed before going out of scope.". I also obviously did the close-logic "for him" anyway, but he would now have pretty hefty indicators that his code is broken. This handle-on-GC logic was implemented using reference queues.
+This approach was extremely nice, and pointed out problematic places in the code right away, with an extremely clear pointer to where the problem is; the mentioned stacktrace.
+Creating such a stacktrace is somewhat hefty, and you can have an option to disable it - typically if the code has been thoroughly vetted, and you now want to go into production with it. Since it should now be "bug free", this overhead can be skipped.
+You can also make a stacktrace on the .close() method (or the "effectively closed" by exiting workspace), and even give the user a nice way of understanding why it is closed: "You tried accessing an NDArray that is closed. It was closed at this point {Close/Effectively close StackTrace}.". You could even tailor it further, if it was "effectively closed" by exiting the Workspace: "NOTICE: You can use the .lift() method to make the NDArray available outside of the Workspace". In my system, I actually also had a "double close" catching, pointing out "WARN: You have already closed this object - and there is no use in closing it twice. It was closed here:  {Close/Effectively close StackTrace}". This because I feel that double closing is also an indicator of the user not having control over the resource flows.
+In my opinion, if something like this is implemented, the periodic-GC should only be a debugging feature: You can enable the frequent-GC logic to find these problematic non-closed objects faster, before the application otherwise explodes (which it can, before GC has ever happened). With the once-ever-100ms frequency, you'd get those non-closed objects into the ref-queue probably way before the application explodes, and thus get those nice ERROR-log-lines that points you to your leaking code path very fast.
+		</comment>
+		<comment id='14' author='stolsvik' date='2018-12-12T10:56:25Z'>
+		Implementing c model (explicit free/close call req) is trivial. Changing rather big code base using INDArray right now is NOT trivial. That's my point.
+		</comment>
+		<comment id='15' author='stolsvik' date='2018-12-12T11:02:32Z'>
+		And yes, we'd like to improve memory management model eventually, but due to existing code base it probably will stay managed model.
+		</comment>
+		<comment id='16' author='stolsvik' date='2018-12-12T11:07:00Z'>
+		
+Implementing c model (explicit free/close call req) is trivial. Changing rather big code base using INDArray right now is NOT trivial. That's my point.
+
+But, is not pretty much all internals of dl4j using Workspaces now? And with the suggestion of finding non-closed allocations (ref. above comment), it should be quite simple to find the remaining "leaking" allocations.
+		</comment>
+		<comment id='17' author='stolsvik' date='2018-12-12T11:08:08Z'>
+		What about at least having the option of explicitly closing, with async situations handled? Then I could at least choose to turn GC off, but still be able to manage memory, even if using freestanding NDArrays.
+It would be fantastic if I when turning off GC had the option to turn on the feature with "non-close catching", ref comment detailing such feature above. This should, IIUC, be a pretty non-intrusive addition to the code base.
+		</comment>
+		<comment id='18' author='stolsvik' date='2018-12-12T11:14:32Z'>
+		
+But, is not pretty much all internals of dl4j using Workspaces now?
+
+It's a bit different. Workspaces are implemented as "optional". So if they are used - they will be used in any code, not just dl4j. But there are restrictions: thread safety, stale pointers possibility, etc.
+		</comment>
+		<comment id='19' author='stolsvik' date='2018-12-12T11:47:06Z'>
+		
+What about at least having the option of explicitly closing, with async situations handled?
+
+Hypothetically doable.
+		</comment>
+		<comment id='20' author='stolsvik' date='2018-12-12T12:24:13Z'>
+		Not too much to add here.
+Obviously 100ms default is bad (I thought it was a lot higher).
+
+So, what I suggest is "just" to drop the periodic System.gc() totally. Let the user be responsible for the "dangling" NDArrays that pop out of Workspaces.
+
+Manual deallocation: possible, sure. Will have a noticable performance overhead esp. for CUDA unless we rely on caching. (Edit: though adding to a queue as suggested would help move this overhead to non-user threads).
+I don't see many users using this (your average java programmer relies on GC not manual memory management as per C, which is basically what is being proposed here), but it's a reasonable approach for some use cases. Absent a System.gc backup - it not viable from a usability perspective: instead of a fraction having performance issues due to GC, we have a majority having OOMs.
+Furthermore, anything allocated internally in called methods can't be cleaned up by the user unless they have a reference.
+And for this idea with the System.gc backup enabled by default - why manually deallocate if it'll be cleaned up automatically anyway?
+Anyway, what I would be in favor of - having 2 'modes' of using ND4J.
+
+Mode 1: existing GC approach, with tweaks to improve usability
+Mode 2: Manual management - (disable periodic GC + manually deallocate memory).
+
+Mode 2 is only viable if the user has full control of all array allocations (i.e., no library methods, etc).
+Of course, something equivalent to mode 2 can also be implemented in a lot of cases (but not all) using workspaces, without the "no libraries" restriction. Or just allocating arrays once and reusing, unless shapes change.
+
+You could also make it so that if a NDArray was allocated within a workspace, it was "effectively closed" once the Workspace was closed. If the throw-if-closed semantics was implemented, the developer could then get a nice exception in his face if he tried using such an workspace-allocated array outside the workspace, unless he had "lifted" it out (don't remember the method name).
+
+We have exactly this already, though I don't think we're catching all possible invalid uses of leaked arrays yet (we catch and throw an exception the majority, however - if you run into any, log an issue).
+		</comment>
+		<comment id='21' author='stolsvik' date='2018-12-12T13:48:39Z'>
+		
+I don't see many users using this (your average java programmer relies on GC not manual memory management as per C, which is basically what is being proposed here)
+
+I really don't understand the sentiment here. Java programmers, average or not, are used to dealing with Files, InputOutputWriterStreamsWhatevers, Sockets, Lots-and-lots-and-lots of things, from both standard Java and lots of libraries - including basically anything that uses JNI or similar functionality.
+Java has even included a construct for this, the try-with-resources (which Workspaces employ), to make the standard try-finally construct simpler to write - with AutoClosable.
+Why the concept that a INDArray would have such a requirement is completely unfathomabe, is just not understandable for me. It is an object with external resources attached. I immediately expected to have to manage this myself, and was just "eh, where is the close()?!".
+I've now been bitten by the GC-logic of dl4j so many times, from so many different angles (all of them very bad, with tons of wasted hours), that having to manage my usage of the external resources that dl4j and nd4j gives me easy access to - i.e. CUDA-features - would have been an absolute blessing. This is my sole actual problem with dl4j, which otherwise is absolutely kick-ass. I just so want ML/DL/AI to be accessible from "native Java" that it hurts me to be this heavily kicked by the library.
+Coupled with my idea for how to catch wrong usage, it would actually be rather simple for a developer to handle this. It would make the entire experience with dl4j/nd4j much more consistent. I even believe it would be simpler to explain Workspaces with this concept.
+		</comment>
+		<comment id='22' author='stolsvik' date='2018-12-12T14:03:02Z'>
+		
+Mode 2 is only viable if the user has full control of all array allocations (i.e., no library methods, etc).
+Of course, something equivalent to mode 2 can also be implemented in a lot of cases (but not all) using workspaces, without the "no libraries" restriction. Or just allocating arrays once and reusing, unless shapes change.
+
+I don't get this either: If the library hands you an array, you "own" it. The Workspaces-concept basically boils down to "If you employ Workspaces, we will effectively manage the closing of all arrays allocated within the workspace-use block. You cannot use arrays which are created within the use-block, except if you lift them out.".
+The library would possibly have to be fixed-upped in some corners, to propagate the current (given) Workspace to the different corners. But I see that you actually  doing such work already, like e.g. &lt;denchmark-link:https://github.com/deeplearning4j/deeplearning4j/issues/6279&gt;https://github.com/deeplearning4j/deeplearning4j/issues/6279&lt;/denchmark-link&gt;
+ and many others. And this makes plenty sense at any rate.
+The point about shape change I don't quite understand. I am not to experienced with shape-changing yet. However, if the shape-change ends up allocating more memory, or shedding memory, why would that be a problem? This is typically done in the nd4j backend anyway? You just insta-close the current, and create a new. If this could be "tricked" in the backend, by not really ditching the current allocated memory, only tricking with strides and sizes, then don't do the deallocation - thus would just constitute a optimization. "When changing shape of an INDArray, the returned array will be your ownership, while the existing is closed." If, however, these operations are done "in place", well, then it still is not a problem as the INDArray itself is just a "shell" atop the actual backend. You - as the library user - would still have an object you "owned" and had to manage, while the backend resource that this "shell" actually manages would have changed from one pointer to another.
+		</comment>
+		<comment id='23' author='stolsvik' date='2018-12-12T14:10:35Z'>
+		
+Furthermore, anything allocated internally in called methods can't be cleaned up by the user unless they have a reference.
+
+Well, the library would of course have to do proper handling itself (and most of the library employs Workspaces now, unless I misunderstand quite a bit). If you code up my idea for missing-close-catching, and had the GC set at 100ms periods, you'd get all the places that misses proper resource handling with a single run of the tests, I suspect. 😄
+
+And for this idea with the System.gc backup enabled by default - why manually deallocate if it'll be cleaned up automatically anyway?
+
+I am not sure where I set forth that idea? (oh, I guess I have: This is the "backwards compatible" logic, where this is introduced in a gradual manner) Given the "two-style approach", you'd either have GC and no missing-close catching, or you'd have no GC, and get missing-close ERRORs in the log when the GC eventually ran. (Or you can have a third way: Ability to close arrays, but still have the GC run less frequently to pick up any arrays that wasn't explicitly closed - the missing-close ERROR log lines would then have to be an option you could turn on when debugging). (I would go for the latter, and start submitting bugs and PRs for any library-internal usage that didn't properly close its arrays)
+If I had the option, I'd go with GC turned off (and with missing-close ERROR loglines feature turned on). If getting into OOMs, I'd turn on the "really frequent GC"-feature, and then instantly be greeted with ERRORs (for missing closes) and WARNs (for double closes) in the logs for where I handled my resources wrongly.
+		</comment>
+		<comment id='24' author='stolsvik' date='2018-12-12T14:18:09Z'>
+		
+Manual deallocation: possible, sure. Will have a noticable performance overhead esp. for CUDA unless we rely on caching. (Edit: though adding to a queue as suggested would help move this overhead to non-user threads).
+
+This is simply not true (and I see your edit). The performance overhead will be WAY less than with the current GC approach: Instead of GCing the entire heap of the JVM completely unnecessary (every 100ms!), you'd only have a thread (or even only stick in "deallocate ops" in the pipeline) that took care of only the objects that needed to be taken care of. Not checking every single object on the heap tons of unnecessary times, but only handling the much fewer resources that have actually been explicitly deallocated by the user (or by the library, of course). The GC would then revert back to doing what it actually shall do: Handle the Java heap, and only when it is necessary.
+With regard to timeliness, I already argued that case: This solution can never be worse than the current GC approach: Since you'd close an array before it went out of scope (by definition, otherwise you could not close it), the backend would be notified about its demise at least as early as with GC. And since GC will come on periods, it would in close to 100% be much earlier than when relying on GC. Furthermore, since the backend now would get explicit "deallocation requests" as soon as an object actually was on its way out of scope, it could stick them into the async operations flow at the earliest possible time. I don't know how the ops works, but I can envision how this pipeline works. Given that I am not that far off: If you just tacked the deallocate-op to the very back of the queue, you would by definition be correct (no other operation using this memory block could be later than the .close() operation issued by the user). However, if you added some analysis to the flow, you could potentially stick the deallocate-op earlier than at the very back, thus performance (or at least memory) optimizing it. This is also by definition close to 100% of the time much earlier than what a GC-approach can possibly do.
+		</comment>
+		<comment id='25' author='stolsvik' date='2018-12-12T14:39:56Z'>
+		
+This is simply not true (and I see your edit). The performance overhead will be WAY less than with the current GC approach:
+
+Unfortunately you're wrong. We're using gc for non-workspace allocations exactly because we've been there before. CUDA memory allocations are very expensive. So we try to reuse memory as soon as possible. Sure, with high amount of heap allocations external wrt training process this becomes PITA. But it's solvable, and we'll make a pass there.
+		</comment>
+		<comment id='26' author='stolsvik' date='2018-12-12T16:03:13Z'>
+		
+
+This is simply not true (and I see your edit). The performance overhead will be WAY less than with the current GC approach:
+
+Unfortunately you're wrong. We're using gc for non-workspace allocations exactly because we've been there before. CUDA memory allocations are very expensive. So we try to reuse memory as soon as possible. Sure, with high amount of heap allocations external wrt training process this becomes PITA. But it's solvable, and we'll make a pass there.
+
+Please elucidate me of what you imply here. I do not say that you should ditch Workspaces, which I assume is the way to reuse allocations. If you think that I mean that you should handle the work that Workspaces do differently, that is also NOT what I am trying to say. When I say that Workspaces "close" the arrays, I always precede that by "effectively", trying to convey that yes, in Workspace-mode, the code would not actually ditch the allocations, because it will be reused in the next iteration.
+We absolutely must be talking past each other, because if non-workspace deallocation works with GC, it WILL work with the approach I try to point out. Seriously, either you are not reading what I am writing, or I am simply terrible at conveying an idea.
+The idea here is to structure the work now performed implicitly by GC in a different way that is more explicit, and this WILL lead to less overhead, by sheer definition of how any logic relying on GC's work must be structured - and that with this suggested mode of operation, you would not have to invoke System.gc() ever. We all agree that System.gc() is overhead, yes? If you could do what you rely on the GC for, WITHOUT using the GC, then that overhead would disappear, yes?
+		</comment>
+		<comment id='27' author='stolsvik' date='2018-12-12T18:22:11Z'>
+		If I understood this right, there are multiple points here:
+
+
+Changing the default behavior (aside from the 100ms instead of 5000ms bug) to disable System.gc() isn't going to happen any time soon, because it will break existing user code in unpredictable ways.
+
+
+You'd like to be able to disable GC (you can, as you've found out yourself) and you'd like to be able to free off-heap memory yourself - and you can do that as well, but here you are entering dangerous territory.
+
+
+You can use JavaCPP APIs directly to do this: Pointer.free(array.data().addressPointer());
+But if you then try to access the freed array, you will get a very unhappy JVM: #  EXCEPTION_ACCESS_VIOLATION (0xc0000005) at pc=0x00000000602c76ef, pid=9964, tid=0x0000000000001bf8
+		</comment>
+		<comment id='28' author='stolsvik' date='2018-12-12T18:24:32Z'>
+		
+And for this idea with the System.gc backup enabled by default - why manually deallocate if it'll be cleaned up automatically anyway?
+
+An answer to this: Because "automatic" cleanup is either extremely expensive (100 ms auto-gc), or the timeliness will suffer (with e.g. 1 minute auto-gc) and you can hit OOM anyway. Thus, if I handle a majority of cleanup myself, but with a couple of arrays that pop out that eventually will be picked up by the GC, I can have a much-less-frequent auto-GC, and still not hit OOM.
+		</comment>
+		<comment id='29' author='stolsvik' date='2018-12-12T18:30:24Z'>
+		
+
+Changing the default behavior (aside from the 100ms instead of 5000ms bug) to disable System.gc() isn't going to happen any time soon, because it will break existing user code in unpredictable ways.
+
+
+This would obviously have to included in a backwards-compatible way: Include a array.close() method, so that I can ask for free'ing of the resources - which will be handled in a proper way wrt. the async-ness of the CUDA code by the backend (this is the crucial point here, as far as I have understood). Also, the internal methods of the library could then start to call this close-method themselves at appropriate places, so that the load on the GC-reliant cleaning algo would become less. One could then increase the default auto-GC interval.
+One could also start educating users that "if you close your non-Workspace arrays yourself, you will have less off-heap memory dangling around, and can thus increase the GC-interval further, or even turn it off entirely".
+
+2. You'd like to be able to disable GC (you can, as you've found out yourself) and you'd like to be able to free off-heap memory yourself - and you can do that as well, but here you are entering dangerous territory.
+You can use JavaCPP APIs directly to do this: Pointer.free(array.data().addressPointer());
+But if you then try to access the freed array, you will get a very unhappy JVM: # EXCEPTION_ACCESS_VIOLATION (0xc0000005) at pc=0x00000000602c76ef, pid=9964, tid=0x0000000000001bf8
+
+The problem here, as far as I have understood, is that due to the async nature of the CUDA processes, you could then free stuff that still is in use?
+		</comment>
+		<comment id='30' author='stolsvik' date='2018-12-12T18:32:39Z'>
+		&lt;denchmark-link:https://github.com/treo&gt;@treo&lt;/denchmark-link&gt;
+
+
+Nope, it's going to change. At least optionally. I can make it work without gc calls, but as trade-off performance for workspace-less runs will suffer.
+For CUDA it's a bit different, but we still provide methods for that in NativeOps class.
+
+		</comment>
+		<comment id='31' author='stolsvik' date='2018-12-12T18:45:55Z'>
+		
+@treo
+
+Nope, it's going to change. At least optionally. I can make it work without gc calls, but as trade-off performance for workspace-less runs will suffer.
+
+
+Great! Would you mind explaining just a bit of how you'd go about? And why would workspace-less runs suffer?
+
+
+For CUDA it's a bit different, but we still provide methods for that in NativeOps class.
+
+
+Is that NativeOps method you mention basically exactly what I suggest that the close()-method could insert? (After either setting boolean closed = true or rather Exception closePoint = new ClosePointException("The array was closed at this point in the code.") which all methods would check and throw new IllegalStateException("Array is closed - this exception's 'cause' is the close point.", closePoint) if true/set.)
+		</comment>
+		<comment id='32' author='stolsvik' date='2018-12-12T23:37:36Z'>
+		&lt;denchmark-link:https://github.com/thorsanvil&gt;@thorsanvil&lt;/denchmark-link&gt;
+ we're the last project you should be lecturing about trying to make money in a real enterprise environment :) all we deal with are traditional enterprises (banks, government,telco, aerospace,..). Research is far from our target market.  If you want to learn more about what we do reach out.
+Most people are windows/java shops that don't want to deal with manual GC. We get paid to do this all the time (even at peta byte scale) people would rather have easier to use learning libraries that they can configure but collect memory by default. Applications come in all shapes.
+I can also tell you that people at these companies barely come on github and comment on something low level like this. They may want solutions in search results but that's about as far as it goes.
+These people are not specialists in this space, they focus on building applications. Most are not performance experts.
+For very low level work we tend to  implement as much as we can in the c library.
+		</comment>
+		<comment id='33' author='stolsvik' date='2018-12-12T23:57:47Z'>
+		&lt;denchmark-link:https://github.com/stolsvik&gt;@stolsvik&lt;/denchmark-link&gt;
+ Replying separately to you here.
+So again thanks for sparking this discussion. Generally our litmus test for this is to consider how to run this on a spark cluster and not have a JVM crash happen. We also have tomcat application servers to consider. Both have very different performance considerations.
+Spark workloads tend to be very carefully tuned due to the variance of the batch sizes and data you are dealing with.
+This usually includes tuning the number of workers vs the number of OMP_NUM_THREADS. If we're using gpus, it might be making sure all workers have the same memory and batch size per partition.
+Implementing try/with semantics in that kind of environment ends up being very error prone (especially when it comes to writing real spark job code)
+If you look at MLN and ComputationGraph you'll see what we had to do to workspaces. There's workspaces for different parts of the neural net. That is a lot to manually track.
+For the high level api, we want that to be easier to use. A compromise we might be able to make optional is maybe we could make both of those implement closeable. When you turn gc off, close() , with the right semantics (in theory) could take care of the memory allocation. As has been talked about earlier though, I'm not sure how well that would work for cuda and async workloads. For example, I know we couldn't do very much for external input data coming in. We might be able to that internally.
+Answering your question about turning off gc.
+A few things you should take a look at:
+&lt;denchmark-link:https://github.com/deeplearning4j/deeplearning4j/blob/master/nd4j/nd4j-backends/nd4j-backend-impls/nd4j-native/src/main/java/org/nd4j/linalg/cpu/nativecpu/CpuMemoryManager.java&gt;https://github.com/deeplearning4j/deeplearning4j/blob/master/nd4j/nd4j-backends/nd4j-backend-impls/nd4j-native/src/main/java/org/nd4j/linalg/cpu/nativecpu/CpuMemoryManager.java&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://github.com/deeplearning4j/deeplearning4j/blob/master/nd4j/nd4j-backends/nd4j-backend-impls/nd4j-cuda/src/main/java/org/nd4j/jita/memory/CudaMemoryManager.java&gt;https://github.com/deeplearning4j/deeplearning4j/blob/master/nd4j/nd4j-backends/nd4j-backend-impls/nd4j-cuda/src/main/java/org/nd4j/jita/memory/CudaMemoryManager.java&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://github.com/deeplearning4j/deeplearning4j/blob/master/nd4j/nd4j-backends/nd4j-api-parent/nd4j-api/src/main/java/org/nd4j/linalg/memory/BasicMemoryManager.java&gt;https://github.com/deeplearning4j/deeplearning4j/blob/master/nd4j/nd4j-backends/nd4j-api-parent/nd4j-api/src/main/java/org/nd4j/linalg/memory/BasicMemoryManager.java&lt;/denchmark-link&gt;
+
+You are welcome to dig in.
+You can turn it off with this:
+&lt;denchmark-link:https://github.com/deeplearning4j/deeplearning4j/blob/master/nd4j/nd4j-backends/nd4j-api-parent/nd4j-api/src/main/java/org/nd4j/linalg/memory/BasicMemoryManager.java#L178&gt;https://github.com/deeplearning4j/deeplearning4j/blob/master/nd4j/nd4j-backends/nd4j-api-parent/nd4j-api/src/main/java/org/nd4j/linalg/memory/BasicMemoryManager.java#L178&lt;/denchmark-link&gt;
+
+The NativeOps class has 2 different implementations. That is where you start getting in to javacpp and auto generated interfaces. See the implementations here:
+&lt;denchmark-link:https://github.com/deeplearning4j/deeplearning4j/blob/master/libnd4j/blas/cuda/NativeOps.cuhttps://github.com/deeplearning4j/deeplearning4j/blob/master/libnd4j/blas/cpu/NativeOps.cpp&gt;https://github.com/deeplearning4j/deeplearning4j/blob/master/libnd4j/blas/cuda/NativeOps.cuhttps://github.com/deeplearning4j/deeplearning4j/blob/master/libnd4j/blas/cpu/NativeOps.cpp&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://github.com/deeplearning4j/deeplearning4j/blob/master/nd4j/nd4j-backends/nd4j-api-parent/nd4j-native-api/src/main/java/org/nd4j/nativeblas/NativeOps.java&gt;https://github.com/deeplearning4j/deeplearning4j/blob/master/nd4j/nd4j-backends/nd4j-api-parent/nd4j-native-api/src/main/java/org/nd4j/nativeblas/NativeOps.java&lt;/denchmark-link&gt;
+
+You can access NativeOps here as a singleton: &lt;denchmark-link:https://github.com/deeplearning4j/deeplearning4j/blob/master/nd4j/nd4j-backends/nd4j-api-parent/nd4j-native-api/src/main/java/org/nd4j/nativeblas/NativeOpsHolder.java&gt;https://github.com/deeplearning4j/deeplearning4j/blob/master/nd4j/nd4j-backends/nd4j-api-parent/nd4j-native-api/src/main/java/org/nd4j/nativeblas/NativeOpsHolder.java&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='34' author='stolsvik' date='2018-12-13T07:56:33Z'>
+		
+As has been talked about earlier though, I'm not sure how well that would work for cuda and async workloads.
+
+If it works when relying on the "indirect" information that the GC gives ("this object is not used anymore, and will be GCed, thus any underlying external resources can be reclaimed or reused."), then it will absolutely be possible to implement this by relying on the explicit, direct information from the user ("I shall not use this object anymore, you can do whatever you want with the underlying external resources, reclaim or resue them - now, or when appropriate. I fully expect the end of the world if I try to make use of the object after having stated this.").
+I find it hard to see how this is not obvious. It would be great if anyone could shed light on what is the problem they see, which I cannot see.
+
+For example, I know we couldn't do very much for external input data coming in. We might be able to that internally.
+
+This was too vague for me, I would appreciate very much if you could elaborate a bit more on this.
+		</comment>
+		<comment id='35' author='stolsvik' date='2018-12-13T11:52:01Z'>
+		
+I really don't understand the sentiment here. Java programmers, average or not, are used to dealing with Files, InputOutputWriterStreamsWhatevers, Sockets, Lots-and-lots-and-lots of things, from both standard Java and lots of libraries - including basically anything that uses JNI or similar functionality.
+
+Right, but they don't have to worry about cleaning up strings, arrays, or probably 99% of the classes of objects they use.
+I would argue that most users will think of an INDArray in the same way as they think something like a double[], double[][] etc - or the way they think of a numpy array.
+My main point is that can you imagine numpy or tensorflow forcing manual memory management? It would be a usability nightmare. And doing something radically different to functionally equivalent libraries would be a terrible design decision IMO.
+Maybe you are an exception, but the vast majority of our users don't think "how can I close my INDArray?". I mean we've talked a ton of users on a daily basis for years now, so I'm pretty confident on that point.
+Anyway, we're not going to force users to manually manage their memory, but I think we're all on-board with allowing manual memory management as an option (at some point).
+Not much left to discuss other than when/who/how for manual memory management.
+
+I've now been bitten by the GC-logic of dl4j so many times
+
+Other than the bad GC frequency defaults (again, already discussed this enough), where specifically are you running into this?
+We have options for zero-GC-managed training, inference, evaluation and iterators in MLN/CG/PW etc (i.e., methods using workspaces).
+
+The point about shape change I don't quite understand.
+
+I just mean like a cyclical workload... like z = a + b in a loop. You can reuse the z (result) array. But not if a/b are a different shape to the last iteration.
+
+And why would workspace-less runs suffer?
+This solution can never be worse than the current GC approach
+We absolutely must be talking past each other, because if non-workspace deallocation works with GC, it WILL work with the approach I try to point out. Seriously, either you are not reading what I am writing, or I am simply terrible at conveying an idea.
+
+Raver covered this:
+
+We're using gc for non-workspace allocations exactly because we've been there before. CUDA memory allocations are very expensive. So we try to reuse memory as soon as possible
+
+We have measured this, and that's why we use workspaces and not manual deallocation (which, performance cost aside, was an option instead of workspaces). With workspaces (assuming you don't need to resize the workspace), you allocate memory once and just mess with pointers and offsets, which is essentially free.
+It should be possible to write some benchmarks for this yourself, to time memory allocation/deallocation for CUDA device memory - which I encourage you to do. (As to how: I'm not the best one to ask that :))
+Then benchmark the equivalent implementation using workspaces.
+Agree on the "never be worse than current GC approach" but that's not what we're saying. We're saying it'll give you considerably worse performance than using workspaces because of the allocation/deallocation cost. That's nothing to do with DL4J/ND4J/JavaCPP - that's a CUDA/GPU limitation. Same thing if you implement it manually in C.
+It not nearly as bad for system memory (i.e., RAM) but still isn't free.
+I think we understand what you are proposing. And we agree it'll be better performance than GC managed memory. The key point is the substantial allocation and deallocation cost. Again, benchmark it and see for yourself.
+Only workaround for that is using some sort of caching (i.e., don't actually deallocate on close, and reuse existing pointer if we need another array of that size soon), which also has downsides.
+		</comment>
+		<comment id='36' author='stolsvik' date='2018-12-13T15:50:24Z'>
+		
+We have measured this, and that's why we use workspaces and not manual deallocation (which, performance cost aside, was an option instead of workspaces). With workspaces (assuming you don't need to resize the workspace), you allocate memory once and just mess with pointers and offsets, which is essentially free.
+
+Just to point this out again: I do NOT suggest that this should be used instead of Workspaces. I am totally onboard with the Workspaces-concept, I do understand the rationale there: It is basically the "good old" argument about "pooling of heavy objects": In the olden days, it was in Java smarter to have a pool of Lists hanging around than creating a List when you needed it. The CUDA memory (and maybe also standard off-heap memory?) is a "heavy" external resource, so it is smarter to reuse it than to ditch it and allocate a fresh one. Right? Workspaces! Yay! Good idea, brilliant solution! NOT arguing to go away from that!
+This is NOT what we are talking about here. We are exclusively talking about how to handle non-Workspace arrays - how to not have to run the Garbage Collector at all without getting mysterious OOM-style Exceptions thrown in your face even though you have JVM heap in tons. And the sole reason for having to run GC periodically, are those arrays that are NOT governed by a Workspace. So - if it was even possible to close them (handling the async and concurrency issues that CUDA introduces), it would be possible to just turn that thing off, or at least run it with a considerable lower frequency. (This does imply that the library itself at some point actually need to close (intermediary) arrays that it created (and didn't hand responsibility of back to the user)).
+
+Other than the bad GC frequency defaults (again, already discussed this enough), where specifically are you running into this?
+
+The other side: OOMs and insane Exceptions jumping in my face, with really unhelpful exception messages (not stating in a clear way what memory there is too little of, what the limit is, why it needs that memory, what you can do to fix it), totally pointing you in the wrong direction unless you know the complete innards of the system. Thus, having no idea of how to fix it, other than running the GC every millisecond, and then making the system completely unusable - in a different way.
+Also, while in rant-mode: the javacpp-parameters: I've now set them as such: -Dorg.bytedeco.javacpp.maxbytes=10G -Dorg.bytedeco.javacpp.maxphysicalbytes=500G (they had completely wrong documentation untill recently) - just to get that feature out of my way. That, and not using non-Workspace arrays at all, hacking some innards of dl4j (e.g. issue #6279, hacking that to use Workspaces) and effectively disabling the GC (10 minute intervals), are now finally letting me run this stuff without too many destructive problems. Until I try to do some new stuff, not just tweaking what I have, I suspect. It should not be like this, IMHO. And it all boils down to the "helpfulness" of not having to free my arrays...
+		</comment>
+		<comment id='37' author='stolsvik' date='2018-12-13T16:18:32Z'>
+		I'm not sure what we're discussing here.
+We've all agreed that:
+
+INDArray.close() is relatively easy to provide, and it will be provided.
+System.gc() should be lifted, as much as possible.
+
+Both things will be implemented in current iteration.
+		</comment>
+		<comment id='38' author='stolsvik' date='2018-12-13T16:21:10Z'>
+		P.s. it doesn't mean that we'll rewrite DL4J to use INDArray.close() everywhere.
+		</comment>
+		<comment id='39' author='stolsvik' date='2018-12-13T21:58:55Z'>
+		
+P.s. it doesn't mean that we'll rewrite DL4J to use INDArray.close() everywhere.
+
+Because Workspaces are used instead, right? Yes. Good. I have never argued against workspaces. Ever. Not even once, in this thread, or ever.
+I am using Workspaces in my own code to overcome the problem of having to rely on the GC - and getting nice speeds too! (And an obvious thing about Workspaces is that this is literally manual memory management when seen from the user space).
+I have pointed out that with close semantics implemented, Workspaces might be easier to "explain": The arrays allocated WITHIN a "Workspace-boundary" (the try-with-resources block) will effectively be closed for the user when exiting the workspace block. Arrays allocated OUTSIDE of a Workspace, or which are given out by any library method (not within a Workspace), or which are detached (I previously called it "lifted out") from the Workspace, can be closed by the user (if not "should") when not needed anymore. If such arrays are not closed by the user before going out of scope, the external resources they represent won't be deallocated until GC comes around.
+		</comment>
+		<comment id='40' author='stolsvik' date='2018-12-13T22:45:04Z'>
+		BTW, TensorFlow does force manual memory management with its C and Java
+APIs...
+		</comment>
+		<comment id='41' author='stolsvik' date='2018-12-15T15:01:18Z'>
+		Does the network itself also contain INDArrays? I am currently trying to do an ensemble of a bunch of networks (i.e. analyze and predict with each one of them), and wonder whether INDArrays contained in the network ends up being non-Workspace and thus relies on GC to be cleared. Might seem so when looking at the memory usage.
+In that case, it would be great to have a network.close() method too, so that I could ditch it after having analysed and predict with it, before restoring the next network. Same applies here: close() is utterly destructive, you obviously loose all weights etc, and you cannot use if after having called that method.
+(another method that could be nice (unrelated to this ditch-allocated-memory use-case, but nice nonetheless) was "reset()", which re-inits all values with random values - obviously needing the random number generator to be reset too - maybe cool if you could change the seed first).
+		</comment>
+		<comment id='42' author='stolsvik' date='2018-12-15T15:04:42Z'>
+		Yes it does. NN contains parameters, which are NOT attached to workspace.
+		</comment>
+		<comment id='43' author='stolsvik' date='2018-12-19T06:52:55Z'>
+		close() and closeable() were implemented for INDArray and DataBuffer
+		</comment>
+		<comment id='44' author='stolsvik' date='2019-01-18T07:52:32Z'>
+		This thread has been automatically locked since there has not been any recent activity after it was closed. Please open a new issue for related bugs.
+		</comment>
+	</comments>
+</bug>

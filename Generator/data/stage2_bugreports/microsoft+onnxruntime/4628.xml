@@ -1,0 +1,274 @@
+<bug id='4628' author='Channingss' open_date='2020-07-27T08:48:31Z' closed_time='2020-07-31T09:10:35Z'>
+	<summary>when input shape  too big, the result of GRU is different with Numpy.</summary>
+	<description>
+Describe the bug
+when input shape  too big, and  there are both positive and negative numbers in ’X‘ or 'W', the result of GRU is wrong.
+System information
+
+OS Platform and Distribution (Linux Ubuntu 16.04):
+ONNX Runtime installed from (pip install onnxruntime==1.4.0):
+ONNX Runtime version: 1.4.0
+Python version:3.7
+
+To Reproduce
+&lt;denchmark-code&gt;import numpy as np
+import onnx
+from collections import namedtuple
+import onnxruntime as rt
+from onnx import helper
+from onnx import AttributeProto, TensorProto, GraphProto
+
+def _extract_value_info(arr, name):  # type: (np.ndarray, Text) -&gt; onnx.ValueInfoProto
+    return onnx.helper.make_tensor_value_info(
+            name=name,
+                    elem_type=onnx.mapping.NP_TYPE_TO_TENSOR_TYPE[arr.dtype],
+                            shape=arr.shape)
+
+def expect(nodes,  # type: onnx.NodeProto
+           inputs,  # type: Sequence[np.ndarray]
+           outputs,  # type: Sequence[np.ndarray]
+           name,  # type: Text
+           opset,
+           ):  # type: (...) -&gt; None
+    print('op_type:{}, op_set:{}'.format(node.op_type, opset))
+    present_inputs = [x for x in node.input if (x != '')]
+    present_outputs = [x for x in node.output if (x != '')]
+    inputs_vi = [_extract_value_info(arr, arr_name)
+                 for arr, arr_name in zip(inputs, present_inputs)]
+    outputs_vi = [_extract_value_info(arr, arr_name)
+                  for arr, arr_name in zip(outputs, present_outputs)]
+    graph = onnx.helper.make_graph(
+        nodes=nodes,
+        name=name,
+        inputs=inputs_vi,
+        outputs=outputs_vi)
+    opset_imports = [onnx.helper.make_opsetid("", opset)]
+    model = onnx.helper.make_model(graph, producer_name='backend-test', opset_imports=opset_imports)
+    onnx.save_model(model, 'GRU-1.onnx')
+    sess = rt.InferenceSession('GRU-1.onnx')
+    inputs_dict = {}
+    for i in range(0, len(inputs)):
+        inputs_dict[sess.get_inputs()[i].name] = inputs[i]
+    res_onnx = sess.run(None,input_feed=inputs_dict)
+    for i in range(0, len(outputs)):
+        output = outputs[i].flatten()
+        output_onnx = res_onnx[i].flatten()
+        diff = output - output_onnx
+        max_elem = max(np.max(np.fabs(output)) , np.max(np.fabs(output_onnx)))
+        print('max absolute diff: ', np.max(np.fabs(diff)))
+        print('max relative diff: ', np.max(np.fabs(diff))/max_elem)
+
+class GRU_Helper():
+   def __init__(self, **params):  # type: (*Any) -&gt; None
+       # GRU Input Names
+       X = str('X')
+       W = str('W')
+       R = str('R')
+       B = str('B')
+       H_0 = str('initial_h')
+       LBR = str('linear_before_reset')
+       number_of_gates = 3
+
+       required_inputs = [X, W, R]
+       for i in required_inputs:
+           assert i in params, "Missing Required Input: {0}".format(i)
+
+       self.num_directions = params[W].shape[0]
+
+       if self.num_directions == 1:
+           for k in params.keys():
+               if k != X:
+                   params[k] = np.squeeze(params[k], axis=0)
+
+           hidden_size = params[R].shape[-1]
+           batch_size = params[X].shape[1]
+
+           b = params[B] if B in params else np.zeros(2 * number_of_gates * hidden_size)
+           h_0 = params[H_0] if H_0 in params else np.zeros((batch_size, hidden_size))
+           lbr = params[LBR] if LBR in params else 0
+
+           self.X = params[X]
+           self.W = params[W]
+           self.R = params[R]
+           self.B = b
+           self.H_0 = h_0
+           self.LBR = lbr
+
+       else:
+           raise NotImplementedError()
+
+   def f(self, x):  # type: (np.ndarray) -&gt; np.ndarray
+       return 1 / (1 + np.exp(-x))
+
+   def g(self, x):  # type: (np.ndarray) -&gt; np.ndarray
+       return np.tanh(x)
+
+   def step(self):  # type: () -&gt; Tuple[np.ndarray, np.ndarray]
+       h_list = []
+       [w_z, w_r, w_h] = np.split(self.W, 3)
+       [r_z, r_r, r_h] = np.split(self.R, 3)
+       [w_bz, w_br, w_bh, r_bz, r_br, r_bh] = np.split(self.B, 6)
+       gates_w = np.transpose(np.concatenate((w_z, w_r)))
+       gates_r = np.transpose(np.concatenate((r_z, r_r)))
+       gates_b = np.add(np.concatenate((w_bz, w_br)), np.concatenate((r_bz, r_br)))
+
+       H_t = self.H_0
+       for x in np.split(self.X, self.X.shape[0], axis=0):
+           gates = np.dot(x, gates_w) + np.dot(H_t, gates_r) + gates_b
+           #print(np.dot(x, gates_w), np.dot(x, gates_w).shape)
+           z, r = np.split(gates, 2, -1)
+           z = self.f(z)
+           r = self.f(r)
+           h_default = self.g(np.dot(x, np.transpose(w_h)) + np.dot(r * H_t, np.transpose(r_h)) + w_bh + r_bh)
+           h_linear = self.g(np.dot(x, np.transpose(w_h)) + r * (np.dot(H_t, np.transpose(r_h)) + r_bh) + w_bh)
+           #print(np.dot(x,  np.transpose(w_h)), np.dot(x,  np.transpose(w_h)).shape)
+           h = h_linear if self.LBR else h_default
+           H = (1 - z) * h + z * H_t
+           h_list.append(H)
+           H_t = H
+       concatenated = np.concatenate(h_list)
+       if self.num_directions == 1:
+           output = np.expand_dims(concatenated, 1)
+       return output, h_list[-1]
+
+
+input_size = 512
+hidden_size = 128
+weight_scale = 0.1
+number_of_gates = 3
+num_direct = 1
+seq_len = 10
+batch_size = 10
+input = np.random.random((seq_len, batch_size , input_size)).astype(np.float32) - 0.5
+W = weight_scale * np.random.random((num_direct, number_of_gates * hidden_size, input_size)).astype(np.float32)
+R = weight_scale * np.random.random((num_direct, number_of_gates * hidden_size, hidden_size)).astype(np.float32)
+B = weight_scale * np.random.random((num_direct, 2*number_of_gates * hidden_size)).astype(np.float32)
+
+w = onnx.helper.make_node(
+    'Constant',
+    inputs=[],
+    outputs=['w'],
+    value=onnx.helper.make_tensor(
+        name='const_tensor',
+        data_type=onnx.TensorProto.FLOAT,
+        dims=W.shape,
+        vals=W.flatten().astype(float),
+    ),
+)
+
+r = onnx.helper.make_node(
+    'Constant',
+    inputs=[],
+    outputs=['r'],
+    value=onnx.helper.make_tensor(
+        name='const_tensor',
+        data_type=onnx.TensorProto.FLOAT,
+        dims=R.shape,
+        vals=R.flatten().astype(float),
+    )
+)
+
+b = onnx.helper.make_node(
+    'Constant',
+    inputs=[],
+    outputs=['b'],
+    value=onnx.helper.make_tensor(
+        name='const_tensor',
+        data_type=onnx.TensorProto.FLOAT,
+        dims=B.shape,
+        vals=B.flatten().astype(float),
+    ),
+)
+
+node = onnx.helper.make_node(
+    'GRU',
+    inputs=['X', 'w', 'r', 'b'],
+    outputs=['Y', 'Y_h'],
+    hidden_size=hidden_size,
+    #linear_before_reset=1,
+    #direction='bidirectional'
+)
+
+Y = weight_scale * np.ones((1, 1, 3, hidden_size)).astype(np.float32)
+Y_h = weight_scale * np.ones((1, 3, hidden_size)).astype(np.float32)
+gru = GRU_Helper(X=input, W=W, R=R)
+Y, Y_h = gru.step()
+expect([w,r,b,node], inputs=[input], outputs=[Y.astype(np.float32), Y_h.astype(np.float32)], name='test_gru_defaults', opset=10)
+&lt;/denchmark-code&gt;
+
+Expected behavior
+diff should small than 10e-4?
+
+&lt;denchmark-link:https://user-images.githubusercontent.com/12471701/88522450-f079ba00-d028-11ea-8a6a-126af005bb8a.png&gt;&lt;/denchmark-link&gt;
+
+Additional context
+the expect function &amp; GRU_Helper class is copyed form Test module in onnxruntime.
+	</description>
+	<comments>
+		<comment id='1' author='Channingss' date='2020-07-28T01:15:46Z'>
+		Is the assertion that GRU is incorrect based on the actual predictions or purely the diff?
+GRU involves a lot of matrix multiplications, so with longer sequence lengths the accumulated floating point inaccuracy will result in larger diffs. The order of operations and the instructions used to execute them (e.g. which AVX instructions if any are used) will be different between numpy and ORT, so this is expected.
+		</comment>
+		<comment id='2' author='Channingss' date='2020-07-28T03:48:59Z'>
+		&lt;denchmark-link:https://github.com/skottmckay&gt;@skottmckay&lt;/denchmark-link&gt;
+ there are no incorrect reported when predicted by ORT.
+Can you describe more detail of the different between numpy and ORT，matrix multiplication of np.dot(x, gates_w)？
+thanks!
+Notice: When input shape become bigger,  and there are only positive or negative numbers in ’X‘ or 'W',  ORT result close to Numpy, the difference happened  when both positive or negative numbers in ’X‘ or 'W'.
+		</comment>
+		<comment id='3' author='Channingss' date='2020-07-29T00:30:11Z'>
+		See &lt;denchmark-link:https://docs.oracle.com/cd/E19957-01/806-3568/ncg_goldberg.html&gt;https://docs.oracle.com/cd/E19957-01/806-3568/ncg_goldberg.html&lt;/denchmark-link&gt;
+
+Depending on the order of the operations different types of inaccuracies may be introduced. A matrix multiplication involves a collection of operations that can be done independently to produce the output matrix. e.g. for each output value there are a collection of multiplications and additions between a row from one matrix and a column from the other. Depending on the order those are done in you will get a slightly different floating point value. Depending on the instructions used some may be done in a single instruction, and some may require multiple. Unless ORT and Numpy did them in exactly the same order using exactly the same instructions you will get differences.
+When the input shape becomes larger there are more steps in the GRU calculations, so any diff will grow with each step. How are you defining 'close' to Numpy?
+		</comment>
+		<comment id='4' author='Channingss' date='2020-07-29T02:24:30Z'>
+		&lt;denchmark-link:https://github.com/skottmckay&gt;@skottmckay&lt;/denchmark-link&gt;
+
+'close to Numpy' means diff should small than 10e-4 or smaller, I calculate  the diff between numpy and ORT by code mentioned above:
+&lt;denchmark-code&gt;diff = output_numpy - output_onnx
+print('max absolute diff: ', np.max(np.fabs(diff)))
+&lt;/denchmark-code&gt;
+
+the input data:
+&lt;denchmark-code&gt;input_size = 512
+hidden_size = 128
+weight_scale = 0.1
+number_of_gates = 3
+num_direct = 1
+seq_len = 10
+batch_size = 10
+input = np.random.random((seq_len, batch_size , input_size)).astype(np.float32) - 0.5
+W = weight_scale * np.random.random((num_direct, number_of_gates * hidden_size, input_size)).astype(np.float32)
+R = weight_scale * np.random.random((num_direct, number_of_gates * hidden_size, hidden_size)).astype(np.float32)
+B = weight_scale * np.random.random((num_direct, 2*number_of_gates * hidden_size)).astype(np.float32)
+&lt;/denchmark-code&gt;
+
+More steps in the GRU calculations, so any diff will grow with each step, but the difference is too large, which is expected? and when i make input shape larger, the diff become more larger.
+&lt;denchmark-link:https://user-images.githubusercontent.com/12471701/88748226-10bd8c00-d183-11ea-9951-ad9b79ba75c2.png&gt;&lt;/denchmark-link&gt;
+
+Notice: When input shape become bigger, and there are only positive or negative numbers in ’X‘ or 'W',  the diff  between ORT numpy small than 10e-4. the large difference happened when both positive or negative numbers in ’X‘ or 'W'.
+		</comment>
+		<comment id='5' author='Channingss' date='2020-07-29T05:48:25Z'>
+		For each step of GRU the previous output value is an input (the H_t value in the python GRU_Helper.step function). Due to that the potential growth of the diff is relative to the number of steps.
+Say each step had a potential diff of 10e-5. If you did 10 steps that may add up to a 10e-4.  Also keep in mind there are multiple matrix multiplications per step (I count 6 calls to numpy.dot in the python code). There are a lot of floating point operations going on here.
+I don't believe you can choose an arbitrary value like 10e-4 and deem any diff larger than that to be 'incorrect' due to this. That value should be reasonable for a single step though.
+You're also assuming the numpy value is the ground truth but there's no 100% accurate value due to floating point numbers not having 100% precision. Just because the value is different to numpy doesn't necessarily make it incorrect.
+If you want smaller diffs you could change your model to use double instead of float. I wouldn't expect it would change correctness though.
+If you have only positive or only negative numbers you're always adding positive numbers when calculating each output (as it's (A0 x B0) + (A1 x B1) etc. etc., so whether A or B are both positive or both negative doesn't matter as the product of the two will be positive . If one of A and B is negative than the multiplication yields a negative value and you may now be subtracting when accumulating the products bringing into play things like subtractive cancellation. I would expect doing something like generating random data in a range of 0..1 and arbitrarily shifting it into a range of -0.5..0.5 is just increasing the chance of inaccuracies due to how floating point numbers behave.
+		</comment>
+		<comment id='6' author='Channingss' date='2020-07-29T07:26:04Z'>
+		&lt;denchmark-link:https://github.com/skottmckay&gt;@skottmckay&lt;/denchmark-link&gt;
+ thanks for your reply, the numpy calculate process i used to compare, which come from test module(
+). From your description, can I see that the calculation order of test module(numpy) is inconsistent with onnruntime?
+		</comment>
+		<comment id='7' author='Channingss' date='2020-07-29T07:41:56Z'>
+		I would expect the difference is primarily within the implementation of the matrix multiplication and not at the level you see in the python code. There are many potential optimizations to improve matrix multiplication performance. e.g. &lt;denchmark-link:http://en.wikipedia.org/wiki/Loop_tiling&gt;http://en.wikipedia.org/wiki/Loop_tiling&lt;/denchmark-link&gt;
+. Depending on which options are used including how/when they are parallelized the order that different calculations happen in will differ. The MLAS library in ORT has different optimizations depending on the instructions available on the machine (e.g. if AVX512 is available different instructions will be used than when it is not). Unless all that matched the internal implementation of numpy.dot exactly you will see diffs.
+		</comment>
+		<comment id='8' author='Channingss' date='2020-07-31T09:10:31Z'>
+		&lt;denchmark-link:https://github.com/skottmckay&gt;@skottmckay&lt;/denchmark-link&gt;
+  thanks for your reply
+		</comment>
+	</comments>
+</bug>

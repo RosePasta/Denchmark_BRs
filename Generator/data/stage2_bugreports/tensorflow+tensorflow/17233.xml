@@ -1,0 +1,215 @@
+<bug id='17233' author='yaroslavvb' open_date='2018-02-23T23:46:35Z' closed_time='2018-11-16T23:47:45Z'>
+	<summary>4x slowdown in feed_dict in tf-nightly-gpu</summary>
+	<description>
+Upgrading to pip install tf-nightly-gpu from pip install tensorflow (1.5) slows down feeding about 4x
+Feeding 100MB array used to take 15ms, and it takes 60ms after the change. I think this is due to change in alignment requirements for AVX-compiled binary. I want to start the thread to figure out how to regain the performance before these changes make it into official release
+benchmark: &lt;denchmark-link:https://github.com/diux-dev/cluster/blob/0edf19d919ee02273c7beb3af2ea378496a95610/yuxin_numpy/align_feed_bug.py&gt;align_feed_bug.py&lt;/denchmark-link&gt;
+
+&lt;denchmark-code&gt;# version: 1.5.0
+python align_feed_bug.py
+feed-cpu-variable   : min: 17.17, median: 19.95, mean: 19.82
+
+# After upgrading to tf nightly
+# version: 1.7.0-dev20180221
+python align_feed_bug.py
+feed-cpu-variable   : min: 53.97, median: 57.15, mean: 66.60
+&lt;/denchmark-code&gt;
+
+I've tried using &lt;denchmark-link:https://github.com/eamartin&gt;@eamartin&lt;/denchmark-link&gt;
+ 's recipe (&lt;denchmark-link:https://github.com/numpy/numpy/issues/5312#issuecomment-299533915&gt;numpy/numpy#5312 (comment)&lt;/denchmark-link&gt;
+) to make sure numpy array are 128-byte aligned, but that didn't make any difference in speed
+&lt;denchmark-code&gt;python align_feed_bug.py --align=1
+feed-cpu-variable   : min: 49.54, median: 50.50, mean: 60.06
+&lt;/denchmark-code&gt;
+
+cc &lt;denchmark-link:https://github.com/martinwicke&gt;@martinwicke&lt;/denchmark-link&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='yaroslavvb' date='2018-02-24T02:57:14Z'>
+		OK, here's a hacky way of aligning an existing array. This removes the speed penalty of speed dict, and you can copy new data into existing aligned memory using np.copyto
+&lt;denchmark-code&gt;def align_numpy(unaligned):
+  sess = tf.get_default_session()
+  aligned = sess.run(tf.ones(unaligned.shape, dtype=unaligned.dtype))
+  np.copyto(aligned, unaligned)
+  return aligned
+
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='2' author='yaroslavvb' date='2018-02-24T03:17:45Z'>
+		&lt;denchmark-link:https://github.com/alextp&gt;@alextp&lt;/denchmark-link&gt;
+ what is the logic to determine if existing numpy memory is aligned?
+		</comment>
+		<comment id='3' author='yaroslavvb' date='2018-02-24T05:01:45Z'>
+		Just to check. Does the regression also affect 1.6 RC1?
+		</comment>
+		<comment id='4' author='yaroslavvb' date='2018-02-24T05:22:43Z'>
+		Also, could this be related to the AVX build?
+		</comment>
+		<comment id='5' author='yaroslavvb' date='2018-02-24T15:35:49Z'>
+		I suspect an extra memcpy is the cause. The slowdown is 45ms, and 100MB/45ms = 2.2GB/s. This is about the throughput of a memcpy that causes a lot of pagefaults.
+In [5]: x = np.ones(100 * 1 &lt;&lt; 20, dtype=np.uint8)
+
+In [6]: %time y = np.copy(x)
+CPU times: user 32 ms, sys: 8 ms, total: 40 ms
+Wall time: 36.9 ms
+GIven this, I suspect the TF changes caused an additional memcpy on feed. The memcpy theory can be further tested by running &lt;denchmark-link:https://github.com/yaroslavvb&gt;@yaroslavvb&lt;/denchmark-link&gt;
+ 's test at 200MB instead of 100MB. If slowdown roughly doubles to 90ms, strong indicator that memcpy (or at least something that touches every fed byte) is the source of slowdown.
+Good catch &lt;denchmark-link:https://github.com/yaroslavvb&gt;@yaroslavvb&lt;/denchmark-link&gt;
+ !
+		</comment>
+		<comment id='6' author='yaroslavvb' date='2018-02-24T16:19:07Z'>
+		That would be consistent with an alignment mismatch forcing a copy.
+		</comment>
+		<comment id='7' author='yaroslavvb' date='2018-02-25T03:10:49Z'>
+		&lt;denchmark-link:https://github.com/gunan&gt;@gunan&lt;/denchmark-link&gt;
+ it would affect it if RC1 is built with avx
+I regain the speed when using TensorFlow to allocate memory and writing my own data into that memory using np.copyto.
+benchmark: &lt;denchmark-link:https://github.com/diux-dev/cluster/blob/41b318a5e5248b8e236c31c323be6d7777fa6133/yuxin_numpy/tf_numpy_benchmark.py&gt;tf_numpy_benchmark.py&lt;/denchmark-link&gt;
+
+Using 100 MB of data, times are in ms
+&lt;denchmark-code&gt;python tf_numpy_benchmark.py --allocator=numpy --benchmark=feed_cpu_tensor
+feed_cpu_tensor               :   2.0 GB/sec, min: 50.10, median: 53.48, mean: 54.61
+
+python tf_numpy_benchmark.py --allocator=tf --benchmark=feed_cpu_tensor
+feed_cpu_tensor               :  12.9 GB/sec, min:  7.77, median:  8.53, mean:  8.88
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='8' author='yaroslavvb' date='2018-02-25T06:40:08Z'>
+		Thank you very much for the analysis.
+Since this will require some investigation, I will release 1.6 final without a fix for this, however I want to follow up on this and once we have a fix prepare patch releases for 1.5 and 1.6.
+&lt;denchmark-link:https://github.com/tfboyd&gt;@tfboyd&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/tatianashp&gt;@tatianashp&lt;/denchmark-link&gt;
+ FYI
+		</comment>
+		<comment id='9' author='yaroslavvb' date='2018-02-26T18:07:35Z'>
+		&lt;denchmark-link:https://github.com/yaroslavvb&gt;@yaroslavvb&lt;/denchmark-link&gt;
+ this is the test we apply 
+ and it hasn't changed recently so I don't know what's going on. The call site to this is in 
+ and that hasn't changed recently either.
+		</comment>
+		<comment id='10' author='yaroslavvb' date='2018-02-26T18:15:55Z'>
+		&lt;denchmark-link:https://github.com/alextp&gt;@alextp&lt;/denchmark-link&gt;
+ I think what's going on is that  has changed recently in  due to switching to AVX build
+		</comment>
+		<comment id='11' author='yaroslavvb' date='2018-02-27T22:41:22Z'>
+		&lt;denchmark-link:https://github.com/alextp&gt;@alextp&lt;/denchmark-link&gt;
+ is there any other place that copy can happen? I'm finding that there's significant penalty in feeding read-only numpy arrays, and I can't see anything in that c_api.cc logic that checks for read-only attrs . This comes up when trying to feed data from Ray which uses read-only memory buffers
+IE,
+&lt;denchmark-code&gt;sess.run(some_op, feed_dict={a:arr})  # 12.6 GB/sec
+arr.flags['WRITEABLE']=False
+sess.run(some_op, feed_dict={a:arr})  # 1.2 GB/sec
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-link:https://github.com/diux-dev/cluster/blob/ee5c07056a9d1dadb118aaa93e721bc81a962428/yuxin_numpy/tf_numpy_benchmark.py&gt;tf_numpy_benchmark.py&lt;/denchmark-link&gt;
+
+&lt;denchmark-code&gt;python tf_numpy_benchmark.py --benchmark=feed_cpu_tensor --allocator=tf --num-iters=51
+feed_cpu_tensor               :  12.9 GB/sec, min:  7.75, median:  8.98, mean:  9.01
+
+python tf_numpy_benchmark.py --benchmark=feed_cpu_tensor --allocator=tf_readonly --num-iters=51
+feed_cpu_tensor               :   1.1 GB/sec, min: 88.48, median: 91.55, mean: 93.30
+
+
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='12' author='yaroslavvb' date='2018-02-28T00:26:52Z'>
+		Moving "read-only" slowness to separate issue &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/17315&gt;#17315&lt;/denchmark-link&gt;
+ because it's unrelated to alignment
+		</comment>
+		<comment id='13' author='yaroslavvb' date='2018-03-07T13:57:57Z'>
+		I &lt;denchmark-link:https://stackoverflow.com/q/46712934&gt;have to&lt;/denchmark-link&gt;
+ use feed_dict for a large (&gt; 2 GB) embedding matrix and I'm seeing a 60 fold slowdown in my Siamese CNN between Tensorflow 1.5 and 1.6 (via nvidia-docker and the official images). While a batch takes about 1 second in 1.5 it takes &gt; 1 minute in 1.6. I strongly suspect this could also be caused by this issue. Also it seems this gets much worse with CPU load where it slows down to 3 minutes on 1.6. I can provide code and embeddings if needed.
+		</comment>
+		<comment id='14' author='yaroslavvb' date='2018-03-07T16:28:34Z'>
+		CPU slowdown has also been reported in &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/17383&gt;#17383&lt;/denchmark-link&gt;
+, Could you please provide data about your environment and build? Does the workaround suggested by &lt;denchmark-link:https://github.com/yaroslavvb&gt;@yaroslavvb&lt;/denchmark-link&gt;
+ help you?
+		</comment>
+		<comment id='15' author='yaroslavvb' date='2018-03-07T17:57:27Z'>
+		&lt;denchmark-link:https://github.com/tatianashp&gt;@tatianashp&lt;/denchmark-link&gt;
+ the problem occurs on nvidia-docker with  on an NVIDIA TITAN X (Maxwell and Pascal). Both inside Kubernetes as well as on the Ubuntu 16.04 LTS host + Docker CE.  Driver version is 390.25 but the same happened with an older version already (tried updating today during our investigation). As for the docker image there are almost no other dependencies (gensim + joblib) and those remain the same when changing from 1.5 to 1.6.
+I have spent some time trying to get &lt;denchmark-link:https://github.com/yaroslavvb&gt;@yaroslavvb&lt;/denchmark-link&gt;
+ 's align_numpy_tf() hack to work but it's a bit hairy because the embeddings' size is taken into account when building the graph and at that point there is no session yet. I got it working with a hack but couldn't really see a performance difference. Still, I think that the very large NumPy array feed is a likely culprit as other models by colleagues don't show a similar degradation but also don't feed large NumPy arrays.
+Note that this is with the embeddings created under a the 'cpu:0' device. When creating on the GPU it takes 1 minute per batch even on 1.5, I'm not sure about 1.6. The loss seems to develop almost identically. Interestingly with 1.5 I see 60-70% utilization in nvidia-smi but with 1.6 it drops to 0-2%. CPU load is 100% with both versions, though on 1.5 when using no GPU it doesn't go beyond 100% while with 1.6 it uses just one core.
+I can try to create a reproducer tomorrow though it will likely need a large download for the embeddings..
+		</comment>
+		<comment id='16' author='yaroslavvb' date='2018-03-07T19:28:41Z'>
+		&lt;denchmark-link:https://github.com/niklas88&gt;@niklas88&lt;/denchmark-link&gt;
+ GPU at low utilization while TF only uses 1 core is consistent with copy problem. memcpy of 1GB array would take 1 second and will use a single core. You could check if  is working for you by feeding 1GB aligned array and checking if takes 1 sec vs 1ms
+		</comment>
+		<comment id='17' author='yaroslavvb' date='2018-03-08T00:37:04Z'>
+		The issue in &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/17383&gt;#17383&lt;/denchmark-link&gt;
+ is unrelated, as it is specific to MKL.
+&lt;denchmark-link:https://github.com/niklas88&gt;@niklas88&lt;/denchmark-link&gt;
+ Let us know if  &lt;denchmark-link:https://github.com/yaroslavvb&gt;@yaroslavvb&lt;/denchmark-link&gt;
+ suggestion helps you.
+		</comment>
+		<comment id='18' author='yaroslavvb' date='2018-03-08T09:41:10Z'>
+		&lt;denchmark-link:https://github.com/tatianashp&gt;@tatianashp&lt;/denchmark-link&gt;
+ ok I've tried integrating &lt;denchmark-link:https://github.com/yaroslavvb&gt;@yaroslavvb&lt;/denchmark-link&gt;
+ 's  again. First I can confirm that with his  I definitely see the slowdown on my setup. However integrating it for my embedding doesn't significantly speed things up. I also tried running with  on 1.5 and it's as fast as always (1 second per epoch) but on 1.6 it remains at 1 minute per epoch. So there is still something very weird going on. I still think it's got to be related. So now I'll put together a reproducer, the code isn't too pretty but also not too large.
+		</comment>
+		<comment id='19' author='yaroslavvb' date='2018-03-08T13:06:29Z'>
+		I've put together a reproducer &lt;denchmark-link:https://github.com/niklas88/tf_perf_regression&gt;here&lt;/denchmark-link&gt;
+ and also host the required data (see the README for instructions). This is the code with &lt;denchmark-link:https://github.com/yaroslavvb&gt;@yaroslavvb&lt;/denchmark-link&gt;
+ 's workaround just to make sure I've applied it correctly. If you need me to further simplify the code I can of course look into that still. 
+		</comment>
+		<comment id='20' author='yaroslavvb' date='2018-03-08T16:50:28Z'>
+		&lt;denchmark-link:https://github.com/niklas88&gt;@niklas88&lt;/denchmark-link&gt;
+ have you isolated this problem to ? If  doesn't help, it suggests that extra memcpy on feed-dict is not the problem.
+Also, just in case, you could try running this beforehand. That's an alternative way of making your numpy arrays aligned.
+&lt;denchmark-code&gt;sudo apt-get install -y google-perftools
+export LD_PRELOAD="/usr/lib/libtcmalloc.so.4"
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='21' author='yaroslavvb' date='2018-03-08T17:22:17Z'>
+		&lt;denchmark-link:https://github.com/yaroslavvb&gt;@yaroslavvb&lt;/denchmark-link&gt;
+ so with  as used in my posted code I didn't see an improvement. However using   does the trick and the performance returns to 1.5 levels. When doing this tcmalloc warns of s though.
+Maybe  doesn't work since the embedding uses &lt;denchmark-link:https://github.com/niklas88/tf_perf_regression/blob/master/deep_relscorer.py#L156&gt;vstack&lt;/denchmark-link&gt;
+ or because the placeholder has an &lt;denchmark-link:https://github.com/niklas88/tf_perf_regression/blob/e7bdac70ceba120ad20820cc3f93f8e4493b1a8b/deep_relscorer.py#L702&gt;explicit shape&lt;/denchmark-link&gt;
+?
+		</comment>
+		<comment id='22' author='yaroslavvb' date='2018-03-08T17:36:05Z'>
+		OK, it looks like your issue is also due to change in alignment requirements in TF 1.6
+The reason align_numpy_tf didn't help is possibly because you were calling it too many times. Each time you call it, it involves a memory copy into aligned memory. The way I use it is to call it once, and then do in-place operations on the resulting array.
+PS, you can check alignment of various allocators using this utility
+&lt;denchmark-code&gt;# install ray, pytorch, then
+wget -N https://raw.githubusercontent.com/diux-dev/cluster/fa98c59d07447e2b7923fde8ee294f9a054f9fbb/yuxin_numpy/tf_numpy_benchmark.py
+python tf_numpy_benchmark.py --benchmark=allocator_alignment
+&lt;/denchmark-code&gt;
+
+it prints how many bytes you are off 64-byte alignment, ie, I see something like this with tcmalloc
+&lt;denchmark-code&gt;     numpy: 0
+       ray: 48
+   pytorch: 0
+        tf: 0
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='23' author='yaroslavvb' date='2018-03-08T17:50:08Z'>
+		&lt;denchmark-link:https://github.com/yaroslavvb&gt;@yaroslavvb&lt;/denchmark-link&gt;
+ that can't be it. I only call it when I build the graph which happens exactly once in the reproducer. But it was a quick addition so I might simply have screwed up.
+Im getting the following alignments (uncommented ray and pytorch as I didn't want to install them in nvidia-docker):
+&lt;denchmark-code&gt; numpy: 16
+ tf: 0
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='24' author='yaroslavvb' date='2018-04-09T18:21:48Z'>
+		&lt;denchmark-link:https://github.com/tatianashp&gt;@tatianashp&lt;/denchmark-link&gt;
+, has this issue been fixed? The last comment of &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/17383&gt;#17383&lt;/denchmark-link&gt;
+ states that this is fixed in 1.7.
+		</comment>
+		<comment id='25' author='yaroslavvb' date='2018-11-07T19:09:35Z'>
+		Nagging Assignee &lt;denchmark-link:https://github.com/tatianashp&gt;@tatianashp&lt;/denchmark-link&gt;
+: It has been 211 days with no activity and this issue has an assignee. Please update the label and/or status accordingly.
+		</comment>
+		<comment id='26' author='yaroslavvb' date='2018-11-16T23:47:45Z'>
+		Closing as this is resolved, feel free to reopen if problem persists.
+		</comment>
+	</comments>
+</bug>

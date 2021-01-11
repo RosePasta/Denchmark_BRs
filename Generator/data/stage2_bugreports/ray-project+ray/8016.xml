@@ -1,0 +1,190 @@
+<bug id='8016' author='cpn' open_date='2020-04-14T09:46:15Z' closed_time='2020-11-27T02:31:08Z'>
+	<summary>custom PPO loss not used after failure</summary>
+	<description>
+Ray version: 0.8.3
+TensorFlow version: 2.1.0
+If you change the PPO loss as in &lt;denchmark-link:https://github.com/ray-project/ray/issues/7855&gt;here&lt;/denchmark-link&gt;
+, and the run fails it will load the old PPO loss. This is with max_failures set to something different than 0.
+	</description>
+	<comments>
+		<comment id='1' author='cpn' date='2020-04-14T10:00:08Z'>
+		Code to reproduce the issue:
+&lt;denchmark-code&gt;import logging
+
+from ray.rllib.evaluation.postprocessing import Postprocessing
+from ray.rllib.policy.sample_batch import SampleBatch
+from ray.rllib.agents.ppo.ppo_tf_policy import PPOTFPolicy
+from ray.rllib.utils import try_import_tf
+from ray.rllib.models import ModelCatalog
+tf = try_import_tf()
+
+logger = logging.getLogger(__name__)
+
+
+class CustomPPOLoss:
+    def __init__(
+        self,
+        dist_class,
+        model,
+        value_targets,
+        advantages,
+        actions,
+        prev_logits,
+        prev_actions_logp,
+        vf_preds,
+        curr_action_dist,
+        value_fn,
+        cur_kl_coeff,
+        valid_mask,
+        entropy_coeff=0,
+        clip_param=0.1,
+        vf_clip_param=0.1,
+        vf_loss_coeff=1.0,
+        use_gae=True,
+    ):
+        """Constructs the loss for Proximal Policy Objective.
+        Arguments:
+            dist_class: action distribution class for logits.
+            value_targets (Placeholder): Placeholder for target values; used
+                for GAE.
+            actions (Placeholder): Placeholder for actions taken
+                from previous model evaluation.
+            advantages (Placeholder): Placeholder for calculated advantages
+                from previous model evaluation.
+            prev_logits (Placeholder): Placeholder for logits output from
+                previous model evaluation.
+            prev_actions_logp (Placeholder): Placeholder for action prob output
+                from the previous (before update) Model evaluation.
+            vf_preds (Placeholder): Placeholder for value function output
+                from the previous (before update) Model evaluation.
+            curr_action_dist (ActionDistribution): ActionDistribution
+                of the current model.
+            value_fn (Tensor): Current value function output Tensor.
+            cur_kl_coeff (Variable): Variable holding the current PPO KL
+                coefficient.
+            valid_mask (Optional[tf.Tensor]): An optional bool mask of valid
+                input elements (for max-len padded sequences (RNNs)).
+            entropy_coeff (float): Coefficient of the entropy regularizer.
+            clip_param (float): Clip parameter
+            vf_clip_param (float): Clip parameter for the value function
+            vf_loss_coeff (float): Coefficient of the value function loss
+            use_gae (bool): If true, use the Generalized Advantage Estimator.
+        """
+        if valid_mask is not None:
+
+            def reduce_mean_valid(t):
+                return tf.reduce_mean(tf.boolean_mask(t, valid_mask))
+
+        else:
+
+            def reduce_mean_valid(t):
+                return tf.reduce_mean(t)
+
+        prev_dist = dist_class(prev_logits, model)
+        # Make loss functions.
+        logp_ratio = tf.exp(curr_action_dist.logp(actions) - prev_actions_logp)
+        action_kl = prev_dist.kl(curr_action_dist)
+        self.mean_kl = reduce_mean_valid(action_kl)
+
+        curr_entropy = curr_action_dist.entropy()
+        self.mean_entropy = reduce_mean_valid(curr_entropy)
+
+        surrogate_loss = tf.minimum(
+            advantages * logp_ratio,
+            advantages * tf.clip_by_value(logp_ratio, 1 - clip_param, 1 + clip_param),
+        )
+        self.mean_policy_loss = reduce_mean_valid(-surrogate_loss)
+
+        # kl_loss = ... TODO
+        # self.mean_kl_loss = reduce_mean_valid(kl_loss) TODO
+
+        if use_gae:
+            vf_loss1 = tf.square(value_fn - value_targets)
+            vf_clipped = vf_preds + tf.clip_by_value(value_fn - vf_preds, -vf_clip_param, vf_clip_param)
+            vf_loss2 = tf.square(vf_clipped - value_targets)
+            vf_loss = tf.maximum(vf_loss1, vf_loss2)
+            self.mean_vf_loss = reduce_mean_valid(vf_loss)
+            loss = reduce_mean_valid(
+                -surrogate_loss
+                + cur_kl_coeff * action_kl
+                + vf_loss_coeff * vf_loss
+                - entropy_coeff * curr_entropy
+                # + kl_loss TODO
+            )
+        else:
+            self.mean_vf_loss = tf.constant(0.0)
+            loss = reduce_mean_valid(
+                -surrogate_loss
+                + cur_kl_coeff * action_kl
+                - entropy_coeff * curr_entropy  # + kl_loss TODO
+            )
+        self.loss = loss
+
+
+def custom_ppo_surrogate_loss(policy, model, dist_class, train_batch):
+    logits, state = model.from_batch(train_batch)
+    action_dist = dist_class(logits, model)
+    mask = None
+    if state:
+        max_seq_len = tf.reduce_max(train_batch["seq_lens"])
+        mask = tf.sequence_mask(train_batch["seq_lens"], max_seq_len)
+        mask = tf.reshape(mask, [-1])
+
+    policy.loss_obj = CustomPPOLoss(
+        dist_class,
+        model,
+        train_batch[Postprocessing.VALUE_TARGETS],
+        train_batch[Postprocessing.ADVANTAGES],
+        train_batch[SampleBatch.ACTIONS],
+        train_batch[SampleBatch.ACTION_DIST_INPUTS],
+        train_batch[SampleBatch.ACTION_LOGP],
+        train_batch[SampleBatch.VF_PREDS],
+        action_dist,
+        model.value_function(),
+        policy.kl_coeff,
+        mask,
+        entropy_coeff=policy.entropy_coeff,
+        clip_param=policy.config["clip_param"],
+        vf_clip_param=policy.config["vf_clip_param"],
+        vf_loss_coeff=policy.config["vf_loss_coeff"],
+        use_gae=policy.config["use_gae"],
+    )
+    assert(False)
+    return policy.loss_obj.loss
+
+
+CustomPPOTFPolicy = PPOTFPolicy.with_updates(name="CustomPPOTFPolicy", loss_fn=custom_ppo_surrogate_loss)
+
+
+from ray import tune
+from ray.rllib.agents.ppo.ppo import PPOTrainer
+
+
+CustomPPOTrainer = PPOTrainer.with_updates(default_policy=CustomPPOTFPolicy, get_policy_class= None)
+
+tune.run(CustomPPOTrainer, config={"env": "CartPole-v0"}, max_failures=10)
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='2' author='cpn' date='2020-11-13T01:45:43Z'>
+		Hi, I'm a bot from the Ray team :)
+To help human contributors to focus on more relevant issues, I will automatically add the stale label to issues that have had no activity for more than 4 months.
+If there is no further activity in the 14 days, the issue will be closed!
+
+If you'd like to keep the issue open, just leave any comment, and the stale label will be removed!
+If you'd like to get more attention to the issue, please tag one of Ray's contributors.
+
+You can always ask for help on our &lt;denchmark-link:https://discuss.ray.io/&gt;discussion forum&lt;/denchmark-link&gt;
+ or &lt;denchmark-link:https://github.com/ray-project/ray#getting-involved&gt;Ray's public slack channel&lt;/denchmark-link&gt;
+.
+		</comment>
+		<comment id='3' author='cpn' date='2020-11-27T02:31:03Z'>
+		Hi again! The issue will be closed because there has been no more activity in the 14 days since the last message.
+Please feel free to reopen or open a new issue if you'd still like it to be addressed.
+Again, you can always ask for help on our &lt;denchmark-link:https://discuss.ray.io&gt;discussion forum&lt;/denchmark-link&gt;
+ or &lt;denchmark-link:https://github.com/ray-project/ray#getting-involved&gt;Ray's public slack channel&lt;/denchmark-link&gt;
+.
+Thanks again for opening the issue!
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,429 @@
+<bug id='34637' author='HLSS-Hen' open_date='2019-11-27T07:17:43Z' closed_time='2020-01-13T16:23:43Z'>
+	<summary>multi-device function optimization failure</summary>
+	<description>
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow):No
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04):ubuntu 19.10
+TensorFlow installed from (source or binary):github release
+TensorFlow version (use command below):2.0
+Python version:3.7.5
+Bazel version (if compiling from source):0.26.1
+GCC/Compiler version (if compiling from source):9.2.1 20191008
+CUDA/cuDNN version:10.1, 7.6.4
+GPU model and memory: RTX2080Ti x2 NVLink
+
+Describe the current behavior
+It takes to much time and shows W:"multi-device function optimization failure"
+Describe the expected behavior
+Fastly start train after compile the model with no W.
+Code to reproduce the issue
+
+main:
+
+&lt;denchmark-code&gt;import os
+os.environ['TF_AUTO_MIXED_PRECISION_GRAPH_REWRITE_IGNORE_PERFORMANCE'] = '1'
+import tensorflow as tf
+from Models import MCN
+from DataSets import ImageNet
+
+for gpu in tf.config.experimental.list_physical_devices('GPU'):
+    tf.config.experimental.set_memory_growth(gpu, True)
+logical_gpus = tf.config.experimental.list_logical_devices('GPU')
+
+BATCH_SIZE=20
+BATCHS_PER_APLY_GRADIENTS=1000//BATCH_SIZE
+
+ds=ImageNet.ImageNetP()
+starategy=tf.distribute.MirroredStrategy()
+with starategy.scope():
+    model=MCN.mcn_520(2,24)
+    model.summary()
+    model.compile(
+        loss=tf.keras.losses.SparseCategoricalCrossentropy(),
+        optimizer=tf.keras.optimizers.SGD(),
+        metrics=[tf.keras.metrics.TopKCategoricalAccuracy(1,'top1'),tf.keras.metrics.TopKCategoricalAccuracy(5,'top5')]
+        )
+    fit_ds,val_ds=ds(BATCH_SIZE)
+    model.fit(
+        fit_ds,
+        epochs=1000000,
+        steps_per_epoch=BATCHS_PER_APLY_GRADIENTS*200,
+        validation_data=val_ds,
+        validation_steps=ds.val_images//BATCH_SIZE,
+    )
+&lt;/denchmark-code&gt;
+
+
+MCN.py:
+
+&lt;denchmark-code&gt;import math
+import tensorflow as tf
+from tensorflow import keras
+
+class Swish(keras.layers.Layer):
+    def __init__(self):
+        super(Swish, self).__init__()
+        self.weight = self.add_weight(initializer='uniform',trainable=True)
+
+    def __call__(self, inputs):
+        return inputs+tf.sigmoid(self.weight*inputs)
+
+
+class Conv(keras.Model):
+    def __init__(self,filters,kernel_size=1,strides=1,padding='valid'):
+        super(Conv, self).__init__()
+        self.conv = keras.layers.Conv2D(filters,kernel_size,strides,padding)
+        self.bn = keras.layers.BatchNormalization()
+        self.ac = Swish()
+
+    def __call__(self,inputs):
+        return self.ac(self.bn(self.conv(inputs)))
+
+
+class SEBlock(keras.Model):
+    def __init__(self, filters):
+        super(SEBlock, self).__init__()
+        self.conv0 = keras.layers.Conv2D(filters//4,1,1)
+        self.drop = keras.layers.Dropout(0.25)
+        self.conv1 = keras.layers.Conv2D(filters,1,1)
+        self.bn = keras.layers.BatchNormalization()
+        self.ac = Swish()
+
+    def __call__(self,inputs):
+        x = self.conv1(self.drop(self.conv0(tf.reduce_mean(inputs,[1,2],keepdims=True))))
+        return self.ac(self.bn(tf.sigmoid(x)*inputs))
+
+
+class ResBlock(keras.Model):
+    def __init__(self, filters):
+        super(ResBlock, self).__init__()
+        self.conv0 = keras.layers.Conv2D(filters//4,1,1)
+        self.drop = keras.layers.Dropout(0.25)
+        self.conv1 = keras.layers.Conv2D(filters,3,1,'same')
+        self.bn = keras.layers.BatchNormalization()
+        self.ac = Swish()
+
+    def __call__(self,inputs):
+        x = self.conv1(self.drop(self.conv0(inputs)))
+        return self.ac(self.bn(inputs+x))
+
+def mcn_520(width, growth,input_shape=[256,256,3]):
+    fs = int(width*growth)
+    inputs=keras.layers.Input(input_shape)
+    x=keras.layers.Conv2D(fs,8,2)(inputs)
+    x=keras.layers.MaxPool2D(2)(x)
+    x1=Conv(fs//width)(SEBlock(fs)(x))
+    x2=Conv(fs//width)(ResBlock(fs)(x))
+    for i, depth in enumerate([2, 3, 5, 4]):
+        for _ in range(int(6*depth)):
+            fs+=int(math.sqrt(fs*width))
+            t=keras.layers.Concatenate()([x,x1,x2])
+            t=keras.layers.Dropout(0.25)(t)
+            t=Conv(fs//width, 1, 1)(t)
+            t=keras.layers.Dropout(0.25)(t)
+            x1=SEBlock(fs//width)(t)
+            x2=ResBlock(fs//width)(t)
+            t=keras.layers.Concatenate()([t,x1,x2])
+            t=keras.layers.Dropout(0.25)(t)
+            t=Conv(growth,1,1)(t)
+            x=keras.layers.Concatenate()([x,t])
+        if i != 3:
+            fs //= 2
+            x=keras.layers.MaxPool2D(2)(Conv(fs)(x))
+            x1=keras.layers.MaxPool2D(2)(Conv(fs//width)(x1))
+            x2=keras.layers.MaxPool2D(2)(Conv(fs//width)(x2))
+    x=keras.layers.GlobalMaxPool2D()(x)
+    x=keras.layers.Dropout(0.25)(x)
+    outputs=keras.layers.Dense(1000,activation='softmax')(x)
+    return keras.Model(inputs=inputs,outputs=outputs,name='MCN520')
+&lt;/denchmark-code&gt;
+
+Other info / logs
+
+Train for 10000 steps, validate for 2500 steps
+Epoch 1/1000000
+2019-11-27 07:06:16.642667: W tensorflow/core/common_runtime/process_function_library_runtime.cc:675] Ignoring multi-device function optimization failure: Deadline exceeded: meta_optimizer exceeded deadline.
+2019-11-27 07:06:27.657015: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamic library libcublas.so.10
+2019-11-27 07:06:28.144415: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamic library libcudnn.so.7
+
+	</description>
+	<comments>
+		<comment id='1' author='HLSS-Hen' date='2019-12-02T03:59:38Z'>
+		Also met with the same warning with distributed strategy. The model I used is an encoder-decoder UNet++ architecture. The warning only shows up when I connect two UNet++ models together. My guess is the graph compile time is just too long for such sophisticated model that it exceed the predefined time. Is there anyway to bypass this?
+		</comment>
+		<comment id='2' author='HLSS-Hen' date='2019-12-02T06:01:52Z'>
+		Yeah it looks like grappler is taking too long and timing out for the big graph - and is likely skipping some graph optimizations.
+&lt;denchmark-link:https://github.com/HLSS-Hen&gt;@HLSS-Hen&lt;/denchmark-link&gt;
+ when you say it is slow, can you provide some numbers? is the time to start first step slow or is the actual training slow? Can you provide numbers for 1 GPU (No distribution) vs 2 GPUs with mirrored strategy?
+		</comment>
+		<comment id='3' author='HLSS-Hen' date='2019-12-05T06:16:04Z'>
+		&lt;denchmark-link:https://github.com/ChunHsinWang&gt;@ChunHsinWang&lt;/denchmark-link&gt;
+  I think so. But I don't known anyways to bypass this.
+		</comment>
+		<comment id='4' author='HLSS-Hen' date='2019-12-05T06:45:46Z'>
+		&lt;denchmark-link:https://github.com/guptapriya&gt;@guptapriya&lt;/denchmark-link&gt;
+ ok, in my test. run without distribution is a little faster than 2GPUs with mirrored startegy. And there is no warning. It direct start train with  fewer time wait.
+		</comment>
+		<comment id='5' author='HLSS-Hen' date='2020-01-13T16:23:43Z'>
+		I build tf2.1, and it seems repaired.
+		</comment>
+		<comment id='6' author='HLSS-Hen' date='2020-01-13T16:23:45Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/34637&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/34637&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='7' author='HLSS-Hen' date='2020-01-25T03:34:57Z'>
+		I use tensorflow 2.0-GPU, nivida-tesla V100, 32G, gru model
+I also get the same warning and the process do not move for two days.
+My code  is :
+&lt;denchmark-code&gt;import tensorflow as tf
+from tensorflow.keras import datasets, layers, optimizers, Sequential, metrics
+import pandas as pd
+import numpy as np
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+from scipy import sparse
+
+import os
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+
+tf.random.set_seed(22)
+np.random.seed(22) 
+assert tf.__version__.startswith('2.')
+
+batchsz = 256
+
+# the most frequest words
+total_words = 4096
+max_review_len = 4995
+embedding_len = 100
+
+matrixfile = "my matrix"
+targetfile = "my label"
+
+allmatrix = sparse.load_npz(matrixfile).toarray()
+target = np.loadtxt(targetfile)
+print("allmatrix shape: {}；target shape: {}".format(allmatrix.shape, target.shape))
+
+x = tf.convert_to_tensor(allmatrix, dtype=tf.float32)
+y = tf.convert_to_tensor(target, dtype=tf.int32)
+idx = tf.range(allmatrix.shape[0])
+idx = tf.random.shuffle(idx)
+x_train, y_train = tf.gather(x, idx[:int(0.7 * len(idx))]), tf.gather(y,idx[:int(0.7 * len(idx))])
+x_val, y_val = tf.gather(x, idx[int(0.7 * len(idx)):int(0.8 * len(idx))]), tf.gather(y, idx[int(0.7 * len(idx)):int(0.8 * len(idx))])
+x_test, y_test = tf.gather(x, idx[int(0.8 * len(idx)):]), tf.gather(y, idx[int(0.8 * len(idx)):])
+
+
+db_train = tf.data.Dataset.from_tensor_slices((x_train, y_train))
+db_train = db.shuffle(6000).batch(batchsz, drop_remainder=True).repeat()
+db_val = tf.data.Dataset.from_tensor_slices((x_val, y_val))
+db_val = ds_val.batch(batchsz, drop_remainder=True)
+db_test = tf.data.Dataset.from_tensor_slices((x_test, y_test))
+db_test = db_test.batch(batchsz, drop_remainder=True)
+
+
+class MyRNN(keras.Model):
+
+    def __init__(self, units):
+        super(MyRNN, self).__init__()
+
+
+       
+        self.embedding = layers.Embedding(total_words, embedding_len,
+                                          input_length=max_review_len)
+
+
+        self.rnn = keras.Sequential([
+            layers.GRU(units, dropout=0.5, return_sequences=True, unroll=True),
+            layers.GRU(units, dropout=0.5, unroll=True)
+        ])
+
+
+        # fc, [b, 80, 100] =&gt; [b, 64] =&gt; [b, 1]
+        self.outlayer = layers.Dense(1)
+
+    def call(self, inputs, training=None):
+        # [b, 80]
+        x = inputs
+        # embedding: [b, 80] =&gt; [b, 80, 100]
+        x = self.embedding(x)
+        # rnn cell compute
+        # x: [b, 80, 100] =&gt; [b, 64]
+        x = self.rnn(x, training=training)
+
+        # out: [b, 64] =&gt; [b, 1]
+        x = self.outlayer(x)
+        # p(y is pos|x)
+        prob = tf.sigmoid(x)
+
+        return prob
+
+def main():
+    units = 64
+    epochs = 100
+
+    import time
+
+
+    t0 = time.time()
+    model = MyRNN(units)
+    model.compile(optimizer = keras.optimizers.Adam(0.001),
+                  loss = tf.losses.BinaryCrossentropy(),
+                  metrics=['accuracy'])
+
+    model.fit(db_train, epochs=epochs, validation_data=db_val)
+
+    model.evaluate(db_test)
+
+
+    t1 = time.time()
+   
+    print('total time cost:', t1-t0)
+
+
+if __name__ == '__main__':
+    main()
+&lt;/denchmark-code&gt;
+
+the warning is:
+&lt;denchmark-code&gt;2020-01-24 16:19:09.414217: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamic library libcudnn.so.7
+2020-01-24 16:19:09.416491: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1746] Adding visible gpu devices: 0
+2020-01-24 16:19:09.416531: I tensorflow/stream_executor/platform/default/dso_loader.cc:44] Successfully opened dynamic library libcudart.so.10.0
+2020-01-24 16:19:09.418195: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1159] Device interconnect StreamExecutor with strength 1 edge matrix:
+2020-01-24 16:19:09.418215: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1165]      0
+2020-01-24 16:19:09.418226: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1178] 0:   N
+2020-01-24 16:19:09.421327: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1304] Created TensorFlow device (/job:localhost/replica:0/task:0/device:GPU:0 with 30555 MB memory) -&gt; physical GPU (device: 0, name: Tesla V100-PCIE-32GB, pci bus id: 0000:8e:00.0, compute capability: 7.0)
+Epoch 1/100
+2020-01-24 16:41:16.523636: W tensorflow/core/common_runtime/process_function_library_runtime.cc:675] Ignoring multi-device function optimization failure: Deadline exceeded: meta_optimizer exceeded deadline.
+&lt;/denchmark-code&gt;
+
+has anyone know the solution ?
+		</comment>
+		<comment id='8' author='HLSS-Hen' date='2020-01-25T06:51:05Z'>
+		&lt;denchmark-link:https://github.com/Xiaohui-Z&gt;@Xiaohui-Z&lt;/denchmark-link&gt;
+ try use tf2.1. Or, add  function to your  class.
+In my try, custom Model without  function in TF2.1 will have the WARNING  --  .
+I don't know if it matters
+		</comment>
+		<comment id='9' author='HLSS-Hen' date='2020-01-25T18:06:21Z'>
+		
+@Xiaohui-Z try use tf2.1. Or, add get_confgi() function to your MyRNN class.
+In my try, custom Model without get_config() function in TF2.1 will have the WARNING -- WARNING:tensorflow:Model failed to serialize as JSON. Ignoring...  .
+I don't know if it matters
+
+&lt;denchmark-link:https://github.com/HLSS-Hen&gt;@HLSS-Hen&lt;/denchmark-link&gt;
+ ，Hi Hen, Thanks. Can you show me how to add  to the MyRNN class. I think get_config() just give you a dictionary containing the configuration of the model and only be used when you save a model, How can it affect my current model ?Thanks
+		</comment>
+		<comment id='10' author='HLSS-Hen' date='2020-01-26T09:41:18Z'>
+		&lt;denchmark-link:https://github.com/Xiaohui-Z&gt;@Xiaohui-Z&lt;/denchmark-link&gt;
+  is to tell keras what your parameters you defined in .
+Here are my codes:
+&lt;denchmark-code&gt;class Swish(keras.layers.Layer):
+    def __init__(self):
+        super(Swish, self).__init__() # must have this
+
+    def build(self,input_shape):
+        # if add_weight() function set in __init__(),
+        # tensor's name may can't to auto rename,
+        # it will cause error when save model or model's weight.
+        self.kernel = self.add_weight(name='kernel',trainable=True)
+        super(Swish,self).build(input_shape) # must have this
+
+    def get_config(self):
+        # for Layer,get_config() must have base config in 'super(CLASS_NAME,self).get_config()'
+        # if your custom layer have other parameters,
+        # you need to add then to the dictionary.
+        return super(Swish,self).get_config()
+
+    def call(self, inputs):
+        return inputs+tf.sigmoid(self.kernel*inputs)a
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-code&gt;class SEBlock(keras.Model):
+    def __init__(self, filters):
+        super(SEBlock, self).__init__() # must have this
+        self.conv0 = keras.layers.Conv2D(filters//4,1,1)
+        self.drop = keras.layers.Dropout(0.25)
+        self.conv1 = keras.layers.Conv2D(filters,1,1)
+        self.bn = keras.layers.BatchNormalization()
+        self.ac = Swish()
+        
+    def get_config(self):
+        # I tried to use 'supper().get_config()',
+        # but it seems not have this function.
+        return {'filters':self.conv1.get_config()['filters']}
+
+    def call(self,inputs):
+        x = self.conv1(self.drop(self.conv0(tf.reduce_mean(inputs,[1,2],keepdims=True))))
+        return self.ac(self.bn(tf.sigmoid(x)*inputs))
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='11' author='HLSS-Hen' date='2020-07-09T12:49:46Z'>
+		I am having the same issue. If anyone has any ideas on how to go about diagnosing (or fixing) the problem I would be extremely grateful
+I have two gigabyte servers with 8 K20X GPUS. They are identical in pretty much every way. With the same model launched on both one of them executes fine with distribution enabled (~1.5s per epoch) the other has the optimization timeout (~6.5s per epoch).
+System Details:
+
+2 X Intel E5-2650
+8 X NVIDIA K20X
+2 1TB SATA SSD configured in RAID 0
+128GB DDR3 memory
+256GB Swap
+Ubuntu 18.04.4
+
+Software Details
+
+Python 3.6
+TF 2.1.0-2.2.0
+
+I have attempted the following actions with no success:
+
+Re-install CUDA 10.1 from scratch
+Re-install TF 2.2.0 from binary
+Re-install TF 2.1.0 from binary
+Build TF 2.2.0 from source
+
+		</comment>
+		<comment id='12' author='HLSS-Hen' date='2020-07-09T13:03:41Z'>
+		&lt;denchmark-link:https://github.com/pbatk&gt;@pbatk&lt;/denchmark-link&gt;
+ Can you show more about your model? In my experience, This warning may caused by too large model or custom layers don't have  function.
+		</comment>
+		<comment id='13' author='HLSS-Hen' date='2020-07-09T13:07:01Z'>
+		&lt;denchmark-link:https://github.com/HLSS-Hen&gt;@HLSS-Hen&lt;/denchmark-link&gt;
+ Wow! Talk about a quick response! Thanks for the effort!
+Unfortunately I am not allowed to share the model as it is proprietary and the legal blah, blah, blah
+With that said I can say that is is very similar to a Res-Net50 and it runs successfully on one of the two identical machines. Sorry, I know this doesn't help much or answer you question. I am in a tough spot because I can't disclose too much info but everyone around here is scratching their head on this one
+		</comment>
+		<comment id='14' author='HLSS-Hen' date='2020-07-09T13:48:07Z'>
+		&lt;denchmark-link:https://github.com/pbatk&gt;@pbatk&lt;/denchmark-link&gt;
+ In fact, I have no experience with muti-machine training. I suggest you:
+Try use tensorboard to find out which operation use to much time.
+Try check your .
+Try check your dataset.
+See these web: &lt;denchmark-link:https://www.tensorflow.org/api_docs/python/tf/distribute/experimental&gt;tf.distrivute.experimental&lt;/denchmark-link&gt;
+, &lt;denchmark-link:https://www.tensorflow.org/guide/distributed_training&gt;Distributed training with TensorFlow&lt;/denchmark-link&gt;
+, &lt;denchmark-link:https://www.tensorflow.org/tutorials/distribute/multi_worker_with_keras&gt;Multi-worker training with Keras&lt;/denchmark-link&gt;
+, &lt;denchmark-link:https://www.tensorflow.org/tutorials/distribute/multi_worker_with_estimator&gt;Multi-worker training with Estimator&lt;/denchmark-link&gt;
+
+You may need to creat a new issue to ask someone have more muti-machine training experiences.
+		</comment>
+		<comment id='15' author='HLSS-Hen' date='2020-07-09T13:49:29Z'>
+		&lt;denchmark-link:https://github.com/HLSS-Hen&gt;@HLSS-Hen&lt;/denchmark-link&gt;
+ I'll likely create my own issue. I very much appreciate your effort though! Thank you!
+		</comment>
+		<comment id='16' author='HLSS-Hen' date='2020-11-27T03:29:49Z'>
+		I have the same issue with tf  2.2.0 (with MirroredStrategy or without MirroredStrategy). If anyone has any ideas on how to fix the problem I would be very grateful (Number of inputs to my model is a few millions).
+		</comment>
+		<comment id='17' author='HLSS-Hen' date='2020-11-27T10:22:25Z'>
+		&lt;denchmark-link:https://github.com/hosseinece&gt;@hosseinece&lt;/denchmark-link&gt;
+ You may try use tf2.3.1 or other new version.
+If you use , try to use  but not comput ops in ,  make sure that your custom layers/blocks have  method. All these will help to build the GPU graph.
+Others, your inputs seems to be too large. Use small inputs to start training first.
+In fact, my dual 2080ti with nvlink wasn't normal for a while, until I re install these cards and nvlink. In that time, tf call cudnn will use a long time, make all UI/X-windows error, and nvidia-smi will show no cards. I'm not sure if this is a bug to NVIDIA or my mother board(Tachi X570).
+		</comment>
+	</comments>
+</bug>

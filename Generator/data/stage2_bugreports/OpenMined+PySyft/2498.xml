@@ -1,0 +1,303 @@
+<bug id='2498' author='bussfromspace' open_date='2019-08-13T08:52:28Z' closed_time='2020-03-25T14:08:01Z'>
+	<summary>Error in Federated Learning when Batch Normalization layer is used</summary>
+	<description>
+Hi, I am trying to replicate the tutorial (Part 06 - Federated Learning on MNIST using a CNN.ipynb)  with CIFAR10 dataset and with a network model I defined myself. However, it gives an error like this when it tries to execute nn.BatchNorm2d() function:
+
+RuntimeError: running_mean should contain 3 elements not [32]
+
+If I don't use batch normalization layers in my model, it works fine. If I use batch normalization layer without any federated learning approach, it also works perfectly. I need to use batch normalization layer to get a good accuracy and also I need to work this example with ResNet (also having batch normalization layer), so I am not sure how to work around this.
+I am using google colab netbook with the installation example you gave (and also tested with my own computer with Python3.6 and PyTorch 1.1.0)
+The example code and the related error is below:
+&lt;denchmark-code&gt;
+from __future__ import print_function
+import argparse
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+torch.__version__
+
+from torchvision import datasets, transforms
+from torch.autograd import Variable
+
+
+import syft as sy  # &lt;-- NEW: import the Pysyft library
+hook = sy.TorchHook(torch)  # &lt;-- NEW: hook PyTorch ie add extra functionalities to support Federated Learning
+bob = sy.VirtualWorker(hook, id="bob")  # &lt;-- NEW: define remote worker bob
+alice = sy.VirtualWorker(hook, id="alice")  # &lt;-- NEW: and alice
+
+
+class Arguments():
+    def __init__(self):
+        self.batch_size = 64
+        self.test_batch_size = 1000
+        self.epochs = 10
+        self.lr = 0.01
+        self.momentum = 0.5
+        self.no_cuda = False
+        self.seed = 1
+        self.log_interval = 30
+        self.save_model = False
+
+args = Arguments()
+
+use_cuda = not args.no_cuda and torch.cuda.is_available()
+
+torch.manual_seed(args.seed)
+
+device = torch.device("cuda" if use_cuda else "cpu")
+
+kwargs = {'num_workers': 1, 'pin_memory': True} if use_cuda else {}
+
+federated_train_loader = sy.FederatedDataLoader( # &lt;-- this is now a FederatedDataLoader 
+    datasets.CIFAR10('../data', train=True, download=True,
+                   transform=transforms.Compose([
+                       transforms.ToTensor(),
+                       transforms.Normalize((0.5,), (0.5,), (0.5,))
+                   ]))
+    .federate((bob, alice)), # &lt;-- NEW: we distribute the dataset across all the workers, it's now a FederatedDataset
+    batch_size=args.batch_size, shuffle=True, **kwargs)
+
+test_loader = torch.utils.data.DataLoader(
+    datasets.CIFAR10('../data', train=False, transform=transforms.Compose([
+                       transforms.ToTensor(),
+                       transforms.Normalize((0.5,), (0.5,), (0.5,))
+                   ])),
+    batch_size=args.test_batch_size, shuffle=True, **kwargs)
+
+class Net(nn.Module):
+    def __init__(self, dropout=0.0):
+        super(Net, self).__init__()
+
+        self.dropout = dropout
+        self.conv_layer = nn.Sequential(
+
+            # Conv Layer block 1
+            nn.Conv2d(in_channels=3, out_channels=32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+
+            # Conv Layer block 2
+            nn.Conv2d(in_channels=64, out_channels=128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels=128, out_channels=128, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Dropout2d(p=0.05),  # 0.05
+
+            # Conv Layer block 3
+            nn.Conv2d(in_channels=128, out_channels=256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels=256, out_channels=256, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+        )
+        
+        self.fc_layer = nn.Sequential(
+            nn.Dropout(p=0.1),  # 0.1
+            nn.Linear(4096, 1024),
+            nn.ReLU(inplace=True),
+            nn.Linear(1024, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.1),  # 0.1
+            nn.Linear(512, 10)
+        )
+
+    def forward(self, x):
+        x = self.conv_layer(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc_layer(x)
+
+        return x
+
+def train(args, model, device, federated_train_loader, optimizer, epoch):
+    model.train()
+    for batch_idx, (data, target) in enumerate(federated_train_loader): # &lt;-- now it is a distributed dataset
+        model.send(data.location) # &lt;-- NEW: send the model to the right location
+        data, target = data.to(device), target.to(device)
+        optimizer.zero_grad()
+        output = model(data)
+        loss = F.cross_entropy(output, target)
+        loss.backward()
+        optimizer.step()
+        model.get() # &lt;-- NEW: get the model back
+        if batch_idx % args.log_interval == 0:
+            loss = loss.get() # &lt;-- NEW: get the loss back
+            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
+                epoch, batch_idx * args.batch_size, len(federated_train_loader) * args.batch_size,
+                100. * batch_idx / len(federated_train_loader), loss.item()))
+
+def test(args, model, device, test_loader):
+    model.eval()
+    test_loss = 0
+    correct = 0
+    with torch.no_grad():
+        for data, target in test_loader:
+            data, target = data.to(device), target.to(device)
+            output = model(data)
+            test_loss += F.cross_entropy(output, target, reduction='sum').item() # sum up batch loss
+            pred = output.argmax(1, keepdim=True) # get the index of the max log-probability 
+            correct += pred.eq(target.view_as(pred)).sum().item()
+
+    test_loss /= len(test_loader.dataset)
+
+    print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
+        test_loss, correct, len(test_loader.dataset),
+        100. * correct / len(test_loader.dataset)))
+
+
+model = Net().to(device)
+optimizer = optim.SGD(model.parameters(), lr=args.lr) # TODO momentum is not supported at the moment
+
+for epoch in range(1, args.epochs + 1):
+    train(args, model, device, federated_train_loader, optimizer, epoch)
+    test(args, model, device, test_loader)
+
+if (args.save_model):
+    torch.save(model.state_dict(), "CIFAR10_cnn.pt")
+
+
+&lt;/denchmark-code&gt;
+
+The complete output (from google colab):
+&lt;denchmark-code&gt;
+WARNING: Logging before flag parsing goes to stderr.
+W0813 08:46:34.190028 140520788572032 secure_random.py:26] Falling back to insecure randomness since the required custom op could not be found for the installed version of TensorFlow. Fix this by compiling custom ops. Missing file was '/usr/local/lib/python3.6/dist-packages/tf_encrypted/operations/secure_random/secure_random_module_tf_1.14.0.so'
+W0813 08:46:34.211576 140520788572032 deprecation_wrapper.py:119] From /usr/local/lib/python3.6/dist-packages/tf_encrypted/session.py:26: The name tf.Session is deprecated. Please use tf.compat.v1.Session instead.
+
+0it [00:00, ?it/s]
+
+Downloading https://www.cs.toronto.edu/~kriz/cifar-10-python.tar.gz to ../data/cifar-10-python.tar.gz
+
+170500096it [00:04, 40609204.86it/s]                               
+
+---------------------------------------------------------------------------
+
+PureTorchTensorFoundError                 Traceback (most recent call last)
+
+/content/PySyft/syft/frameworks/torch/tensors/interpreters/native.py in handle_func_command(cls, command)
+    300             new_args, new_kwargs, new_type, args_type = syft.frameworks.torch.hook_args.unwrap_args_from_function(
+--&gt; 301                 cmd, args, kwargs, return_args_type=True
+    302             )
+
+16 frames
+
+PureTorchTensorFoundError: 
+
+
+During handling of the above exception, another exception occurred:
+
+RuntimeError                              Traceback (most recent call last)
+
+/usr/local/lib/python3.6/dist-packages/torch/nn/functional.py in batch_norm(input, running_mean, running_var, weight, bias, training, momentum, eps)
+   1695     return torch.batch_norm(
+   1696         input, weight, bias, running_mean, running_var,
+-&gt; 1697         training, momentum, eps, torch.backends.cudnn.enabled
+   1698     )
+   1699 
+
+RuntimeError: running_mean should contain 3 elements not 32 
+&lt;/denchmark-code&gt;
+
+One possible workaround for this problem is to divide the net and use batch norm in client side. However, I do not want to rewrite big ResNet architectures and make the code more complex.
+I hope you can help me with this issue.
+	</description>
+	<comments>
+		<comment id='1' author='bussfromspace' date='2019-08-20T15:48:08Z'>
+		+1
+		</comment>
+		<comment id='2' author='bussfromspace' date='2019-09-24T13:42:46Z'>
+		+1
+		</comment>
+		<comment id='3' author='bussfromspace' date='2019-11-20T02:14:05Z'>
+		+1
+		</comment>
+		<comment id='4' author='bussfromspace' date='2019-12-02T16:06:59Z'>
+		+1
+		</comment>
+		<comment id='5' author='bussfromspace' date='2020-01-04T04:03:46Z'>
+		+10086
+		</comment>
+		<comment id='6' author='bussfromspace' date='2020-02-25T07:37:54Z'>
+		+1
+		</comment>
+		<comment id='7' author='bussfromspace' date='2020-03-19T19:11:59Z'>
+		+1
+		</comment>
+		<comment id='8' author='bussfromspace' date='2020-03-21T15:42:54Z'>
+		Is this bug solve? I have the same problem
+even use the pytorch resnet (model= torchvision.models.resnet34(pretrained=False).to(device))can't train
+		</comment>
+		<comment id='9' author='bussfromspace' date='2020-03-21T16:36:06Z'>
+		So the answer here is that BatchNormalization has internal statistics (means and stds, etc.) which themselves contain private information but are not parameters.
+This means that when you move a model from one machine to another (iterating through model.parameters()), those statistics probably aren't moving with it.
+Solution: extend nn.Module() with a .parameters_and_statistics() iterator which will look for this kind of information so that we can make sure that federated learning properly moves everything from machien to machine.
+		</comment>
+		<comment id='10' author='bussfromspace' date='2020-03-23T07:42:24Z'>
+		I tried re creating this issue but it did not occur, So I dug a bit into the BatchNorm.
+&lt;denchmark-link:https://github.com/pytorch/pytorch/blob/a6672f3b305c3805c691f3477e7940d146130a88/torch/nn/modules/batchnorm.py#L11&gt;here&lt;/denchmark-link&gt;
+ I could see these running statistics are being able to be registered as parameters or states.
+which extends to these lines if it is just a buffer
+&lt;denchmark-link:https://github.com/pytorch/pytorch/blob/a6672f3b305c3805c691f3477e7940d146130a88/torch/nn/modules/module.py#L100&gt;def register_buffer(self, name, tensor):&lt;/denchmark-link&gt;
+
+But I suspect either way these are now taken care by syft in moving.
+So should we still look into this issue &lt;denchmark-link:https://github.com/OpenMined/PySyft/issues/3236&gt;#3236&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='11' author='bussfromspace' date='2020-03-23T08:34:13Z'>
+		&lt;denchmark-link:https://github.com/ratmcu&gt;@ratmcu&lt;/denchmark-link&gt;
+
+I use the code  above , and still this issue happen , can you please tell what your code is ?
+Because in my code and the code above both get this problem , and when i change the net  without batchnorm2d , the error is gone . So I think this issue is still here , or someone can try it?
+		</comment>
+		<comment id='12' author='bussfromspace' date='2020-03-23T16:51:36Z'>
+		&lt;denchmark-link:https://github.com/johnnylin110&gt;@johnnylin110&lt;/denchmark-link&gt;
+ what is the pytorch version you are using? Can you check your source to see if it is the same as I mentioned? &lt;denchmark-link:https://colab.research.google.com/drive/1rJzcKscyZleiLxMH_mj7UIrGY1DgkXlI&gt;colab&lt;/denchmark-link&gt;
+  notebook here has the code, It runs on pytorch 
+		</comment>
+		<comment id='13' author='bussfromspace' date='2020-03-24T00:53:12Z'>
+		&lt;denchmark-link:https://github.com/ratmcu&gt;@ratmcu&lt;/denchmark-link&gt;
+ I think my syft version is the old one , and I udpate it to the new version which use pytorch1.4.0 . This issue is solve .  Thanks for helping !
+		</comment>
+		<comment id='14' author='bussfromspace' date='2020-03-25T05:14:44Z'>
+		&lt;denchmark-link:https://github.com/bussfromspace&gt;@bussfromspace&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/karlhigley&gt;@karlhigley&lt;/denchmark-link&gt;
+ This issue seems to be solved. Can you close it ?
+		</comment>
+		<comment id='15' author='bussfromspace' date='2020-03-30T01:40:48Z'>
+		&lt;denchmark-link:https://github.com/ratmcu&gt;@ratmcu&lt;/denchmark-link&gt;
+ Hi again, I am looking at the code you paste, the different between is you modify the forward part into
+&lt;denchmark-code&gt;if x.location != None:
+            print(x.location)
+            loc = x.location
+            x = x.get()
+            print(x.sixe(0))
+            x = x.view(x.size(0), -1)
+            x = x.send(loc)
+        else:
+            x = x.view(x.size(0), -1)
+        x = self.fc_layer(x)
+&lt;/denchmark-code&gt;
+
+however , this network i try it on pysyft get 10% accuracy only , but in Pytorch version, this can achieve high accuracy , and if use the same code from above(without the part you modifiy) , the pysyft will pop out error message about "shape [0,-1]  is invalid for input of size XXXX pytorch"
+Is this still a bug here?
+		</comment>
+		<comment id='16' author='bussfromspace' date='2020-03-30T07:12:13Z'>
+		&lt;denchmark-link:https://github.com/johnnylin110&gt;@johnnylin110&lt;/denchmark-link&gt;
+ this is a separate bug due to not being able to call .size() method remotely, batchnorm layer running remotely was the goal. so it was running in this example.
+		</comment>
+		<comment id='17' author='bussfromspace' date='2020-03-31T09:12:51Z'>
+		&lt;denchmark-link:https://github.com/ratmcu&gt;@ratmcu&lt;/denchmark-link&gt;
+  I know there is a bug so need to call .size() method here, but still, why the accuracy of the same approach(same network) will lead different ?
+In my Pytorch CIFAR with the net above is 65% at final , but in pysyft version it only 10% at the end(even when worker set to 1) . Why will this happen?
+Thanks for reply ! very appreciate!
+		</comment>
+	</comments>
+</bug>

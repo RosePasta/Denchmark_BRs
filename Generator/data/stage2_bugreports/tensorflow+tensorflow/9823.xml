@@ -1,0 +1,193 @@
+<bug id='9823' author='fesun' open_date='2017-05-11T01:18:51Z' closed_time='2018-06-01T01:39:41Z'>
+	<summary>Tensorflow consumes much more memory than expected</summary>
+	<description>
+My model has four CPU variables:
+[500M, 3] tf.int32
+[500M] tf.float32
+[500M] tf.float32 (FTRL accumulate slot)
+[500M] tf.float32 (FTRL linear slot)
+expected memory consumption should be (500M * 6) * 4 = 12G, however tensorflow used 20G memory.
+When I increased 500M to 1B, total memory usage is 40G, seems tensorflow do allocate much more memory than needed, any idea? By the way I am not using any tcmalloc stuff.
+I also used timeline show_memory to print allocated tensor size, everything is consistent with my calculating.
+	</description>
+	<comments>
+		<comment id='1' author='fesun' date='2017-05-11T02:43:22Z'>
+		I traced it using strace and found two mmap called by different two threads, so actually memory consumption is 2x than needed.
+Here is the code:
+import tensorflow as tf
+import time
+
+bucket_size = 1000000000
+
+a = tf.get_variable("W", [bucket_size], initializer=tf.zeros_initializer, dtype=tf.float32, trainable=False)
+
+with tf.Session() as sess:
+    print("start to initialize variable")
+    time.sleep(10)
+    sess.run(a.initializer)
+    print("initialize variable done")
+
+time.sleep(10)
+Here is the strace output
+&lt;denchmark-code&gt;[pid 25768] write(1, "start to initialize variable\n", 29start to initialize variable
+ &lt;unfinished ...&gt;
+[pid 25817] futex(0x26c92e4, FUTEX_WAIT_PRIVATE, 1, NULL &lt;unfinished ...&gt;
+[pid 25768] &lt;... write resumed&gt; )       = 29
+[pid 25768] select(0, NULL, NULL, NULL, {10, 0}) = 0 (Timeout)
+[pid 25768] mmap(NULL, 4294967296, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0) = 0x7f2ec8000000
+[pid 25768] futex(0x26c92e4, FUTEX_WAKE_OP_PRIVATE, 1, 1, 0x26c92e0, {FUTEX_OP_SET, 0, FUTEX_OP_CMP_GT, 1}) = 1
+[pid 25817] &lt;... futex resumed&gt; )       = 0
+[pid 25768] futex(0x7ffdfa482a9c, FUTEX_WAIT_PRIVATE, 1, NULL &lt;unfinished ...&gt;
+[pid 25817] futex(0x26c92b8, FUTEX_WAKE_PRIVATE, 1) = 0
+[pid 25817] futex(0x26c9264, FUTEX_WAKE_OP_PRIVATE, 1, 1, 0x26c9260, {FUTEX_OP_SET, 0, FUTEX_OP_CMP_GT, 1}) = 1
+[pid 25816] &lt;... futex resumed&gt; )       = 0
+[pid 25817] mmap(NULL, 2097152, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0 &lt;unfinished ...&gt;
+[pid 25816] futex(0x26c9238, FUTEX_WAKE_PRIVATE, 1 &lt;unfinished ...&gt;
+[pid 25817] &lt;... mmap resumed&gt; )        = 0x7f307f9ff000
+[pid 25816] &lt;... futex resumed&gt; )       = 0
+[pid 25817] munmap(0x7f307f9ff000, 2097152 &lt;unfinished ...&gt;
+[pid 25816] futex(0x26c9264, FUTEX_WAIT_PRIVATE, 3, NULL &lt;unfinished ...&gt;
+[pid 25817] &lt;... munmap resumed&gt; )      = 0
+[pid 25817] mmap(NULL, 4190208, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0) = 0x7f307f800000
+[pid 25817] munmap(0x7f307fa00000, 2093056) = 0
+[pid 25817] mmap(NULL, 4294967296, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0) = 0x7f2dc8000000
+[pid 25817] futex(0x26c9264, FUTEX_WAKE_OP_PRIVATE, 1, 1, 0x26c9260, {FUTEX_OP_SET, 0, FUTEX_OP_CMP_GT, 1}) = 1
+[pid 25816] &lt;... futex resumed&gt; )       = 0
+[pid 25817] futex(0x7ffdfa482a9c, FUTEX_CMP_REQUEUE_PRIVATE, 1, 2147483647, 0x7ffdfa482a70, 2) = 1
+[pid 25816] futex(0x26c9238, FUTEX_WAKE_PRIVATE, 1 &lt;unfinished ...&gt;
+[pid 25817] futex(0x26c92e4, FUTEX_WAIT_PRIVATE, 3, NULL &lt;unfinished ...&gt;
+[pid 25816] &lt;... futex resumed&gt; )       = 0
+[pid 25768] &lt;... futex resumed&gt; )       = 0
+[pid 25816] futex(0x26c9264, FUTEX_WAIT_PRIVATE, 5, NULL &lt;unfinished ...&gt;
+[pid 25768] futex(0x7ffdfa482a70, FUTEX_WAKE_PRIVATE, 1) = 0
+[pid 25768] write(1, "initialize variable done\n", 25initialize variable done
+&lt;/denchmark-code&gt;
+
+Both 25768 25817 called mmap to allocate 4G memory. Why?
+		</comment>
+		<comment id='2' author='fesun' date='2017-05-11T02:57:22Z'>
+		It seems that this code actually initialized two variables, one is zero const with 4G, the other is W variable, then assign zero const to W. I will check the python code to see what I can do to avoid it.
+		</comment>
+		<comment id='3' author='fesun' date='2017-05-11T05:23:36Z'>
+		&lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/master/tensorflow/python/ops/variables.py#L276&gt;https://github.com/tensorflow/tensorflow/blob/master/tensorflow/python/ops/variables.py#L276&lt;/denchmark-link&gt;
+ If initializer is provided and callable, how about passing variable to initializer instead of initialize and then assign it?
+Codebase now has one zero initializer operator to initialize variables, &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/master/tensorflow/contrib/framework/kernels/zero_initializer_op.h&gt;https://github.com/tensorflow/tensorflow/blob/master/tensorflow/contrib/framework/kernels/zero_initializer_op.h&lt;/denchmark-link&gt;
+, we need to add more.
+Any idea?
+		</comment>
+		<comment id='4' author='fesun' date='2017-05-11T14:59:51Z'>
+		You can already do this, tf.get_variable("a",another_variable), I'm not sure that will avoid a copy.
+		</comment>
+		<comment id='5' author='fesun' date='2017-05-11T15:01:39Z'>
+		BTW, easier way than strace is to look at tensor allocation/deallocation messages with &lt;denchmark-link:https://github.com/yaroslavvb/memory_util&gt;https://github.com/yaroslavvb/memory_util&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='6' author='fesun' date='2017-05-11T20:18:36Z'>
+		&lt;denchmark-link:https://github.com/benoitsteiner&gt;@benoitsteiner&lt;/denchmark-link&gt;
+ Would it be feasible to add a graph rewriting optimization to do in-place assignment for simple cases?
+		</comment>
+		<comment id='7' author='fesun' date='2017-05-12T01:49:37Z'>
+		It's on our to-do list, we just lacked a good reason to prioritize this ahead of other rewrites.
+		</comment>
+		<comment id='8' author='fesun' date='2017-05-12T05:04:03Z'>
+		&lt;denchmark-link:https://github.com/benoitsteiner&gt;@benoitsteiner&lt;/denchmark-link&gt;
+  I am training super sparse model, no memory left due to this 2x memory issue. This is very general case, I don't want to spend effort to fix it for my own, and  several weeks after my own fix you guys fix and commit it, what if I make the change and send pull request?
+		</comment>
+		<comment id='9' author='fesun' date='2017-05-12T15:44:48Z'>
+		&lt;denchmark-link:https://github.com/rmlarsen&gt;@rmlarsen&lt;/denchmark-link&gt;
+: Your name is on comments in  that buffer forwarding rarely triggers.  Looks like &lt;denchmark-link:https://github.com/fesun&gt;@fesun&lt;/denchmark-link&gt;
+ is offering to submit a PR; can we direct him to the right change to make?
+		</comment>
+		<comment id='10' author='fesun' date='2017-05-15T01:38:39Z'>
+		&lt;denchmark-link:https://github.com/rmlarsen&gt;@rmlarsen&lt;/denchmark-link&gt;
+ ping...
+		</comment>
+		<comment id='11' author='fesun' date='2017-05-17T05:42:26Z'>
+		&lt;denchmark-link:https://github.com/girving&gt;@girving&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/rmlarsen&gt;@rmlarsen&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/benoitsteiner&gt;@benoitsteiner&lt;/denchmark-link&gt;
+  Could you guys make some decision? It's our blocking issue, long time no response.
+		</comment>
+		<comment id='12' author='fesun' date='2017-05-17T16:04:08Z'>
+		Sorry for not noticing this thread earlier. Let me take a look.
+		</comment>
+		<comment id='13' author='fesun' date='2017-05-24T04:00:43Z'>
+		&lt;denchmark-link:https://github.com/rmlarsen&gt;@rmlarsen&lt;/denchmark-link&gt;
+ any update? If you guys don't have resource now, I can make the change, but we need to talk and agree the design.
+		</comment>
+		<comment id='14' author='fesun' date='2017-06-19T12:12:34Z'>
+		Since googler didn't response for very long time, I made one minimal change on my codebase to solve this, and post my solution here in case others are also confused by this:
+
+Tensorflow provides ones_initializer/zeros_initializer for initializing variables to 1/0, what tensorflow actually does is creating one const tensor and then assign it to variable, however constant operator holds tensor as its instance member, so its memory will not be freed unless the operator instance is deleted. Tensorflow AssignOp intent to try it's best to avoid memory copy(https://github.com/tensorflow/tensorflow/blob/master/tensorflow/core/kernels/assign_op.h#L47), this happens only when input tensor refcount is 1, while const tensor refcount is always greater than 1.
+Solution: write custom operator to create normal 0/1 tensor
+As AssignOp comments said, conservative constraints make buffer forwarding unlikely to happen very often, my model doesn't leverage GPU and any other advanced communication tech, so I set both gpu and nic compatible to false.
+patch desired optimizer to use custom 0/1 initializer(slot creation)
+
+		</comment>
+		<comment id='15' author='fesun' date='2017-06-19T16:31:18Z'>
+		&lt;denchmark-link:https://github.com/fesun&gt;@fesun&lt;/denchmark-link&gt;
+ Good job figuring this out. My apologies for not getting back to you. I think we can probably implement a more general solution by doing a graph analysis and strip off the buffer constraints when they are not needed, or perhaps propagate them to dependencies, so the bufferes are compatible, perhaps similar to
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/master/tensorflow/core/common_runtime/executor.cc#L718&gt;https://github.com/tensorflow/tensorflow/blob/master/tensorflow/core/common_runtime/executor.cc#L718&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='16' author='fesun' date='2017-12-22T07:28:50Z'>
+		It has been 14 days with no activity and the awaiting tensorflower label was assigned. Please update the label and/or status accordingly.
+		</comment>
+		<comment id='17' author='fesun' date='2018-01-05T19:05:57Z'>
+		Nagging Awaiting TensorFlower: It has been 14 days with no activityand the awaiting tensorflower label was assigned. Please update the label and/or status accordingly.
+		</comment>
+		<comment id='18' author='fesun' date='2018-01-23T23:12:20Z'>
+		A member of the TensorFlow organization has replied after the stat:awaiting tensorflower label was applied.
+		</comment>
+		<comment id='19' author='fesun' date='2018-01-25T01:30:18Z'>
+		&lt;denchmark-link:https://github.com/rmlarsen&gt;@rmlarsen&lt;/denchmark-link&gt;
+ any updates on the more general solution?
+		</comment>
+		<comment id='20' author='fesun' date='2018-02-08T19:30:11Z'>
+		Nagging Awaiting TensorFlower: It has been 14 days with no activity and the awaiting tensorflower label was assigned. Please update the label and/or status accordingly.
+		</comment>
+		<comment id='21' author='fesun' date='2018-02-23T14:03:09Z'>
+		Nagging Awaiting TensorFlower: It has been 14 days with no activity and the awaiting tensorflower label was assigned. Please update the label and/or status accordingly.
+		</comment>
+		<comment id='22' author='fesun' date='2018-03-10T13:17:11Z'>
+		Nagging Awaiting TensorFlower: It has been 14 days with no activity and the awaiting tensorflower label was assigned. Please update the label and/or status accordingly.
+		</comment>
+		<comment id='23' author='fesun' date='2018-03-25T12:38:53Z'>
+		Nagging TensorFlower: It has been 14 days with no activity and the awaiting tensorflower label was assigned. Please update the label and/or status accordingly.
+		</comment>
+		<comment id='24' author='fesun' date='2018-04-10T12:37:31Z'>
+		Nagging Assignee &lt;denchmark-link:https://github.com/tatianashp&gt;@tatianashp&lt;/denchmark-link&gt;
+: It has been 14 days with no activity and this issue has an assignee. Please update the label and/or status accordingly.
+		</comment>
+		<comment id='25' author='fesun' date='2018-04-25T15:41:29Z'>
+		&lt;denchmark-link:https://github.com/fesun&gt;@fesun&lt;/denchmark-link&gt;
+ Do you happen to have a github link handy to that custom operator?
+		</comment>
+		<comment id='26' author='fesun' date='2018-05-10T12:45:10Z'>
+		Nagging Assignee &lt;denchmark-link:https://github.com/tatianashp&gt;@tatianashp&lt;/denchmark-link&gt;
+: It has been 14 days with no activity and this issue has an assignee. Please update the label and/or status accordingly.
+		</comment>
+		<comment id='27' author='fesun' date='2018-05-27T03:06:10Z'>
+		Nagging Assignee &lt;denchmark-link:https://github.com/tatianashp&gt;@tatianashp&lt;/denchmark-link&gt;
+: It has been 30 days with no activity and this issue has an assignee. Please update the label and/or status accordingly.
+		</comment>
+		<comment id='28' author='fesun' date='2018-05-28T02:21:12Z'>
+		&lt;denchmark-link:https://github.com/rmlarsen&gt;@rmlarsen&lt;/denchmark-link&gt;
+ Was the general solution that you mentioned ever implemented?
+		</comment>
+		<comment id='29' author='fesun' date='2018-05-29T17:00:55Z'>
+		&lt;denchmark-link:https://github.com/tatianashp&gt;@tatianashp&lt;/denchmark-link&gt;
+ Yes, this was implemented about a month ago:
+The graph pass is here:
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/master/tensorflow/core/grappler/optimizers/memory_optimizer.cc#L1226&gt;https://github.com/tensorflow/tensorflow/blob/master/tensorflow/core/grappler/optimizers/memory_optimizer.cc#L1226&lt;/denchmark-link&gt;
+
+And the code using the result here:
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/master/tensorflow/core/kernels/assign_op.h#L58&gt;https://github.com/tensorflow/tensorflow/blob/master/tensorflow/core/kernels/assign_op.h#L58&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='30' author='fesun' date='2018-06-01T01:39:41Z'>
+		Great. Thank you!
+I am closing the issue.
+		</comment>
+	</comments>
+</bug>

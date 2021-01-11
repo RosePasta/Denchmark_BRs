@@ -1,0 +1,597 @@
+<bug id='7480' author='GoingMyWay' open_date='2020-03-06T07:54:24Z' closed_time='2020-03-07T03:57:39Z'>
+	<summary>RLlib: policy_map[name] = cls(obs_space, act_space, merged_conf), when merged_conf contains keys that TFPolicy does not have in the argument list</summary>
+	<description>
+&lt;denchmark-h:h3&gt;What is the problem?&lt;/denchmark-h&gt;
+
+In rollout_worker.py, when the cls is TFPolicy or subclass of TFPolicy,  the following line will fail
+&lt;denchmark-code&gt;policy_map[name] = cls(obs_space, act_space, merged_conf)
+&lt;/denchmark-code&gt;
+
+Because there is no num_workers and worker_index in TFPolicy and its subclasses
+    def _build_policy_map(self, policy_dict, policy_config):
+        policy_map = {}
+        preprocessors = {}
+        for name, (cls, obs_space, act_space,
+                   conf) in sorted(policy_dict.items()):
+            logger.debug("Creating policy for {}".format(name))
+            merged_conf = merge_dicts(policy_config, conf)
+            merged_conf["num_workers"] = self.num_workers
+            merged_conf["worker_index"] = self.worker_index
+            if self.preprocessing_enabled:
+                preprocessor = ModelCatalog.get_preprocessor_for_space(
+                    obs_space, merged_conf.get("model"))
+                preprocessors[name] = preprocessor
+                obs_space = preprocessor.observation_space
+            else:
+                preprocessors[name] = NoPreprocessor(obs_space)
+            if isinstance(obs_space, gym.spaces.Dict) or \
+                    isinstance(obs_space, gym.spaces.Tuple):
+                raise ValueError(
+                    "Found raw Tuple|Dict space as input to policy. "
+                    "Please preprocess these observations with a "
+                    "Tuple|DictFlatteningPreprocessor.")
+            if tf and tf.executing_eagerly():
+                if hasattr(cls, "as_eager"):
+                    cls = cls.as_eager()
+                    if policy_config["eager_tracing"]:
+                        cls = cls.with_tracing()
+                elif not issubclass(cls, TFPolicy):
+                    pass  # could be some other type of policy
+                else:
+                    raise ValueError("This policy does not support eager "
+                                     "execution: {}".format(cls))
+            if tf:
+                with tf.variable_scope(name):
+                    policy_map[name] = cls(obs_space, act_space, merged_conf)
+            else:
+                policy_map[name] = cls(obs_space, act_space, merged_conf)
+        if self.worker_index == 0:
+            logger.info("Built policy map: {}".format(policy_map))
+            logger.info("Built preprocessor map: {}".format(preprocessors))
+        return policy_map, preprocessors
+Ray version and other system information (Python version, TensorFlow version, OS):
+Ray: 0.8.2
+Python: 3.6
+TF: 2.0
+&lt;denchmark-h:h3&gt;Reproduction (REQUIRED)&lt;/denchmark-h&gt;
+
+Please provide a script that can be run to reproduce the issue. The script should have no external library dependencies (i.e., use fake or mock data / environments):
+there is an example code
+import argparse
+
+import ray
+import gym
+import copy
+import random
+import numpy as np
+
+from ray import tune
+from ray.rllib.utils import try_import_tf
+
+from ray.rllib.models import ModelCatalog
+from ray.rllib.models.tf.tf_modelv2 import TFModelV2
+
+from ray.rllib.models.tf.tf_action_dist import Categorical
+
+from ray.rllib.evaluation import RolloutWorker
+from ray.rllib.evaluation.metrics import collect_metrics
+from ray.rllib.policy.sample_batch import SampleBatch
+from ray.rllib.policy.tests.test_policy import TestPolicy
+from ray.rllib.policy.tf_policy import TFPolicy
+
+from ray.rllib.agents.trainer import with_common_config
+
+from ray.rllib.evaluation.postprocessing import Postprocessing, compute_advantages
+from ray.rllib.policy.tf_policy_template import build_tf_policy
+
+
+from ray.rllib.models.tf.misc import normc_initializer, get_activation_fn
+
+tf = try_import_tf()
+
+
+class CustomCategorical(Categorical):
+    def __init__(self, inputs, model=None, temperature=1.0):
+        """ The inputs are action logits """
+        super().__init__(inputs, model, temperature)
+        self.softmax = tf.nn.softmax(inputs)
+
+    def prob(self, actions):
+        _prob_given_action = tf.one_hot(actions, depth=self.softmax.get_shape().as_list()[-1]) * self.softmax
+        return tf.reduce_sum(_prob_given_action, axis=-1)
+
+
+class DemoModel(TFModelV2):
+    def __init__(self, obs_space, action_space, num_outputs, model_config, name):
+        super(DemoModel, self).__init__(obs_space, action_space, num_outputs, model_config, name)
+
+        self.loss_inputs = [
+            ('taken_actions', tf.placeholder(tf.int32, (None,))),
+            ('returns', tf.placeholder(tf.float32, (None,)))
+        ]
+        self.ph_obs_input = tf.placeholder(tf.float32, (None,)+obs_space.shape)
+
+        inputs = tf.keras.layers.Input(
+            shape=(np.product(obs_space.shape), ))
+
+        _layer_out = tf.keras.layers.Dense(
+            128,
+            activation=tf.nn.tanh,
+            kernel_initializer=normc_initializer(1.0))(inputs)
+
+        self._layer_out = tf.keras.layers.Dense(
+            num_outputs,
+            activation=None,
+            kernel_initializer=normc_initializer(1.0))(_layer_out)
+
+        self._value_out = tf.keras.layers.Dense(
+            1,
+            activation=None,
+            kernel_initializer=normc_initializer(0.01))(_layer_out)
+
+        self.action_dist = CustomCategorical(self._layer_out, None)
+        self.predicted_actions = self.action_dist.sample()
+
+        # self.model and self.base_model are different
+        self.model = tf.keras.Model(inputs, [self._layer_out, self._value_out])
+        self.register_variables(self.model.variables)
+
+    def forward(self, input_dict, state, seq_lens):
+        model_out, self._value_out = self.model(input_dict["obs_flat"])
+        return model_out, state
+
+    def custom_loss(self, policy_loss, loss_inputs):
+        """
+        Arguments:
+            policy_loss (Tensor): scalar policy loss from the policy.
+            loss_inputs (dict): map of input placeholders for rollout data.
+        """
+        ph_taken_actions = loss_inputs['taken_actions']
+        returns = loss_inputs['returns']
+        self.cross_entropy_loss = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=self._layer_out,
+                                                                                 labels=ph_taken_actions)
+        self.loss = tf.reduce_mean(returns * self.cross_entropy_loss)
+        return self.loss
+
+    def from_batch(self, train_batch, is_training=True):
+        """Convenience function that calls this model with a tensor batch.
+
+        All this does is unpack the tensor batch to call this model with the
+        right input dict, state, and seq len arguments.
+        """
+
+        input_dict = {
+            "obs": train_batch[SampleBatch.CUR_OBS],
+            "is_training": is_training,
+        }
+        if SampleBatch.PREV_ACTIONS in train_batch:
+            input_dict["prev_actions"] = train_batch[SampleBatch.PREV_ACTIONS]
+        if SampleBatch.PREV_REWARDS in train_batch:
+            input_dict["prev_rewards"] = train_batch[SampleBatch.PREV_REWARDS]
+        states = []
+        i = 0
+        while "state_in_{}".format(i) in train_batch:
+            states.append(train_batch["state_in_{}".format(i)])
+            i += 1
+        return self.__call__(input_dict, states, train_batch.get("seq_lens"))
+
+    def value_function(self):
+        return tf.reshape(self._value_out, [-1])
+
+    def metrics(self):
+        """Override to return custom metrics from your model.
+
+        The stats will be reported as part of the learner stats, i.e.,
+            info:
+                learner:
+                    model:
+                        key1: metric1
+                        key2: metric2
+
+        Returns:
+            Dict of string keys to scalar tensors.
+        """
+        return {}
+
+
+def pg_tf_loss(policy, model, dist_class, train_batch):
+    """The basic policy gradients loss."""
+    logits, _ = model.from_batch(train_batch)
+    action_dist = dist_class(logits, model)
+    return -tf.reduce_mean(
+        action_dist.logp(train_batch[SampleBatch.ACTIONS]) *
+        train_batch[Postprocessing.ADVANTAGES])
+
+
+def post_process_advantages(policy,
+                            sample_batch,
+                            other_agent_batches=None,
+                            episode=None):
+    """This adds the "advantages" column to the sample train_batch."""
+    return compute_advantages(
+        sample_batch,
+        0.0,
+        policy.config["gamma"],
+        use_gae=False,
+        use_critic=False)
+
+
+DEFAULT_CONFIG = with_common_config({
+    # # No remote workers by default.
+    # "num_workers": 0,
+    # # Learning rate.
+    # "lr": 0.0004,
+})
+
+class CustomPolicy(TFPolicy):
+    """Example of a custom policy written from scratch.
+    You might find it more convenient to extend TF/TorchPolicy instead
+    for a real policy.
+    """
+
+    def __init__(self,
+                 observation_space,
+                 action_space,
+                 kwargs):
+        super().__init__(observation_space,
+                         action_space,
+                         **kwargs)
+
+
+def training_workflow(config, reporter):
+    # Setup policy and policy evaluation actors
+
+    new_config = copy.deepcopy(config)
+    new_config.update(DEFAULT_CONFIG)
+
+    sess = tf.Session()
+    env = gym.make("CartPole-v0")
+    model = DemoModel(env.observation_space,
+                      env.action_space,
+                      num_outputs=1,
+                      model_config=new_config,
+                      name='CartPoleModel')
+
+    # policy = CustomPolicy(observation_space=env.observation_space, action_space=env.action_space, config=config,
+    #                       sess=sess, model=model, loss_inputs=model.loss_inputs, loss='Not None',
+    #                       action_sampler=model.predicted_actions, obs_input=model.ph_obs_input)
+
+    conf = {'config': config, 'sess': sess, 'model': model, 'loss_inputs': model.loss_inputs, 'loss': 'Not None',
+            'action_sampler': model.predicted_actions, 'obs_input': model.ph_obs_input}
+
+    policy = CustomPolicy(env.observation_space, env.action_space, conf)
+
+    workers = [
+        RolloutWorker.as_remote().remote(env_creator=lambda c: gym.make("CartPole-v0"),
+                                         policy=CustomPolicy,
+                                         )
+        for _ in range(config["num_workers"])
+    ]
+
+    for i in range(config["num_iters"]):
+        # Broadcast weights to the policy evaluation workers
+        weights = ray.put({"default_policy": policy.get_weights()})
+        for w in workers:
+            w.set_weights.remote(weights)
+
+        # Gather a batch of samples
+        T1 = SampleBatch.concat_samples(
+            ray.get([w.sample.remote() for w in workers]))
+
+        # Update the remote policy replicas and gather another batch of samples
+        # new_value = policy.get_weights()
+        # for w in workers:
+        #     w.for_policy.remote(lambda p: p.update_some_value(new_value))
+
+        # Gather another batch of samples
+        T2 = SampleBatch.concat_samples(
+            ray.get([w.sample.remote() for w in workers]))
+
+        # Improve the policy using the T1 batch
+        policy.learn_on_batch(T1)
+
+        # Do some arbitrary updates based on the T2 batch
+        # print(f'iter: {i}, sum_rewards: {(sum(T2["rewards"])):.2f}')
+
+        reporter(**collect_metrics(remote_workers=workers))
+
+if __name__ == "__main__":
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--gpu", action="store_true")
+    parser.add_argument("--num-iters", type=int, default=3)
+    parser.add_argument("--num-workers", type=int, default=1)
+    parser.add_argument("--num-cpus", type=int, default=0)
+
+    args = parser.parse_args()
+    ray.init(num_cpus=args.num_cpus or None)
+    ModelCatalog.register_custom_model("demo_model", DemoModel)
+
+    tune.run(
+        training_workflow,
+        # resources_per_trial={
+        #     "gpu": 1 if args.gpu else 0,
+        #     "cpu": 1,
+        #     "extra_cpu": args.num_workers,
+        # },
+        config={
+            "num_workers": args.num_workers,
+            "num_iters": args.num_iters,
+            "lr": 1e-3,
+            "model": {
+                "custom_model": "demo_model",
+                "custom_options": {
+                    "activation": tf.nn.tanh,
+                }
+            },
+        },
+    )
+If we cannot run your script, we cannot fix your issue.
+
+ I have verified my script runs in a clean environment and reproduces the issue.
+ I have verified the issue also occurs with the latest wheels.
+
+	</description>
+	<comments>
+		<comment id='1' author='GoingMyWay' date='2020-03-06T11:51:43Z'>
+		I don't think your example is right:
+You are passing the items in your config (which is a dict) as **kwargs further up to the TFPolicy constructor, which you should not do. The TFPolicy constructor does not take (I would assume) most of the keys in any Trainer's config dict as **kwargs and hence complains about num_workers not being a valid kwarg.
+From your example:
+&lt;denchmark-code&gt;class CustomPolicy(TFPolicy):
+    ...
+    def __init__(self,
+                 observation_space,
+                 action_space,
+                 kwargs):
+        super().__init__(observation_space,
+                         action_space,
+                         **kwargs) # &lt;- this is an error: should be `kwargs` (as single config dict!).
+
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='2' author='GoingMyWay' date='2020-03-06T18:12:12Z'>
+		&lt;denchmark-link:https://github.com/sven1977&gt;@sven1977&lt;/denchmark-link&gt;
+
+Dear, thank you for your reply, I think it is not that problem, I set **kwargs to kwags, it returns
+&lt;denchmark-code&gt;TypeError: __init__() missing 5 required positional arguments: 'sess', 'obs_input', 'action_sampler', 'loss', and 'loss_inputs'
+&lt;/denchmark-code&gt;
+
+The reason this issue I mentioned above is that there is no num_workers and worker_index arguments in TFPolicy class.
+And I think the default config is also used instead of the config passed into the workflow as I mentioned in this issue &lt;denchmark-link:https://github.com/ray-project/ray/issues/7490&gt;#7490&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='3' author='GoingMyWay' date='2020-03-07T03:57:03Z'>
+		&lt;denchmark-link:https://github.com/sven1977&gt;@sven1977&lt;/denchmark-link&gt;
+
+I tried to figure out the process of the code. Here is a runnable customized code of Policy, Model and Workflow.
+import argparse
+
+import ray
+import gym
+import copy
+import random
+import numpy as np
+
+from ray import tune
+from ray.rllib.utils import try_import_tf
+
+from ray.rllib.models import ModelCatalog
+from ray.rllib.models.tf.tf_modelv2 import TFModelV2
+
+from ray.rllib.models.tf.tf_action_dist import Categorical
+
+from ray.rllib.evaluation import RolloutWorker
+from ray.rllib.evaluation.metrics import collect_metrics
+from ray.rllib.policy.sample_batch import SampleBatch
+
+from ray.rllib.agents.trainer import with_common_config
+
+from ray.rllib.evaluation.postprocessing import Postprocessing, compute_advantages
+from ray.rllib.policy.tf_policy_template import build_tf_policy
+
+from ray.tune import grid_search
+
+from ray.rllib.models.tf.misc import normc_initializer
+
+
+tf = try_import_tf()
+
+
+class CustomCategorical(Categorical):
+    def __init__(self, inputs, model=None, temperature=1.0):
+        """ The inputs are action logits """
+        super().__init__(inputs, model, temperature)
+        self.softmax = tf.nn.softmax(inputs)
+
+    def prob(self, actions):
+        _prob_given_action = tf.one_hot(actions, depth=self.softmax.get_shape().as_list()[-1]) * self.softmax
+        return tf.reduce_sum(_prob_given_action, axis=-1)
+
+
+class DemoModel(TFModelV2):
+    def __init__(self, obs_space, action_space, num_outputs, model_config, name):
+        super(DemoModel, self).__init__(obs_space, action_space, num_outputs, model_config, name)
+
+        inputs = tf.keras.layers.Input(
+            shape=(np.product(obs_space.shape), ))
+
+        _layer_out = tf.keras.layers.Dense(
+            128,
+            name='fc1',
+            activation=tf.nn.tanh,
+            kernel_initializer=normc_initializer(1.0))(inputs)
+
+        self._layer_out = tf.keras.layers.Dense(
+            num_outputs,
+            name='fc2',
+            activation=None,
+            kernel_initializer=normc_initializer(1.0))(_layer_out)
+
+        self._value_out = tf.keras.layers.Dense(
+            1,
+            name='fc_v',
+            activation=None,
+            kernel_initializer=normc_initializer(0.01))(_layer_out)
+
+        self.action_dist = CustomCategorical(self._layer_out, None)
+        self.predicted_actions = self.action_dist.sample()
+
+        # self.model and self.base_model are different
+        self.model = tf.keras.Model(inputs, [self._layer_out, self._value_out])
+        self.register_variables(self.model.variables)
+
+    def forward(self, input_dict, state, seq_lens):
+        model_out, self._value_out = self.model(input_dict["obs"])
+        return model_out, state
+
+    def custom_loss(self, policy_loss, loss_inputs):
+        return policy_loss
+
+    def value_function(self):
+        return tf.reshape(self._value_out, [-1])
+
+    def metrics(self):
+        """Override to return custom metrics from your model.
+
+        The stats will be reported as part of the learner stats, i.e.,
+            info:
+                learner:
+                    model:
+                        key1: metric1
+                        key2: metric2
+
+        Returns:
+            Dict of string keys to scalar tensors.
+        """
+        return {}
+
+
+def pg_tf_loss(policy, model, dist_class, train_batch):
+    """The basic policy gradients loss."""
+    logits, _ = model.from_batch(train_batch)
+    action_dist = dist_class(logits, model)
+    return -tf.reduce_mean(
+        action_dist.logp(train_batch[SampleBatch.ACTIONS]) * train_batch[Postprocessing.ADVANTAGES])
+
+
+def post_process_advantages(policy,
+                            sample_batch,
+                            other_agent_batches=None,
+                            episode=None):
+    """This adds the "advantages" column to the sample train_batch."""
+    return compute_advantages(
+        sample_batch,
+        0.0,
+        policy.config["gamma"],
+        use_gae=False,
+        use_critic=False)
+
+
+DEFAULT_CONFIG = with_common_config({
+    # # No remote workers by default.
+    # "num_workers": 0,
+    # # Learning rate.
+    # "lr": 0.0004,
+})
+
+
+CustomPolicy = build_tf_policy(
+    name="CustomPolicy",
+    get_default_config=lambda: DEFAULT_CONFIG,
+    postprocess_fn=post_process_advantages,
+    loss_fn=pg_tf_loss)
+
+
+def set_variables(policy: CustomPolicy):
+    policy._variables = ray.experimental.tf_utils.TensorFlowVariables(
+        [], policy._sess, policy.variables())
+
+
+def add_prefix(weights: dict, prefix: str) -&gt; dict:
+    return {
+        (prefix+'/'+k): v for k, v in weights.items()
+    }
+
+
+def training_workflow(config, reporter):
+    env = gym.make("CartPole-v0")
+    policy = CustomPolicy(env.observation_space, env.action_space,
+                          config=config)  # , existing_inputs=model.ph_all_inputs)#, existing_model=model)
+    set_variables(policy)
+    workers = [
+        RolloutWorker.as_remote().remote(env_creator=lambda c: gym.make("CartPole-v0"),
+                                         policy=CustomPolicy,
+                                         policy_config=config
+                                         )
+        for _ in range(config["num_workers"])
+    ]
+
+    # print(ray.get(workers[0].get_weights.remote())['default_policy'])
+    for i in range(config["num_iters"]):
+        # Broadcast weights to the policy evaluation workers
+        weights = ray.put({"default_policy": add_prefix(policy.get_weights(), prefix='default_policy')})
+        for w in workers:
+            w.set_weights.remote(weights)
+
+        # Gather a batch of samples
+        T1 = SampleBatch.concat_samples(
+            ray.get([w.sample.remote() for w in workers]))
+
+        # Update the remote policy replicas and gather another batch of samples
+        # new_value = policy.get_weights()
+        # for w in workers:
+        #     w.for_policy.remote(lambda p: p.update_some_value(new_value))
+
+        # Gather another batch of samples
+        T2 = SampleBatch.concat_samples(
+            ray.get([w.sample.remote() for w in workers]))
+
+        # Improve the policy using the T1 batch
+        policy.learn_on_batch(T1)
+
+        # Do some arbitrary updates based on the T2 batch
+        # print(f'iter: {i}, sum_rewards: {(sum(T2["rewards"])):.2f}')
+        reporter(**collect_metrics(remote_workers=workers))
+
+    policy.base_model.summary()
+
+
+if __name__ == "__main__":
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--gpu", action="store_true")
+    parser.add_argument("--num-iters", type=int, default=100)
+    parser.add_argument("--num-workers", type=int, default=1)
+    parser.add_argument("--num-cpus", type=int, default=0)
+
+    args = parser.parse_args()
+    ray.init(num_cpus=args.num_cpus or None)
+    ModelCatalog.register_custom_model("demo_model", DemoModel)
+
+    tune.run(
+        training_workflow,
+        # resources_per_trial={
+        #     "gpu": 1 if args.gpu else 0,
+        #     "cpu": 1,
+        #     "extra_cpu": args.num_workers,
+        # },
+        config={
+            "num_workers": args.num_workers,
+            "num_iters": args.num_iters,
+            "lr": grid_search([1e-2, 1e-3]),
+            "model": {
+                "custom_model": "demo_model",
+                "max_seq_len": 1,
+                "custom_options": {
+                    "activation": tf.nn.tanh,
+                }
+            },
+        },
+    )
+Dear &lt;denchmark-link:https://github.com/ericl&gt;@ericl&lt;/denchmark-link&gt;
+ , can I make a PR to enhance the &lt;denchmark-link:https://github.com/ray-project/ray/blob/master/rllib/examples/rollout_worker_custom_workflow.py&gt;https://github.com/ray-project/ray/blob/master/rllib/examples/rollout_worker_custom_workflow.py&lt;/denchmark-link&gt;
+?
+		</comment>
+	</comments>
+</bug>

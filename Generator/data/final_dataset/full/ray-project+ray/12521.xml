@@ -1,0 +1,320 @@
+<bug_data>
+<bug id='12521' author='richardliaw' open_date='2020-12-01T04:13:26Z' closed_time='2020-12-02T00:47:04Z'>
+ 	<summary>[tune] `with_parameters` doubly serializes parameters</summary>
+ 	<description>
+ &lt;denchmark-h:h3&gt;What is the problem?&lt;/denchmark-h&gt;
+ 
+ Ray version and other system information (Python version, TensorFlow version, OS): master
+ with_parameters does not actually remove the parameters after serializing them through the object store. In fact, it actually captures them within the scope of the function.
+ The cause:
+     prefix = f"{str(fn)}_"
+     for k, v in kwargs.items():
+         parameter_registry.put(prefix + k, v)
+ 
+     use_checkpoint = detect_checkpoint_function(fn)
+ 
+     def inner(config, checkpoint_dir=None):
+         fn_kwargs = {}
+         if use_checkpoint:
+             default = checkpoint_dir
+             sig = inspect.signature(fn)
+             if "checkpoint_dir" in sig.parameters:
+                 default = sig.parameters["checkpoint_dir"].default \
+                           or default
+             fn_kwargs["checkpoint_dir"] = default
+ 
+         for k in kwargs:
+             fn_kwargs[k] = parameter_registry.get(prefix + k)
+         fn(config, **fn_kwargs)
+ ^ this causes kwargs to be captured within inner, nulling the effect of with_parameters.
+ See the below reproduction script.
+ The fix for this
+ &lt;denchmark-h:h3&gt;Reproduction (REQUIRED)&lt;/denchmark-h&gt;
+ 
+ Please provide a script that can be run to reproduce the issue. The script should have no external library dependencies (i.e., use fake or mock data / environments):
+ import os
+ import sys
+ 
+ import numpy as np
+ import torch
+ import torch.nn as nn
+ import torch.nn.functional as F
+ import torchvision
+ from numpy.random import normal
+ import ray
+ from ray import tune
+ from ray.tune.schedulers import ASHAScheduler
+ import random
+ from torchvision.transforms import transforms
+ 
+ random.seed(100)
+ 
+ transform = transforms.Compose([transforms.ToTensor(),
+                                 transforms.Normalize((0.5,), (0.5,)),
+                                 ])
+ 
+ xy_trainPT = torchvision.datasets.MNIST(
+     root="./",
+     train=True,
+     download=True
+ )
+ 
+ trainset = torchvision.datasets.MNIST(root="./",
+                                       train=True,
+                                       download=True,
+                                       transform=transform)
+ 
+ originalSet = torchvision.datasets.MNIST(root="./",
+                                          train=True,
+                                          download=True,
+                                          transform=transform)
+ 
+ # noisyArr = np.zeros(shape=(60000, [28, 28]))
+ # originalArr = np.zeros(shape=(60000, [28, 28]))
+ 
+ noisyArr = []
+ originalArr = []
+ 
+ for index, shape in enumerate(trainset):
+     # shape = (imageTensor, Label)
+     # print(shape[0].squeeze(dim=0).numpy().shape)
+     # noisyArr[index] = shape[0].squeeze(dim=0).numpy()
+     # originalArr[index] = originalSet[0][0].squeeze(dim=0).numpy()
+     noisyArr.append(shape[0].squeeze(dim=0).numpy())
+     originalArr.append(originalSet[0][0].squeeze(dim=0).numpy())
+     if index == 30000:
+         break
+ 
+ noisyArr = np.array(noisyArr)
+ originalArr = np.array(originalArr)
+ print('done loading data')
+ 
+ original = originalArr / 255
+ 
+ X_2 = noisyArr / 255
+ 
+ for i in range(len(X_2)):
+     norm = abs(np.random.normal(0, 0.3, size=(28, 28)))
+     X_2[i] = X_2[i] + norm
+ 
+ pixels = int(784)
+ 
+ 
+ class autoencoder(nn.Module):
+     def __init__(self, config):
+         super(autoencoder, self).__init__()
+ 
+         size = 28
+         kernel = config['convK']
+         # print(f"kernal: {kernel}")
+         stride = config['convS']
+         # print(f"stride: {stride}")
+         padding = config['convP']
+         #  print(f"padding: {padding}")
+         poolK = config['poolK']
+         poolS = config['poolS']
+         poolP = config['poolP']
+         finalOutput = config['actMap']
+         self.conv1 = torch.nn.Conv2d(1, finalOutput, kernel_size=kernel, stride=stride, padding=padding)
+         self.bn1 = torch.nn.BatchNorm2d(finalOutput)
+         self.pool1 = torch.nn.MaxPool2d(stride=poolS, kernel_size=poolK, padding=poolP)
+ 
+         def poolAdjust(originalSize, kernel=poolK, stride=poolS, dilation=1, padding=poolP):
+             return ((originalSize + (2 * padding) - (dilation * (kernel - 1)) - 1) // stride) + 1
+ 
+         def conv2d_size_out(size, kernel_size=kernel, stride=stride, padding=padding):
+             return ((size + (padding * 2) - (kernel_size - 1) - 1) // stride) + 1
+ 
+         #         convw = conv2d_size_out(size)
+         #         convh = conv2d_size_out(size)
+         convw = poolAdjust(conv2d_size_out(size))
+         convh = poolAdjust(conv2d_size_out(size))
+         #  print('Convulution adjust:::', conv2d_size_out(size))
+         #  print('Pooling Adjust: ', convw)
+         self.linear_input_size = convw * convh * finalOutput
+         # print('linear_Input: ', linear_input_size)
+         self.head = torch.nn.Linear(self.linear_input_size, pixels)
+         self.flatten = torch.nn.Linear(self.linear_input_size, self.linear_input_size)
+         self.func = torch.nn.Hardtanh()
+         self.softMax2d = torch.nn.Softmax2d()
+ 
+     def forward(self, x):
+         x = self.bn1(self.conv1(x))
+         # print(x.size())
+         x = self.pool1(x)
+         # print(x.size())
+         x = torch.nn.functional.relu(x)
+         # print(self.linear_input_size)
+         return self.head(x.view(x.size(0), -1))
+ 
+ 
+ def train(config, checkpoint_dir=None, data=None):
+     # data = (X_2, original)
+     loss_fn = torch.nn.MSELoss()
+     model = autoencoder(config)
+     optimizer = torch.optim.SGD(model.parameters(), lr=config['lr'], momentum=0.9)
+     maxIter = 20000
+     batchAmount = config['batchSize']
+ 
+     if checkpoint_dir:
+         checkpoint = os.path.join(checkpoint_dir, "checkpoint")
+         model_state, optimizer_state = torch.load(checkpoint)
+         model.load_state_dict(model_state)
+         optimizer.load_state_dict(optimizer_state)
+ 
+     for t in range(maxIter):
+         epoch_loss = 0
+ 
+         optimizer.zero_grad()
+         # idx = np.random.randint(data[0].shape[0], size=batchAmount)  # bootstrapping a subset of the total samples
+         tempIDX = 1
+         X_scaled = torch.unsqueeze(torch.from_numpy(data[0][tempIDX, :]).float(),
+                                    dim=1)  # creating tensor for convultion
+ 
+         testValues = torch.from_numpy(
+             np.reshape(data[1][tempIDX, :],
+                        (batchAmount, -1))
+         ).float()  # creating a flattened array for testing
+ 
+         y_pred = model(X_scaled)  # predict on the subset
+ 
+         loss = loss_fn(testValues, y_pred)  # get loss on subset
+         epoch_loss += loss.item()
+ 
+         if not t == 0:
+             if t % (maxIter / 10) == 0:
+                 # print(t, loss.item())
+                 tune.report(score=epoch_loss)
+                 with tune.checkpoint_dir(step=t) as checkpoint_dir:
+                     path = os.path.join(checkpoint_dir, "checkpoint")
+                     torch.save(
+                         (model.state_dict(), optimizer.state_dict()), path)
+ 
+         loss.backward()  # get gradient stuff
+         optimizer.step()  # optimize
+ 
+     tune.report(score=epoch_loss)
+ 
+ 
+ def tunerTrain():
+     # ray.init(_memory=1000000000, object_store_memory=8000000000,  _redis_max_memory=1000000000, num_cpus=4)
+     ray.init(_redis_max_memory=1000000000, object_store_memory=1000000000, num_cpus=4)
+     # searchSpace = {
+     #     'lr': 0.025,
+     #     'actMap': tune.grid_search([2, 3, 4]),
+     #     'convK': tune.choice([3, 5, 7, 9]),
+     #     'convS': tune.grid_search([1, 2]),
+     #     'convP': tune.choice([0, 1, 2, 3]),
+     #     'poolK': tune.choice([3, 5, 7, 9]),
+     #     'poolS': tune.grid_search([1, 2]),
+     #     'poolP': tune.grid_search([0,1,2,3]),
+     #     'batchSize': 64,
+     # }
+     searchSpace = {
+         'lr': 0.0351993, 'actMap': 2, 'convK': 3, 'convS': 1, 'convP': 1, 'poolK': 3, 'poolP': 1,
+         'poolS': tune.grid_search([1, 2]),
+         'batchSize': 16,
+     }
+ 
+     analysis = tune.run(tune.with_parameters(train, data=[X_2, original]), num_samples=10, metric='score', mode='min',
+                         resources_per_trial={"cpu": 4},
+                         scheduler=ASHAScheduler(),
+                         config=searchSpace)
+     dfs = analysis.trial_dataframes
+     print(f"Best Config: {analysis.get_best_config('score', mode='min')}")
+     df = analysis.results_df
+     logdir = analysis.get_best_logdir("score", mode="min")
+     print(f"dir of best: {logdir}")
+     print(analysis.best_result)
+     print(f"Best trial final score: {analysis.get_best_trial('score', mode='min')}")
+ 
+ 
+ tunerTrain()
+ 
+ 
+ # import ray.cloudpickle as pk
+ #
+ # object = pk.dumps(train)
+ # print(sys.getsizeof(object))
+ 
+ #
+ #
+ # import inspect;
+ # closure = inspect.getclosurevars(train)
+ # print(closure)
+ 
+ 
+ # train(config={
+ #     'lr': 0.0351993,
+ #     'actMap': 2,
+ #     'convK': 3,
+ #     'convS': 1,
+ #     'convP': 1,
+ #     'poolK': 3,
+ #     'poolS': 1,
+ #     'poolP': 1,
+ #     'batchSize': 16,
+ # })
+ 	</description>
+ 	<comments>
+ 		<comment id='1' author='richardliaw' date='2020-12-01T04:13:40Z'>
+ 		cc &lt;denchmark-link:https://github.com/krfricke&gt;@krfricke&lt;/denchmark-link&gt;
+ 
+ 		</comment>
+ 	</comments>
+ </bug>
+<commit id='4dc16730a7cd97c7dec3484331f508dc5d7a79cd' author='Richard Liaw' date='2020-12-01 16:47:03-08:00'>
+ 	<dmm_unit complexity='1.0' interfacing='1.0' size='0.0'></dmm_unit>
+ 	<modification change_type='MODIFY' old_name='python\ray\tune\function_runner.py' new_name='python\ray\tune\function_runner.py'>
+ 		<file_info nloc='428' complexity='94' token_count='2284'></file_info>
+ 		<method name='with_parameters' parameters='fn,kwargs'>
+ 				<method_info nloc='16' complexity='4' token_count='76' nesting_level='0' start_line='587' end_line='654'></method_info>
+ 			<added_lines>630,642</added_lines>
+ 			<deleted_lines>641</deleted_lines>
+ 		</method>
+ 		<method name='with_parameters.inner' parameters='config,checkpoint_dir'>
+ 				<method_info nloc='12' complexity='5' token_count='78' nesting_level='1' start_line='632' end_line='644'></method_info>
+ 			<added_lines>642</added_lines>
+ 			<deleted_lines>641</deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines></added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='python\ray\tune\registry.py' new_name='python\ray\tune\registry.py'>
+ 		<file_info nloc='105' complexity='32' token_count='739'></file_info>
+ 		<method name='flush' parameters='self'>
+ 				<method_info nloc='4' complexity='2' token_count='38' nesting_level='1' start_line='169' end_line='172'></method_info>
+ 			<added_lines>172</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines></added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='python\ray\tune\tests\test_function_api.py' new_name='python\ray\tune\tests\test_function_api.py'>
+ 		<file_info nloc='429' complexity='109' token_count='3538'></file_info>
+ 		<method name='testWithParameters2.__init__' parameters='self'>
+ 				<method_info nloc='3' complexity='1' token_count='27' nesting_level='3' start_line='475' end_line='477'></method_info>
+ 			<added_lines>475,476,477</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<method name='testWithParameters2' parameters='self'>
+ 				<method_info nloc='7' complexity='1' token_count='45' nesting_level='1' start_line='473' end_line='484'></method_info>
+ 			<added_lines>473,474,475,476,477,478,479,480,481,482,483,484</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<method name='testWithParameters2.train' parameters='config,data'>
+ 				<method_info nloc='2' complexity='1' token_count='22' nesting_level='2' start_line='479' end_line='480'></method_info>
+ 			<added_lines>479,480</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines>3,9,485</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ </commit>
+</bug_data>

@@ -1,0 +1,359 @@
+<bug id='38062' author='kalaluthien' open_date='2020-03-31T02:20:47Z' closed_time='2020-04-03T10:06:56Z'>
+	<summary>A bug: TFLite post-training quantization with calibration</summary>
+	<description>
+System information
+
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Ubuntu 18.04.3 LTS
+TensorFlow installed from (source or binary): source
+TensorFlow version (or github SHA if from source): r2.2
+
+Command used to run the converter or code if you’re using the Python API
+&lt;denchmark-code&gt;with qauntize_scope():
+  converter = tf.lite.TFLiteConverter.from_keras_model(model)
+  converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+  converter.optimizations = [tf.lite.Optimize.OPTIMIZE_FOR_LATENCY]
+  converter.representative_dataset = calibration_gen
+  tflite_model = converter.convert()
+&lt;/denchmark-code&gt;
+
+The output from the converter invocation
+&lt;denchmark-code&gt;Traceback (most recent call last):
+  File "test_minist_qat.py", line 171, in &lt;module&gt;
+    tflite_model = converter.convert()
+  File "/home/mumu/.miniconda3/envs/hyperfast/lib/python3.7/site-packages/tensorflow/lite/python/lite.py", line 522, in convert
+    result, constants.FLOAT, constants.FLOAT)
+  File "/home/mumu/.miniconda3/envs/hyperfast/lib/python3.7/site-packages/tensorflow/lite/python/lite.py", line 267, in _calibrate_quantize_model
+    inference_output_type, allow_float, self.experimental_new_quantizer)
+AttributeError: 'TFLiteConverterV2' object has no attribute 'experimental_new_quantizer'
+&lt;/denchmark-code&gt;
+
+Also, please include a link to the saved model or GraphDef
+None
+
+From commit &lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/e6895b3648595080143e8f5dd6f56c16e7852e91&gt;e6895b&lt;/denchmark-link&gt;
+, some experimental feature flags were made private.
+And at line 267, it does not changed properly.
+This introduces bugs when apply post-training quantization using TFLite converter.
+(Manually fixing it works well)
+Any other info / logs
+None
+	</description>
+	<comments>
+		<comment id='1' author='kalaluthien' date='2020-03-31T07:36:58Z'>
+		&lt;denchmark-link:https://github.com/kalaluthien&gt;@kalaluthien&lt;/denchmark-link&gt;
+
+can you please provide us with complete code for us to replicate the issue
+		</comment>
+		<comment id='2' author='kalaluthien' date='2020-03-31T17:24:27Z'>
+		Modified code from tensorflow/model-optimization mnist examples:
+import numpy as np
+import tensorflow as tf
+
+""" Step0: configure test
+"""
+batch_size = 128
+num_epochs = 10
+calibration_size = 300
+input_shape = (28, 28, 1)
+num_classes = 10
+
+""" Step1: prepare dataset
+"""
+(x_train, y_train), (x_test, y_test) = tf.keras.datasets.mnist.load_data()
+
+x_train = x_train.reshape((x_train.shape[0],) + input_shape).astype('float32') / 255
+x_test = x_test.reshape((x_test.shape[0],) + input_shape).astype('float32') / 255
+
+y_train = tf.keras.utils.to_categorical(y_train, num_classes)
+y_test = tf.keras.utils.to_categorical(y_test, num_classes)
+
+
+def calibration_gen():
+    for i in range(calibration_size):
+        yield [x_train[i].reshape((1,) + input_shape)]
+
+
+""" Step2: prepare models
+"""
+trained_models = []
+model_sequential = tf.keras.Sequential(
+    [
+        tf.keras.layers.Conv2D(
+            32, 5,
+            padding='same',
+            activation='relu',
+            use_bias=False,
+            input_shape=input_shape,
+        ),
+        tf.keras.layers.MaxPooling2D((2, 2), (2, 2), padding='same'),
+        tf.keras.layers.Conv2D(
+            64, 5,
+            padding='same',
+            activation='relu',
+            use_bias=False,
+        ),
+        tf.keras.layers.MaxPooling2D((2, 2), (2, 2), padding='same'),
+        tf.keras.layers.Flatten(),
+        tf.keras.layers.Dense(1024, activation='relu'),
+        tf.keras.layers.Dropout(0.4),
+        tf.keras.layers.Dense(num_classes),
+        tf.keras.layers.Softmax(),
+    ],
+    name='MnistSequential',
+)
+trained_models.append(model_sequential)
+
+
+""" Step3: train models
+"""
+for model in trained_models:
+    print(f'Train {model.name}...')
+    model.compile(
+        loss=tf.keras.losses.categorical_crossentropy,
+        optimizer=tf.keras.optimizers.Adadelta(),
+        metrics=['accuracy']
+    )
+    model.fit(
+        x_train, y_train,
+        validation_data=(x_test, y_test),
+        batch_size=batch_size,
+        epochs=num_epochs,
+        verbose=True,
+    )
+
+
+""" Step4: convert models
+"""
+converted_models = []
+for model in trained_models:
+    converter = tf.lite.TFLiteConverter.from_keras_model(model)
+    converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS]
+
+    tflite_model = converter.convert()
+    tflite_path = f'./{model.name}.tflite'
+    open(tflite_path, "wb").write(tflite_model)
+    converted_models.append(tflite_path)
+
+with quantize_scope():
+    for model in trained_models:
+        converter = tf.lite.TFLiteConverter.from_keras_model(model)
+        converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+        converter.optimizations = [tf.lite.Optimize.DEFAULT]
+        converter.representative_dataset = calibration_gen
+
+        tflite_model = converter.convert()
+        tflite_path = f'./{model.name}_quantized.tflite'
+        open(tflite_path, "wb").write(tflite_model)
+        converted_models.append(tflite_path)
+
+""" Step5: evaluate keras models &amp; tflite models
+"""
+x_test = x_test[:calibration_size, :]
+y_test = y_test[:calibration_size, :]
+
+for model in trained_models:
+    total_seen = 0
+    num_correct = 0
+
+    for img, label in zip(x_test, y_test):
+        inp = img.reshape((1,) + input_shape)
+        total_seen += 1
+        predictions = model(inp)
+        if np.argmax(predictions) == np.argmax(label):
+            num_correct += 1
+
+    score = float(num_correct) / float(total_seen)
+    print(f'{model.name} accuracy: {score}')
+
+for tflite_path in converted_models:
+    interpreter = tf.lite.Interpreter(model_path=tflite_path)
+    interpreter.allocate_tensors()
+    input_index = interpreter.get_input_details()[0]['index']
+    output_index = interpreter.get_output_details()[0]['index']
+
+    total_seen = 0
+    num_correct = 0
+
+    for img, label in zip(x_test, y_test):
+        inp = img.reshape((1,) + input_shape)
+        total_seen += 1
+        interpreter.set_tensor(input_index, inp)
+        interpreter.invoke()
+        predictions = interpreter.get_tensor(output_index)
+        if np.argmax(predictions) == np.argmax(label):
+            num_correct += 1
+
+    score = float(num_correct) / float(total_seen)
+    print(f'{tflite_path} accuracy: {score}')
+		</comment>
+		<comment id='3' author='kalaluthien' date='2020-04-01T06:48:19Z'>
+		&lt;denchmark-link:https://github.com/kalaluthien&gt;@kalaluthien&lt;/denchmark-link&gt;
+
+i ran the code shared by you but face a different error, please find the &lt;denchmark-link:https://colab.sandbox.google.com/gist/Saduf2019/deac57fdb0414f1bc02549bae098356a/38062.ipynb&gt;gist here&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='4' author='kalaluthien' date='2020-04-02T08:28:20Z'>
+		I think with quantize_scope(): should be deleted:
+import numpy as np
+import tensorflow as tf
+
+""" Step0: configure test
+"""
+batch_size = 128
+num_epochs = 10
+calibration_size = 300
+input_shape = (28, 28, 1)
+num_classes = 10
+
+""" Step1: prepare dataset
+"""
+(x_train, y_train), (x_test, y_test) = tf.keras.datasets.mnist.load_data()
+
+x_train = x_train.reshape((x_train.shape[0],) + input_shape).astype('float32') / 255
+x_test = x_test.reshape((x_test.shape[0],) + input_shape).astype('float32') / 255
+
+y_train = tf.keras.utils.to_categorical(y_train, num_classes)
+y_test = tf.keras.utils.to_categorical(y_test, num_classes)
+
+
+def calibration_gen():
+    for i in range(calibration_size):
+        yield [x_train[i].reshape((1,) + input_shape)]
+
+
+""" Step2: prepare models
+"""
+trained_models = []
+model_sequential = tf.keras.Sequential(
+    [
+        tf.keras.layers.Conv2D(
+            32, 5,
+            padding='same',
+            activation='relu',
+            use_bias=False,
+            input_shape=input_shape,
+        ),
+        tf.keras.layers.MaxPooling2D((2, 2), (2, 2), padding='same'),
+        tf.keras.layers.Conv2D(
+            64, 5,
+            padding='same',
+            activation='relu',
+            use_bias=False,
+        ),
+        tf.keras.layers.MaxPooling2D((2, 2), (2, 2), padding='same'),
+        tf.keras.layers.Flatten(),
+        tf.keras.layers.Dense(1024, activation='relu'),
+        tf.keras.layers.Dropout(0.4),
+        tf.keras.layers.Dense(num_classes),
+        tf.keras.layers.Softmax(),
+    ],
+    name='MnistSequential',
+)
+trained_models.append(model_sequential)
+
+
+""" Step3: train models
+"""
+for model in trained_models:
+    print(f'Train {model.name}...')
+    model.compile(
+        loss=tf.keras.losses.categorical_crossentropy,
+        optimizer=tf.keras.optimizers.Adadelta(),
+        metrics=['accuracy']
+    )
+    model.fit(
+        x_train, y_train,
+        validation_data=(x_test, y_test),
+        batch_size=batch_size,
+        epochs=num_epochs,
+        verbose=True,
+    )
+
+
+""" Step4: convert models
+"""
+converted_models = []
+for model in trained_models:
+    converter = tf.lite.TFLiteConverter.from_keras_model(model)
+    converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS]
+
+    tflite_model = converter.convert()
+    tflite_path = f'./{model.name}.tflite'
+    open(tflite_path, "wb").write(tflite_model)
+    converted_models.append(tflite_path)
+
+for model in trained_models:
+    converter = tf.lite.TFLiteConverter.from_keras_model(model)
+    converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+    converter.representative_dataset = calibration_gen
+
+    tflite_model = converter.convert()
+    tflite_path = f'./{model.name}_quantized.tflite'
+    open(tflite_path, "wb").write(tflite_model)
+        converted_models.append(tflite_path)
+
+""" Step5: evaluate keras models &amp; tflite models
+"""
+x_test = x_test[:calibration_size, :]
+y_test = y_test[:calibration_size, :]
+
+for model in trained_models:
+    total_seen = 0
+    num_correct = 0
+
+    for img, label in zip(x_test, y_test):
+        inp = img.reshape((1,) + input_shape)
+        total_seen += 1
+        predictions = model(inp)
+        if np.argmax(predictions) == np.argmax(label):
+            num_correct += 1
+
+    score = float(num_correct) / float(total_seen)
+    print(f'{model.name} accuracy: {score}')
+
+for tflite_path in converted_models:
+    interpreter = tf.lite.Interpreter(model_path=tflite_path)
+    interpreter.allocate_tensors()
+    input_index = interpreter.get_input_details()[0]['index']
+    output_index = interpreter.get_output_details()[0]['index']
+
+    total_seen = 0
+    num_correct = 0
+
+    for img, label in zip(x_test, y_test):
+        inp = img.reshape((1,) + input_shape)
+        total_seen += 1
+        interpreter.set_tensor(input_index, inp)
+        interpreter.invoke()
+        predictions = interpreter.get_tensor(output_index)
+        if np.argmax(predictions) == np.argmax(label):
+            num_correct += 1
+
+    score = float(num_correct) / float(total_seen)
+    print(f'{tflite_path} accuracy: {score}')
+		</comment>
+		<comment id='5' author='kalaluthien' date='2020-04-03T06:41:19Z'>
+		&lt;denchmark-link:https://github.com/kalaluthien&gt;@kalaluthien&lt;/denchmark-link&gt;
+
+i ran the above code shared by you, please find &lt;denchmark-link:https://colab.sandbox.google.com/gist/Saduf2019/4fd48325f5575fe79bdccf01402cbddf/untitled123.ipynb&gt;gist here&lt;/denchmark-link&gt;
+, if possible please share a colab gist so we could analyse your issue
+		</comment>
+		<comment id='6' author='kalaluthien' date='2020-04-03T10:06:56Z'>
+		Oh,, it was fixed few hours ago: &lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/46055ea64aaf9cdfaf0c218a109770cd851eeb8a&gt;46055ea&lt;/denchmark-link&gt;
+
+I'll close this issue. Thanks!
+		</comment>
+		<comment id='7' author='kalaluthien' date='2020-04-03T10:28:45Z'>
+		Hey, The same error is still being encountered in Colab with the official notebook provided here : &lt;denchmark-link:url&gt;https://www.tensorflow.org/lite/performance/post_training_integer_quant&lt;/denchmark-link&gt;
+ . I'm attaching the screenshot of the error.
+&lt;denchmark-link:https://user-images.githubusercontent.com/28225784/78351125-f3592680-75c3-11ea-9425-c8e6f2a483c0.png&gt;&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='8' author='kalaluthien' date='2020-04-06T19:39:50Z'>
+		&lt;denchmark-link:https://github.com/imtoba&gt;@imtoba&lt;/denchmark-link&gt;
+  It looks fixed &lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/46055ea64aaf9cdfaf0c218a109770cd851eeb8a&gt;46055ea&lt;/denchmark-link&gt;
+,  just hasn't been merged in yet
+		</comment>
+	</comments>
+</bug>

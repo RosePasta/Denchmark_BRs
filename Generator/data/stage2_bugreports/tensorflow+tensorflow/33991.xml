@@ -1,0 +1,143 @@
+<bug id='33991' author='georgesterpu' open_date='2019-11-04T21:57:33Z' closed_time='2019-11-07T23:16:32Z'>
+	<summary>Autograph error in LSTMCell when using dropout</summary>
+	<description>
+System information
+
+Have I written custom code: no
+OS Platform and Distribution: Manjaro linux testing
+TensorFlow installed from: pip binary
+TensorFlow version: v2.0.0-rc2-26-g64c3d38 2.0.0
+Python version: 3.7.4
+CUDA/cuDNN version: N/A
+GPU model and memory: N/A
+
+Describe the current behavior
+TensorFlow returns an error when decorating functions calling LSTMCell.call with @tf.function if dropout is non-zero (most common scenario).
+&lt;denchmark-code&gt;TypeError: An op outside of the function building code is being passed
+a "Graph" tensor. It is possible to have Graph tensors
+leak out of the function building context by including a
+tf.init_scope in your function building code.
+For example, the following function will fail:
+  @tf.function
+  def has_init_scope():
+    my_constant = tf.constant(1.)
+    with tf.init_scope():
+      added = my_constant * 2
+The graph tensor has name: lstm_cell_1/ones_like:0
+&lt;/denchmark-code&gt;
+
+Describe the expected behavior
+Compile the LSTMCell code correctly
+Code to reproduce the issue
+&lt;denchmark-code&gt;import tensorflow as tf
+
+
+good_cell = tf.keras.layers.LSTMCell(units=2, dropout=0.0, implementation=1)
+bad_cell = tf.keras.layers.LSTMCell(units=2, dropout=0.1, implementation=1)
+inputs = tf.ones((1, 2))
+
+state = good_cell.get_initial_state(inputs)
+
+@tf.function
+def no_dropout():
+    output = good_cell(inputs, state)
+    return output
+
+@tf.function
+def dropout():
+    output = bad_cell(inputs, state)
+    return output
+
+print('='*50)
+print(no_dropout())
+print('='*50)
+print(dropout())
+&lt;/denchmark-code&gt;
+
+
+I did a quick investigation and found out that setting  &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/r2.0/tensorflow/python/keras/layers/recurrent.py#L2210&gt;at the top of the call method&lt;/denchmark-link&gt;
+ makes the code work again. This forces the reset of the cached dropout mask used at the previous/first call of LSTMCell.
+	</description>
+	<comments>
+		<comment id='1' author='georgesterpu' date='2019-11-05T04:21:15Z'>
+		Issue replicating for both  TF 2.0 and nightly version.Kindly find the &lt;denchmark-link:https://colab.sandbox.google.com/gist/oanush/7c9b4739689b5a093a27dbe3bc12c834/33991.ipynb&gt;gist&lt;/denchmark-link&gt;
+ of colab.Thanks!
+		</comment>
+		<comment id='2' author='georgesterpu' date='2019-11-07T23:14:20Z'>
+		So the story is bit complicated.
+If you debug the bad cell call with debugger, you will see the the bad_cell.call() is invoked twice. This means the second time when its invoked, its using the cached dropout mask created in the second trace.
+To walkaround this issue, you can update your code as below. This is mimic what a normal cell will behave to process the inputs 10 times. The LSTM/RNN layer is resetting mask for every batch. User will have to do the same if they want to direct play with the cell.
+&lt;denchmark-code&gt;@tf.function
+def dropout(inputs):
+  time_step = 10
+  bad_cell.reset_dropout_mask()
+  bad_cell.reset_recurrent_dropout_mask()
+  state = bad_cell.get_initial_state(inputs)
+  for i in range(time_step):
+    inputs, state = bad_cell(inputs, state)
+  return inputs, state
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='3' author='georgesterpu' date='2019-11-07T23:16:33Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/33991&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/33991&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='4' author='georgesterpu' date='2019-11-12T15:11:08Z'>
+		Hi &lt;denchmark-link:https://github.com/qlzh727&gt;@qlzh727&lt;/denchmark-link&gt;
+
+Just wanted to thank you for your great response. This is an interesting behaviour of tf.function that I was not aware of, so I learnt something new :)
+
+This means the second time when its invoked, its using the cached dropout mask created in the second trace.
+
+Would you be able to help me with a high-level technical explanation ? I don't fully understand this yet, although it seems related to the specific implementation of tf.function.
+		</comment>
+		<comment id='5' author='georgesterpu' date='2019-11-12T17:41:46Z'>
+		Ah sorry, I made a typo in the original message:
+
+This means the second time when its invoked, its using the cached dropout mask created in the FIRST trace.
+
+So, in high level, tf.function will convert a python function into a tf graph, which will be used to execution. The conversion process is called "trace". During tracing, tf.function will check if there is any variable gets created. If that is the case, tf.function will trace the second time and make sure no other variable is created, as a verification. When the verification failed, it will raise an error.
+In your case, the function body will create following items in the first trace:
+
+cached masks
+variables for bad_cell when it is called with inputs. The build() function is first invoked when cell is not build.
+
+Since tf.function detect the variable creation, it will try to trace the second time. During the second trace, the code will try to use the cached mask in a different graph (created in the first trace). Since it can't access those tensors across the graph, it raises an error to you.
+As a verification, you can try build your cell first outside the tf.function for your existing code, and it should make it work too.
+		</comment>
+		<comment id='6' author='georgesterpu' date='2019-11-12T17:43:06Z'>
+		import tensorflow as tf
+
+
+good_cell = tf.keras.layers.LSTMCell(units=2, dropout=0.0, implementation=1)
+bad_cell = tf.keras.layers.LSTMCell(units=2, dropout=0.1, implementation=1)
+inputs = tf.ones((1, 2))
+good_cell.build(inputs.shape)
+bad_cell.build(inputs.shape)
+
+state = good_cell.get_initial_state(inputs)
+
+@tf.function
+def no_dropout():
+  output = good_cell(inputs, state)
+  return output
+
+@tf.function
+def dropout():
+  output = bad_cell(inputs, state)
+  return output
+
+print('='*50)
+print(no_dropout())
+print('='*50)
+print(dropout())
+		</comment>
+		<comment id='7' author='georgesterpu' date='2020-02-20T08:44:05Z'>
+		So, are there any fix plans?
+		</comment>
+	</comments>
+</bug>

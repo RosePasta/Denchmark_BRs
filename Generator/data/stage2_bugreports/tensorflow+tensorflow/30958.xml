@@ -1,0 +1,191 @@
+<bug id='30958' author='durandg12' open_date='2019-07-23T15:55:00Z' closed_time='2019-08-27T17:09:19Z'>
+	<summary>fit and save methods fail with a subclassed model using a SequenceFeatures layer with sequence_numeric_column</summary>
+	<description>
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): macOS 10.13.6
+TensorFlow installed from (source or binary): from pip install
+TensorFlow version (use command below): v2.0.0-beta0-16-g1d91213fe7 2.0.0-beta1
+Python version: v3.6.7:6ec5cf24b7, Oct 20 2018, 03:02:14
+
+Describe the current behavior
+tf.keras.Model.fit and tf.keras.Model.save method fail and return an error when applied to a model created by subclassing the tf.keras.Model class which uses a SequenceFeatures layer created by calling SequenceFeatures.__init__ on a feature colmun created with tf.feature_column.sequence_numeric_column. Note that the issue does not occur when the SequenceFeatures layer is created by calling SequenceFeatures.__init__ on a feature colmun created with tf.feature_column.embedding_column, as my code to reproduce the issue shows below.
+Note also that the call method of the subclassed model using sequence_numeric_column works fine, in eager execution or in graph mode, see also the example code.
+The error message I get with fit and export_saved_model is
+&lt;denchmark-code&gt;ValueError: Cannot convert a partially known TensorShape to a Tensor: (None, 9)
+&lt;/denchmark-code&gt;
+
+Hence it seems to be occuring because I did not explicitely set the batch size. But the last batch usually have a size less than the batch size so I am not interested in setting it to a fixed value before training. As a side note, I did not find how to do it anyway, my experiments with passing a batch_input_shape keyword argument to the __init__ method of SequenceFeatures have failed, as if the argument was always ignored, and this combines poorly with nested structures of inputs like the one I have here with a dictionary of tensors.
+Describe the expected behavior
+The case when I use embedding_column, which is the case when the functions do not fail, suggests that the case with sequence_numeric_column should behave similarly and should not make the functions fail. It does not make sense to me that not knowing the batch size is relevant in one case and not relevant in the other. It may be due to the use, somewhere, of tf.Tensor.shape (which is static and returns the None) instead of tf.shape (which is dynamic). Additionally, it seems a standard practice to let the batch dimension to None (for the reason given above) so this should be supported.
+Code to reproduce the issue
+&lt;denchmark-code&gt;import numpy as np
+import tensorflow as tf
+from tensorflow.keras import Model
+from tensorflow.python.feature_column.feature_column_v2 import EmbeddingColumn
+from tensorflow.keras.layers import LSTM, Dense
+from tensorflow.keras.experimental import SequenceFeatures
+
+print('Using Tensorflow version {} (git version {})'.format(tf.version.VERSION, tf.version.GIT_VERSION))
+
+class Toy(Model):
+
+    def __init__(self,
+                 fc_list,
+                 nb_features,
+                 name='toy_model',
+                 **kwargs):
+        super(Toy, self).__init__(name=name, **kwargs)
+        self.fc_list = fc_list
+        self.dict_layers = {}
+        for fc in self.fc_list:
+            fc_name = fc.name
+            self.dict_layers[fc_name] = SequenceFeatures(fc)
+        self.lstm = LSTM(64, return_sequences=False)
+        self.output_layer = Dense(nb_features, activation='softmax')
+        
+    def call(self, inputs, training=None):
+        dict_apply_layers = {}
+        for fc in self.fc_list:
+            fc_name = fc.name
+            if type(fc) == EmbeddingColumn:
+                dict_apply_layers[fc_name] = self.dict_layers[fc_name](inputs)[0]
+            else:
+                # we need to convert inputs[fc_name] to a sparse tensor, see https://github.com/tensorflow/tensorflow/issues/29879
+                zero = tf.constant(0, dtype=tf.float32)
+                dense = inputs[fc_name]
+                indices = tf.where(tf.not_equal(dense, zero))
+                values = tf.gather_nd(dense, indices)
+                sparse = tf.SparseTensor(indices, values, dense.shape)
+                dict_apply_layers[fc_name] = self.dict_layers[fc_name]({fc_name: sparse})[0]
+        x = tf.concat([v for _, v in dict_apply_layers.items()], axis=-1)
+        x = self.lstm(x)
+        x = self.output_layer(x)
+        return x
+    
+#Dataset Parameters
+nb_batches = 15
+batch_size = 24
+sequence_length = 9
+nb_features = 10
+
+#Dataset construction
+input_dense = tf.constant(np.random.normal(0, 1, (nb_batches, batch_size, sequence_length)))
+input_dense = tf.cast(input_dense, dtype=tf.float32)
+input_cat = tf.constant(np.random.randint(0, nb_features, (nb_batches, batch_size, sequence_length)))
+input_dict = {'dense': input_dense, 'categorical': input_cat}
+input_dataset = tf.data.Dataset.from_tensor_slices(input_dict)
+
+target_cat = tf.constant(np.random.randint(0, high=nb_features, size=(nb_batches, batch_size)))
+target_dataset = tf.data.Dataset.from_tensor_slices(target_cat)
+
+training_dataset = tf.data.Dataset.zip((input_dataset, target_dataset))
+
+#Feature columns definition
+fc_dense = tf.feature_column.sequence_numeric_column('dense')
+fc_cat = tf.feature_column.sequence_categorical_column_with_identity('categorical', nb_features)
+embedding_units = 16
+fc_cat = tf.feature_column.embedding_column(fc_cat, embedding_units)
+    
+#Model Parameters
+rnn_units = 64
+
+#Training Parameters
+epochs = 2
+
+#Try the model with the sequence_numeric_column feature column
+model = Toy([fc_dense,], nb_features)
+model.compile(optimizer='adam',
+              loss='sparse_categorical_crossentropy',
+              metrics=['sparse_categorical_accuracy'])
+try:
+    model.fit(x=training_dataset, epochs=epochs)
+    model.evaluate(x=training_dataset)
+except ValueError as e:
+    print(e)
+try:
+    path = 'tmp/test'
+    model.save(path)
+    new_model = tf.keras.models.load_model(path)
+    new_model.evaluate(x=training_dataset)
+except ValueError as e:
+    print(e)
+    
+#Try the call method with the sequence_numeric_column feature column
+model = Toy([fc_dense], nb_features)
+try:
+    for x, y in training_dataset:
+        model(x)
+    print('call worked')
+except ValueError as e:
+    print(e)
+
+#Try the call method in graph mode with the sequence_numeric_column feature column
+@tf.function
+def call_graph(model, inputs):
+    return model(inputs)
+model = Toy([fc_dense], nb_features)
+try:
+    for x, y in training_dataset:
+        call_graph(model, x)
+    print('call in graph mode worked')
+except ValueError as e:
+    print(e)
+    
+#Try the model with the embedding_column feature column
+model = Toy([fc_cat,], nb_features)
+model.compile(optimizer='adam',
+              loss='sparse_categorical_crossentropy',
+              metrics=['sparse_categorical_accuracy'])
+try:
+    model.fit(x=training_dataset, epochs=epochs)
+    model.evaluate(x=training_dataset)
+except ValueError as e:
+    print(e)
+try:
+    path = 'tmp/test'
+    model.save(path)
+    new_model = tf.keras.models.load_model(path)
+    new_model.evaluate(x=training_dataset)
+except ValueError as e:
+    print(e)
+&lt;/denchmark-code&gt;
+
+Note that trying to build the model first, by inserting the lines
+&lt;denchmark-code&gt;for x, y in training_dataset.take(1):
+    model(x)
+&lt;/denchmark-code&gt;
+
+just before calling fit does not change anything.
+	</description>
+	<comments>
+		<comment id='1' author='durandg12' date='2019-07-23T17:19:50Z'>
+		I edited my message to talk about the save method instead of tf.keras.experimental.export_saved_model. export_saved_model has the same issue but has additional problems with subclassed models making it useless even in the case where fit and save do not fail (that is, the case with embedding_column). Indeed, export_saved_model do not save saved_model.json because the subclassed model do not  have a get_config method, see the following warning when calling export_saved_model:
+&lt;denchmark-code&gt;W0723 19:17:28.631285 140736192209792 saved_model.py:171] Skipped saving model JSON, subclassed model does not have get_config() defined.
+&lt;/denchmark-code&gt;
+
+Hence we cannot rebuild the model with tf.keras.experimental.load_from_saved_model and we get this error instead:
+&lt;denchmark-code&gt;NotFoundError: tmp/test/assets/saved_model.json; No such file or directory
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='2' author='durandg12' date='2019-07-24T06:34:27Z'>
+		Was able to reproduce the issue on Colab with Tensorflow version 2.0.0.beta1. Please find the gist &lt;denchmark-link:https://colab.research.google.com/drive/17M78uFxsUg82xjqOYPdMb4Hm2TqB-J9J&gt;here&lt;/denchmark-link&gt;
+. Thanks!
+		</comment>
+		<comment id='3' author='durandg12' date='2019-08-12T23:03:53Z'>
+		Sorry, can you clarify the current code and error? The example above is fairly complicated; can you reduce to the minimal example required to reproduce the error?
+		</comment>
+		<comment id='4' author='durandg12' date='2019-08-27T17:09:19Z'>
+		There is no need to clarify my code, because I have found the cause of the issue. It was my use of the static dense.shape instead of the dynamic tf.shape(dense).
+		</comment>
+		<comment id='5' author='durandg12' date='2019-08-27T17:09:20Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=30958&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=30958&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

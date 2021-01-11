@@ -1,0 +1,154 @@
+<bug id='36542' author='bioothod' open_date='2020-02-07T14:45:54Z' closed_time='2020-07-11T21:12:14Z'>
+	<summary>TF 2.1.0 crashes during shape inference</summary>
+	<description>
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): standard docker image with ubuntu 18.04
+TensorFlow installed from (source or binary): binary
+TensorFlow version (use command below):
+Python version: v2.1.0-rc2-17-ge5bf8de 2.1.0
+CUDA/cuDNN version: 10.1.243-1 / 7.6.4.38-1+cuda10.1
+GPU model and memory: titan rtx 24220MiB
+
+Describe the current behavior
+Using rather large complex model with lots of tf.TensorArray operations ends up with the crash. 100% reproducible, but overall codebase (python only) is quite large and input pipeline is tricky.
+Code to reproduce the issue
+This is the class I use to operate with tensor arrays, which seems to be a reason for crash.
+It works in evaluation mode though
+&lt;denchmark-code&gt;class RNNBatch:
+    def __init__(self, rnn_layer, rnn_batch_size, true_words, true_lengths, training):
+        self.rnn_batch_size = rnn_batch_size
+        self.training = training
+        self.dtype = tf.float32
+
+        self.rnn_layer = rnn_layer
+        max_sequence_len = rnn_layer.max_sequence_len
+        dictionary_size = rnn_layer.dictionary_size
+
+        self.true_words = true_words
+        self.true_lengths = true_lengths
+
+        self.written = 0
+        self.rnn_processed_start = 0
+
+        self.output_written = 0
+
+    def run(self, arrays):
+        selected_features = arrays['selected_features'].concat()
+
+        batch_size = tf.shape(selected_features)[0]
+        states_h = tf.zeros((batch_size, self.rnn_layer.num_rnn_units), dtype=self.dtype)
+        states_c = tf.zeros((batch_size, self.rnn_layer.num_rnn_units), dtype=self.dtype)
+        states = [states_h, states_c]
+
+        tw = self.true_words[self.rnn_processed_start : self.rnn_processed_start + self.written, ...]
+        tl = self.true_lengths[self.rnn_processed_start : self.rnn_processed_start + self.written, ...]
+
+        out, out_ar = self.rnn_layer(selected_features, tw, tl, states, self.training)
+
+        arrays['outputs'] = arrays['outputs'].write(self.output_written, out)
+        arrays['outputs_ar'] = arrays['outputs'].write(self.output_written, out_ar)
+        self.output_written += 1
+
+        self.rnn_processed_start += self.written
+        self.written = 0
+
+        return arrays
+
+    def feed_crop(self, cropped_features, arrays):
+        arrays['selected_features'] = arrays['selected_features'].write(self.written, cropped_features)
+        self.written += 1
+
+        if self.written == self.rnn_batch_size:
+            arrays = self.run(arrays)
+            arrays['selected_features'] = tf.TensorArray(cropped_features.dtype, size=0, element_shape=tf.TensorShape([None] + [cropped_features.shape[1:]]))
+
+
+        return arrays
+
+    def return_values(self, arrays):
+        if self.written != 0:
+            arrays = self.run(arrays)
+
+        return arrays['outputs'].concat(), arrays['outputs_ar'].concat()
+
+&lt;/denchmark-code&gt;
+
+And the use case is something like this:
+&lt;denchmark-code&gt;images -&gt; huge tensor of data -&gt;
+        rnn_batch = RNNBatch(self.rnn_layer, 64, true_words, true_lengths, training)
+        arrays = {
+            'selected_features': tf.TensorArray(dtype, size=0, dynamic_size=True, element_shape=tf.TensorShape([None, crop_size, crop_size, features_full.shape[3]])),
+            'outputs': tf.TensorArray(dtype, size=0, dynamic_size=True, element_shape=tf.TensorShape([None, self.max_sequence_len, self.dictionary_size])),
+            'outputs_ar': tf.TensorArray(dtype, size=0, dynamic_size=True, element_shape=tf.TensorShape([None, self.max_sequence_len, self.dictionary_size])),
+        }
+
+        for idx in tf.range(batch_size):
+            for crop_idx in tf.range(num_crops):
+                  arrays = rnn_batch.feed_crop(cropped_features, arrays)
+&lt;/denchmark-code&gt;
+
+
+Full traceback: &lt;denchmark-link:https://github.com/tensorflow/tensorflow/files/4171246/tf.traceback.txt&gt;tf.traceback.txt&lt;/denchmark-link&gt;
+
+There is also a core file, gzipped size is about 749M.
+What should be the next steps (besides rewriting above class) to debug this problem?
+Attached stack trace which ends up like this:
+&lt;denchmark-code&gt;Thread 1 "python3" received signal SIGSEGV, Segmentation fault.
+0x00007fff647051e0 in tensorflow::(anonymous namespace)::{lambda(tensorflow::shape_inference::InferenceContext*)#14}::_FUN(tensorflow::shape_inference::InferenceContext*) ()
+   from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/_pywrap_tensorflow_internal.so
+(gdb) bt                                             
+#0  0x00007fff647051e0 in tensorflow::(anonymous namespace)::{lambda(tensorflow::shape_inference::InferenceContext*)#14}::_FUN(tensorflow::shape_inference::InferenceContext*) ()
+   from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/_pywrap_tensorflow_internal.so
+#1  0x00007fff5d5a6104 in std::_Function_handler&lt;tensorflow::Status (tensorflow::shape_inference::InferenceContext*), tensorflow::Status (*)(tensorflow::shape_inference::InferenceContext*)&gt;::_M_invoke(std::_Any_d
+ata const&amp;, tensorflow::shape_inference::InferenceContext*&amp;&amp;) () from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/_pywrap_tensorflow_internal.so
+#2  0x00007fff5a018c22 in tensorflow::shape_inference::InferenceContext::Run(std::function&lt;tensorflow::Status (tensorflow::shape_inference::InferenceContext*)&gt; const&amp;) ()
+   from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/../libtensorflow_framework.so.2
+#3  0x00007fff64342a14 in tensorflow::ShapeRefiner::RunShapeFn(tensorflow::Node const*, tensorflow::OpRegistrationData const*, tensorflow::ExtendedInferenceContext*) ()
+   from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/_pywrap_tensorflow_internal.so
+#4  0x00007fff643443ee in tensorflow::ShapeRefiner::AddNode(tensorflow::Node const*) () from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/_pywrap_tensorflow_internal.so
+#5  0x00007fff5df740f1 in TF_FinishOperation () from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/_pywrap_tensorflow_internal.so
+#6  0x00007fff5d529dd6 in _wrap_TF_FinishOperation () from /usr/local/lib/python3.6/dist-packages/tensorflow_core/python/_pywrap_tensorflow_internal.so
+&lt;/denchmark-code&gt;
+
+Unfortunately there is no debug package I could use to make better trace
+	</description>
+	<comments>
+		<comment id='1' author='bioothod' date='2020-02-07T17:56:28Z'>
+		Bug happens during augraph tracing time and is related to the typo in the second string:
+arrays['outputs'] = arrays['outputs'].write(self.output_written, out)
+arrays['outputs_ar'] = arrays['outputs'].write(self.output_written, out_ar)
+		</comment>
+		<comment id='2' author='bioothod' date='2020-02-10T09:25:30Z'>
+		&lt;denchmark-link:https://github.com/bioothod&gt;@bioothod&lt;/denchmark-link&gt;
+, Can you provide the complete code to replicate the reported issue. Thanks!
+		</comment>
+		<comment id='3' author='bioothod' date='2020-02-17T10:38:34Z'>
+		&lt;denchmark-link:https://github.com/bioothod&gt;@bioothod&lt;/denchmark-link&gt;
+, Any update
+		</comment>
+		<comment id='4' author='bioothod' date='2020-02-17T13:33:25Z'>
+		This is a bit tricky process to run this large chunk of code, I can put both model and data online, but can you instead release package with debug symbols? It will be order of magnitude faster getting that I have all setup handy, I will also make a core
+		</comment>
+		<comment id='5' author='bioothod' date='2020-03-03T21:24:07Z'>
+		Have you considered using &lt;denchmark-link:https://github.com/tensorflow/tensorboard/tree/master/tensorboard/plugins/debugger#the-debugger-dashboard&gt;tensorboard debugger&lt;/denchmark-link&gt;
+ for this case?
+		</comment>
+		<comment id='6' author='bioothod' date='2020-03-03T22:06:24Z'>
+		Hmm, how can it help in catching segmentation fault?
+Let me try to export the whole pipeline for this, it should not be hard to reproduce when everything is in place
+		</comment>
+		<comment id='7' author='bioothod' date='2020-07-11T21:12:13Z'>
+		I will close it for now, because it looks like this should be fixed here: &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/33862&gt;#33862&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='8' author='bioothod' date='2020-07-11T21:12:15Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/36542&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/36542&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

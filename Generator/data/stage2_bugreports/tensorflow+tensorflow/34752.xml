@@ -1,0 +1,207 @@
+<bug id='34752' author='zwqjoy' open_date='2019-12-02T09:32:56Z' closed_time='2020-02-12T23:53:48Z'>
+	<summary>MultiWorkerMirroredStrategy  Performance is low (2gpu, 2node)  X1.3   speed-up</summary>
+	<description>
+System information
+&lt;denchmark-code&gt;Have I written custom code (as opposed to using a stock example script provided in TensorFlow):
+OS Platform and Distribution: Ubuntu 18.04
+TensorFlow installed from (source or binary): pip install tensorflow-gpu
+TensorFlow version (use command below): 2.0
+Python version: 3.6.9
+CUDA/cuDNN version: 10/7.6.4.38
+GPU model and memory: Tesla P4  8G
+&lt;/denchmark-code&gt;
+
+Describe the current behavior
+I  run the code described below:
+TEST 1:   (two machine)
+os.environ['TF_CONFIG'] = json.dumps({
+'cluster': {
+'worker': ["server1:12345", "server2:12345"]
+},
+'task': {'type': 'worker', 'index': 0}
+})
+In the other machine
+os.environ['TF_CONFIG'] = json.dumps({
+'cluster': {
+'worker': ["server1:12345", "server2:12345"]
+},
+'task': {'type': 'worker', 'index': 1}
+})
+When the script start processing the first epoch it crashes,
+Describe the expected behavior
+15s/epoch  is so slow
+&lt;denchmark-link:https://user-images.githubusercontent.com/12653212/69707374-942a6780-1134-11ea-8dd1-994fd7e41451.png&gt;&lt;/denchmark-link&gt;
+
+TEST 2:   (one machine)
+os.environ['TF_CONFIG'] = json.dumps({
+'cluster': {
+'worker': ["server1:12345"]
+},
+'task': {'type': 'worker', 'index': 0}
+})
+Describe the expected behavior
+5s/epoch      same as use  strategy = tf.distribute.MirroredStrategy()  one GPU card
+&lt;denchmark-link:https://user-images.githubusercontent.com/12653212/69707387-9b517580-1134-11ea-976a-73c9d36fdc2b.png&gt;&lt;/denchmark-link&gt;
+
+CODE
+&lt;denchmark-code&gt;import ssl
+import os
+import json
+import argparse
+import time
+
+import numpy as np
+import tensorflow as tf
+import tensorflow_datasets as tfds
+
+ssl._create_default_https_context = ssl._create_unverified_context
+
+
+def configure_cluster(worker_hosts=None, task_index=-1):
+    """Set multi-worker cluster spec in TF_CONFIG environment variable.
+    Args:
+      worker_hosts: comma-separated list of worker ip:port pairs.
+    Returns:
+      Number of workers in the cluster.
+    """
+    tf_config = json.loads(os.environ.get('TF_CONFIG', '{}'))
+    if tf_config:
+        num_workers = len(tf_config['cluster'].get('worker', []))
+    elif worker_hosts:
+        workers = worker_hosts.split(',')
+        num_workers = len(workers)
+        if num_workers &gt; 1 and task_index &lt; 0:
+            raise ValueError('Must specify task_index when number of workers &gt; 1')
+        task_index = 0 if num_workers == 1 else task_index
+        os.environ['TF_CONFIG'] = json.dumps({
+            'cluster': {
+                'worker': workers
+            },
+            'task': {'type': 'worker', 'index': task_index}
+        })
+    else:
+        num_workers = 1
+    return num_workers
+
+
+parser = argparse.ArgumentParser(description='TensorFlow Benchmark',
+                                 formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+parser.add_argument('--num-epochs', type=int, default=5, help='input batch size')
+parser.add_argument('--batch-size-per-replica', type=int, default=32, help='input batch size')
+parser.add_argument('--worker-method', type=str, default="NCCL")
+parser.add_argument('--worker-hosts', type=str, default="localhost:23456")
+parser.add_argument('--worker-index', type=int, default=0)
+
+args = parser.parse_args()
+
+worker_num = configure_cluster(args.worker_hosts, args.worker_index)
+batch_size = args.batch_size_per_replica * worker_num
+print('Batch Size: %d' % batch_size)
+
+gpus = tf.config.experimental.list_physical_devices('GPU')
+print("Physical GPU Devices Num:", len(gpus))
+for gpu in gpus:
+    tf.config.experimental.set_memory_growth(gpu, True)
+
+if args.worker_method == "AUTO":
+    communication = tf.distribute.experimental.CollectiveCommunication.AUTO
+elif args.worker_method == "RING":
+    communication = tf.distribute.experimental.CollectiveCommunication.RING
+else:
+    communication = tf.distribute.experimental.CollectiveCommunication.NCCL
+
+strategy = tf.distribute.experimental.MultiWorkerMirroredStrategy(
+    communication=communication)
+
+
+# logical_gpus = tf.config.experimental.list_logical_devices('GPU')
+# print("Logical GPU Devices Num:", len(gpus))
+
+
+def resize(image, label):
+    image = tf.image.resize(image, [128, 128]) / 255.0
+    return image, label
+
+
+# if as_supervised is True，return image abd label
+dataset, info = tfds.load("tf_flowers", split=tfds.Split.TRAIN, with_info=True, as_supervised=True)
+dataset = dataset.map(resize).repeat().shuffle(1024).batch(batch_size)
+
+# options = tf.data.Options()
+# options.experimental_distribute.auto_shard = False
+# dataset = dataset.with_options(options)
+
+def build_and_compile_cnn_model():
+    model = tf.keras.Sequential([
+        tf.keras.layers.Conv2D(32, [3, 3], activation='relu'),
+        tf.keras.layers.Conv2D(64, [3, 3], activation='relu'),
+        tf.keras.layers.MaxPooling2D(pool_size=(2, 2)),
+        tf.keras.layers.Dropout(0.25),
+        tf.keras.layers.Flatten(),
+        tf.keras.layers.Dense(128, activation='relu'),
+        tf.keras.layers.Dropout(0.5),
+        tf.keras.layers.Dense(info.features['label'].num_classes, activation='softmax')
+    ])
+    model.compile(
+        opt=tf.keras.optimizers.Adam(learning_rate=0.0001),
+        loss=tf.keras.losses.sparse_categorical_crossentropy,
+        metrics=[tf.keras.metrics.sparse_categorical_accuracy]
+    )
+    return model
+
+
+with strategy.scope():
+    multi_worker_model = build_and_compile_cnn_model()
+print("Now training the distributed model")
+
+
+class TimeHistory(tf.keras.callbacks.Callback):
+    def on_train_begin(self, logs={}):
+        self.times = []
+        self.totaltime = time.time()
+
+    def on_train_end(self, logs={}):
+        self.totaltime = time.time() - self.totaltime
+
+    def on_epoch_begin(self, batch, logs={}):
+        self.epoch_time_start = time.time()
+
+    def on_epoch_end(self, batch, logs={}):
+        self.times.append(time.time() - self.epoch_time_start)
+
+
+time_callback = TimeHistory()
+steps_per_epoch = 100
+print('Running benchmark...')
+multi_worker_model.fit(dataset, steps_per_epoch=steps_per_epoch, epochs=args.num_epochs, callbacks=[time_callback])
+per_epoch_time = np.mean(time_callback.times[1:])
+print("per_epoch_time:", per_epoch_time)
+img_sec = batch_size * steps_per_epoch / per_epoch_time
+print("Result:  {:.1f} pic/sec".format(img_sec))
+
+
+&lt;/denchmark-code&gt;
+
+In TEST 2:    only 1 worker,   440pic/sec  （batch_szie = 128）
+In TEST 1:  2 workers,     610 pic/sec   （batch_szie = 128*2）   [Expect  440 *2 = 800+]
+Question1:
+with dist MultiWorkerMirroredStrategy  worker nums &gt; 1,   why Training is so slow
+Expect
+	</description>
+	<comments>
+		<comment id='1' author='zwqjoy' date='2020-02-06T06:46:47Z'>
+		There are many reasons why your models can be slow: networking, reading data, threads contention, etc. You can profile your program to see which part is the bottleneck: &lt;denchmark-link:https://www.tensorflow.org/tensorboard/tensorboard_profiling_keras&gt;https://www.tensorflow.org/tensorboard/tensorboard_profiling_keras&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='2' author='zwqjoy' date='2020-02-12T23:53:49Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/34752&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/34752&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='3' author='zwqjoy' date='2020-02-12T23:54:53Z'>
+		Closing now. Feel free to reopen or file a new issue if you see obvious problems on your profile.
+		</comment>
+	</comments>
+</bug>

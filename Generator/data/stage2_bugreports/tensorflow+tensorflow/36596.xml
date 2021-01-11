@@ -1,0 +1,417 @@
+<bug id='36596' author='dmus' open_date='2020-02-09T17:11:57Z' closed_time='2020-05-09T14:08:07Z'>
+	<summary>tf.keras GradientTape: get gradient with respect to input</summary>
+	<description>
+Tensorflow 2.1
+I want to get the gradients with respect to the input instead of the gradient with respect to the trainable weights. I adjust the example from &lt;denchmark-link:https://www.tensorflow.org/guide/keras/train_and_evaluate&gt;https://www.tensorflow.org/guide/keras/train_and_evaluate&lt;/denchmark-link&gt;
+ to
+&lt;denchmark-code&gt;import tensorflow as tf
+import numpy as np
+
+physical_devices = tf.config.experimental.list_physical_devices('GPU')
+assert len(physical_devices) &gt; 0, 'Not enough GPU hardware devices available'
+tf.config.experimental.set_memory_growth(physical_devices[0], True)
+
+def loss_fun(y_true, y_pred):
+    loss = tf.reduce_mean(tf.square(y_true - y_pred), axis=-1)
+    return loss
+
+# Create a dataset
+x = np.random.rand(10, 180, 320, 3).astype(np.float32)
+y = np.random.rand(10, 1).astype(np.float32)
+dataset = tf.data.Dataset.from_tensor_slices((x, y)).batch(1)
+
+# Create a model
+base_model = tf.keras.applications.MobileNet(input_shape=(180, 320, 3), weights=None, include_top=False)
+x = tf.keras.layers.GlobalAveragePooling2D()(base_model.output)
+output = tf.keras.layers.Dense(1)(x)
+model = tf.keras.models.Model(inputs=base_model.input, outputs=output)
+
+for input, target in dataset:
+
+    for iteration in range(400):
+        with tf.GradientTape() as tape:
+            # Run the forward pass of the layer.
+            # The operations that the layer applies
+            # to its inputs are going to be recorded
+            # on the GradientTape.
+            prediction = model(input, training=False)  # Logits for this minibatch
+
+            # Compute the loss value for this minibatch.
+            loss_value = loss_fun(target, prediction)
+
+        # Use the gradient tape to automatically retrieve
+        # the gradients of the trainable variables with respect to the loss.
+        grads = tape.gradient(loss_value, model.inputs)
+        print(grads)  # output: [None]
+        # Run one step of gradient descent by updating
+        # the value of the variables to minimize the loss.
+        optimizer = tf.keras.optimizers.Adam(learning_rate=0.001)
+        optimizer.apply_gradients(zip(grads, model.inputs))
+
+        print('Iteration {}'.format(iteration))
+&lt;/denchmark-code&gt;
+
+However, this doesnot work, because grads = tape.gradient(loss_value, model.inputs) returns [None]. Is this intended behaviour or not? If yes, what is the recommended way to get the gradients with respect to the input?
+	</description>
+	<comments>
+		<comment id='1' author='dmus' date='2020-02-10T11:06:43Z'>
+		&lt;denchmark-link:https://github.com/dmus&gt;@dmus&lt;/denchmark-link&gt;
+
+I tried to reproduce the issue with TF-GPU  2.1.0 ,2.2.0-dev20200210 .It returns [None] and also I am seeing the error message `ValueError: No gradients provided for any variable: ['input_1:0'].Please, find the gist &lt;denchmark-link:https://colab.research.google.com/gist/ravikyram/a60963d39257237126a70cb305e73662/untitled632.ipynb&gt;here&lt;/denchmark-link&gt;
+. Is this the expected behavior?. Thanks!
+		</comment>
+		<comment id='2' author='dmus' date='2020-02-10T13:04:21Z'>
+		&lt;denchmark-link:https://github.com/ravikyram&gt;@ravikyram&lt;/denchmark-link&gt;
+ I updated the gist. It turns out for one input this can be solved by converting the input explicitly to a tf.Variable and then use tape.watch() explicitly for the case with one input. However, it does not work when using multiple inputs
+&lt;denchmark-code&gt;for input, target in dataset:
+    image = tf.Variable(input[0])
+    for iteration in range(400):
+        with tf.GradientTape() as tape:
+            tape.watch(image)
+            # Run the forward pass of the layer.
+            # The operations that the layer applies
+            # to its inputs are going to be recorded
+            # on the GradientTape.
+            prediction = model(input, training=False)  # Logits for this minibatch
+
+            # Compute the loss value for this minibatch.
+            loss_value = loss_fun(target, prediction)
+
+        # Use the gradient tape to automatically retrieve
+        # the gradients of the trainable variables with respect to the loss.
+        grads = tape.gradient(loss_value, image)
+        print(grads)  # output: [None]
+        # Run one step of gradient descent by updating
+        # the value of the variables to minimize the loss.
+        optimizer = tf.keras.optimizers.Adam(learning_rate=0.001)
+        optimizer.apply_gradients(zip([grads], [image]))
+
+        print('Iteration {}'.format(iteration))
+&lt;/denchmark-code&gt;
+
+So the problem is there when using multiple inputs, seems like this is a bug?
+		</comment>
+		<comment id='3' author='dmus' date='2020-02-13T20:59:06Z'>
+		As a workaround: I can get this example working when I convert the image to a tensor for computing the gradient and to a tf.Variable for updating.
+&lt;denchmark-code&gt;for input, target in dataset:
+    image0 = tf.convert_to_tensor(input[0])
+    image1 = tf.convert_to_tensor(input[1])
+
+    image0_var = tf.Variable(image0)
+
+    for iteration in range(400):
+        with tf.GradientTape() as tape:
+            tape.watch(image0)
+            # Run the forward pass of the layer.
+            # The operations that the layer applies
+            # to its inputs are going to be recorded
+            # on the GradientTape.
+            # prediction = model(input, training=False)  # Logits for this minibatch
+            prediction = model([input[0], input[1]])
+            print('prediction: {}'.format(prediction))
+            # Compute the loss value for this minibatch.
+            # loss_value = loss_fun(target, prediction)
+
+        # Use the gradient tape to automatically retrieve
+        # the gradients of the trainable variables with respect to the loss.
+        grads = tape.gradient(prediction, [input[0]])
+        print(grads)  # output: [None]
+        # Run one step of gradient descent by updating
+        # the value of the variables to minimize the loss.
+
+        optimizer = tf.keras.optimizers.Adam(learning_rate=0.001)
+        optimizer.apply_gradients(zip(grads, [image0_var]))
+        #optimizer.apply_gradients(zip(grads, model.trainable_weights))
+
+        print('Iteration {}'.format(iteration))
+
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='4' author='dmus' date='2020-03-17T00:25:57Z'>
+		I recently ran into this issue and was able to confirm that &lt;denchmark-link:https://github.com/dmus&gt;@dmus&lt;/denchmark-link&gt;
+ 's workaround seems to solve it for me (TF 2.1.0, stable, compiled from source, GPU).  Going to give my thoughts for the benefit of the next person to come across the issue of wanting to compute gradients with respect to inputs.
+In my testing, I'm not sure if this is bug, but it feels unintuitive.  Suppose we have a Model model and Variable v and we execute
+&lt;denchmark-code&gt;with tf.GradientTape() as tape:
+    tape.watch(model.input)
+    model_vals = model(v)
+&lt;/denchmark-code&gt;
+
+The problem is that the call tape.gradient(model_vals, model.variables) generally works as expected to get the gradients with respect to the variables of the model, but tape.gradient(model_vals, model.input) does not work like one would expect.  The sources parameter of GradentTape.gradient seems to expect variables, but the attribute model.input is a symbolic Tensor.  For whatever reason, feeding this variable into either tape.watch or tape.gradient fails silently.  The default behavior of tape.gradient if it can't find a path of differentiation is for it to return None, so this is why this value is returned.
+Thinking deeper about this, it seems unreasonable to assume that we can use model.input as the object to differentiate against because the same model can be used multiple times within the same GradientTape session.  If composed together (model_vals = model(model(v))), there would be multiple paths from the target to the input tensors, making the gradient ill-defined.
+I think it would be nice for one of those methods to throw a warning if called in this way, considering that it's easy to conflate the idea of input with the variable fed into the input.  But perhaps this would be harder than it seems.
+Below I have a simple example that illustrates what's happening.
+&lt;denchmark-code&gt;import tensorflow as tf
+import tensorflow.keras as keras
+import tensorflow.keras.layers as layers
+
+tf.random.set_seed(0)
+
+model_in = keras.Input(shape=(2,))
+model_d1 = layers.Dense(64, activation='relu')(model_in)
+model_d2 = layers.Dense(64, activation='relu')(model_d1)
+model_d3 = layers.Dense(1)(model_d2)
+model = keras.Model(inputs=[model_in], outputs=[model_d3])
+model.summary()
+
+v = tf.Variable([[0.1, 0.2]], name='v_var')
+
+####################################################
+with tf.GradientTape() as tape:
+    tape.watch(model.input)
+    model_vals = model(v)
+print(len(tape.watched_variables())) 
+# 7      ( = (1 kernel + 1 bias) * (3 dense layers) + (1 v_var) )
+print(model.input)
+# Tensor("input_1:0", shape=(None, 2), dtype=float32)
+model_grad = tape.gradient(model_vals, model.input)
+print(model_grad)
+# None
+####################################################
+
+####################################################
+with tf.GradientTape(watch_accessed_variables=False) as tape:
+    tape.watch(model.input)
+    model_vals = model(v)
+print(len(tape.watched_variables())) 
+# 0      (model.input isn't a variable so it is ignored)
+####################################################
+
+####################################################
+with tf.GradientTape(watch_accessed_variables=False) as tape:
+    tape.watch(v)
+    model_vals = model(v)
+print(len(tape.watched_variables())) 
+# 1
+print(v)
+# &lt;tf.Variable 'v_var:0' shape=(1, 2) dtype=float32, numpy=array([[0.1, 0.2]], dtype=float32)&gt;
+model_grad = tape.gradient(model_vals, v)
+print(model_grad)
+# tf.Tensor([[-0.04392226 -0.06807809]], shape=(1, 2), dtype=float32)
+####################################################
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='5' author='dmus' date='2020-04-09T09:55:40Z'>
+		any update on this? I am also not getting any gradients even after converting input as a Variable and watching that variable using tape.watch
+I am trying to get the gradient with respect to the input but I am getting None. tried using &lt;denchmark-link:https://stackoverflow.com/questions/57759635/get-gradients-with-keras-tensorflow-2-0&gt;https://stackoverflow.com/questions/57759635/get-gradients-with-keras-tensorflow-2-0&lt;/denchmark-link&gt;
+ this answer but it is giving None. I have given total code below. You can check and execute the same code in &lt;denchmark-link:https://colab.research.google.com/drive/1pHzLA7kHB1AGgaILCnv012ZlgNVPIQRW&gt;https://colab.research.google.com/drive/1pHzLA7kHB1AGgaILCnv012ZlgNVPIQRW&lt;/denchmark-link&gt;
+ colab notebook.
+&lt;denchmark-code&gt;import pandas as pd
+import random as rn
+import tensorflow as tf
+from tensorflow.keras.layers import LSTM, GRU, Dense, Input, Embedding
+from tensorflow.keras.models import Model
+
+def get_model():
+    input_layer = Input(shape=(24,), name="input_layer")
+    ##i am initilizing randomly. But you can use predefined embeddings. 
+    x_embedd = Embedding(input_dim=13732, output_dim=100, input_length=24, mask_zero=True, 
+                        embeddings_initializer=tf.keras.initializers.RandomNormal(mean=0, stddev=1, seed=23),
+                         name="Embedding_layer")(input_layer)
+    
+    x_lstm = LSTM(units=20, activation='tanh', recurrent_activation='sigmoid', use_bias=True, 
+                 kernel_initializer=tf.keras.initializers.glorot_uniform(seed=26),
+                 recurrent_initializer=tf.keras.initializers.orthogonal(seed=54),
+                 bias_initializer=tf.keras.initializers.zeros(), name="LSTM_layer")(x_embedd)
+    
+    x_out = Dense(1, activation='sigmoid', kernel_initializer=tf.keras.initializers.glorot_uniform(seed=45),
+                  name="output_layer")(x_lstm)
+    
+    basic_lstm_model = Model(inputs=input_layer, outputs=x_out, name="basic_lstm_model")
+    
+    return basic_lstm_model
+
+basic_lstm_model = get_model()
+
+temp_features = np.random.randint(low=1, high=13732, size=(10,24))
+
+def get_gradient(model, x):
+    x_tensor = tf.Variable(tf.convert_to_tensor(x, dtype=tf.float32))
+    with tf.GradientTape() as tape:
+        tape.watch(x_tensor)
+        loss = model(x_tensor)
+    #print(tape.watched_variables())
+    grads = tape.gradient(loss, x_tensor)
+    return grads
+
+print(get_gradient(basic_lstm_model, temp_features))```
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='6' author='dmus' date='2020-04-10T09:25:16Z'>
+		Got it. It is because of the Embedding layer. The gradient is not flowing through the embedding layer.
+		</comment>
+		<comment id='7' author='dmus' date='2020-04-10T15:08:46Z'>
+		Can you get the gradient of the input by calling:
+&lt;denchmark-code&gt;tape.gradient(loss, input)
+&lt;/denchmark-code&gt;
+
+instead of:
+&lt;denchmark-code&gt;tape.gradient(loss, model.input)
+&lt;/denchmark-code&gt;
+
+?
+		</comment>
+		<comment id='8' author='dmus' date='2020-04-17T14:23:16Z'>
+		I have a similar issue trying to compute gradients with tf.gradients of the loss wrt the inputs. Just returns None in all cases.
+Interestingly this works perfectly in older versions of tensorflow (&lt; 2.0) - so they've broken something. This is an extremely annoying issue if trying to work within tf.keras's train functions, but from reading above it seems that even if you were to write your own this issue would persist.
+Can't this behaviour be reverted to how it was pre-2.0, where you could calculate the gradients however you liked, without arbitrary restrictions?
+EDIT:
+Duh, obviously this is because 2.0 enforced eager execution, if you disable this the old-style gradient calculations seem to work fine. (Though apparently this is meant to issue a runtime warning, which it did not.)
+		</comment>
+		<comment id='9' author='dmus' date='2020-04-24T16:08:34Z'>
+		This issue has been automatically marked as stale because it has not had recent activity. It will be closed if no further activity occurs. Thank you.
+		</comment>
+		<comment id='10' author='dmus' date='2020-04-27T21:05:14Z'>
+		this simple example fails as well
+&lt;denchmark-code&gt;import tensorflow as tf
+
+(x_train, y_train), _ = tf.keras.datasets.mnist.load_data()
+train_ds = tf.data.Dataset.from_tensor_slices((x_train, y_train)).batch(32)
+
+model = tf.keras.models.Sequential([
+  tf.keras.layers.Flatten(input_shape=(28, 28)),
+  tf.keras.layers.Dense(128),
+  tf.keras.layers.ReLU(),
+  tf.keras.layers.Dense(10)
+])
+loss_object = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+
+images, labels = next(iter(train_ds))
+
+with tf.GradientTape() as tape:
+  tape.watch(model.layers[0].output)
+  predictions = model(image)
+  loss = loss_object(labels, predictions)
+
+grads = tape.gradient(loss, model.layers[0].output)
+print(grads)
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='11' author='dmus' date='2020-05-02T07:28:00Z'>
+		&lt;denchmark-link:https://github.com/UdiBhaskar&gt;@UdiBhaskar&lt;/denchmark-link&gt;
+ Did you find a work-around to make the gradient flow through the embedding layer?
+		</comment>
+		<comment id='12' author='dmus' date='2020-05-02T13:53:56Z'>
+		I found a solution to my problem. For future references and in hope that it would help someone in a similar need as me -
+The error that I was committing - Converting the loss value and the predictions from the model to numpy array. It is imperative that you don't convert them to numpy arrays at any point in time before computing the gradients. In my case, I was using a custom loss function which converted the predicted values to numpy arrays for computations.
+		</comment>
+		<comment id='13' author='dmus' date='2020-05-09T14:08:06Z'>
+		Closing as stale. Please reopen if you'd like to work on this further.
+		</comment>
+		<comment id='14' author='dmus' date='2020-05-09T14:08:08Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/36596&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/36596&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='15' author='dmus' date='2020-07-15T07:36:41Z'>
+		
+Got it. It is because of the Embedding layer. The gradient is not flowing through the embedding layer.
+
+I am
+
+I recently ran into this issue and was able to confirm that @dmus 's workaround seems to solve it for me (TF 2.1.0, stable, compiled from source, GPU). Going to give my thoughts for the benefit of the next person to come across the issue of wanting to compute gradients with respect to inputs.
+In my testing, I'm not sure if this is bug, but it feels unintuitive. Suppose we have a Model model and Variable v and we execute
+with tf.GradientTape() as tape:
+    tape.watch(model.input)
+    model_vals = model(v)
+
+The problem is that the call tape.gradient(model_vals, model.variables) generally works as expected to get the gradients with respect to the variables of the model, but tape.gradient(model_vals, model.input) does not work like one would expect. The sources parameter of GradentTape.gradient seems to expect variables, but the attribute model.input is a symbolic Tensor. For whatever reason, feeding this variable into either tape.watch or tape.gradient fails silently. The default behavior of tape.gradient if it can't find a path of differentiation is for it to return None, so this is why this value is returned.
+Thinking deeper about this, it seems unreasonable to assume that we can use model.input as the object to differentiate against because the same model can be used multiple times within the same GradientTape session. If composed together (model_vals = model(model(v))), there would be multiple paths from the target to the input tensors, making the gradient ill-defined.
+I think it would be nice for one of those methods to throw a warning if called in this way, considering that it's easy to conflate the idea of input with the variable fed into the input. But perhaps this would be harder than it seems.
+Below I have a simple example that illustrates what's happening.
+import tensorflow as tf
+import tensorflow.keras as keras
+import tensorflow.keras.layers as layers
+
+tf.random.set_seed(0)
+
+model_in = keras.Input(shape=(2,))
+model_d1 = layers.Dense(64, activation='relu')(model_in)
+model_d2 = layers.Dense(64, activation='relu')(model_d1)
+model_d3 = layers.Dense(1)(model_d2)
+model = keras.Model(inputs=[model_in], outputs=[model_d3])
+model.summary()
+
+v = tf.Variable([[0.1, 0.2]], name='v_var')
+
+####################################################
+with tf.GradientTape() as tape:
+    tape.watch(model.input)
+    model_vals = model(v)
+print(len(tape.watched_variables())) 
+# 7      ( = (1 kernel + 1 bias) * (3 dense layers) + (1 v_var) )
+print(model.input)
+# Tensor("input_1:0", shape=(None, 2), dtype=float32)
+model_grad = tape.gradient(model_vals, model.input)
+print(model_grad)
+# None
+####################################################
+
+####################################################
+with tf.GradientTape(watch_accessed_variables=False) as tape:
+    tape.watch(model.input)
+    model_vals = model(v)
+print(len(tape.watched_variables())) 
+# 0      (model.input isn't a variable so it is ignored)
+####################################################
+
+####################################################
+with tf.GradientTape(watch_accessed_variables=False) as tape:
+    tape.watch(v)
+    model_vals = model(v)
+print(len(tape.watched_variables())) 
+# 1
+print(v)
+# &lt;tf.Variable 'v_var:0' shape=(1, 2) dtype=float32, numpy=array([[0.1, 0.2]], dtype=float32)&gt;
+model_grad = tape.gradient(model_vals, v)
+print(model_grad)
+# tf.Tensor([[-0.04392226 -0.06807809]], shape=(1, 2), dtype=float32)
+####################################################
+
+
+&lt;denchmark-link:https://github.com/kphawkins&gt;@kphawkins&lt;/denchmark-link&gt;
+
+I am trying to find out the gradient of the cross entropy loss and some custom loss functions with respect to the input image .
+I followed the same procedure you mentioned ,still the gradient value returning None.Please go through the code  below.
+from keras.applications.vgg19 import preprocess_input
+from keras.applications.vgg19 import decode_predictions
+from keras.preprocessing.image import img_to_array
+from keras.preprocessing.image import load_img
+model = vgg19.VGG19(weights="imagenet", include_top=True)
+image = load_img('/content/dog.jpg', target_size=(224, 224))
+image = img_to_array(image)
+image = image.reshape((1, image.shape[0], image.shape[1], image.shape[2]))
+&lt;denchmark-h:h1&gt;prepare the image for the VGG model&lt;/denchmark-h&gt;
+
+image = preprocess_input(image)
+yhat = model.predict(image)
+#print(yhat)
+label = decode_predictions(yhat)
+label = label[0][0]
+&lt;denchmark-h:h1&gt;print the classification&lt;/denchmark-h&gt;
+
+cross_entropy_loss=-(math.log(label[2]))
+print(cross_entropy_loss)
+&lt;denchmark-h:h1&gt;Cross_entropy loss returnining  0.035864354427793455&lt;/denchmark-h&gt;
+
+image=tf.convert_to_tensor(image)
+cross_entropy_loss=tf.convert_to_tensor(cross_entropy_loss)
+image=tf.Variable(image)
+ce=tf.Variable(cross_entropy_loss)
+with tf.GradientTape() as tape:
+tape.watch(image)
+loss=ce
+#print(loss)
+print(len(tape.watched_variables()))
+model_grad = tape.gradient(loss,image)
+print(model_grad)
+It is still returning 1 None
+Is there any way to solve this issue?
+		</comment>
+	</comments>
+</bug>

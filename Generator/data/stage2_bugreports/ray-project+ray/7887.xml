@@ -1,0 +1,371 @@
+<bug id='7887' author='clarkzinzow' open_date='2020-04-03T05:58:39Z' closed_time='2020-04-11T23:51:33Z'>
+	<summary>[Core] Apparent task/object leak on certain direct task calls.</summary>
+	<description>
+&lt;denchmark-h:h3&gt;What is the problem?&lt;/denchmark-h&gt;
+
+Ray appears to be leaking tasks/objects on certain direct task calls. Namely, it appears that the raylet/node manager is losing track of direct task calls that depend on the same return object of an upstream task (and are possibly sharing a worker lease, need to confirm that.) So far, all instances of leaked tasks appear to correspond to pairs of tasks, sharing the same scheduler key and submitted nearly at the same time, both depending on the same task return object, with the task submitted second tending to be leaked.
+From an end-user perspective, this leak manifests in many orphaned objects being left in the object store, none of which are retrievable (ray.get() hangs indefinitely.)
+&lt;denchmark-h:h4&gt;Version information&lt;/denchmark-h&gt;
+
+
+Python 3.7.5
+Ubuntu 19.10
+ray at commit 93b5c38 (will test on most recently built master commit soon)
+
+&lt;denchmark-h:h3&gt;Bug Information&lt;/denchmark-h&gt;
+
+Currently unable to create a minimal reproduction, still working on that. &lt;denchmark-link:https://github.com/stephanie-wang&gt;@stephanie-wang&lt;/denchmark-link&gt;
+ said that it'd be a good idea to open an issue so this bug isn't only tracked by a Slack thread, and she was pretty confident that there is in fact a leak. Below is a summary of some log and code spelunking.
+&lt;denchmark-h:h4&gt;Summary&lt;/denchmark-h&gt;
+
+
+Two tasks, 240f6960faf7db13ffffffff0100 and c83000702c305163ffffffff0100, depend on the same object 1d539110471eab4dffffffff010000c801000000, and both appear to have the same scheduling key and both are making worker lease requests at around the same time.
+It appears that the lease request for the second task, c83000702c305163ffffffff0100, is never granted.
+It also appears that the raylet loses track of the second task: the task is never transitioned out of READY. Namely, in the node manager, FinishAssignTask() and FinishAssignedTask() are never called for the task.
+An object with ID 1d539110471eab4dffffffff010000c801000000 ends up being orphaned in the object store since the node manager thinks that task c83000702c305163ffffffff0100 still depends on the object after its unpinned; this results in a failed object pull and a failed object reconstruction, which I believe means that the object orphaned in the object store is an error object.
+Not sure if the second task is reusing the first task's worker lease and is somehow making a lease request of its own, or if they aren't sharing a worker lease and the lease request never returns and the raylet loses track of the task for a different reason.
+
+&lt;denchmark-h:h4&gt;Details&lt;/denchmark-h&gt;
+
+There are two downstream tasks that depend on the return object of task 1d539110471eab4dffffffff0100:
+raylet:
+&lt;denchmark-code&gt;I0331 01:26:54.120884  4315 task_dependency_manager.cc:184] Task 240f6960faf7db13ffffffff0100 blocked on object 1d539110471eab4dffffffff010000c801000000
+I0331 01:26:55.895077  4315 task_dependency_manager.cc:184] Task c83000702c305163ffffffff0100 blocked on object 1d539110471eab4dffffffff010000c801000000
+&lt;/denchmark-code&gt;
+
+Both of these downstream tasks complete according to the worker:
+python-worker:
+&lt;denchmark-code&gt;I0331 01:26:55.904520  4339 core_worker.cc:1186] Finished executing task 240f6960faf7db13ffffffff0100
+I0331 01:26:55.909976  4352 task_manager.cc:127] Completing task 240f6960faf7db13ffffffff0100
+I0331 01:26:55.930382  4339 core_worker.cc:1186] Finished executing task c83000702c305163ffffffff0100
+I0331 01:26:55.930879  4352 task_manager.cc:127] Completing task c83000702c305163ffffffff0100
+&lt;/denchmark-code&gt;
+
+However, according to the raylet logs, task 240f6960faf7db13ffffffff0100 finished but task c83000702c305163ffffffff0100 did not:
+raylet:
+&lt;denchmark-code&gt;I0331 01:26:55.950846  4315 node_manager.cc:2414] Finished task 240f6960faf7db13ffffffff0100
+&lt;/denchmark-code&gt;
+
+In fact, from the raylet's perspective, the   task is never moved out of the ready queue into the running queue by the scheduler, the node manager never assigns the task to a worker, etc. I'm assuming that this is because that task is a direct task call whose scheduling decision is cached and an existing worker lease (provisioned by task ) is being reused, so no worker lease is granted and it appears to go through a different code path that doesn't call &lt;denchmark-link:https://github.com/ray-project/ray/blob/93b5c38b7dc75b64a4812c1b300f48f9f1bf5d2b/src/ray/raylet/node_manager.cc#L3016-L3055&gt;FinishAssignTask()&lt;/denchmark-link&gt;
+ or &lt;denchmark-link:https://github.com/ray-project/ray/blob/93b5c38b7dc75b64a4812c1b300f48f9f1bf5d2b/src/ray/raylet/node_manager.cc#L2412-L2456&gt;FinishAssignedTask()&lt;/denchmark-link&gt;
+ in the node manager. Therefore, from the node manager's perspective,   is a queued task that still depends on the return object of task  when that object gets unpinned:
+raylet:
+&lt;denchmark-code&gt;I0331 01:26:55.950737  4315 node_manager.cc:3264] Unpinning object 1d539110471eab4dffffffff010000c801000000
+I0331 01:26:56.616161  4315 node_manager.cc:2815] Object missing 1d539110471eab4dffffffff010000c801000000,  on 87b1fb4ac8cb822f02545201693611dc853749e7, 1 tasks waiting, tasks: c83000702c305163ffffffff0100
+&lt;/denchmark-code&gt;
+
+This will cause the task dependency manager to consider the object ID required, which causes an attempted (and failed) object pull and object reconstruction to kick off 10 seconds later:
+
+
+
+ray/src/ray/raylet/node_manager.cc
+
+
+         Line 2804
+      in
+      93b5c38
+
+
+
+
+
+
+ const auto waiting_task_ids = task_dependency_manager_.HandleObjectMissing(object_id); 
+
+
+
+
+
+
+
+
+ray/src/ray/raylet/task_dependency_manager.cc
+
+
+         Line 170
+      in
+      93b5c38
+
+
+
+
+
+
+ HandleRemoteDependencyRequired(object_id); 
+
+
+
+
+
+
+
+
+ray/src/ray/raylet/task_dependency_manager.cc
+
+
+        Lines 73 to 74
+      in
+      93b5c38
+
+
+
+
+
+
+ RAY_CHECK_OK(object_manager_.Pull(object_id)); 
+
+
+
+ reconstruction_policy_.ListenAndMaybeReconstruct(object_id); 
+
+
+
+
+
+
+
+
+ray/src/ray/raylet/reconstruction_policy.cc
+
+
+        Lines 210 to 223
+      in
+      93b5c38
+
+
+
+
+
+
+ void ReconstructionPolicy::ListenAndMaybeReconstruct(const ObjectID &amp;object_id) { 
+
+
+
+ RAY_LOG(DEBUG) &lt;&lt; "Listening and maybe reconstructing object " &lt;&lt; object_id; 
+
+
+
+   TaskID task_id = object_id.TaskId(); 
+
+
+
+ auto it = listening_tasks_.find(task_id); 
+
+
+
+ // Add this object to the list of objects created by the same task. 
+
+
+
+ if (it == listening_tasks_.end()) { 
+
+
+
+ auto inserted = listening_tasks_.emplace(task_id, ReconstructionTask(io_service_)); 
+
+
+
+     it = inserted.first; 
+
+
+
+ // Set a timer for the task that created the object. If the lease for that 
+
+
+
+ // task expires, then reconstruction of that task will be triggered. 
+
+
+
+ SetTaskTimeout(it, initial_reconstruction_timeout_ms_); 
+
+
+
+   } 
+
+
+
+   it-&gt;second.created_objects.insert(object_id); 
+
+
+
+ } 
+
+
+
+
+
+raylet:
+&lt;denchmark-code&gt;# unpinned
+I0331 01:26:55.950737  4315 node_manager.cc:3264] Unpinning object 1d539110471eab4dffffffff010000c801000000
+I0331 01:26:56.616024  4315 object_directory.cc:71] Reporting object removed to GCS 1d539110471eab4dffffffff010000c801000000
+I0331 01:26:56.616030  4315 service_based_accessor.cc:748] Removing object location, object id = 1d539110471eab4dffffffff010000c801000000, node id = 87b1fb4ac8cb822f02545201693611dc853749e7
+# attempted object pull request
+I0331 01:26:56.616096  4315 object_manager.cc:126] Pull on 87b1fb4ac8cb822f02545201693611dc853749e7 of object 1d539110471eab4dffffffff010000c801000000
+I0331 01:26:56.616108  4315 service_based_accessor.cc:776] Subscribing object location, object id = 1d539110471eab4dffffffff010000c801000000
+I0331 01:26:56.616137  4315 service_based_accessor.cc:781] Finished subscribing object location, object id = 1d539110471eab4dffffffff010000c801000000
+# object reconstruction in 10 seconds from this point since pull request will fail
+I0331 01:26:56.616145  4315 reconstruction_policy.cc:211] Listening and maybe reconstructing object 1d539110471eab4dffffffff010000c801000000
+I0331 01:26:56.616161  4315 node_manager.cc:2815] Object missing 1d539110471eab4dffffffff010000c801000000,  on 87b1fb4ac8cb822f02545201693611dc853749e7, 1 tasks waiting, tasks: c83000702c305163ffffffff0100
+# failed object pull
+E0331 01:26:56.616714  4315 object_manager.cc:189] The object manager with ID 87b1fb4ac8cb822f02545201693611dc853749e7 is trying to pull object 1d539110471eab4dffffffff010000c801000000 but the object table suggests that this object manager already has the object. The object may have been evicted.
+I0331 01:26:56.618919  4315 service_based_accessor.cc:762] Finished removing object location, status = OK, object id = 1d539110471eab4dffffffff010000c801000000, node id = 87b1fb4ac8cb822f02545201693611dc853749e7
+# object reconstruction starts here, after waiting for 10 seconds
+I0331 01:27:06.616205  4315 service_based_accessor.cc:653] Subscribing task lease, task id = 1d539110471eab4dffffffff0100
+I0331 01:27:06.616250  4315 service_based_accessor.cc:658] Finished subscribing task lease, task id = 1d539110471eab4dffffffff0100
+I0331 01:27:06.618786  4315 service_based_accessor.cc:574] Getting task, task id = 1d539110471eab4dffffffff0100
+# task lineage not available in GCS since it was already cleaned up
+W0331 01:27:06.619911  4315 node_manager.cc:2703] Metadata of task 1d539110471eab4dffffffff0100 not found in either GCS or lineage cache. It may have been evicted by the redis LRU configuration. Consider increasing the memory allocation via ray.init(redis_max_memory=&lt;max_memory_bytes&gt;).
+I0331 01:27:06.620035  4315 service_based_accessor.cc:585] Finished getting task, status = Invalid: Task not exist., task id = 1d539110471eab4dffffffff0100
+&lt;/denchmark-code&gt;
+
+After the reconstruction fails, it appears that an object is put into the object store under that ID, which I believe is an error object (I can't inspect it since the object has already gone out of scope according to the Ray workers; a ray.get() call hangs indefinitely):
+&lt;denchmark-code&gt;I0331 01:27:06.620035  4315 service_based_accessor.cc:585] Finished getting task, status = Invalid: Task not exist., task id = 1d539110471eab4dffffffff0100
+I0331 01:27:06.620261  4315 object_manager.cc:78] Object added 1d539110471eab4dffffffff010000c801000000
+I0331 01:27:06.620273  4315 object_directory.cc:62] Reporting object added to GCS 1d539110471eab4dffffffff010000c801000000
+I0331 01:27:06.620281  4315 service_based_accessor.cc:721] Adding object location, object id = 1d539110471eab4dffffffff010000c801000000, node id = 87b1fb4ac8cb822f02545201693611dc853749e7
+I0331 01:27:06.620378  4315 service_based_accessor.cc:787] Unsubscribing object location, object id = 1d539110471eab4dffffffff010000c801000000
+I0331 01:27:06.620412  4315 service_based_accessor.cc:789] Finished unsubscribing object location, object id = 1d539110471eab4dffffffff010000c801000000
+I0331 01:27:06.620429  4315 reconstruction_policy.cc:226] Reconstruction for object 1d539110471eab4dffffffff010000c801000000 canceled
+I0331 01:27:06.620440  4315 service_based_accessor.cc:664] Unsubscribing task lease, task id = 1d539110471eab4dffffffff0100
+I0331 01:27:06.620460  4315 service_based_accessor.cc:666] Finished unsubscribing task lease, task id = 1d539110471eab4dffffffff0100
+I0331 01:27:06.620471  4315 node_manager.cc:2756] Object local 1d539110471eab4dffffffff010000c801000000,  on 87b1fb4ac8cb822f02545201693611dc853749e7, 1 tasks ready
+I0331 01:27:06.620859  4315 service_based_accessor.cc:736] Finished adding object location, status = OK, object id = 1d539110471eab4dffffffff010000c801000000, node id = 87b1fb4ac8cb822f02545201693611dc853749e7
+&lt;/denchmark-code&gt;
+
+I believe that the reference counting logic is behaving as expected. It appears to be the c83000702c305163ffffffff0100 task becoming untracked by the raylet/node manager that's causing the failed object pull and the failed task reconstruction. Whatever code path this task is taking, it needs to tell the raylet/node manager that the task is assigned (once it's assigned) and that it's finished (once it's finished.)
+&lt;denchmark-h:h4&gt;Direct Task Model Confusion&lt;/denchmark-h&gt;
+
+I'm still trying to wrap my head around the code path differences between a direct task that leases a worker and a direct task that reuses an existing worker lease. In this case, it appears that both tasks request a worker lease:
+raylet:
+&lt;denchmark-code&gt;I0331 01:26:54.120754  4315 node_manager.cc:1626] Worker lease request 240f6960faf7db13ffffffff0100
+I0331 01:26:55.894937  4315 node_manager.cc:1626] Worker lease request c83000702c305163ffffffff0100
+&lt;/denchmark-code&gt;
+
+but only one is granted:
+python-driver
+&lt;denchmark-code&gt;I0331 01:26:55.894311  4352 direct_task_transport.cc:133] Lease granted 240f6960faf7db13ffffffff0100
+&lt;/denchmark-code&gt;
+
+suggesting that (if the lease is shared) a lease request is made for each task once dependencies are resolved, the lease is granted for the first task while the second task's lease request is not, the latter task is pushed to the worker after the former completes, but the former never calls the &lt;denchmark-link:https://github.com/ray-project/ray/blob/93b5c38b7dc75b64a4812c1b300f48f9f1bf5d2b/src/ray/core_worker/transport/direct_actor_transport.cc#L283-L290&gt;task_done_&lt;/denchmark-link&gt;
+ callback, which never causes the raylet to indicate that the worker is available, so the worker is never put back into the worker pool, which causes the latter task to never be "assigned" (via &lt;denchmark-link:https://github.com/ray-project/ray/blob/93b5c38b7dc75b64a4812c1b300f48f9f1bf5d2b/src/ray/raylet/node_manager.cc#L2327-L2410&gt;NodeManager.AssignTask()&lt;/denchmark-link&gt;
+ or &lt;denchmark-link:https://github.com/ray-project/ray/blob/93b5c38b7dc75b64a4812c1b300f48f9f1bf5d2b/src/ray/raylet/node_manager.cc#L3016-L3055&gt;NodeManager.FinishAssignTask()&lt;/denchmark-link&gt;
+) to a worker, so the task is never transitioned to .
+However, I can't see how two lease requests on the same scheduling key could be in flight concurrently, given that the direct task submitter's &lt;denchmark-link:https://github.com/ray-project/ray/blob/93b5c38b7dc75b64a4812c1b300f48f9f1bf5d2b/src/ray/core_worker/transport/direct_task_transport.cc#L108-L151&gt;RequestNewWorkerIfNeeded&lt;/denchmark-link&gt;
+ is guarded by a mutex and a collision in  should short-circuit the function, preventing the second task from submitting a lease request. This would suggest that the second task isn't sharing a worker lease, but that makes the fact that the lease is never granted and the raylet losing track of the task even more confusing. Moreover, I've pretty sure that both tasks have the same scheduling key (they have the same resource requirements, function descriptor, and arguments.)
+&lt;denchmark-h:h3&gt;Next Steps&lt;/denchmark-h&gt;
+
+
+
+If anyone could shed some light on the intended submission flow and lifetime of direct tasks reusing worker leases, I would be forever grateful.
+
+
+I'm going to keep working on a minimal reproducible example and will add it to this issue if/when I find one.
+
+
+ I have verified my script runs in a clean environment and reproduces the issue.
+
+
+ I have verified the issue also occurs with the latest wheels.
+
+
+	</description>
+	<comments>
+		<comment id='1' author='clarkzinzow' date='2020-04-03T19:12:38Z'>
+		Thanks, &lt;denchmark-link:https://github.com/clarkzinzow&gt;@clarkzinzow&lt;/denchmark-link&gt;
+! I think I actually have an idea of what's going on. Hopefully I can get a PR open for it later today or this weekend, and you can try it out. The bug seems to be an interaction between task batching and eager eviction of objects that have gone out of scope. I believe the sequence is this:
+
+Driver submits tasks T1 and T2 that both depend on object O, so they have the same scheduling key (same resources, dependencies, etc). Driver sends one lease request for each task to the raylet, which queues them. We submit one lease request for each because optimistically, we'd like the tasks to run in parallel on different workers.
+O appears and the raylet grants a lease for T1 to the driver. T2's lease request is still queued.
+Driver pushes T1 to the leased worker for execution. The worker finishes while the lease is still active, so the driver also pushes T2 to the worker for execution. This is the "task batching" optimization - we try to reuse the same worker for multiple tasks so we don't have to wait for the scheduler to grant another lease request.
+Worker finishes T2, so the driver/raylet free O since it no longer has any references.
+Raylet still has T2's lease request queued and is trying to fetch O since it is no longer available locally. Eventually, this times out because O will not be created again.
+
+My plan to fix this is to have the worker cancel active lease requests once there are no more tasks to run for that scheduling key. Downside is we'd need to keep a bit more state at the workers, and have an additional IPC to send the cancellation. This could also slightly hurt performance if another task with the same key gets added immediately after, since we'd have to request a lease from the raylet again.
+		</comment>
+		<comment id='2' author='clarkzinzow' date='2020-04-03T23:20:52Z'>
+		&lt;denchmark-link:https://github.com/stephanie-wang&gt;@stephanie-wang&lt;/denchmark-link&gt;
+ That's awesome! And that sequence jives with my spelunking, a few quick questions there:
+
+Driver sends one lease request for each task to the raylet, which queues them. We submit one lease request for each because optimistically, we'd like the tasks to run in parallel on different workers.
+
+I thought that only one lease request should be sent for tasks with the same scheduling key? Shouldn't the T1 lease request be made, with that lease request added to pending_lease_requests_, while holding a lock on a lease request mutex, and then when RequestNewWorkerIfNeeded is called for T2, it should short-circuit before making a lease request for T2?
+
+
+
+ray/src/ray/core_worker/transport/direct_task_transport.cc
+
+
+        Lines 110 to 113
+      in
+      93b5c38
+
+
+
+
+
+
+ if (pending_lease_requests_.find(scheduling_key) != pending_lease_requests_.end()) { 
+
+
+
+ // There's already an outstanding lease request for this type of task. 
+
+
+
+ return; 
+
+
+
+ } 
+
+
+
+
+
+I'm probably missing something here, but it seems like those concurrent lease requests shouldn't be possible. 🤔
+
+Raylet still has T2's lease request queued and is trying to fetch O since it is no longer available locally. Eventually, this times out because O will not be created again.
+
+So the flow for this is:
+
+The object is deleted from the object store.
+This triggers a SubscribeObjDeleted subscription, which calls HandleObjectMissing.
+Which calls the corresponding HandleObjectMissing method on the dependency manager.
+Which checks to see if the remote dependency is required; it is considered required since it was never removed from the set of required tasks.
+This triggers the immediate failed pull request and the failed reconstruction attempt 10 seconds later.
+
+Is that about right?
+
+My plan to fix this is to have the worker cancel active lease requests once there are no more tasks to run for that scheduling key. Downside is we'd need to keep a bit more state at the workers, and have an additional IPC to send the cancellation. This could also slightly hurt performance if another task with the same key gets added immediately after, since we'd have to request a lease from the raylet again.
+
+I'm probably missing something, but shouldn't the task dependency manager be notified of a batched task being done right after the task finishes, via the existing callbacks, rather than on lease cancellation at the end of a batch? I could imagine a batch of tasks fitting within a lease window pilling up, none finishing according to the raylet since it won't receive notice that the tasks have finished until those lease request cancellations come through.
+Is this an apt description of ideal behavior?
+
+The raylet properly maintains the task state for batched tasks, transitioning them into RUNNING when the task is sent to the worker and removing them from the node manager's local_queue_ when the task is done executing.
+The task should be removed from the raylet's task dependency manager (via task_dependency_manager_.UnsubscribeGetDependencies() and task_dependency_manager_.Cancel()) when the task is done running.
+The worker lease expiration should be extended at the beginning of the execution of a batched task, since a new task of the same scheduling key should be taken as an indication that the leased worker is valuable and will probably see more utilization from this worker in the near term.
+
+If so, could that be achieved by invoking the node manager's  and  methods at the beginning of task execution and after task execution has finished (e.g. in the core worker direct call receiver's  method, via a mechanism similar to &lt;denchmark-link:https://github.com/ray-project/ray/blob/93b5c38b7dc75b64a4812c1b300f48f9f1bf5d2b/src/ray/core_worker/transport/direct_actor_transport.cc#L289&gt;the OnTaskDone callback&lt;/denchmark-link&gt;
+), respectively, with the task lease request returning an indication of a successful reuse of an existing lease (indicating that the lease expiration should be extended)? I feel like the semantics might be better in having the lease request return with an extension indication and the raylet task state being kept up-to-date via the the same  and  methods used elsewhere being called out to between task state transitions in the direct task receiver. What do you think?
+Also I wouldn't be surprised if I completely misunderstood a billion things about the leasing architecture and if everything that I said is wrong or untenable, feel free to ignore if that's the case! 😁
+		</comment>
+		<comment id='3' author='clarkzinzow' date='2020-04-11T23:52:21Z'>
+		Hey &lt;denchmark-link:https://github.com/clarkzinzow&gt;@clarkzinzow&lt;/denchmark-link&gt;
+, if you get a chance, can you try out your application on the latest master? We just merged &lt;denchmark-link:https://github.com/ray-project/ray/pull/7929&gt;#7929&lt;/denchmark-link&gt;
+ which should hopefully have fixed the issue. Thanks!
+		</comment>
+		<comment id='4' author='clarkzinzow' date='2020-04-13T16:46:11Z'>
+		Thanks &lt;denchmark-link:https://github.com/stephanie-wang&gt;@stephanie-wang&lt;/denchmark-link&gt;
+, that was quick!  I'll confirm that the issue is fixed today.
+		</comment>
+		<comment id='5' author='clarkzinzow' date='2020-04-13T23:00:19Z'>
+		&lt;denchmark-link:https://github.com/stephanie-wang&gt;@stephanie-wang&lt;/denchmark-link&gt;
+ I haven't been able to trigger any more task leakages, so it looks like the lease cancellation has done the trick!
+		</comment>
+		<comment id='6' author='clarkzinzow' date='2020-04-13T23:06:23Z'>
+		Great, thanks &lt;denchmark-link:https://github.com/clarkzinzow&gt;@clarkzinzow&lt;/denchmark-link&gt;
+ for reporting and helping us out with the issue!
+		</comment>
+	</comments>
+</bug>

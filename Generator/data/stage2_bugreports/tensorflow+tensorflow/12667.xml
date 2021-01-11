@@ -1,0 +1,277 @@
+<bug id='12667' author='lsy643' open_date='2017-08-29T02:32:00Z' closed_time='2017-12-15T18:38:30Z'>
+	<summary>Distributed Training Randomly Stops During the Training Process</summary>
+	<description>
+&lt;denchmark-h:h3&gt;System information&lt;/denchmark-h&gt;
+
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Ubuntu 16.04
+TensorFlow version (use command below): v1.3.0-rc2-20-g0787eee 1.3.0
+Python version: 3.5.2
+CUDA/cuDNN version: 6.0
+GPU model and memory:  Tesla K80, 12G
+
+&lt;denchmark-h:h3&gt;Describe the problem&lt;/denchmark-h&gt;
+
+In my distributed training program, there are one server and two workers, which all run in separately nvidia-docker container. At the beginning, the cluster works just fine, but running normally after several hours, the two workers just stop.
+My training process:
+
+I create three nvidia-docker containers, one for parameter server, two for workers
+In every container, I run the train_replica function below after defining all necessary parts such as cluster_spec, inference function, data batch and so on.
+It works correctly at the beginning
+It stops several hours later
+
+&lt;denchmark-h:h3&gt;Source code / logs&lt;/denchmark-h&gt;
+
+My trainer function:
+&lt;denchmark-code&gt;def train_replica(cluster_spec,
+                  get_data_batch,
+                  inference_fn,
+                  get_init_fn,
+                  get_learning_rate,
+                  get_optimizer,
+                  get_train_variables,
+                  replica_param,
+                  train_param,
+                  ):
+    job_name = replica_param['job_name']
+    task_index = replica_param['task_index']
+    sync_replicas = train_param['sync_replicas']
+    log_dir = train_param['log_dir']
+    assert job_name in ['ps', 'worker']
+    server = tf.train.Server(cluster_spec, job_name=job_name,
+                             task_index=task_index, config=get_ps_session_config())
+    if job_name == 'ps':
+        server.join()
+    else:
+        is_chief = (task_index == 0)
+        device_setter = tf.train.replica_device_setter(cluster=cluster_spec)
+        with tf.Graph().as_default():
+            with tf.device(device_setter):
+                global_step = create_global_step()
+                learning_rate = get_learning_rate(global_step)
+                data_batch = get_data_batch()
+                _ = inference_fn(data_batch)
+                total_loss, task_loss = get_losses()
+                optimizer = get_optimizer(learning_rate)
+                if sync_replicas:
+                    optimizer = tf.train.SyncReplicasOptimizer(
+                        opt=optimizer,
+                        replicas_to_aggregate=cluster_spec.num_tasks('worker'),
+                        total_num_replicas=cluster_spec.num_tasks('worker'),
+                        name='sync_replica_optimizer'
+                    )
+                train_op = slim.learning.create_train_op(
+                    total_loss=total_loss,
+                    optimizer=optimizer,
+                    global_step=global_step,
+                    variables_to_train=get_train_variables(),
+                    clip_gradient_norm=train_param['clip_norm'],
+                    gradient_multipliers=train_param['gradient_multipliers'],
+                )
+                init_fn = get_init_fn() if get_init_fn is not None else None
+                scaffold = tf.train.Scaffold(
+                    init_op=tf.global_variables_initializer())
+                scaffold._init_fn = init_fn
+                hooks = [tf.train.StopAtStepHook(train_param['train_steps'])]
+                if sync_replicas is True:
+                    hooks.append(optimizer.make_session_run_hook(is_chief))
+                chief_only_hooks = [tf.train.LoggingTensorHook([total_loss, task_loss], 100)]
+                step_ind = 0
+                with tf.train.MonitoredTrainingSession(
+                        master=server.target,
+                        is_chief=is_chief,
+                        checkpoint_dir=log_dir,
+                        scaffold=scaffold,
+                        hooks=hooks,
+                        chief_only_hooks=chief_only_hooks,
+                        config=get_worker_session_config(task_index)) as session:
+                    while not session.should_stop():
+                        session.run(train_op)
+                        step_ind += 1
+                        if step_ind % 1000 == 0:
+                            tf.logging.debug('Training Step At {s}'.format(s=step_ind))
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='lsy643' date='2017-08-30T20:45:37Z'>
+		Is there any chance you could have it generate a Python stack trace, or attach a GDB debugger to the process to get a backtrace of all the threads, so we can have a better idea of where the code is getting stuck at?
+		</comment>
+		<comment id='2' author='lsy643' date='2017-09-03T06:16:10Z'>
+		&lt;denchmark-link:https://github.com/jart&gt;@jart&lt;/denchmark-link&gt;
+
+I have run my codes again, and when the training cluster hung, I used gdb to attach the server and worker processes. The trace back is stored in log files.
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/files/1272757/ps.log.txt&gt;ps.log.txt&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/files/1272755/worker1.log.txt&gt;worker1.log.txt&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/files/1272756/worker0.log.txt&gt;worker0.log.txt&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='3' author='lsy643' date='2017-09-12T03:26:56Z'>
+		Some more information, this problem exists among all TF versions.
+The stuck problem only happens in SyncReplicasOptimizer. When tracing the stucked processes, all workers and PSes are waiting on mutex. PSes do not get all the gradients in this round, so the global_step won't be updated to start next round.
+And the problem is related to the variables size in the model. If the variables are small enough(less data to transfer during iterations), the stuck doesn't happen. Not sure the exact threshold.
+		</comment>
+		<comment id='4' author='lsy643' date='2017-09-21T17:18:26Z'>
+		&lt;denchmark-link:https://github.com/mrry&gt;@mrry&lt;/denchmark-link&gt;
+, could you please take a look?
+		</comment>
+		<comment id='5' author='lsy643' date='2017-09-21T21:59:26Z'>
+		There's nothing obviously wrong with the code you've shown, but without a minimal and complete reproduction, there's almost no chance we'll be able to trigger the same bug, which might be due to transient network connectivity issues between your containers. In general, for long-running training, I would recommend adding a watchdog process that monitors whether progress is still being made (e.g. whether checkpoints are still being written), and that restarts the cluster from a checkpoint when no progress is detected for (e.g.) 2x the checkpoint interval.
+		</comment>
+		<comment id='6' author='lsy643' date='2017-09-25T16:28:55Z'>
+		&lt;denchmark-link:https://github.com/mrry&gt;@mrry&lt;/denchmark-link&gt;
+
+I will try to provide a minimal and complete reproduction. Can I provide My Docker Image and corresponding script to run the Cluster?
+Besides, when the cluster hung, the checkpoints will not be generated. And if the cluster is restarted, the cluster will work correctly until the next sudden hung.
+As mentioned by &lt;denchmark-link:https://github.com/passerbyd&gt;@passerbyd&lt;/denchmark-link&gt;
+, is there any possibility that it is all the grpc's fault?
+		</comment>
+		<comment id='7' author='lsy643' date='2017-09-28T07:35:12Z'>
+		About the checkpoints.
+If train.supervisor is used, checkpoints will keep being written, as it's on a separated thread. So there is no problem about the whole TF process, but only in the optimizer.
+As mentioned by &lt;denchmark-link:https://github.com/lsy643&gt;@lsy643&lt;/denchmark-link&gt;
+, everything works fine after restarting all processes.
+		</comment>
+		<comment id='8' author='lsy643' date='2017-11-30T22:26:23Z'>
+		I am experimenting something quite similar. With TensorFlow 1.4 and python 2.7. I run 2 workers (master + worker) one in each GPU and several parameter servers (I tried with 1 and 4). After a couple of hours, the master hangs and the worker keeps working. I run the master and the worker with the python debugger. It works for the worker but not for the master. It seems master is stopped in the C code somewhere. All processes are using the CPU, but master doesn't use any GPU and there is no progress in the training (nothing written in the log). So it could be master is in a loop somewhere. I have no idea how to debug it more to give you more information.
+		</comment>
+		<comment id='9' author='lsy643' date='2017-12-01T11:58:47Z'>
+		This is the back trace where it hangs for me:
+&lt;denchmark-code&gt;#0  0x00007ffff7bc738d in pthread_cond_wait@@GLIBC_2.3.2 () from /usr/lib/libpthread.so.0
+#1  0x00007fffb19a248d in __gthread_cond_wait (__mutex=&lt;optimized out&gt;, __cond=&lt;optimized out&gt;)
+    at /build/gcc/src/gcc-build/x86_64-pc-linux-gnu/libstdc++-v3/include/x86_64-pc-linux-gnu/bits/gthr-default.h:864
+#2  std::condition_variable::wait (this=&lt;optimized out&gt;, __lock=...)
+    at /build/gcc/src/gcc/libstdc++-v3/src/c++11/condition_variable.cc:53
+#3  0x00007fffbc58c2fb in nsync::nsync_mu_semaphore_p_with_deadline(nsync::nsync_semaphore_s_*, timespec) ()
+   from /python2env/lib/python2.7/site-packages/tensorflow/python/_pywrap_tensorflow_internal.so
+#4  0x00007fffbc58bbe1 in nsync::nsync_sem_wait_with_cancel_(nsync::waiter*, timespec, nsync::nsync_note_s_*) ()
+   from /python2env/lib/python2.7/site-packages/tensorflow/python/_pywrap_tensorflow_internal.so
+#5  0x00007fffbc589134 in nsync::nsync_cv_wait_with_deadline_generic(nsync::nsync_cv_s_*, void*, void (*)(void*), void (*)(void*), timespec, nsync::nsync_note_s_*) ()
+   from /python2env/lib/python2.7/site-packages/tensorflow/python/_pywrap_tensorflow_internal.so
+#6  0x00007fffbc589645 in nsync::nsync_cv_wait_with_deadline(nsync::nsync_cv_s_*, nsync::nsync_mu_s_*, timespec, nsync::nsync_note_s_*) () from /python2env/lib/python2.7/site-packages/tensorflow/python/_pywrap_tensorflow_internal.so
+#7  0x00007fffba294c1b in tensorflow::(anonymous namespace)::WaitForNotification(tensorflow::CallOptions*, long long, tensorflow::Notification*) ()
+   from /python2env/lib/python2.7/site-packages/tensorflow/python/_pywrap_tensorflow_internal.so
+#8  0x00007fffba29573b in tensorflow::LocalMaster::RunStep(tensorflow::CallOptions*, tensorflow::RunStepRequestWrapper*, tensorflow::MutableRunStepResponseWrapper*) ()
+   from /python2env/lib/python2.7/site-packages/tensorflow/python/_pywrap_tensorflow_internal.so
+#9  0x00007fffba27ee09 in tensorflow::GrpcSession::RunProto(tensorflow::CallOptions*, tensorflow::MutableRunStepRequestWrapper*, tensorflow::MutableRunStepResponseWrapper*) ()
+   from /python2env/lib/python2.7/site-packages/tensorflow/python/_pywrap_tensorflow_internal.so
+#10 0x00007fffba27fc81 in tensorflow::GrpcSession::RunHelper(tensorflow::RunOptions const&amp;, std::vector&lt;std::pair&lt;std::string, tensorflow::Tensor&gt;, std::allocator&lt;std::pair&lt;std::string, tensorflow::Tensor&gt; &gt; &gt; const&amp;, std::vector&lt;std::string, std::allocator&lt;std::string&gt; &gt; const&amp;, std::vector&lt;std::string, std::allocator&lt;std::string&gt; &gt; const&amp;, std::vector&lt;tensorflow::Tensor, std::allocator&lt;tensorflow::Tensor&gt; &gt;*, tensorflow::RunMetadata*, std::string const&amp;) ()
+   from /python2env/lib/python2.7/site-packages/tensorflow/python/_pywrap_tensorflow_internal.so
+#11 0x00007fffba2802fb in tensorflow::GrpcSession::Run(tensorflow::RunOptions const&amp;, std::vector&lt;std::pair&lt;std::string, tensorflow::Tensor&gt;, std::allocator&lt;std::pair&lt;std::string, tensorflow::Tensor&gt; &gt; &gt; const&amp;, std::vector&lt;std::string, std::allocator&lt;std::string&gt; &gt; const&amp;, std::vector&lt;std::string, std::allocator&lt;std::string&gt; &gt; const&amp;, std::vector&lt;tensorflow::Tensor, std::allocator&lt;tensorflow::Tensor&gt; &gt;*, tensorflow::RunMetadata*) ()
+   from /python2env/lib/python2.7/site-packages/tensorflow/python/_pywrap_tensorflow_internal.so
+#12 0x00007fffba5084ea in TF_Run_Helper(tensorflow::Session*, char const*, TF_Buffer const*, std::vector&lt;std::pair&lt;std::string, tensorflow::Tensor&gt;, std::allocator&lt;std::pair&lt;std::string, tensorflow::Tensor&gt; &gt; &gt; const&amp;, std::vector&lt;std::string, std::allocator&lt;std::string&gt; &gt; const&amp;, TF_Tensor**, std::vector&lt;std::string, std::allocator&lt;std::string&gt; &gt; const&amp;, TF_Buffer*, TF_Status*) () from /python2env/lib/python2.7/site-packages/tensorflow/python/_pywrap_tensorflow_internal.so
+#13 0x00007fffba508824 in TF_Run ()
+   from /python2env/lib/python2.7/site-packages/tensorflow/python/_pywrap_tensorflow_internal.so
+#14 0x00007fffba22601a in tensorflow::TF_Run_wrapper_helper(TF_DeprecatedSession*, char const*, TF_Buffer const*, _object*, tensorflow::gtl::InlinedVector&lt;char const*, 8&gt; const&amp;, tensorflow::gtl::InlinedVector&lt;char const*, 8&gt; const&amp;, TF_Status*, tensorflow::gtl::InlinedVector&lt;_object*, 8&gt;*, TF_Buffer*) ()
+   from /python2env/lib/python2.7/site-packages/tensorflow/python/_pywrap_tensorflow_internal.so
+#15 0x00007fffba226411 in tensorflow::TF_Run_wrapper(TF_DeprecatedSession*, TF_Buffer const*, _object*, tensorflow::gtl::InlinedVector&lt;char const*, 8&gt; const&amp;, tensorflow::gtl::InlinedVector&lt;char const*, 8&gt; const&amp;, TF_Status*, tensorflow::gtl::InlinedVector&lt;_object*, 8&gt;*, TF_Buffer*) ()
+   from /python2env/lib/python2.7/site-packages/tensorflow/python/_pywrap_tensorflow_internal.so
+#16 0x00007fffba1ea6f1 in _wrap_TF_Run ()
+   from /python2env/lib/python2.7/site-packages/tensorflow/python/_pywrap_tensorflow_internal.so
+#17 0x00007ffff74a4449 in PyEval_EvalFrameEx () from /usr/lib/libpython2.7.so.1.0
+#18 0x00007ffff7503886 in PyEval_EvalCodeEx () from /usr/lib/libpython2.7.so.1.0
+#19 0x00007ffff747c80f in function_call.lto_priv () from /usr/lib/libpython2.7.so.1.0
+#20 0x00007ffff74ccd93 in PyObject_Call () from /usr/lib/libpython2.7.so.1.0
+#21 0x00007ffff74a76fe in PyEval_EvalFrameEx () from /usr/lib/libpython2.7.so.1.0
+#22 0x00007ffff7503886 in PyEval_EvalCodeEx () from /usr/lib/libpython2.7.so.1.0
+#23 0x00007ffff74aa283 in PyEval_EvalFrameEx () from /usr/lib/libpython2.7.so.1.0
+#24 0x00007ffff7503886 in PyEval_EvalCodeEx () from /usr/lib/libpython2.7.so.1.0
+#25 0x00007ffff74aa283 in PyEval_EvalFrameEx () from /usr/lib/libpython2.7.so.1.0
+#26 0x00007ffff7503886 in PyEval_EvalCodeEx () from /usr/lib/libpython2.7.so.1.0
+#27 0x00007ffff74aa283 in PyEval_EvalFrameEx () from /usr/lib/libpython2.7.so.1.0
+#28 0x00007ffff7503886 in PyEval_EvalCodeEx () from /usr/lib/libpython2.7.so.1.0
+#29 0x00007ffff747c9b8 in function_call.lto_priv () from /usr/lib/libpython2.7.so.1.0
+#30 0x00007ffff74ccd93 in PyObject_Call () from /usr/lib/libpython2.7.so.1.0
+#31 0x00007ffff74a76fe in PyEval_EvalFrameEx () from /usr/lib/libpython2.7.so.1.0
+#32 0x00007ffff7503886 in PyEval_EvalCodeEx () from /usr/lib/libpython2.7.so.1.0
+#33 0x00007ffff747c9b8 in function_call.lto_priv () from /usr/lib/libpython2.7.so.1.0
+#34 0x00007ffff74ccd93 in PyObject_Call () from /usr/lib/libpython2.7.so.1.0
+#35 0x00007ffff746144f in instancemethod_call.lto_priv () from /usr/lib/libpython2.7.so.1.0
+#36 0x00007ffff74ccd93 in PyObject_Call () from /usr/lib/libpython2.7.so.1.0
+#37 0x00007ffff74a9c6e in PyEval_EvalFrameEx () from /usr/lib/libpython2.7.so.1.0
+#38 0x00007ffff7503886 in PyEval_EvalCodeEx () from /usr/lib/libpython2.7.so.1.0
+#39 0x00007ffff747c9b8 in function_call.lto_priv () from /usr/lib/libpython2.7.so.1.0
+#40 0x00007ffff74ccd93 in PyObject_Call () from /usr/lib/libpython2.7.so.1.0
+#41 0x00007ffff74a76fe in PyEval_EvalFrameEx () from /usr/lib/libpython2.7.so.1.0
+#42 0x00007ffff7503886 in PyEval_EvalCodeEx () from /usr/lib/libpython2.7.so.1.0
+#43 0x00007ffff74aa283 in PyEval_EvalFrameEx () from /usr/lib/libpython2.7.so.1.0
+#44 0x00007ffff7503886 in PyEval_EvalCodeEx () from /usr/lib/libpython2.7.so.1.0
+#45 0x00007ffff74a9d7f in PyEval_EvalFrameEx () from /usr/lib/libpython2.7.so.1.0
+#46 0x00007ffff7503886 in PyEval_EvalCodeEx () from /usr/lib/libpython2.7.so.1.0
+#47 0x00007ffff74a9d7f in PyEval_EvalFrameEx () from /usr/lib/libpython2.7.so.1.0
+#48 0x00007ffff7503886 in PyEval_EvalCodeEx () from /usr/lib/libpython2.7.so.1.0
+#49 0x00007ffff74a9d7f in PyEval_EvalFrameEx () from /usr/lib/libpython2.7.so.1.0
+#50 0x00007ffff74a4b50 in PyEval_EvalFrameEx () from /usr/lib/libpython2.7.so.1.0
+#51 0x00007ffff74a4b50 in PyEval_EvalFrameEx () from /usr/lib/libpython2.7.so.1.0
+#52 0x00007ffff74a4b50 in PyEval_EvalFrameEx () from /usr/lib/libpython2.7.so.1.0
+#53 0x00007ffff74a4b50 in PyEval_EvalFrameEx () from /usr/lib/libpython2.7.so.1.0
+#54 0x00007ffff7503886 in PyEval_EvalCodeEx () from /usr/lib/libpython2.7.so.1.0
+#55 0x00007ffff751905a in PyEval_EvalCode () from /usr/lib/libpython2.7.so.1.0
+#56 0x00007ffff75207f1 in run_mod () from /usr/lib/libpython2.7.so.1.0
+#57 0x00007ffff75220d5 in PyRun_FileExFlags () from /usr/lib/libpython2.7.so.1.0
+#58 0x00007ffff75222aa in PyRun_SimpleFileExFlags () from /usr/lib/libpython2.7.so.1.0
+#59 0x00007ffff7510863 in Py_Main () from /usr/lib/libpython2.7.so.1.0
+#60 0x00007ffff7822f6a in __libc_start_main () from /usr/lib/libc.so.6
+#61 0x000055555555478a in _start ()
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='10' author='lsy643' date='2017-12-04T04:49:43Z'>
+		There's no such problem in "grpc + verbs" mode. &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/5394&gt;#5394&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='11' author='lsy643' date='2017-12-04T16:34:05Z'>
+		To anyone facing hangs in the distributed mode, there was a bug in the version of gRPC used in TF 1.4 that would cause servers to stop serving after a (non-deterministic) period of time. This has been fixed at HEAD, and TensorFlow now uses a version of gRPC with the fix. I'd recommend trying to reproduce the problem with the tf-nightly build to rule out that old bug as the source of the problem.
+		</comment>
+		<comment id='12' author='lsy643' date='2017-12-11T21:53:29Z'>
+		&lt;denchmark-link:https://github.com/lsy643&gt;@lsy643&lt;/denchmark-link&gt;
+, &lt;denchmark-link:https://github.com/jorgemf&gt;@jorgemf&lt;/denchmark-link&gt;
+, can you confirm that the issue has been fixed for you at HEAD?
+		</comment>
+		<comment id='13' author='lsy643' date='2017-12-12T09:55:54Z'>
+		@angersson I have been using a nightly build for the last week and no stop happening anymore. I am not sure about TF 1.4.1
+		</comment>
+		<comment id='14' author='lsy643' date='2017-12-15T02:54:24Z'>
+		@angersson I ran my experiment again after updating, so far It works fine and no stop happens
+		</comment>
+		<comment id='15' author='lsy643' date='2017-12-15T18:38:30Z'>
+		Great, thanks for confirming!
+		</comment>
+		<comment id='16' author='lsy643' date='2018-11-27T06:54:24Z'>
+		&lt;denchmark-link:https://github.com/mrry&gt;@mrry&lt;/denchmark-link&gt;
+  Is there the same issue with grpc used in tf1.7.0?
+		</comment>
+		<comment id='17' author='lsy643' date='2018-12-12T12:34:49Z'>
+		&lt;denchmark-link:https://github.com/mrry&gt;@mrry&lt;/denchmark-link&gt;
+ I have encountered hang issue 3 times since last week in tf1.9.0 on a 8x8 GPUs cluster.
+by the way, the GPU bound to the hanging process is forever in 100% usage when it is hanging.
+
+, argc=10,
+argv=0x7ffc2ac5c958, init=, fini=,
+rtld_fini=, stack_end=0x7ffc2ac5c948)
+at ../csu/libc-start.c:291
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/73&gt;#73&lt;/denchmark-link&gt;
+ 0x00000000005d6999 in _start ()
+
+		</comment>
+		<comment id='18' author='lsy643' date='2019-05-11T08:00:10Z'>
+		&lt;denchmark-link:https://github.com/chenjiasheng&gt;@chenjiasheng&lt;/denchmark-link&gt;
+, anything new ? i see the same call stack ...
+		</comment>
+		<comment id='19' author='lsy643' date='2019-05-11T10:22:07Z'>
+		&lt;denchmark-link:https://github.com/zrss&gt;@zrss&lt;/denchmark-link&gt;
+ My colleague has avoided this hanging issue, or at least reduced the hanging probability, by making an explicit call to mpi barrier at the end of each batch.  We don't know why it works but it just goes that way.
+		</comment>
+		<comment id='20' author='lsy643' date='2019-05-11T14:51:13Z'>
+		&lt;denchmark-link:https://github.com/chenjiasheng&gt;@chenjiasheng&lt;/denchmark-link&gt;
+ , oh thx a lot, we use the tf 1.8 with horovod nccl, and ran at 8 * 4 GPU cluster, and it hang at the middle of trainning with all GPUs util 100%; we print the backtrace of threads, it is very similar to your case ...
+		</comment>
+		<comment id='21' author='lsy643' date='2020-03-13T13:14:14Z'>
+		&lt;denchmark-link:https://github.com/zrss&gt;@zrss&lt;/denchmark-link&gt;
+ I met the same problem, have you solved it?
+		</comment>
+	</comments>
+</bug>

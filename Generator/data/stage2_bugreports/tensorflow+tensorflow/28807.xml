@@ -1,0 +1,89 @@
+<bug id='28807' author='geert56' open_date='2019-05-17T19:25:15Z' closed_time='2019-11-15T22:47:43Z'>
+	<summary>TensorFlow Lite InterpreterBuilder::ParseTensors incorrect for big-endian machines</summary>
+	<description>
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): No
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Ubuntu 18.04.2 LTS (GNU/Linux 4.15.0-45-generic s390x)
+Mobile device (e.g. iPhone 8, Pixel 2, Samsung Galaxy) if the issue happens on mobile device: N/A
+TensorFlow installed from (source or binary): source
+TensorFlow version (use command below): 1.13.0
+Python version: Python 2.7.15rc1 (default, Nov 12 2018, 14:31:15)
+Bazel version (if compiling from source): N/A (tflite build via lite/tools/make/Makefile)
+GCC/Compiler version (if compiling from source): gcc (Ubuntu 7.3.0-27ubuntu1~18.04) 7.3.0
+CUDA/cuDNN version: N/A
+GPU model and memory: N/A
+
+Describe the current behavior
+Any attempt to run one of the TF Lite utilities (e.g. label_image, benchmark_model) or use the interpreter via an import in Python will generate error messages at time of loading a FlatBuffers tflite model file.
+Describe the expected behavior
+TensorFlow Lite should correctly read a FlatBuffers tflite file and build an internal model structure for its interpreter without any errors.
+
+A mere inspection of the model.cc source code (in directory tensorflow/lite) will show that the InterpreterBuilder::ParseTensors function assigns a FlatBuffers buffer pointer directly to the TF Lite tensor's object data field. (See &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/master/tensorflow/lite/model.cc&gt;https://github.com/tensorflow/tensorflow/blob/master/tensorflow/lite/model.cc&lt;/denchmark-link&gt;
+ line 350).
+This will cause any multi-byte element of a tensor to be incorrectly interpreted since FlatBuffers use strictly little-endian for all numeric values.
+Other info / logs
+The offending source line is line 390:
+buffer_data = reinterpret_cast&lt;const char&gt;(array-&gt;data());
+A tentative solution needs a two-fold change:
+
+The tensor type must be used to learn how to interpret the char data and this data must be byte swapped accordingly. FlatBuffers already provides a utility function for that:
+flatbuffers::EndianScalar(). Unfortunately this requires a loop over all data in strides of the size of a tensor element. But need only be done once during model build.
+
+Example of correctly handling 32-bit integers:
+            *buffer_size = size;                                                                
+            *buffer_data = reinterpret_cast&lt;const char*&gt;(array-&gt;data());                                                                   
+            switch (type) {                                                                     
+            case kTfLiteInt32: {                                                                
+              int32_t *p = reinterpret_cast&lt;int32_t*&gt;(const_cast&lt;uint8_t*&gt;(array-&gt;data()));     
+              for (size_t i = 0; i &lt; size; i+=4, ++p)                                           
+                *p = flatbuffers::EndianScalar(*p);                                             
+              break;                                                                            
+            }                                                                                   
+
+
+The FlatBuffers buffer must be writable. One must drop the const specifier and moreover since the tflite file is memory-mapped the mapping options must include PROT_WRITE and the mode must be MAP_PRIVATE in mmap_allocation.cc.
+
+Example of new mmap call:
+   mmap(nullptr, buffer_size_bytes_, PROT_READ|PROT_WRITE, MAP_PRIVATE, mmap_fd_, 0);
+
+There is also a minor issue in the label_image example where a BMP file is read and its header which has some little-endian integers that are not converted on a big-endian machine.
+A simple solution for this (in lite/examples/label_image/bitmap_helpers.cc):
+ header_size = flatbuffers::EndianScalar(header_size);
+ *width = flatbuffers::EndianScalar(*width);
+ *height = flatbuffers::EndianScalar(*height);
+ bpp = flatbuffers::EndianScalar(bpp);
+
+	</description>
+	<comments>
+		<comment id='1' author='geert56' date='2019-07-02T11:40:15Z'>
+		I'd like to update this issue. I've run into exactly the same problem while deploying a TensorFlow lite model to a new big endian target using lite micro. The additional problem here is that the FlatBuffer is compiled into the program binary and referenced from there. This means that step 2 of the proposed solution is not possible in TensorFlow lite micro deployments.
+I'm not sure what the best solution in this case is. Either the values are byte shuffled from little endian to big endian as the tensor operations are being evaluated which would have a terrible effect on performance or a big endian version of the FlatBuffer could be created which would technically break the flat buffer standard. The latter would be the simplest and highest performance solution, but alter the TensorFlow lite micro deployment process.
+		</comment>
+		<comment id='2' author='geert56' date='2019-07-04T15:49:00Z'>
+		I've actually made the solution presented by &lt;denchmark-link:https://github.com/geert56&gt;@geert56&lt;/denchmark-link&gt;
+ work successfully in TF lite micro when tested on the Leon 3 (Sparc V8) big endian system. There wasn't any problem updating the values stored in the binary.
+A pull request with these updates has been submitted here &lt;denchmark-link:https://github.com/tensorflow/tensorflow/pull/30362&gt;#30362&lt;/denchmark-link&gt;
+
+This doesn't fix the problem in TF lite in general only in TF lite micro.
+Two files of this PR are specifically dealing with big endian compatability.
+tensorflow/lite/experimental/micro/micro_interpreter.cc - modifies the loaded model weights in the case of a big endian system
+tensorflow/lite/kernels/kernel_util.h - modifies the reading of several array indices which are incorrect if not converted.
+Update demonstrates the proposed solution works as indented and can be used as a guide to updating the relevant files for TF lite in general
+		</comment>
+		<comment id='3' author='geert56' date='2019-11-15T22:47:43Z'>
+		This is a known limitation of TFLite schema:
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/master/tensorflow/lite/schema/schema.fbs#L94&gt;https://github.com/tensorflow/tensorflow/blob/master/tensorflow/lite/schema/schema.fbs#L94&lt;/denchmark-link&gt;
+
+Also please try out what &lt;denchmark-link:https://github.com/PeteBlackerThe3rd&gt;@PeteBlackerThe3rd&lt;/denchmark-link&gt;
+ suggested. Thanks!
+		</comment>
+		<comment id='4' author='geert56' date='2019-11-15T22:47:45Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/28807&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/28807&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,154 @@
+<bug id='37839' author='lminer' open_date='2020-03-23T20:35:46Z' closed_time='2020-11-06T18:20:26Z'>
+	<summary>ModelCheckpoint callback can't save entire subclassed models</summary>
+	<description>
+The keras callback ModelCheckpoint won't save a subclassed model in SavedModel format. It only ever saves the checkpoints.
+import tensorflow as tf
+import numpy as np
+
+class TestModel(tf.keras.Model):
+
+    def __init__(self):
+        super().__init__()
+        self.dense1 = tf.keras.layers.Dense(64, activation='relu')
+        self.dense2 = tf.keras.layers.Dense(64, activation='relu')
+        self.dense3 = tf.keras.layers.Dense(10)
+
+    def call(self, inputs):
+        x = self.dense1(inputs)
+        x = self.dense2(x)
+        return self.dense3(x)
+
+
+model = TestModel()
+model.compile(optimizer=tf.keras.optimizers.Adam(0.01),
+              loss='mse',      
+              metrics=['mae'])  
+
+data = np.random.random((1000, 32))
+labels = np.random.random((1000, 10))
+
+model.fit(
+    data, labels, epochs=10, batch_size=32,
+    callbacks=[tf.keras.callbacks.ModelCheckpoint('model_{epoch:02d}.ckpt',
+                                                  save_weights_only=False)])
+It seems as if the callback forces weights_only saving &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/master/tensorflow/python/keras/callbacks.py#L1148&gt;here&lt;/denchmark-link&gt;
+. While this makes sense if the model is in  format, it doesn't make sense for  format.
+	</description>
+	<comments>
+		<comment id='1' author='lminer' date='2020-03-24T06:01:37Z'>
+		&lt;denchmark-link:https://github.com/lminer&gt;@lminer&lt;/denchmark-link&gt;
+
+Can you please share simple standalone code to reproduce the issue.It helps us in localizing the issue faster. Please, let us know TF version as well. Thanks!
+		</comment>
+		<comment id='2' author='lminer' date='2020-03-24T11:12:58Z'>
+		If I read well the source code, if you custom model inherits from Model and is a graph network (i.e. not running eagerly) it should be working...
+		</comment>
+		<comment id='3' author='lminer' date='2020-03-24T16:05:31Z'>
+		&lt;denchmark-link:https://github.com/pandrey-fr&gt;@pandrey-fr&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/ravikyram&gt;@ravikyram&lt;/denchmark-link&gt;
+ I'll try to get a standalone example together. The problem must be that the model is being run eagerly. How to you force it to be a graph network? Also, why is it a problem if it's run eagerly? I made my own version of the callback where I deleted the check for whether it is running eagerly and it saves without a problem.
+		</comment>
+		<comment id='4' author='lminer' date='2020-03-25T21:19:26Z'>
+		&lt;denchmark-link:https://github.com/ravikyram&gt;@ravikyram&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/pandrey-fr&gt;@pandrey-fr&lt;/denchmark-link&gt;
+ it's updated.
+		</comment>
+		<comment id='5' author='lminer' date='2020-03-26T09:33:10Z'>
+		Okay, actually it turns out that _is_graph_network is not about Eager execution, but about the distinction between the functional and subclass APIs.
+In functional API, you would define your example network as:
+dense1 = tf.keras.layers.Dense(64, activation='relu')
+dense2 = tf.keras.layers.Dense(64, activation='relu')
+dense3 = tf.keras.layers.Dense(10)
+inputs = tf.keras.Input((32,), dtype='float32')
+output = dense3(dense2(dense1(inputs)))
+model = tf.keras.Model(inputs, output)
+Which would have the computation graph built at instantiation, notably through the clear definition of inputs' (and thus, all nodes') specification.
+In the subclass API however, the instantiation procedure differs (&lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/dc05a7a6b94e65f92924c82841a5332c86cbc3c9/tensorflow/python/keras/engine/network.py#L366&gt;this method&lt;/denchmark-link&gt;
+ is called), which results in a Model with somehow reduced capabilities. To be fair, the point of this is to allow defining  constructor subclasses which implement alternative behaviours,  different train step procedures, yet remain general enough to be used in functional API.
+Now in your example, I would advise writing your model architecture as a tf.keras.layers.Layer subclass, and then using the functional API to instantiate a Model out of it:
+class TestModel(tf.keras.layers.Layer):
+
+    def __init__(self):
+        super().__init__()
+        self.dense1 = tf.keras.layers.Dense(64, activation='relu')
+        self.dense2 = tf.keras.layers.Dense(64, activation='relu')
+        self.dense3 = tf.keras.layers.Dense(10)
+
+    def call(self, inputs):
+        x = self.dense1(inputs)
+        x = self.dense2(x)
+        return self.dense3(x)
+
+inputs = tf.keras.Input((32,), dtype='float32')
+network = TestModel()
+model = tf.keras.Model(inputs, network(inputs))
+		</comment>
+		<comment id='6' author='lminer' date='2020-03-26T16:11:41Z'>
+		Is it necessary to use that approach anymore? In tensorflow 2.2.0-rc1 I can save a subclassed model in the SavedModel format and restore it without a problem. Maybe this check is now obsolete.
+Edit: &lt;denchmark-link:https://github.com/pandrey-fr&gt;@pandrey-fr&lt;/denchmark-link&gt;
+ is the problem that it wouldn't be possible to serialize the model into the SavedModel format if I overrode  as then it really would involve serializing code?
+		</comment>
+		<comment id='7' author='lminer' date='2020-03-27T09:24:05Z'>
+		
+In tensorflow 2.2.0-rc1 I can save a subclassed model in the SavedModel format and restore it without a problem.
+
+I have to admit I don't quite get why it works in 2.2 and not in previous versions, but great! If I understand well, some specifications are inferred / set within the fit call, which explains why I was initially able to replicate the issue by attempting to use model.save before model.fit.
+
+is the problem that it wouldn't be possible to serialize the model into the SavedModel format if I overrode train_step as then it really would involve serializing code?
+
+Normally this should not be an issue. The checkpoints should allow you to resume training with an instance of the same custom model class; I don't think that checkpoints do not contain the train_step code, but to be honest I do not know much about the checkpointing system.
+		</comment>
+		<comment id='8' author='lminer' date='2020-03-27T16:16:10Z'>
+		Should we perhaps alter that check to only apply for h5 format?
+		</comment>
+		<comment id='9' author='lminer' date='2020-04-05T08:46:02Z'>
+		&lt;denchmark-link:https://github.com/lminer&gt;@lminer&lt;/denchmark-link&gt;
+ Isn't this the intended behavior of checkpointing as it only saves weights of the model not the model itself?
+		</comment>
+		<comment id='10' author='lminer' date='2020-04-05T15:53:59Z'>
+		&lt;denchmark-link:https://github.com/gowthamkpr&gt;@gowthamkpr&lt;/denchmark-link&gt;
+ the callback has the option of either saving weights or saving the entire model. Given that it has this option, and that it has the ability to delivery this functionality provided you are saving in SavedModel format, why not enable it?
+		</comment>
+		<comment id='11' author='lminer' date='2020-04-19T20:42:08Z'>
+		I am running in this same issue as well, have a sub-classed keras model that I can save fine manually using the SaveModel format. However when using the ModelCheckpoint this is not possible, as model._is_graph_network is False for a sub-classed model (which results in save_weights_only flag to be set to True (&lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/master/tensorflow/python/keras/callbacks.py#L1161&gt;here&lt;/denchmark-link&gt;
+).
+		</comment>
+		<comment id='12' author='lminer' date='2020-04-23T00:10:32Z'>
+		&lt;denchmark-link:https://github.com/gowthamkpr&gt;@gowthamkpr&lt;/denchmark-link&gt;
+ Any update on this? I understand why this was the intended behavior back when subclassed models couldn't be saved. But now that this functionality has been added in tensorflow 2.2.0, it makes sense to update the callback so that there is feature parity between subclassed models and functional api models.
+		</comment>
+		<comment id='13' author='lminer' date='2020-05-14T04:17:55Z'>
+		&lt;denchmark-link:https://github.com/lminer&gt;@lminer&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/claudio525&gt;@claudio525&lt;/denchmark-link&gt;
+ Thanks for the update.
+		</comment>
+		<comment id='14' author='lminer' date='2020-08-05T15:45:20Z'>
+		Is there an update here?
+		</comment>
+		<comment id='15' author='lminer' date='2020-08-09T21:44:14Z'>
+		Yes, let's have an update on this ASAP, please.
+Thanks.
+		</comment>
+		<comment id='16' author='lminer' date='2020-08-29T20:59:30Z'>
+		I still see this issue in TF 2.3.0. When I reload model, it doesn't have custom train_step method. Is there any fix yet?
+I would like to continue training model after reloading it.
+		</comment>
+		<comment id='17' author='lminer' date='2020-09-15T18:23:57Z'>
+		Upvote here. I would love to see this fixed.
+		</comment>
+		<comment id='18' author='lminer' date='2020-09-16T20:41:23Z'>
+		I m facing the same issue as well subclass model is the only option for the keras CRF layer and as result of this issue we can't save the best model post early stopping.
+		</comment>
+		<comment id='19' author='lminer' date='2020-11-06T18:20:26Z'>
+		 &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/37620&gt;#37620&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='20' author='lminer' date='2020-11-06T18:20:27Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/37839&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/37839&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

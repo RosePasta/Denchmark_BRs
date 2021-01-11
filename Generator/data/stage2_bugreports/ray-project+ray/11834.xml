@@ -1,0 +1,198 @@
+<bug id='11834' author='synapsesanddendrites' open_date='2020-11-05T15:38:23Z' closed_time='2020-11-06T18:15:37Z'>
+	<summary>[tune] Tune runs until 'trials did not complete' error</summary>
+	<description>
+Python: 3.7.7, Pytorch: 1.6.0, Ray 0:8:1
+I have the following script to tune the architecture of a regression model with 5 inputs and 225 outputs. It runs for a while but will eventually error after several runtime errors of the form 'RuntimeError: The size of tensor a (***) must match the size of tensor b (225) at non-singleton dimension 1'. *** is the size of a tunable layer in the optimization. This is surprising as the output layer size should not be tunable.
+&lt;denchmark-code&gt;from functools import partial
+import numpy as np
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import random_split
+import torchvision
+import torchvision.transforms as transforms
+from ray import tune
+from ray.tune.progress_reporter import CLIReporter
+from ray.tune.schedulers import ASHAScheduler
+import torch.utils.data as Data
+from torch.autograd import Variable
+
+ray.init(local_mode=True)
+thets=np.random.randn([1100000,5])
+y=np.random.randn([1100000,225])
+torch_dataset = Data.TensorDataset(torch.as_tensor(thets).float(), torch.as_tensor(y).float())
+
+class Net(nn.Module):
+    def __init__(self, l1=10, l2=20, l3=40, l4=60, l5=120):
+        super(Net, self).__init__()
+        self.fc1 = nn.Linear(5, l1)
+        self.fc2 = nn.Linear(l1, l2)
+        self.fc3 = nn.Linear(l2, l3)
+        self.fc4 = nn.Linear(l3, l4)
+        self.fc5 = nn.Linear(l4, l5)
+        self.fc6 = nn.Linear(l5, 225)
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = F.relu(self.fc3(x))
+        x = F.relu(self.fc4(x))
+        x = F.relu(self.fc5(x))
+        x = self.fc6(x)
+        return x
+    
+def train_reg(config, dataset,checkpoint_dir=None):
+    net=Net(config["l1"],config["l2"],config["l3"],config["l4"],config["l5"])
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda:0"
+        if torch.cuda.device_count() &gt; 1:
+            net = nn.DataParallel(net)
+    net.to(device)
+
+    criterion = nn.MSELoss()
+    optimizer = optim.SGD(net.parameters(), lr=config["lr"], momentum=0.9)
+    if checkpoint_dir:
+        model_state, optimizer_state = torch.load(
+            os.path.join(checkpoint_dir, "checkpoint"))
+        net.load_state_dict(model_state)
+        optimizer.load_state_dict(optimizer_state)
+
+
+    test_abs = int(len(torch_dataset) * 0.8)
+    train_subset, val_subset = random_split(
+        torch_dataset, [test_abs, len(torch_dataset) - test_abs])
+
+    trainloader = torch.utils.data.DataLoader(
+        train_subset,
+        batch_size=int(config["batch_size"]),
+        shuffle=True,
+        num_workers=2)
+    valloader = torch.utils.data.DataLoader(
+        val_subset,
+        batch_size=int(config["batch_size"]),
+        shuffle=True,
+        num_workers=2)
+
+    for epoch in range(50):  # loop over the dataset multiple times
+        running_loss = 0.0
+        epoch_steps = 0
+        for i, data in enumerate(trainloader, 0):
+            # get the inputs; data is a list of [inputs, labels]
+            inputs, labels = data
+            inputs, labels = inputs.to(device), labels.to(device)
+
+            # zero the parameter gradients
+            optimizer.zero_grad()
+
+            # forward + backward + optimize
+            outputs = net(inputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+            # print statistics
+            running_loss += loss.item()
+            epoch_steps += 1
+            if i % 2000 == 1999:  # print every 2000 mini-batches
+                print("[%d, %5d] loss: %.3f" % (epoch + 1, i + 1,
+                                                running_loss / epoch_steps))
+                running_loss = 0.0
+
+        # Validation loss
+        val_loss = 0.0
+        val_steps = 0
+        total = 0
+        correct = 0
+        for i, data in enumerate(valloader, 0):
+            with torch.no_grad():
+                inputs, labels = data
+                inputs, labels = inputs.to(device), labels.to(device)
+
+                outputs = net(inputs)
+                _, predicted = torch.max(outputs.data, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+
+                loss = criterion(outputs, labels)
+                val_loss += loss.cpu().numpy()
+                val_steps += 1
+
+        with tune.checkpoint_dir(epoch) as checkpoint_dir:
+            path = os.path.join(checkpoint_dir, "checkpoint")
+            torch.save((net.state_dict(), optimizer.state_dict()), path)
+
+        tune.report(loss=(val_loss / val_steps), accuracy=correct / total)
+    print("Finished Training")
+
+
+def main(dataset,num_samples=10, max_num_epochs=10, gpus_per_trial=0):
+
+    config = {
+    "l1": tune.sample_from(lambda _: 2**np.random.randint(2, 9)),
+    "l2": tune.sample_from(lambda _: 2**np.random.randint(2, 9)),
+    "l3": tune.sample_from(lambda _: 2**np.random.randint(2, 9)),
+    "l4": tune.sample_from(lambda _: 2**np.random.randint(2, 9)),
+    "l5": tune.sample_from(lambda _: 2**np.random.randint(2, 9)),
+    "lr": tune.loguniform(1e-4, 1e-1),
+    "batch_size": tune.choice([2, 4, 8, 16, 32])
+    }
+
+    scheduler = ASHAScheduler(
+        metric="loss",
+        mode="min",
+        max_t=max_num_epochs,
+        grace_period=1,
+        reduction_factor=2)
+    reporter = CLIReporter()
+        # parameter_columns=["l1", "l2", "lr", "batch_size"],
+        #metric_columns=["loss", "accuracy", "training_iteration"])
+    result = tune.run(
+        partial(train_reg, dataset=dataset),
+        config=config,
+        num_samples=num_samples,
+        scheduler=scheduler)#,
+        #progress_reporter=reporter)
+
+    best_trial = result.get_best_trial("loss", "min", "last")
+    print("Best trial config: {}".format(best_trial.config))
+    print("Best trial final validation loss: {}".format(
+        best_trial.last_result["loss"]))
+    print("Best trial final validation accuracy: {}".format(
+        best_trial.last_result["accuracy"]))
+
+    best_trained_model = Net(best_trial.config["l1"], best_trial.config["l2"],best_trial.config["l3"],best_trial.config["l4"],best_trial.config["l5"])
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda:0"
+        if gpus_per_trial &gt; 1:
+            best_trained_model = nn.DataParallel(best_trained_model)
+    best_trained_model.to(device)
+
+    best_checkpoint_dir = best_trial.checkpoint.value
+    model_state, optimizer_state = torch.load(os.path.join(
+        best_checkpoint_dir, "checkpoint"))
+    best_trained_model.load_state_dict(model_state)
+
+main(torch_dataset)
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='synapsesanddendrites' date='2020-11-05T16:15:09Z'>
+		Hi &lt;denchmark-link:https://github.com/synapsesanddendrites&gt;@synapsesanddendrites&lt;/denchmark-link&gt;
+, does the  function work if you instantiate the Network manually, i.e. without Ray Tune? On a first glance this doesn't seem to be a Tune error but rather something in your model.
+		</comment>
+		<comment id='2' author='synapsesanddendrites' date='2020-11-05T16:16:24Z'>
+		In any case it would be helpful to see which parameters (i.e. which values for l1, l2 etc) cause the problem.
+		</comment>
+		<comment id='3' author='synapsesanddendrites' date='2020-11-05T16:24:23Z'>
+		'train_reg()' does run on its own. I have see the error with different sizes of 'tensor a' drawn from the distribution of layer sizes. I will see which 'l' parameter this seems to correspond to.
+		</comment>
+		<comment id='4' author='synapsesanddendrites' date='2020-11-06T18:15:37Z'>
+		Actually you were quite right, the issue was the batch size parameter which I did not vary in tests. The validation did not work when this was larger than one.
+		</comment>
+	</comments>
+</bug>

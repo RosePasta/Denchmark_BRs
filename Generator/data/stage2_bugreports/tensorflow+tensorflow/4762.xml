@@ -1,0 +1,119 @@
+<bug id='4762' author='gibiansky' open_date='2016-10-04T18:30:34Z' closed_time='2017-12-22T18:14:00Z'>
+	<summary>Request for documentation: Loop implementation</summary>
+	<description>
+I am trying to understand the implementation of tf.while_loop and everything that is built on top of it, because I am implementing a custom tf.Graph subclass, and finding that the way tf.while_loop is handled during gradient computation is important for what I am doing.
+However, I cannot find any documentation on the ops that comprise tf.while_loop – is there any internal documentation on this implementation?
+I am finding myself confused about some of the following concepts:
+
+WhileContext, and, in general, the stack of contexts
+Flows vs tensors
+Frames
+
+So far I've gotten quite a bit by just reading the source code, but it's pretty hard to build yourself a good mental model by going completely bottom up without having any high level picture of how the entire thing is organized.
+If there is no intention to document these things (which would be completely understandable) please feel free to close this issue (although I would definitely appreciate some help or pointers as to where I can figure out the high-level overview of looping implementation).
+	</description>
+	<comments>
+		<comment id='1' author='gibiansky' date='2016-10-05T01:23:18Z'>
+		&lt;denchmark-link:https://github.com/yuanbyu&gt;@yuanbyu&lt;/denchmark-link&gt;
+ might be able to fill in some context here.
+		</comment>
+		<comment id='2' author='gibiansky' date='2016-10-05T16:53:00Z'>
+		I have been working on a doc which we hope to turn into a technical paper. I will give you a copy when it is ready.  In the meantime, feel free to send any specific questions to me.
+WhileContext is at this point a python front-end concept to represent a while_loop. It can be nested to represent nested loops. Internally, a loop is a cyclic graph using five primitive ops: Enter, Exit, Switch, Merge, and NextIteration. A loop can be partitioned onto multiple machines/devices, which is done in core/graph/graph_partition.cc. Frame is a concept used in core/common_runtime/executor.cc, which manages the execution of a partition assigned to a device.  Most of the complexity in the python front-end is on backprop of while_loop.
+		</comment>
+		<comment id='3' author='gibiansky' date='2016-10-05T17:59:01Z'>
+		&lt;denchmark-link:https://github.com/yuanbyu&gt;@yuanbyu&lt;/denchmark-link&gt;
+ Thanks, good to hear that a doc is being prepared.
+So, here's what I understand so far. Perhaps you can correct any misunderstandings and also this will serve as a useful resource for the time being for anyone else who runs into this.
+
+tf.while_loop accepts a list of loop variables, a function mapping loop variables to a boolean, and a function mapping loop variables to a new set of loop variables.
+Internally, this is represented using the special nodes Enter, Exit, NextIteration, Switch, and Merge. Enter, Exit, NextIteration are all semantically equivalent to identity ops (they just forward their input to their output, potentially as a reference), but the fact that they have type Enter, Exit, NextIteration is used by the executor to handle them in a special way. The graph is constructed as follows:
+
+The loop variables are sent through "Enter" nodes.
+The Enter node results are then given to "Merge"  nodes. During the graph construction, the inputs to the "Merge"  nodes are two copies of each enter node; when the NextIteration nodes are constructed, the Merge nodes are fixed by replacing one of the Enter inputs with a NextIteration input. In this way, every Merge node (one per variable) gets an input from its respective variable's Enter and NextIteration nodes.
+The output of the Merge nodes is passed to the condition function, which takes them and outputs a boolean. This boolean is passed to a LoopCond node. This boolean, as well as the output of the Merge nodes, is passed to Switch nodes, again one per variable. The Switch nodes output a dead tensor to one of their outputs and a live tensor (the merge node output) to the other one, depending on the boolean.
+The output of the Switch node is sent to an Exit node (one per variable) or to an Identity op (one per variable), depending on whether the loop condition is false.
+The identity op output is given to the loop body, and the outputs of the loop body are fed to NextIteration ops; these ops are the ones patched back in as inputs to the Merge nodes.
+
+
+The executor has special support for these five primitive ops which make this structure into a loop:
+
+The executor has a concept of a Frame, which is essentially the current iteration of the innermost loop. A frame has state, where all the input and output tensors are stored in a flat vector; each op writes its outputs to a subset of the output vector and gets inputs from a subset of the input vectors; thus, the inputs and outputs of an op can be obtained by just going to the right offset in this vector of Entry values.
+
+
+A new frame is created when the executor sees an Enter node. A frame is removed when it sees an Exit node. The next iteration of the frame is progressed to when it sees a NextIteration node.
+When it sees a NextIteration node, it finds the child of that node (namely the Merge op) and calls ActivateNode on it, in order to continue the loop. Since nodes are not marked ready until all their inputs are non-dead, the nodes that get dead inputs from Switch (e.g. the loop is done) will not get run again.
+For every loop during forward propagation, a few things have to happen to create the backprop gradient graph:
+
+First of all, a loop is added to the forward propagation which counts the number of iterations. More accurately, the original loop is added to; this works because of the way the primitive ops are designed. This loop starts with a f_count Enter node and is created in control_flow_ops.py AddForwardLoopCounter.
+A history_map is maintained of tensors produced during forward prop, and whenever the backprop needs a tensor from the forward prop, a stack is introduced, and the forward prop has a StackPush added to it, while the backprop has a StackPop added to it that pops from the same stack. In that manner, the forward prop pushes anything the backprop will need onto a stack, and the backprop slowly consumes that stack.
+
+
+
+The description above is not quite complete but I think I probably understand enough for what I want to do.
+Questions:
+
+Why is there a LoopCond node? Why not pass the output of the condition directly to Switch?
+What was the motivation for such a seemingly complicated set of primitive ops? It seems like it's possible to build other control structures on top of them – is that the goal? Were these primitive ops chosen because they make it possible to implement the fairly complex gradient loop generation?
+What is an example usecase for parallel_iterations? (This is a simple question which might make sense to add to the tf.while_loop docs)
+
+		</comment>
+		<comment id='4' author='gibiansky' date='2016-10-05T17:59:43Z'>
+		Also, given that you are already working on documentation for this, feel free to close this issue if so desired – it is not very actionable.
+		</comment>
+		<comment id='5' author='gibiansky' date='2016-10-13T23:20:36Z'>
+		Thank you putting in the time to write that documentation above &lt;denchmark-link:https://github.com/gibiansky&gt;@gibiansky&lt;/denchmark-link&gt;
+. Maybe something like that is more appropriate for a pull request? You've signed our CLA and have contributed to the documentation in the past. What would you recommend for him &lt;denchmark-link:https://github.com/yuanbyu&gt;@yuanbyu&lt;/denchmark-link&gt;
+?
+		</comment>
+		<comment id='6' author='gibiansky' date='2016-12-11T00:41:17Z'>
+		I have written a doc and would be happy to share it with you.
+For your questions:
+
+
+LoopCond is just used as a unique marker so we could understand the graph structure in later stages of graph rewriting.  For example, rewriting the graph to support distributed execution of a loop.
+
+
+Yes, that was one of the main design considerations. If you are familiar with the dataflow machines invented in the 70s, you would not be surprised by the choice of the primitives. :-) The other main considerations are non-strictness, automatic differentiation, and parallel and distributed execution of both forward and backprop.
+
+
+A simple example is tf.map.  And it is one of the main reasons that the performance of dynamic_rnn can be as good as static unrolling. For example it allows the dynamic unrolling logic runs on CPU and the actual computation runs on GPU, completely in parallel.
+
+
+		</comment>
+		<comment id='7' author='gibiansky' date='2017-03-28T19:48:59Z'>
+		&lt;denchmark-link:https://github.com/yuanbyu&gt;@yuanbyu&lt;/denchmark-link&gt;
+ was the technical doc finally posted somewhere online? It would help if you shared the link here, for those visiting this issue in the future, like me.
+		</comment>
+		<comment id='8' author='gibiansky' date='2017-08-07T20:36:22Z'>
+		&lt;denchmark-link:https://github.com/yuanbyu&gt;@yuanbyu&lt;/denchmark-link&gt;
+ I'm also interested by this technical doc that you are referring too.
+		</comment>
+		<comment id='9' author='gibiansky' date='2017-10-16T10:03:59Z'>
+		&lt;denchmark-link:https://github.com/yuanbyu&gt;@yuanbyu&lt;/denchmark-link&gt;
+ I'm also interested in this technical doc. How can I get the doc or somewhere to see that technical doc?
+		</comment>
+		<comment id='10' author='gibiansky' date='2017-10-16T17:06:26Z'>
+		&lt;denchmark-link:https://github.com/skye&gt;@skye&lt;/denchmark-link&gt;
+ I remember seeing some docs at some point, but can no longer find them.  Do you have any links?
+		</comment>
+		<comment id='11' author='gibiansky' date='2017-10-16T17:40:46Z'>
+		We have an internal design doc. There's nothing proprietary in it though, so lemme look into sharing it publicly.
+		</comment>
+		<comment id='12' author='gibiansky' date='2017-11-01T23:06:38Z'>
+		Just a heads up that we're working on this! Stay tuned. cc &lt;denchmark-link:https://github.com/wolffg&gt;@wolffg&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='13' author='gibiansky' date='2017-11-22T20:41:16Z'>
+		Here is the doc: &lt;denchmark-link:http://download.tensorflow.org/paper/white_paper_tf_control_flow_implementation_2017_11_1.pdf&gt;http://download.tensorflow.org/paper/white_paper_tf_control_flow_implementation_2017_11_1.pdf&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='14' author='gibiansky' date='2017-12-22T07:44:10Z'>
+		It has been 14 days with no activity and this issue has an assignee.Please update the label and/or status accordingly.
+		</comment>
+		<comment id='15' author='gibiansky' date='2017-12-22T18:14:00Z'>
+		Thanks &lt;denchmark-link:https://github.com/skye&gt;@skye&lt;/denchmark-link&gt;
+!  Closing this out, since the doc is available.
+		</comment>
+	</comments>
+</bug>

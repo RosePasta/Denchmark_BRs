@@ -1,0 +1,345 @@
+<bug id='31616' author='mimxrt' open_date='2019-08-14T11:53:30Z' closed_time='2019-10-23T14:41:41Z'>
+	<summary>Dataset prefetch not working as expected, not storing data in memory</summary>
+	<description>
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Linux Ubuntu 18.04 LTS
+TensorFlow installed from (source or binary): conda-forge
+TensorFlow version (use command below): unknown 1.14.0
+Python version: Python 3.7.3
+CUDA/cuDNN version: NVIDIA-SMI 418.67, Driver Version: 418.67, CUDA Version: 10.1
+GPU model and memory: Quadro RTX 6000, 24190MiB
+Exact command to reproduce:
+
+Describe the current behavior
+I am training a small LSTM model and until recently, I could use Dataset.from_tensor_slices() reading numpy arrays directly because all training data fits into memory. Unfortunately, after adding some new data, I ran into the 2 GB graph memory limitation and was forced to switch to using TFRecord and TFRecordDataset. However, the actual training data still fits into RAM and I want to make sure it is prefetched even when using the TFRecordDataset. Therefore, I tried to use the Dataset.prefetch() methodology to achieve this, assuming a buffer will be created and (constantly) filled with data. However, it does not work - in fact, there seems to be little to no difference comparing a version with and without a final .prefetch(x) in the data pipeline. See the animated gif below:
+&lt;denchmark-link:https://user-images.githubusercontent.com/53339396/63017447-a985c980-be96-11e9-91ce-0ea3cd23945f.gif&gt;&lt;/denchmark-link&gt;
+
+The actual dataset is filtered in the pipeline and the training stalls whenever a sequence of values that is filtered out is occurring in the data. Only a few values in each data/tfrecord file (of which many exist) are relevant. To illustrate this further, the data layout is similar to this:
+&lt;denchmark-code&gt;file 1: [---------#####----------------####------]
+file 2: [--------######----------------###-------]
+file 3: [----------####----------------####------]
+file 4: ...
+...
+&lt;/denchmark-code&gt;
+
+where - denotes irrelevant and # denotes relevant data points in a time series. When holding all values in memory (as previously was the case), the filter is rather fast and irrelevant values are skipped unnoticeable.
+The data pipeline is set up like this:
+&lt;denchmark-code&gt;feature_description = { "features": tf.FixedLenFeature([132], tf.float32),  "label": tf.FixedLenFeature([1], tf.float32) }
+def _parse_function(example_proto):
+    return tf.parse_single_example(example_proto, feature_description)
+
+ds = tf.data.TFRecordDataset([f.as_posix() for f in fs_train])
+ds = ds.map(_parse_function)
+ds = ds.flat_map(lambda v: tf.data.Dataset.from_tensors((v["features"][2:], v["label"])))
+# filter data, only allow Ls[0] and Ls[1]
+ds = ds.filter(
+    lambda _, y: tf.reshape(tf.logical_or(
+        tf.equal(y, Ls[0]),
+        tf.equal(y, Ls[1])
+    ), [])
+)
+# relabel and re-map labels to 0 and 1
+ds = ds.flat_map(lambda x, y: tf.data.Dataset.from_tensors((x, tf_relabel(y) - base_label.value)))
+# create sliding window for LSTM
+ds = ds.window(size=window_size, shift=shift, stride=stride, drop_remainder=True)
+ds = ds.flat_map(lambda x, y: tf.data.Dataset.zip((x.batch(window_size), y.batch(window_size))))
+
+# batch and prefetch
+ds = ds.batch(batch_size, drop_remainder=True)
+ds = ds.prefetch(1000000000000000) # tried many values, nothing works
+&lt;/denchmark-code&gt;
+
+Describe the expected behavior
+I expect to find some value for Dataset.prefetch() that reads all or enough data to memory to allow for fast training without stalling.
+Code to reproduce the issue
+See data pipeline above. I cannot provide the data as it is proprietary.
+	</description>
+	<comments>
+		<comment id='1' author='mimxrt' date='2019-08-15T05:25:30Z'>
+		&lt;denchmark-link:https://github.com/mimxrt&gt;@mimxrt&lt;/denchmark-link&gt;
+ try using the
+ method
+&lt;denchmark-code&gt;**Args**:
+filename: A tf.string scalar tf.Tensor, representing the 
+name of a directory on the filesystem to use for caching 
+tensors in this Dataset. If a filename is not provided, 
+the dataset will be cached in memory.
+&lt;/denchmark-code&gt;
+
+Note : Its is good practice to cache the dataset before performing any non deterministic operations on it, (like random augmentations)
+		</comment>
+		<comment id='2' author='mimxrt' date='2019-08-15T07:55:55Z'>
+		Thank you for your response. From my understanding, while the cache() method would work from the second epoch forward, it does not change the behavior for the first epoch at all. So while I will certainly make use of cache() in future, my expectation is still that prefetch() reads data to memory before any operation is done on the data. My reason for this is that before switching to TFRecordDataset (i.e. when using .from_tensor_slices() on Numpy arrays), the first epoch was running as fast as it can get and the whole training of 50 epochs was finished in under one hour. Now it takes over one hour just for the first epoch. The difference was that previously the raw data was sequentially read into memory as-is, without any operation on it.
+It seems there should be a way to cache the dataset before any further processing; if not preprocess() then what else? NB: I also tried to put preprocess() to an earlier stage of the data pipeline.
+		</comment>
+		<comment id='3' author='mimxrt' date='2019-08-15T08:36:06Z'>
+		&lt;denchmark-link:https://github.com/mimxrt&gt;@mimxrt&lt;/denchmark-link&gt;
+ if you are purely aiming for throughput, you might be better off doing offline filtering.
+Also there are a couple of low hanging fruits viz.
+
+num_parallel_calls arg in map for parallel processing of dataset elements
+tf.data.experimental.parallel_interleave or tf.data.Dataset.interleave when processing tfrecords. However parallel_interleave is deprecated.
+tf.data.experimental.AUTOTUNE for buffer_size  in prefetch and num_parallel_calls in map
+Tune the pipeline according to your needs using tf.data.Options
+
+		</comment>
+		<comment id='4' author='mimxrt' date='2019-08-15T08:48:30Z'>
+		I understand, thank you for your kind help. I will try your suggestions and then decide to do offline filtering if necessary.
+		</comment>
+		<comment id='5' author='mimxrt' date='2019-08-15T10:52:06Z'>
+		I'm sorry to re-open this but it seems again that both cache() and num_parallel_calls have no effect. See the screenshot below for the second epoch when using cache() after pre-processing, i.e. before windowing with window().
+&lt;denchmark-link:https://user-images.githubusercontent.com/53339396/63089655-dac6ce00-bf58-11e9-8a46-ba62b8e4291e.png&gt;&lt;/denchmark-link&gt;
+
+Before, when using Numpy array input, the very same network was trained like this:
+&lt;denchmark-link:https://user-images.githubusercontent.com/53339396/63090289-1e223c00-bf5b-11e9-8e9d-add9756feb5a.png&gt;&lt;/denchmark-link&gt;
+
+For comparison: 145 s / 27485 items = 5.28 ms per item, versus now ~81 ms per item.
+So for the run above, the pipeline looks like this:
+&lt;denchmark-code&gt;ds_train = tf.data.TFRecordDataset([f.as_posix() for f in fs_train])
+#ds_train = ds_train.cache()
+
+ds_train = ds_train.map(lambda x: tf.parse_single_example(x, {
+    "features": tf.FixedLenFeature([132], tf.float32),
+    "label": tf.FixedLenFeature([1], tf.float32),
+}))
+
+ds_train = ds_train.flat_map(lambda v: tf.data.Dataset.from_tensors((v["features"][2:], v["label"])))
+
+ds_train = ds_train.filter(
+    lambda _, y: tf.reshape(tf.logical_or(
+        tf.equal(y, Ls[0]),
+        tf.equal(y, Ls[1])
+    ), [])
+)
+
+ds_train = ds_train.flat_map(lambda x, y: tf.data.Dataset.from_tensors((x, y - base_label.value)))
+
+ds_train = ds_train.cache()
+
+ds_train = ds_train.window(size=num_tsteps, shift=1, stride=1, drop_remainder=True)
+ds_train = ds_train.flat_map(lambda x, y: tf.data.Dataset.zip((x.batch(num_tsteps), y.batch(num_tsteps))))
+
+ds_train = ds_train.batch(batch_size, drop_remainder=True)
+ds_train = ds_train.prefetch(1)
+&lt;/denchmark-code&gt;
+
+I tried to add the suggested optimizations with this pipeline:
+&lt;denchmark-code&gt;ds_train = tf.data.TFRecordDataset([f.as_posix() for f in fs_train])
+#ds_train = ds_train.cache()
+
+ds_train = ds_train.map(lambda x: tf.parse_single_example(x, {
+    "features": tf.FixedLenFeature([132], tf.float32),
+    "label": tf.FixedLenFeature([1], tf.float32),
+}), num_parallel_calls=num_cores)
+
+ds_train = ds_train.interleave(lambda v: tf.data.Dataset.from_tensors((v["features"][2:], v["label"])),
+                               cycle_length=num_cores, block_length=1,
+                               num_parallel_calls=num_cores)
+
+ds_train = ds_train.filter(
+    lambda _, y: tf.reshape(tf.logical_or(
+        tf.equal(y, Ls[0]),
+        tf.equal(y, Ls[1])
+    ), [])
+)
+
+ds_train = ds_train.interleave(lambda x, y: tf.data.Dataset.from_tensors((x, y - base_label.value)),
+                               cycle_length=num_cores, block_length=1,
+                               num_parallel_calls=num_cores)
+
+ds_train = ds_train.window(size=num_tsteps, shift=1, stride=1, drop_remainder=True)
+ds_train = ds_train.interleave(lambda x, y: tf.data.Dataset.zip((x.batch(num_tsteps), y.batch(num_tsteps))),
+                               cycle_length=num_cores, block_length=1,
+                               num_parallel_calls=num_cores)
+
+ds_train = ds_train.batch(batch_size, drop_remainder=True)
+
+ds_train = ds_train.cache()
+ds_train = ds_train.prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
+&lt;/denchmark-code&gt;
+
+Running result:
+&lt;denchmark-link:https://user-images.githubusercontent.com/53339396/63089956-f8486780-bf59-11e9-8a97-7f2e9f8c15b9.png&gt;&lt;/denchmark-link&gt;
+
+NB: I put cache() more towards the end as it had no effect when putting it before window() even though it seems redundant to store windowed results...
+		</comment>
+		<comment id='6' author='mimxrt' date='2019-08-26T20:48:12Z'>
+		prefetch works as expected. It decouples the producer from consumer, using an internal buffer. What I suspect is going on is that your input pipeline is running slower than your training step, which means that you get little benefits from preprocessing.
+You could confirm this hypothesis by separately benchmarking a) the latency of your input pipeline and b) the latency of your model with synthetic data. If a) is much higher than b) you will get little benefits from prefetching and you should instead focus on optimizing the performance of you input pipeline through parallelization. My recommendation would be to use &lt;denchmark-link:https://www.tensorflow.org/tensorboard/r2/tensorboard_profiling_keras&gt;Tensorboard Keras profiler&lt;/denchmark-link&gt;
+ to understand what is going on in your input pipeline. If you share a link to your trace, I would be happy to provide insights.
+		</comment>
+		<comment id='7' author='mimxrt' date='2019-09-03T13:00:05Z'>
+		Thank you for your comment. I understand and I am currently (hopefully) profiling the model fitting to confirm your hypothesis. Until now I am struggling to get TensorBoard to visualize the profile. Anyway, I wanted to let you know that I am still looking into this.
+As a side note: Dataset.cache() seems to work when using a hard disk file instead of RAM. The second epoch forward is now as fast as I would expect which further supports your hypothesis.
+EDIT: I also want to stress, that something is still amiss with the data pipeline even if prefetch() turns out to work as expected. The performance of epoch 0 (i.e. empty cache) is extremely slow compared to reading and pre-processing the data with Dask/Pandas and feeding plain numpy arrays to the Dataset API. It could be that the pipeline does not read/process data in parallel but I am unsure how to enable this feature. num_parallel_calls and tf.data.Dataset.interleave had no effect for me so far. I can confirm that the CPU usage is small compared to the Dask pipeline when using the TF Dataset API.
+		</comment>
+		<comment id='8' author='mimxrt' date='2019-09-04T15:18:02Z'>
+		&lt;denchmark-link:https://github.com/jsimsa&gt;@jsimsa&lt;/denchmark-link&gt;
+ Thanks again for your comment. I attached (&lt;denchmark-link:https://github.com/tensorflow/tensorflow/files/3575133/log_20190904150036.tar.gz&gt;log_20190904150036.tar.gz&lt;/denchmark-link&gt;
+) a trace from the following pipeline:
+&lt;denchmark-code&gt;ds = tf.data.TFRecordDataset([f.as_posix() for f in files])
+ds = ds.map(lambda x: tf.parse_single_example(x, {
+    "features": tf.FixedLenFeature([132], tf.float32),
+    "label": tf.FixedLenFeature([1], tf.float32),
+}), num_parallel_calls=tf.data.experimental.AUTOTUNE)
+ds = ds.flat_map(lambda v: tf.data.Dataset.from_tensors((v["features"][2:], v["label"])))
+
+# only allow two labels
+ds = ds.filter(
+    lambda _, y: tf.reshape(tf.logical_or(
+        tf.equal(y, Ls[0]),
+        tf.equal(y, Ls[1])
+    ), [])
+)
+
+ds = ds.flat_map(lambda x, y: tf.data.Dataset.from_tensors((x, y - base_label.value)))
+ds = ds.cache(cachefile)
+ds = ds.window(size=num_tsteps, shift=1, stride=1, drop_remainder=True)
+ds = ds.flat_map(lambda x, y: tf.data.Dataset.zip((x.batch(num_tsteps), y.batch(num_tsteps))))
+ds = ds.batch(batch_size, drop_remainder=True)
+ds = ds.prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
+&lt;/denchmark-code&gt;
+
+I am looking forward to your insights regarding the performance.
+Additionally, I am currently running another training with a modified pipeline that (hopefully) is functionally equivalent but should be fully parallelized. However, the performance seems not to increase at all (also the CPU usage does not increase, no matter the amount of ). Here is the trace:  &lt;denchmark-link:https://github.com/tensorflow/tensorflow/files/3575226/log_20190904151101.tar.gz&gt;log_20190904151101.tar.gz&lt;/denchmark-link&gt;
+
+&lt;denchmark-code&gt;num_cores = 20
+ds = tf.data.TFRecordDataset([f.as_posix() for f in files])
+ds = ds.map(lambda x: tf.io.parse_single_example(x, {
+    "features": tf.io.FixedLenFeature([132], tf.float32),
+    "label": tf.io.FixedLenFeature([1], tf.float32),
+}), num_parallel_calls=num_cores)
+ds = ds.map(lambda v: (v["features"][2:], v["label"]), num_parallel_calls=num_cores)
+
+def flt(x, y):
+    c = tf.cond(tf.reshape(tf.logical_or(tf.equal(y, Ls[0]), tf.equal(y, Ls[1])), []),
+                lambda: tf.constant(1, dtype=tf.int64),
+                lambda: tf.constant(0, dtype=tf.int64))
+    return tf.data.Dataset.from_tensors((x, y)).repeat(c)
+ds = ds.interleave(flt, cycle_length=num_cores, block_length=1,
+                  num_parallel_calls=num_cores)
+
+ds = ds.map(lambda x, y: (x, y - base_label.value), num_parallel_calls=num_cores)
+ds = ds.cache(cachefile)
+ds = ds.window(size=num_tsteps, shift=1, stride=1, drop_remainder=True)
+ds = ds.interleave(lambda x, y: tf.data.Dataset.zip((x.batch(num_tsteps), y.batch(num_tsteps))),
+                   cycle_length=num_cores, block_length=1,
+                   num_parallel_calls=num_cores)
+ds = ds.batch(batch_size, drop_remainder=True)
+ds = ds.prefetch(1)
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='9' author='mimxrt' date='2019-09-04T18:28:41Z'>
+		I looked at your trace but in the five second window it captures only see one tf.data "get_next" event, which takes &lt;40us. This suggests you are not input pipeline bound. Have you tried benchmarking the latency of your input pipeline (i.e. how long it takes to extra an element running in tight loop):
+&lt;denchmark-code&gt;import timeit
+
+start = timeit.default_timer()
+i = 0
+for elem in dataset:
+  i += 1
+end = timeit.default_timer()
+print("Average latency {}".format((end - start) / i))
+&lt;/denchmark-code&gt;
+
+Separately from the above, try collecting a longer trace (e.g. 30 seconds).
+		</comment>
+		<comment id='10' author='mimxrt' date='2019-09-05T11:06:28Z'>
+		When running your code snipped my workstation does run out of memory (128 GB RAM). For some reason, iterating the dataset like this occupies all memory after approximately 9920000 iterations (i added a print(i) every 10000 rounds to see some progress). After that the execution stalls and nothing happens further. However, I can confirm that the execution takes a long time (similar to running the actual training) and it seems even without further processing the generated elements (i.e. training), the pipeline is slow.
+I tried to do a longer trace as well but unfortunately, the documentation you posted does only really show how to trace exactly one batch (which is probably what you see in the traces above):
+&lt;denchmark-code&gt;tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir=log_dir, histogram_freq=1, profile_batch = 3)
+model.fit(train_data,
+          steps_per_epoch=20,
+          epochs=5, 
+          callbacks=[tensorboard_callback])
+&lt;/denchmark-code&gt;
+
+Further down the &lt;denchmark-link:https://www.tensorflow.org/tensorboard/r2/tensorboard_profiling_keras#profiler_service&gt;profiler service is briefly introduced&lt;/denchmark-link&gt;
+ but  does neither exist in TensorFlow 1.14 nor in TensorFlow 2.0.0-rc0. It seems to be the only "documented" way to use the Keras API for training (as opposed to using  directly) and creating traces of specific length. Could you provide further instructions on how to create the trace you suggested collecting?
+EDIT: Note that because of ds.filter() there should only be 203698 elements in the dataset, judging from the trainings, e.g.
+&lt;denchmark-code&gt;# ...
+Epoch 2/50
+203698/203698 - 1259s - loss: 0.0876 - acc: 0.9680
+Epoch 3/50
+203698/203698 - 1258s - loss: 0.0800 - acc: 0.9704
+# ...
+&lt;/denchmark-code&gt;
+
+I guess simply iterating the dataset does not batch, and it does not create a cache file even though ds.cache(cachefile) is given.
+EDIT2: I realized that the issue is caused by not running in eager execution mode and after enabling it, I got this result:
+&lt;denchmark-code&gt;Average latency 0.05543092633988548
+start: 246634.557416572
+end: 257925.726250154
+i: 203698
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='11' author='mimxrt' date='2019-09-05T17:37:30Z'>
+		Have you tried using the &lt;denchmark-link:https://www.tensorflow.org/tensorboard/r2/tensorboard_profiling_keras#profiler_service&gt;Profiler Service&lt;/denchmark-link&gt;
+?
+		</comment>
+		<comment id='12' author='mimxrt' date='2019-09-06T08:11:01Z'>
+		Yes, sorry, I got some errors before. I now captured 60 seconds to ensure getting multiple phases of valid and invalid samples (see &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/31616#issue-480636359&gt;#31616 (comment)&lt;/denchmark-link&gt;
+, data is only partially valid in one time series file).
+Here is the trace: &lt;denchmark-link:https://github.com/tensorflow/tensorflow/files/3582909/log_20190906075644.tar.gz&gt;log_20190906075644.tar.gz&lt;/denchmark-link&gt;
+
+ I created a few more traces because they look all so different to my untrained eye. I hope I could capture some relevant parts.
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/files/3583581/log_20190906082335_1.tar.gz&gt;log_20190906082335_1.tar.gz&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/files/3583582/log_20190906082335_2.tar.gz&gt;log_20190906082335_2.tar.gz&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/files/3583583/log_20190906082335_3.tar.gz&gt;log_20190906082335_3.tar.gz&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='13' author='mimxrt' date='2019-09-06T21:46:12Z'>
+		Hrm, it is odd that the different samples look different (and the information in the trace does not seem coherent). I could try running your input pipeline myself and analyze it for you but for that, I would need end-to-end reproducible example (include the data).
+		</comment>
+		<comment id='14' author='mimxrt' date='2019-09-09T15:48:09Z'>
+		Thank you for your kind offer, that's really nice. However, due to project deadlines, I had to switch to pre-processing the data in Dask and storing already the pre-processed data to tfrecord files. Doing this, the Tensorflow Dataset-pipeline is reduced to merely reading the files and the training is accelerated. Of course, I am still interested in using the more elegant way of pre-processing the data in parallel on-the-fly, but I would feel bad if you invested a lot of your time into this while there is no emergency.
+Additionally, the data is proprietary, although, of course, I could provide you with fake data of the same shape and size. So, if you are interested in this as well, let me know and I will create a minimal working example including fake data. In either case, thank you very much for your kind support!
+		</comment>
+		<comment id='15' author='mimxrt' date='2019-09-09T16:36:07Z'>
+		Makes sense. I would be happy to take a look at your MRE. I will leave it up to you if you wish to close this issue, or follow up with MRE.
+		</comment>
+		<comment id='16' author='mimxrt' date='2019-10-23T14:41:41Z'>
+		It seems I cannot find the time to create a MRE as I continue to run into different issues that need to be resolved asap. As this issues is mitigated by preprocessing the data before training time, I am going to close it. Thanks again for your offer and your help!
+		</comment>
+		<comment id='17' author='mimxrt' date='2019-10-23T14:41:42Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/31616&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/31616&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='18' author='mimxrt' date='2020-05-13T07:06:59Z'>
+		&lt;denchmark-link:https://github.com/jsimsa&gt;@jsimsa&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/srihari-humbarwadi&gt;@srihari-humbarwadi&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/jvishnuvardhan&gt;@jvishnuvardhan&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/ravikyram&gt;@ravikyram&lt;/denchmark-link&gt;
+
+Hi , I'm not familiar with tf.data api，in my case, I found the IO is a problem: GPU uti is low, about 15%. I use a generator function to read local multiple pickle files(about 200K), examples are bellow:
+&lt;denchmark-code&gt;def train_data():
+    while True:
+        for i in shuffle(train_id):
+            df = pd.read_pickle(df_train_val['file_name'].iloc[i],
+                                compression='gzip')
+            feature = df.to_numpy().reshape(df.shape[0], -1)
+            yield feature.reshape(-1, 56),feature.reshape(-1, 56)
+&lt;/denchmark-code&gt;
+
+Then
+&lt;denchmark-code&gt;gn = tf.data.Dataset.from_generator(train_data, output_types=(tf.float32, tf.float32),
+                                          output_shapes=((None, 56),(None, 56))
+                                         ).prefetch(tf.data.experimental.AUTOTUNE)
+&lt;/denchmark-code&gt;
+
+I found prefetch not work and IO bottleneck is very high, so any advice for this case, how can I speed up the training process?
+		</comment>
+		<comment id='19' author='mimxrt' date='2020-05-13T12:39:18Z'>
+		&lt;denchmark-link:https://github.com/Anhaoxu&gt;@Anhaoxu&lt;/denchmark-link&gt;
+ Please create a new issue and provide a simple standalone code to reproduce the issue. Thanks!
+		</comment>
+	</comments>
+</bug>

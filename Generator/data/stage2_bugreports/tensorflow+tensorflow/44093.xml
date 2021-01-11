@@ -1,0 +1,165 @@
+<bug id='44093' author='psobot' open_date='2020-10-16T16:23:27Z' closed_time='2020-10-21T05:30:06Z'>
+	<summary>tf.distribute.MirroredStrategy using TF_CONFIG and non-eager execution assigns ops to nonexistent device names</summary>
+	<description>
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): Yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Google AI Platform
+TensorFlow installed from (source or binary): binary
+TensorFlow version: reproducible on 2.2 or 2.3
+Python version: 3.7
+CUDA/cuDNN version: Unknown
+GPU model and memory: 2x NVIDIA Tesla K80
+
+&lt;denchmark-h:hr&gt;&lt;/denchmark-h&gt;
+
+When running &lt;denchmark-link:https://github.com/tensorflow/docs/blob/master/site/en/tutorials/distribute/keras.ipynb&gt;the example code from Distributed training with Keras&lt;/denchmark-link&gt;
+ on AI Platform with multiple GPUs, , and using  to utilize all GPUs, TensorFlow raises an :
+&lt;denchmark-code&gt;tensorflow.python.framework.errors_impl.InvalidArgumentError:
+    Cannot assign a device for operation conv2d/kernel/Initializer/random_uniform/RandomUniform:
+    Could not satisfy explicit device specification '' because the node
+    {{colocation_node conv2d/kernel/Initializer/random_uniform/RandomUniform}}
+    was colocated with a group of nodes that required incompatible device 
+    '/job:chief/replica:0/task:0/device:GPU:0'. All available devices [
+        /job:localhost/replica:0/task:0/device:CPU:0,
+        /job:localhost/replica:0/task:0/device:XLA_CPU:0,
+        /job:localhost/replica:0/task:0/device:XLA_GPU:0,
+        /job:localhost/replica:0/task:0/device:XLA_GPU:1,
+        /job:localhost/replica:0/task:0/device:GPU:0,
+        /job:localhost/replica:0/task:0/device:GPU:1
+    ]. 
+    
+    Colocation Debug Info:
+    Colocation group had the following types and supported devices: 
+        Root Member(
+            assigned_device_name_index_=-1
+            requested_device_name_='/job:chief/replica:0/task:0/device:GPU:0'
+            assigned_device_name_=''
+            resource_device_name_='/job:chief/replica:0/task:0/device:GPU:0'
+            supported_device_types_=[GPU, CPU]
+            possible_devices_=[]
+        AssignVariableOp: GPU CPU XLA_CPU XLA_GPU 
+        RandomUniform: GPU CPU XLA_CPU XLA_GPU 
+        VarIsInitializedOp: GPU CPU XLA_CPU XLA_GPU 
+        Const: GPU CPU XLA_CPU XLA_GPU 
+        Mul: GPU CPU XLA_CPU XLA_GPU 
+        ReadVariableOp: GPU CPU XLA_CPU XLA_GPU 
+        Sub: GPU CPU XLA_CPU XLA_GPU 
+        VarHandleOp: GPU CPU XLA_CPU XLA_GPU 
+        Add: GPU CPU XLA_CPU XLA_GPU 
+
+&lt;/denchmark-code&gt;
+
+Oddly, the list of available devices includes the GPUs I want to use, but their names include job:localhost rather than job:chief.
+The logs used to launch the job show that only one worker is being used, and it's being assigned the type chief:
+Running task with arguments:
+  --cluster={"chief": ["127.0.0.1:2222"]}
+  --task={"type": "chief", "index": 0}
+  --job={
+    "scale_tier": "CUSTOM", 
+    "master_type": "n1-standard-16",
+    "package_uris": [...snip...], 
+    "python_module": "psobot.mirrored_strategy_test", 
+    "region": "europe-west1", 
+    "runtime_version": "2.2", 
+    "run_on_raw_vm": true,
+    "python_version": "3.7", 
+    "master_config": {
+      "accelerator_config": {
+        "count": "2",
+        "type": "NVIDIA_TESLA_K80"
+      }
+}}
+...but also show that the device naming mismatch seems to happen earlier:
+&lt;denchmark-code&gt;Created TensorFlow device (/device:GPU:0 with 10634 MB memory) -&gt; physical GPU (device: 0, name: Tesla K80, pci bus id: 0000:00:04.0, compute capability: 3.7)"
+successful NUMA node read from SysFS had negative value (-1), but there must be at least one NUMA node, so returning NUMA node zero"
+Created TensorFlow device (/device:GPU:1 with 10634 MB memory) -&gt; physical GPU (device: 1, name: Tesla K80, pci bus id: 0000:00:05.0, compute capability: 3.7)"
+Some requested devices in `tf.distribute.Strategy` are not visible to TensorFlow: /job:chief/replica:0/task:0/device:GPU:0,/job:chief/replica:0/task:0/device:GPU:1"
+Using MirroredStrategy with devices ('/job:chief/replica:0/task:0/device:GPU:0', '/job:chief/replica:0/task:0/device:GPU:1')"
+&lt;/denchmark-code&gt;
+
+Describe the expected behavior
+TensorFlow should identify that /job:chief and /job:localhost refer to the same machine (the current machine) and should be able to place ops there, and it should be possible to train on multiple GPUs.
+Standalone code to reproduce the issue
+import tensorflow_datasets as tfds
+import tensorflow as tf
+
+# This is the only functional change from the example code.
+tf.compat.v1.disable_eager_execution()
+
+# Copied from the example code at:
+# https://github.com/tensorflow/docs/blob/master/site/en/tutorials/distribute/keras.ipynb
+datasets, info = tfds.load(name="mnist", with_info=True, as_supervised=True)
+mnist_train, mnist_test = datasets["train"], datasets["test"]
+strategy = tf.distribute.MirroredStrategy()
+print("Number of devices: {}".format(strategy.num_replicas_in_sync))
+
+train_dataset = mnist_train.map(lambda im, l: ((tf.cast(im, tf.float32) / 255), l)).batch(64)
+
+with strategy.scope():
+    model = tf.keras.Sequential(
+        [
+            tf.keras.layers.Conv2D(32, 3, activation="relu", input_shape=(28, 28, 1)),
+            tf.keras.layers.MaxPooling2D(),
+            tf.keras.layers.Flatten(),
+            tf.keras.layers.Dense(64, activation="relu"),
+            tf.keras.layers.Dense(10),
+        ]
+    )
+
+    model.compile(
+        loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+        optimizer=tf.keras.optimizers.Adam(),
+        metrics=["accuracy"],
+    )
+
+model.fit(train_dataset, epochs=12)
+Running the above code on AI Platform with the following:
+gcloud ai-platform jobs submit training psobot_mirrored_dummy_$(date +%s) \
+  --runtime-version 2.2
+  --python-version 3.7
+  --project [YOUR GCP PROJECT HERE]
+  --region europe-west1
+  --module-name YOUR_MODULE_NAME_HERE.mirrored_strategy_test
+  --package-path YOUR_PACKAGE_NAME_HERE
+  --scale-tier custom
+  --master-machine-type n1-standard-16
+  --master-accelerator count=2,type=nvidia-tesla-k80 
+  --staging-bucket YOUR_STAGING_BUCKET_HERE
+	</description>
+	<comments>
+		<comment id='1' author='psobot' date='2020-10-19T20:14:53Z'>
+		Hi &lt;denchmark-link:https://github.com/psobot&gt;@psobot&lt;/denchmark-link&gt;
+, is there a reason you have  ? And do you still see this error if you comment out that line?
+		</comment>
+		<comment id='2' author='psobot' date='2020-10-20T16:10:33Z'>
+		Hi &lt;denchmark-link:https://github.com/nikitamaia&gt;@nikitamaia&lt;/denchmark-link&gt;
+! Yes - we're disabling eager execution (in a similar model to the one shown above) for performance reasons, similar to those outlined in &lt;denchmark-link:https://www.tensorflow.org/guide/eager#benchmarks&gt;the Eager Execution documentation&lt;/denchmark-link&gt;
+. Re-enabling eager execution does allow us to train, but reduces performance significantly. If  doesn't support graph execution, I'd also expect it to return an error message saying as such, rather than with the error message that we've seen above.
+		</comment>
+		<comment id='3' author='psobot' date='2020-10-20T16:29:02Z'>
+		You should only use  if you have some specific TF1 code that is incompatible with the TF2 default eager runtime and needs to be run in legacy graph mode. You should not explicitly disable eager execution for performance reasons. Disabling eager execution has additional drawbacks like preventing use of custom loss functions. To get improved performance in TF2 with graph mode, you should make use of &lt;denchmark-link:https://www.tensorflow.org/guide/function&gt;tf.function&lt;/denchmark-link&gt;
+ instead. This is a common confusion, but the gist is that in TF2 the way to get better performance is not to  eager execution, but instead to  graph execution.
+In the MNIST example you have provided, the Keras API's model.fit takes care of running the code in TF2 graph mode with the use of tf.function under the hood. When you compile the model, there's an option to provide run_eagerly=True (it's set to False by defualt) and that will run model training in eager mode. You'll see a dramatic slow down in training, and also if training with MirroredStrategy I believe you will also see a warning that MirroredStrategy works better with graph mode. Hope this helps to clear up any confusion.
+		</comment>
+		<comment id='4' author='psobot' date='2020-10-20T17:02:50Z'>
+		Thanks &lt;denchmark-link:https://github.com/nikitamaia&gt;@nikitamaia&lt;/denchmark-link&gt;
+! That's helpful, but still doesn't solve this issue - am I right to assume then that  cannot be expected to work correctly with eager execution disabled, and that the  is to be expected? (another way to put it: is disabling eager execution such an anti-pattern that bugs aren't worth fixing if they only occur with eager disabled?)
+		</comment>
+		<comment id='5' author='psobot' date='2020-10-20T19:26:31Z'>
+		Yes that's correct. I agree that unfortunately this error message is not really helpful in helping you to figure out what is going on...But unless you have a very specific compat use case that absolutely requires legacy graph mode, you shouldn't disable eager execution.
+		</comment>
+		<comment id='6' author='psobot' date='2020-10-21T05:30:05Z'>
+		Makes sense - I'll close this issue. The performance issues that I was disabling eager execution for in the first place seem to be the result of another bug (see: &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/44194&gt;#44194&lt;/denchmark-link&gt;
+). Thanks for your help, &lt;denchmark-link:https://github.com/nikitamaia&gt;@nikitamaia&lt;/denchmark-link&gt;
+ !
+		</comment>
+		<comment id='7' author='psobot' date='2020-10-21T05:30:07Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/44093&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/44093&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

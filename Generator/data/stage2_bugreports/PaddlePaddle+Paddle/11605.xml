@@ -1,0 +1,141 @@
+<bug id='11605' author='qingqing01' open_date='2018-06-20T11:38:29Z' closed_time='2018-07-31T05:32:16Z'>
+	<summary>There is bug when use parallel executor and memory optimization in some case.</summary>
+	<description>
+在人脸检测模型中，有2个复杂的loss，如下：
+        face_loss = fluid.layers.ssd_loss(
+            self.face_mbox_loc,
+            self.face_mbox_conf,
+            self.face_box,
+            self.gt_label,
+            self.prior_boxes,
+            self.box_vars,
+            overlap_threshold=0.35,
+            neg_overlap=0.35)
+        head_loss = fluid.layers.ssd_loss(
+            self.head_mbox_loc,
+            self.head_mbox_conf,
+            self.head_box,
+            self.gt_label,
+            self.prior_boxes,
+            self.box_vars,
+            overlap_threshold=0.35,
+            neg_overlap=0.35)
+        face_loss = fluid.layers.reduce_sum(face_loss)
+        head_loss = fluid.layers.reduce_sum(head_loss)
+        loss = face_loss + head_loss
+使用了 fluid.memory_optimize，即使设置上面要fetch的face_loss, head_loss, loss的persistable=True，输出的loss结果依然不对。
+    optimizer.minimize(loss)
+    fluid.memory_optimize(fluid.default_main_program())
+为了验证问题，做了一下实验：
+
+将上面head_loss换成和face_loss一样的输入，这样，这两输出的loss会一模一样。
+
+        face_loss = fluid.layers.ssd_loss(
+            self.face_mbox_loc,
+            self.face_mbox_conf,
+            self.face_box,
+            self.gt_label,
+            self.prior_boxes,
+            self.box_vars,
+            overlap_threshold=0.35,
+            neg_overlap=0.35)
+        face_loss.persistable=True
+        head_loss = fluid.layers.ssd_loss(
+            self.face_mbox_loc,
+            self.face_mbox_conf,
+            self.face_box,
+            self.gt_label,
+            self.prior_boxes,
+            self.box_vars,
+            overlap_threshold=0.35,
+            neg_overlap=0.35)
+        #head_loss = fluid.layers.ssd_loss(
+        #    self.head_mbox_loc,
+        #   self.head_mbox_conf,
+        #    self.head_box,
+        #    self.gt_label,
+        #   self.prior_boxes,
+        #    self.box_vars,
+        #   overlap_threshold=0.35,
+        #  neg_overlap=0.35)
+        head_loss.persistable=True
+        face_loss = fluid.layers.reduce_sum(face_loss)
+        face_loss.persistable=True
+        head_loss = fluid.layers.reduce_sum(head_loss)
+        head_loss.persistable=True
+        loss = face_loss + head_loss
+        loss.persistable=True
+
+在【不用】fluid.memory_optimize他时，输出的face_loss和fead_loss【相同】：
+
+&lt;denchmark-code&gt;Pass 0, batch 0, face loss 14.2844762802, head loss 14.2844762802, time 1.67309403419
+Pass 0, batch 1, face loss 11.3860425949, head loss 11.3860416412, time 3.79619002342
+&lt;/denchmark-code&gt;
+
+
+使用【ParallelExecutor +fluid.memory_optimize 】, 也设置上述需要fetch的变量persistable=True，输出face_loss和head_loss输出【不同】：
+
+&lt;denchmark-code&gt;Pass 0, batch 0, face loss 5.40768432617, head loss 10.0967769623, time 1.64687013626
+Pass 0, batch 1, face loss 5.22169494629, head loss 8.87370109558, time 3.9501619339
+&lt;/denchmark-code&gt;
+
+
+使用【Executor +fluid.memory_optimize 】也设置上述需要fetch的变量persistable=True，输出face_loss和head_loss输出【相同】。
+
+&lt;denchmark-code&gt;Pass 0, batch 0, face loss 14.7560405731, head loss 14.7560405731, time 0.444567918777
+Pass 0, batch 1, face loss 11.1143836975, head loss 11.1143836975, time 1.67649412155
+Pass 0, batch 2, face loss 9.84147834778, head loss 9.84147834778, time 1.67893195152
+&lt;/denchmark-code&gt;
+
+所以，fluid.memory_optimize有对graph的分析，复用一些Var。ParallelExecutor中也有依赖一个SSA的graph来运行op。ParallelExecutor+fluid.memory_optimize结合在这种复杂的、有很多分支的网络中有bug。
+	</description>
+	<comments>
+		<comment id='1' author='qingqing01' date='2018-06-20T12:05:04Z'>
+		感觉memory optimizer这种改名字的方法让人夜不能寐呀。很多地方都有用var名字作为map key，或者把var name放开set里面，感觉就是assume名字是唯一的
+		</comment>
+		<comment id='2' author='qingqing01' date='2018-06-21T07:02:13Z'>
+		我觉得是某些Op读了它的输出导致的。。我们改下单测框架，让这个测试严格一些。
+		</comment>
+		<comment id='3' author='qingqing01' date='2018-06-22T02:08:23Z'>
+		&lt;denchmark-link:https://github.com/PaddlePaddle/Paddle/blob/develop/python/paddle/fluid/layers/nn.py#L4220&gt;https://github.com/PaddlePaddle/Paddle/blob/develop/python/paddle/fluid/layers/nn.py#L4220&lt;/denchmark-link&gt;
+
+&lt;denchmark-code&gt;def reshape(x, shape, actual_shape=None, act=None, inplace=True, name=None):
+    helper = LayerHelper("reshape", **locals())
+    reshaped = helper.create_tmp_variable(dtype=x.dtype)
+    helper.append_op(
+        type="reshape",
+        inputs={"X": x,
+                "Shape": actual_shape}
+        if isinstance(actual_shape, Variable) else {"X": x},
+        attrs={"shape": shape,
+               "inplace": inplace},
+        outputs={"Out": reshaped})
+
+    return helper.append_activation(reshaped)
+&lt;/denchmark-code&gt;
+
+reshape_op这里默认是in-place操作，C++里输入、输出Tensor共享了指针，输入输出的Variable name不同。
+测试将这里 inplace 默认设置为False，使用 似乎没问题，待给出合理分析。 &lt;denchmark-link:https://github.com/reyoung&gt;@reyoung&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/dzhwinter&gt;@dzhwinter&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='4' author='qingqing01' date='2018-06-22T02:42:43Z'>
+		in-place还是需要用memory_optimize统一管理，重新写的memory_optimize从图上分析依赖，接管了inplace。
+如果真的是inplace导致的问题，推导一下过程。
+单个op inplace需要满足一个条件: 该op是被复用变量的最后一个消费者，否则会造成其他消费者读出内容出错。executor的拓扑排序需要满足这个条件。
+假设inplace的内存刚好也被memory reuse了(替换为其他non-live的内存，记为op_x的输出)。那么就相当于要求当前执行的op不仅和被复用的op满足上述条件，而且要求和op_x输出变量的消费者也满足上述条件。因为在memory_optimize之后，相当于有更多op输入消费了同一块内存。拓扑排序满足这个条件更难了，所以可能出错。
+这个猜测需要验证一下
+		</comment>
+		<comment id='5' author='qingqing01' date='2018-06-22T02:49:01Z'>
+		感觉memory_optimize assume所有op都不能inplace操作。如果op inplace操作，memory_optimize分析出来将来不会被消费的var1，他的空间可能会被其他的var2使用 (memory optimize无法发现）。memory_optimize如果判读var3复用var1，就可能出错。
+但是，并没有什么东西限制op inplace操作
+		</comment>
+		<comment id='6' author='qingqing01' date='2018-07-06T09:17:04Z'>
+		This issue has been fixed, it is caused by the reshape op inplace.
+		</comment>
+		<comment id='7' author='qingqing01' date='2018-07-31T05:32:07Z'>
+		related PR. &lt;denchmark-link:https://github.com/PaddlePaddle/Paddle/pull/12414&gt;#12414&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

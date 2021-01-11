@@ -1,0 +1,219 @@
+<bug id='38596' author='bentyeh' open_date='2020-04-16T08:34:39Z' closed_time='2020-04-28T17:39:01Z'>
+	<summary>Keras fails to account for smaller last batch in loss metric calculation</summary>
+	<description>
+&lt;denchmark-h:h2&gt;System information&lt;/denchmark-h&gt;
+
+
+OS Platform and Distribution: Google Colab Notebook
+TensorFlow version (use command below): 2.2.0-rc2
+Python version: 3.6
+
+&lt;denchmark-h:h2&gt;Describe the current behavior&lt;/denchmark-h&gt;
+
+In tf.keras models, the model.test_step() method (which is called by model.fit() and model.evaluate()) incorrectly computes the mean loss over all batches in an epoch when the dataset size is not evenly divisible by the batch size. This applies for both training and validation loss. This bug affects the reported epoch loss, but NOT the training loss used for computing gradient updates.
+Currently, TensorFlow-Keras computes the loss for each batch, adds together the losses across batches, then divides by the number of batches. In other words, the reported loss at the end of each epoch is (incorrectly) unweighted with respect to the size of each batch.
+For example, suppose there are 3 samples in a dataset, and the batch size is 2. Then there are 2 batches of size 2 and 1. If the first batch has mean loss of 10 and the second batch has mean loss of 9, then the mean loss over the entire dataset is currently (incorrectly) computed as (10 + 9) / 2 = 9.5.
+&lt;denchmark-h:h2&gt;Describe the expected behavior&lt;/denchmark-h&gt;
+
+Continuing with the example above, the correct mean loss over the dataset should be a weighted mean of the batch losses, where the weights are given by each batch size. Thus, the correct mean loss should be (10*2 + 9*1) / (2 + 1) = 9.66666. This is shown in the code below.
+&lt;denchmark-h:h2&gt;Standalone code to reproduce the issue&lt;/denchmark-h&gt;
+
+Code (&lt;denchmark-link:https://colab.research.google.com/gist/bentyeh/9ec7fd68564f411cc4a1f8a7060c9b92/tf_keras_issue38596.ipynb&gt;gist here&lt;/denchmark-link&gt;
+)
+import tensorflow as tf
+
+X = tf.constant([[1],
+                 [2],
+                 [3]], dtype=tf.float32)
+y = tf.constant([[5],
+                 [4],
+                 [6]], dtype=tf.float32)
+
+# y_pred = a * x + b, where weights are intialized as a = 1, b = 0
+# thus, MSE = (x - y)**2 / len(x)
+model = tf.keras.Sequential([
+    tf.keras.layers.Dense(1, input_dim=1, kernel_initializer='ones', bias_initializer='zeros')])
+model.compile(optimizer='sgd', loss='mean_squared_error')
+
+def mse(y, y_pred):
+    assert len(y) == len(y_pred)
+    return sum((y - y_pred)**2)/len(y)
+
+print('model.evaluate():')
+print('- batch_size=1:', model.evaluate(X, y, batch_size=1, verbose=0))
+print('- batch_size=2:', model.evaluate(X, y, batch_size=2, verbose=0))
+print('- batch_size=3:', model.evaluate(X, y, batch_size=3, verbose=0))
+print()
+
+# incorrect mean of two different-sized batches
+# Batch 1 is size 2, but Batch 2 is size 1
+# So we should compute a weighted mean, but Tensorflow-Keras fails to do so
+print((mse(X[:-1], y[:-1]) + mse(X[-1], y[-1]))/2)
+Output
+&lt;denchmark-code&gt;model.evaluate():
+- batch_size=1: 9.666666984558105
+- batch_size=2: 9.5
+- batch_size=3: 9.666666984558105
+
+tf.Tensor([9.5], shape=(1,), dtype=float32)
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h2&gt;Where this error occurs in TensorFlow source code&lt;/denchmark-h&gt;
+
+The following line in the model.test_step() method calls the self.compiled_loss object.
+
+
+
+tensorflow/tensorflow/python/keras/engine/training.py
+
+
+        Lines 971 to 972
+      in
+      42052dc
+
+
+
+
+
+
+ self.compiled_loss( 
+
+
+
+ y, y_pred, sample_weight, regularization_losses=self.losses) 
+
+
+
+
+
+self.compiled_loss is a compile_utils.LossesContainer object whose __call__() method seems to be implemented incorrectly. Specifically, the following line is where each batch's total loss is accumulated over an epoch, but the accumulation is done without any record of the batch size.
+
+
+
+tensorflow/tensorflow/python/keras/engine/compile_utils.py
+
+
+         Line 235
+      in
+      42052dc
+
+
+
+
+
+
+ self._loss_metric.update_state(total_loss_metric_value) 
+
+
+
+
+
+Consequently, the mean epoch loss is calculated (m.result() below)
+
+
+
+tensorflow/tensorflow/python/keras/engine/training.py
+
+
+         Line 975
+      in
+      42052dc
+
+
+
+
+
+
+ return {m.name: m.result() for m in self.metrics} 
+
+
+
+
+
+by dividing the total accumulated loss by the number of batches (self.count).
+
+
+
+tensorflow/tensorflow/python/keras/metrics.py
+
+
+         Line 383
+      in
+      a5a8cee
+
+
+
+
+
+
+ return math_ops.div_no_nan(self.total, self.count) 
+
+
+
+
+
+&lt;denchmark-h:h2&gt;Proposed solution&lt;/denchmark-h&gt;
+
+I don't know what the best way to solve this problem may be, but the accumulation of each batch's loss should clearly track each batch's actual size. One possible solution may be to use the sample_weight argument and replace
+
+
+
+tensorflow/tensorflow/python/keras/engine/compile_utils.py
+
+
+         Line 235
+      in
+      42052dc
+
+
+
+
+
+
+ self._loss_metric.update_state(total_loss_metric_value) 
+
+
+
+
+
+with
+self._loss_metric.update_state(total_loss_metric_value, sample_weight=ACTUAL_BATCH_SIZE)
+&lt;denchmark-h:h2&gt;Related Issues&lt;/denchmark-h&gt;
+
+To the best of my knowledge, the problem described above is the root problem for a number of other reported issues: &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/35585&gt;#35585&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/35533&gt;#35533&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/38004&gt;#38004&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/38165&gt;#38165&lt;/denchmark-link&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='bentyeh' date='2020-04-16T08:53:42Z'>
+		Experiencing the same bug here. Can confirm and reproduce using the code shared above.
+		</comment>
+		<comment id='2' author='bentyeh' date='2020-04-16T09:31:20Z'>
+		I agree the loss should weight by batch size, but I don't think the big gaps loss between model.fit with GradientTape is cause by this. you can try with my code in &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/35585#issuecomment-606379061&gt;#35585 (comment)&lt;/denchmark-link&gt;
+, I discover, if you want to get same metrics between GradientTape with model.fit , you should set GradientTape's epochs bigger than model.fit, like the epochs of model.fit is 10, the epochs of GradientTape is 100.
+		</comment>
+		<comment id='3' author='bentyeh' date='2020-04-16T12:12:52Z'>
+		I have tried on colab with TF version 2.2.0-rc2 and was able to reproduce the issue.Please, find the gist &lt;denchmark-link:https://colab.sandbox.google.com/gist/ravikyram/ae42f851c0f6ee95183e5998ede1c390/untitled780.ipynb&gt;here&lt;/denchmark-link&gt;
+. Thanks!
+		</comment>
+		<comment id='4' author='bentyeh' date='2020-04-28T17:39:01Z'>
+		&lt;denchmark-link:https://github.com/chrisyeh96&gt;@chrisyeh96&lt;/denchmark-link&gt;
+ This was resolved in recent tf-nightly. It will be available in stable  in near future. &lt;denchmark-link:https://colab.research.google.com/gist/jvishnuvardhan/bfd3642c92417f9a260a0e07326ca3ee/untitled780.ipynb&gt;Here&lt;/denchmark-link&gt;
+ is the gist for your reference. Thanks!
+I am closing this issue as this was resolved. Please feel free to reopen if the issue persists again. Thanks!
+		</comment>
+		<comment id='5' author='bentyeh' date='2020-04-28T17:39:03Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/38596&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/38596&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='6' author='bentyeh' date='2020-04-28T17:43:55Z'>
+		Note to self: Original fix commit to the master branch is &lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/4f17f35befc1b2cefd22c404a8ceb7fe849291f7&gt;4f17f35&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

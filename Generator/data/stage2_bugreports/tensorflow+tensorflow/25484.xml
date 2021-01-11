@@ -1,0 +1,420 @@
+<bug id='25484' author='ricvo' open_date='2019-02-04T10:57:15Z' closed_time='2019-11-19T05:26:13Z'>
+	<summary>initialize variables from other tensor slow in tf1.12.0: comparison tf0.12 vs tf1.12.0</summary>
+	<description>
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow):
+yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): ubuntu 16.04
+TensorFlow version (use command below): 1.12.0 and 0.12
+Python version: 3.5 (for tf1.12.0) and 2.7 (for tf0.12)
+
+
+I am trying to use weight normalization with data-dependent initialization as reported in Salimans Kingma 2016 &lt;denchmark-link:https://arxiv.org/pdf/1602.07868.pdf&gt;https://arxiv.org/pdf/1602.07868.pdf&lt;/denchmark-link&gt;
+
+I use two approaches: 1 sharing the variables between initialization and convolution, 2 creating initializers that will be used in convolution to create the variables accordingly.
+It seems there are substantial differences in tf0.12 and tf1.12.0 in terms of initialize a variable throught the value of another tensor.
+For example, the following code (with 6 layers) is very slow in the newer tf1.12.0.
+approx 2 sec in tf.0.12
+approx 70 sec in tf1.12.0
+The creation of the graph in tf.1.12.0 is progressively getting slower for each extra added layer..
+Describe the expected behavior
+I would expect both version to be equally fast, or the newer version to be faster. In any case I would not expect the creation of the graph to slow down at each extra added layer. Also I cannot understand while sharing variables should be slower than instantiating from initializer with constant tensor...
+Code to reproduce the issue
+&lt;denchmark-code&gt;#!/usr/bin/env python
+# coding: utf-8
+
+# In[1]:
+
+
+import tensorflow as tf
+import numpy as np
+from pprint import pprint
+import time
+
+
+network_architecture = {
+    "channels" : 10,  # Size of z variables.
+    "num_layers" : 6,  # Number of resnet blocks for each downsampling layer.
+}
+
+def initialize_conv2dwn_vars(x, kernel_shape, output_channels, stride, padding, init_scale=1.0, mask=None):
+
+    input_shape = x.get_shape()
+    filter_shape = [kernel_shape[0], kernel_shape[1], int(input_shape[-1]), output_channels]
+    stride_shape = [1, stride[0], stride[1], 1]
+
+    v_inizializer = tf.random_normal_initializer(0, 0.05)
+    v = tf.get_variable("v", filter_shape, tf.float32, v_inizializer)
+#     see https://www.tensorflow.org/api_docs/python/tf/Variable#initialized_value
+    v_aux = v.initialized_value()
+    
+    if mask is not None:  # used for auto-regressive convolutions.
+        v_aux = mask * v_masked
+    
+    v_norm = tf.nn.l2_normalize(v_aux, [0, 1, 2])
+    x_init = tf.nn.conv2d(x, v_norm, strides=stride_shape, padding=padding) # ***
+    m_init, v_init = tf.nn.moments(x_init, [0, 1, 2])
+    scale_init = init_scale / tf.sqrt(v_init + 1e-10)
+
+    h_aux = tf.reshape(scale_init, [1, 1, 1, -1]) * (x_init - tf.reshape(m_init, [1, 1, 1, -1]))
+
+    g = tf.get_variable("g", initializer=tf.log(scale_init) / 3.0)
+    b = tf.get_variable("b", initializer=-m_init * scale_init)
+            
+    return h_aux
+
+def initializers_for_conv2dwn_vars(x, kernel_shape, output_channels, stride, padding, init_scale=1.0, mask=None):
+
+    input_shape = x.get_shape()
+    filter_shape = [kernel_shape[0], kernel_shape[1], int(input_shape[-1]), output_channels]
+    stride_shape = [1, stride[0], stride[1], 1]
+    
+    v_aux = tf.constant(np.random.normal(loc=0, scale=0.05, size=filter_shape), dtype=tf.float32, name="v_aux")
+
+    if mask is not None:  # used for auto-regressive convolutions.
+        v_aux = mask * v_masked
+    
+    v_norm = tf.nn.l2_normalize(v_aux, [0, 1, 2])
+    x_init = tf.nn.conv2d(x, v_norm, strides=stride_shape, padding=padding) # ***
+    m_init, v_init = tf.nn.moments(x_init, [0, 1, 2])
+    scale_init = init_scale / tf.sqrt(v_init + 1e-10)
+
+    def g_inizializer(*args, **kwargs):
+        return tf.log(scale_init) / 3.0
+    
+    def b_inizializer(*args, **kwargs):
+        return -m_init * scale_init
+
+    def v_inizializer(*args, **kwargs):
+        return v_aux
+    
+    h_aux = tf.reshape(scale_init, [1, 1, 1, -1]) * (x_init - tf.reshape(m_init, [1, 1, 1, -1]))
+            
+    return {'v' : v_inizializer, 'g' : g_inizializer, 'b' : b_inizializer}, h_aux
+
+
+def conv2dwn_reuse_vars(inputs, kernel_shape, output_channels, stride, padding, mask):
+
+    input_shape = inputs.get_shape()
+    filter_shape = [kernel_shape[0], kernel_shape[1], int(input_shape[-1]), output_channels]
+    stride_shape = [1, stride[0], stride[1], 1]
+    print("...ready v")
+    v = tf.get_variable("v", shape=filter_shape)
+    print("...ready g")
+    g = tf.get_variable("g", shape=[output_channels]) #initializer=initializers['g'],
+    print("...ready b")
+    b = tf.get_variable("b", shape=[output_channels]) # initializer=initializers['b'],
+    print("...done vars")
+    if mask is not None:
+        v = mask * v
+
+    # use weight normalization (Salimans &amp; Kingma, 2016)
+    w = tf.reshape(tf.exp(g), [1, 1, 1, output_channels]) * tf.nn.l2_normalize(v, [0, 1, 2])
+
+    # calculate convolutional layer output
+    b = tf.reshape(b, [1, 1, 1, -1])
+    
+    print("...ready")
+    r = tf.nn.conv2d(inputs, w, stride_shape, padding) + b
+    print("...done")
+        
+    return r
+
+def conv2dwn_create_vars(inputs, initializers, kernel_shape, output_channels, stride, padding, mask):
+
+    input_shape = inputs.get_shape()
+    filter_shape = [kernel_shape[0], kernel_shape[1], int(input_shape[-1]), output_channels]
+    stride_shape = [1, stride[0], stride[1], 1]
+    print("...ready v")
+    v = tf.get_variable("v", shape=filter_shape, initializer=initializers['v'])
+    print("...ready g")
+    g = tf.get_variable("g", shape=[output_channels], initializer=initializers['g'])
+    print("...ready b")
+    b = tf.get_variable("b", shape=[output_channels], initializer=initializers['b'])
+    print("...done vars")
+    if mask is not None:
+        v = mask * v
+
+    # use weight normalization (Salimans &amp; Kingma, 2016)
+    w = tf.reshape(tf.exp(g), [1, 1, 1, output_channels]) * tf.nn.l2_normalize(v, [0, 1, 2])
+
+    # calculate convolutional layer output
+    b = tf.reshape(b, [1, 1, 1, -1])
+    
+    print("...ready")
+    r = tf.nn.conv2d(inputs, w, stride_shape, padding) + b
+    print("...done")
+        
+    return r
+
+
+# In[8]:
+
+
+# REUSE VARIABLES
+
+def conv2d_weightnorm_layer(name, inputs, inputs_aux, n_channels, kernel_shape=(3,3), stride=(1,1), init_scale=1.0, mask=None):
+    
+    conv2dwn_kwargs = {"kernel_shape" : kernel_shape,
+                       "stride" : stride,
+                       "padding" : 'SAME',
+                       "mask" : mask
+    }
+
+    print("creating layer " + name)
+    
+    with tf.variable_scope(name, reuse=None):#, reuse=tf.AUTO_REUSE):
+        h_aux = initialize_conv2dwn_vars(inputs_aux,
+                                      output_channels = n_channels,
+                                      init_scale = init_scale,
+                                      **conv2dwn_kwargs)
+
+    print("middle")
+
+    with tf.variable_scope(name, reuse=True):#, reuse=tf.AUTO_REUSE):
+        h = conv2dwn_reuse_vars(inputs, output_channels = n_channels, **conv2dwn_kwargs)
+        
+    print("done")
+    print(h, h_aux)
+        
+    return h, h_aux
+
+
+class Network:
+    
+    def __init__(self, network_architecture):
+        self._num_layers = network_architecture["num_layers"]
+        self._channels = network_architecture["channels"]
+    
+    def _build_net(self, x):
+        
+        h, h_aux = conv2d_weightnorm_layer("first_layer_conv",
+                                        x,
+                                        x,
+                                        self._channels,
+                                        kernel_shape = (5,5),
+                                        stride = (2,2)
+                                       )
+
+        print("start loop")
+        for i in range(self._num_layers):
+            print("\n layer %d"%i)
+            h, h_aux = conv2d_weightnorm_layer("layer%d"%i,
+                                    h,
+                                    h_aux,
+                                    self._channels,
+                                    kernel_shape = (5,5),
+                                    stride = (1,1)
+                                   )
+            print("DONE layer %d \n"%i)
+                
+        return h, h_aux
+    
+
+
+# In[9]:
+
+tf.reset_default_graph()
+
+print("\n\nGRAPH CREATION WITH WEIGHT SHARING...\n\n")
+t_i = time.time()
+
+x = tf.placeholder(dtype=tf.float32, shape=[None, 32, 32, 3])
+net = Network(network_architecture)
+output = net._build_net(x)
+
+t_f = time.time()
+print("\nEND OF GRAPH CREATION WITH WEIGHT SHARING")
+print("time : %g s\n\n"%(t_f - t_i))
+
+# In[ ]:
+
+
+g_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES)
+pprint([str(var.name)+" "+str(var.get_shape().as_list()) for var in g_vars])
+print(len(g_vars))
+
+
+# In[ ]:
+
+
+# PASS INITIALIZERS
+
+def conv2d_weightnorm_layer(name, inputs, inputs_aux, n_channels, kernel_shape=(3,3), stride=(1,1), init_scale=1.0, mask=None):
+    
+    conv2dwn_kwargs = {"kernel_shape" : kernel_shape,
+                       "stride" : stride,
+                       "padding" : 'SAME',
+                       "mask" : mask
+    }
+
+    print("creating layer " + name)
+    
+    with tf.variable_scope(name, reuse=None):#, reuse=tf.AUTO_REUSE):
+        initializers, h_aux = initializers_for_conv2dwn_vars(inputs_aux,
+                                                  output_channels = n_channels,
+                                                  init_scale = init_scale,
+                                                  **conv2dwn_kwargs)
+    
+    print("middle")
+
+    with tf.variable_scope(name, reuse=None):#, reuse=tf.AUTO_REUSE):
+        h = conv2dwn_create_vars(inputs,
+                                initializers = initializers,
+                                output_channels = n_channels,
+                                **conv2dwn_kwargs)
+        
+    print("done")
+    print(h, h_aux)
+    
+    return h, h_aux
+
+
+class Network:
+    
+    def __init__(self, network_architecture):
+        self._num_layers = network_architecture["num_layers"]
+        self._channels = network_architecture["channels"]
+    
+    def _build_net(self, x):
+        
+        h, h_aux = conv2d_weightnorm_layer("first_layer_conv",
+                                        x,
+                                        x,
+                                        self._channels,
+                                        kernel_shape = (5,5),
+                                        stride = (2,2)
+                                       )
+
+        print("start loop")
+        for i in range(self._num_layers):
+            print("\n layer %d"%i)
+            h, h_aux = conv2d_weightnorm_layer("layer%d"%i,
+                                    h,
+                                    h_aux,
+                                    self._channels,
+                                    kernel_shape = (5,5),
+                                    stride = (1,1)
+                                   )
+            print("DONE layer %d \n"%i)
+                
+        return h, h_aux
+    
+
+
+# In[ ]:
+
+
+tf.reset_default_graph()
+
+print("\n\nGRAPH CREATION WITH INITIALIZERS FROM OTHER TENSORS...\n\n")
+t_i = time.time()
+
+x = tf.placeholder(dtype=tf.float32, shape=[None, 32, 32, 3])
+net = Network(network_architecture)
+output = net._build_net(x)
+
+t_f = time.time()
+print("\nEND OF GRAPH CREATION WITH INITIALIZERS FROM OTHER TENSORS")
+print("time : %g s\n\n"%(t_f - t_i))
+
+# In[ ]:
+g_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES)
+pprint([str(var.name)+" "+str(var.get_shape().as_list()) for var in g_vars])
+print(len(g_vars))
+
+&lt;/denchmark-code&gt;
+
+Other info
+Also plotting the graph for the two tf versions give completely different results (see graphs attached). It seems in the newer version tf1.12.0 th layer will directly depend on all the previous layers, does this means that more connections will be created in the newer version?
+Is this expected? Could you help me understand the mechanism behind and if there is a workaround to have a fast custom data-dependent initialization from a tensor?
+IN TF0.12
+&lt;denchmark-link:https://user-images.githubusercontent.com/9975354/52204247-4e867080-287c-11e9-911f-af81c6ecddb9.png&gt;&lt;/denchmark-link&gt;
+
+IN TF1.12.0
+&lt;denchmark-link:https://user-images.githubusercontent.com/9975354/52204250-50e8ca80-287c-11e9-8685-d3388a151364.png&gt;&lt;/denchmark-link&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='ricvo' date='2019-02-04T22:40:23Z'>
+		cc &lt;denchmark-link:https://github.com/alextp&gt;@alextp&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/akshaym&gt;@akshaym&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/martinwicke&gt;@martinwicke&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='2' author='ricvo' date='2019-02-05T00:36:53Z'>
+		I believe these are just cosmetic differences because tf.layers changed its implementation of name scopes.
+		</comment>
+		<comment id='3' author='ricvo' date='2019-02-05T00:49:04Z'>
+		That explains the visualization, but not the runtime though
+		</comment>
+		<comment id='4' author='ricvo' date='2019-02-05T09:50:58Z'>
+		I believe it is not only a cosmetic difference. There are two methods in the code that I uploaded:
+
+variable initialization (data-dependent) and weight sharing,
+initialization from custom initializers (custom tensors data-dependent).
+
+I am not sure exactly what is the difference in the low-level implementation of these two but the times are very different for them.
+Also: the graph of tf1.12.0 seems to have much more direct connections, is this really only a visualization issue?
+When I set to initialize from a tensor, in my understanding, it should evaluate the value of that tensor during  the variables initialization operator and assign the value to my variable. Is this correct? So what are the extra connections to all the previous layers for...
+I would say the graph of tf0.12 makes more sense to me... but maybe I don't know exactly what is behind?
+		</comment>
+		<comment id='5' author='ricvo' date='2019-02-26T15:44:53Z'>
+		Any news on this bug?
+Thanks!
+		</comment>
+		<comment id='6' author='ricvo' date='2019-03-05T17:33:08Z'>
+		I don't know how to debug this because 0.12 and 1.12 are very very many
+releases apart from each other, so many things could have changed. Can you
+try to find a small reproducible example of the behavior you don't like?
+&lt;denchmark-link:#&gt;…&lt;/denchmark-link&gt;
+
+
+On Tue, Feb 26, 2019 at 7:49 AM Riccardo Volpi ***@***.***&gt; wrote:
+ Any news on this bug?
+ Thanks!
+
+ —
+ You are receiving this because you were mentioned.
+ Reply to this email directly, view it on GitHub
+ &lt;#25484 (comment)&gt;,
+ or mute the thread
+ &lt;https://github.com/notifications/unsubscribe-auth/AAATxVmmd9CMmwycj5jVCmzjOWNOkkCgks5vRVekgaJpZM4ag9rY&gt;
+ .
+
+
+-- 
+ - Alex
+
+		</comment>
+		<comment id='7' author='ricvo' date='2019-04-20T17:47:24Z'>
+		Certainly!
+I think the small code I posted is exactly the example you mention, I am simply creating some convolutional layers and I try to initialize them in data dependent way.
+If anything specific is not clear please let me know. Thanks
+Edit: it seems to me the graph is excessively connected in the tf 1.12, if you look at the graph all layers are directly connected to all the previous ones. This might be the reason why the slow down is growing so much with the number of layers... in the 0.12 graph each layer is connected only to the previous one, as one would expect I believe,...
+		</comment>
+		<comment id='8' author='ricvo' date='2019-10-18T11:40:31Z'>
+		&lt;denchmark-link:https://github.com/ricvo&gt;@ricvo&lt;/denchmark-link&gt;
+, I tried on colab with Tensorflow version 1.15.0. Looks like the issue is fixed in Tf1.15. Please take a look at the &lt;denchmark-link:https://colab.sandbox.google.com/gist/gadagashwini/97f468883cddce3ccf19b2596de7c2ba/untitled205.ipynb&gt;gist&lt;/denchmark-link&gt;
+ and let us know if issue still persists. Thanks!
+		</comment>
+		<comment id='9' author='ricvo' date='2019-11-04T05:56:11Z'>
+		&lt;denchmark-link:https://github.com/ricvo&gt;@ricvo&lt;/denchmark-link&gt;
+, Is this still an issue!
+		</comment>
+		<comment id='10' author='ricvo' date='2019-11-18T12:37:19Z'>
+		It has been 14 days with no activity and the awaiting response label was assigned. Is this still an issue?
+		</comment>
+		<comment id='11' author='ricvo' date='2019-11-19T05:26:13Z'>
+		Automatically closing due to lack of recent activity. Please update the issue when new information becomes available, and we will reopen the issue. Thanks!
+		</comment>
+		<comment id='12' author='ricvo' date='2019-11-19T05:26:14Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/25484&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/25484&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,302 @@
+<bug id='39587' author='jamescooper-blis' open_date='2020-05-15T18:44:07Z' closed_time='2020-05-18T00:56:51Z'>
+	<summary>TS_SessionRun: 'Input to reshape' errors.  Requested shape is always tensor_size ^ 2</summary>
+	<description>
+Please make sure that this is a bug. As per our
+GitHub Policy,
+we only address code/doc bugs, performance issues, feature requests and
+build/installation issues on GitHub. tag:bug_template
+System information
+
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow):
+Yes
+
+
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04):
+Ubuntu 16.04, Ubuntu 18.04
+
+
+TensorFlow installed from (source or binary):
+Binary, From pip. C-API downloaded from https://www.tensorflow.org/install/lang_c
+
+
+TensorFlow version (use command below):
+('v2.1.0-rc2-17-ge5bf8de', '2.1.0')
+C-API: Hello from TensorFlow C library version 1.15.0
+
+
+Python version:
+Python 2.7.12
+
+
+Bazel version (if compiling from source):
+
+
+GCC/Compiler version (if compiling from source):
+
+
+CUDA/cuDNN version:
+
+
+GPU model and memory:
+
+
+Describe the current behavior
+Loading a saved model with the C-API  fails to run the graph. All input placeholders fail in the 'reshape' operation. For example:
+TF_SessionRun status: 3:Input to reshape is a tensor with 3715 values, but the requested shape has 13801225
+TF_SessionRun status: 3:Input to reshape is a tensor with 2 values, but the requested shape has 4
+TF_SessionRun status: 3:Input to reshape is a tensor with 1422 values, but the requested shape has 2022084
+The number of values in the requested shape is always the 'expected number of values' ^ 2.
+I suspect the following line of code plays a role in this: 
+
+
+tensorflow/tensorflow/core/kernels/reshape_op.h
+
+
+         Line 139
+      in
+      77245d0
+
+
+
+
+
+
+ (*product) *= size; 
+
+
+
+
+
+TF_LoadSessionFromSavedModel loads the model successfully. And it will correctly fail to run if I don't provide all inputs. I can see from stderr that it is calling the InitOp:
+2020-05-15 19:18:37.508528: I tensorflow/cc/saved_model/loader.cc:202] Restoring SavedModel bundle.
+2020-05-15 19:18:37.529034: I tensorflow/cc/saved_model/loader.cc:151] Running initialization op on SavedModel bundle at path: /home/james/model/bq/1
+2020-05-15 19:18:38.585963: I tensorflow/cc/saved_model/loader.cc:311] SavedModel load for tags { serve }; Status: success. Took 1097826 microseconds.
+More on the StackOverflow question: &lt;denchmark-link:https://stackoverflow.com/questions/61787472/reshape-input-layer-requested-shape-size-always-input-shape-size-squared&gt;https://stackoverflow.com/questions/61787472/reshape-input-layer-requested-shape-size-always-input-shape-size-squared&lt;/denchmark-link&gt;
+
+signature_def:
+ - name: 'serving_default'
+ - method_name: 'tensorflow/serving/predict'
+Describe the expected behavior
+TF_LoadSessionFromSavedModel outputs a runnable graph, or if extra steps are required to run a saved_model with the C-API they should be documented.
+Using the JNI code as an example, I cannot find extra steps there: 
+
+
+tensorflow/tensorflow/java/src/main/native/session_jni.cc
+
+
+         Line 132
+      in
+      ff17316
+
+
+
+
+
+
+ JNIEXPORT jbyteArray JNICALL Java_org_tensorflow_Session_run( 
+
+
+
+
+
+I cannot use the C++ shared lib because of the No session factory registered for the given session options: {target: "" config: } Registered factories are {}. issue that I cannot get around.
+Standalone code to reproduce the issue
+I don't think this is possible. The operations that fail are all populated by files in the 'assets' directory.
+The values in the 'tensor with ??? values' are correct, the requested shape is not.
+The code is pretty much just a standard C-API block, influenced by the JNI code above:
+session = TF_LoadSessionFromSavedModel(...);
+for each input:
+   inputs.push_back(TF_GraphOperationByName(...));
+for each output:
+   outputs.push_back(TF_GraphOperationByName(...));
+TF_SessionRun(session, inputs, ..., outputs, ....);
+	</description>
+	<comments>
+		<comment id='1' author='jamescooper-blis' date='2020-05-15T20:15:24Z'>
+		I think the problem was in my input Tensor creation. It is something like this:
+&lt;denchmark-code&gt;TF_Tensor* NewStringTensor(StringView s, TF_Status* status = nullptr)
+{
+   const int OFFSET = 8;
+   auto dstLen = TF_StringEncodedSize(s.length());
+
+   TF_Tensor* t = TF_AllocateTensor(TF_STRING, nullptr, 0, OFFSET + dstLen);
+   char* dst = static_cast&lt;char*&gt;(TF_TensorData(t));
+   std::memset(dst, 0, OFFSET);
+
+   TF_StringEncode(s.data(), s.length(), dst + OFFSET, dstLen, status);
+
+   return t;
+}
+&lt;/denchmark-code&gt;
+
+and
+&lt;denchmark-code&gt;TF_Tensor* NewFloatTensor(float v)
+{
+   auto tensor = TF_AllocateTensor(TF_FLOAT, nullptr, 0, sizeof(v));
+   auto data = static_cast&lt;float*&gt;(TF_TensorData(tensor));
+   std::memcpy(data, &amp;v, sizeof(v));
+
+   return tensor;
+}
+&lt;/denchmark-code&gt;
+
+I ported from the test code here: &lt;denchmark-link:https://github.com/Neargye/hello_tf_c_api/blob/28f7ed7aeaf4fb6462918d3358c6c5d3d517e081/src/tf_utils.cpp#L71&gt;https://github.com/Neargye/hello_tf_c_api/blob/28f7ed7aeaf4fb6462918d3358c6c5d3d517e081/src/tf_utils.cpp#L71&lt;/denchmark-link&gt;
+
+It seems that I actually need to set the const int64_t* and num_dims parameters to TF_AllocateTensor to proper values (unlike in the JNI example)? Like:
+&lt;denchmark-code&gt;TF_Tensor* NewStringTensor(StringView s)
+{
+   const int OFFSET = 8;
+   auto dstLen = TF_StringEncodedSize(s.length());
+
+   int64_t dims = 0;
+   TF_Tensor* t = TF_AllocateTensor(TF_STRING, &amp;dims, 1, OFFSET + dstLen);
+   if (!t)
+   {
+      return nullptr;
+   }
+   
+   char* dst = static_cast&lt;char*&gt;(TF_TensorData(t));
+   std::memset(dst, 0, OFFSET);
+
+   TF_Status* status = TF_NewStatus();
+   TF_StringEncode(s.data(), s.length(), dst + OFFSET, dstLen, status);
+   TF_DeleteStatus(status);
+
+   return t;
+}
+&lt;/denchmark-code&gt;
+
+and similarly for NewFloatTensor. Is this correct?
+		</comment>
+		<comment id='2' author='jamescooper-blis' date='2020-05-16T13:12:32Z'>
+		Now the issue is that the output tensors seem to be empty always. Here's the code
+&lt;denchmark-code&gt;   std::vector&lt;TF_Tensor*&gt; outputValues = { nullptr, nullptr, nullptr };
+
+   TF_Status* s = TF_NewStatus();
+   TF_SessionRun(
+      session.get(),
+      nullptr,
+      inputs.inputs.data(),
+      inputs.inputData.data(),
+      inputs.inputs.size(),
+      outputs.data(),
+      outputValues.data(),
+      outputs.size(),
+      nullptr,
+      0,
+      nullptr,
+      s
+   );
+
+   printf("TF_SessionRun status: %u\n", TF_GetCode(s));
+   TF_DeleteStatus(s);
+   
+   for (TF_Tensor* ov : outputValues)
+   {
+      if (ov == nullptr)
+      {
+         std::cout &lt;&lt; "output failure\n";
+         continue;
+      }
+      
+      std::cout &lt;&lt; "output (0x" &lt;&lt; ov &lt;&lt; "):\n";
+      std::cout &lt;&lt; " - type: " &lt;&lt; TF_TensorType(ov) &lt;&lt; "\n";
+      std::cout &lt;&lt; " - bytesize: " &lt;&lt; TF_TensorByteSize(ov) &lt;&lt; "\n";
+      std::cout &lt;&lt; " - element_count: " &lt;&lt; TF_TensorElementCount(ov) &lt;&lt; "\n";
+      std::cout &lt;&lt; " - data: " &lt;&lt; TF_TensorData(ov) &lt;&lt; "\n";
+      std::cout &lt;&lt; " - num_dims: " &lt;&lt; TF_NumDims(ov) &lt;&lt; "\n";
+
+      for (int i = 0; i &lt; TF_NumDims(ov); ++i)
+      {
+         std::cout &lt;&lt; "  - size_dim[" &lt;&lt; i &lt;&lt; "]: " &lt;&lt; TF_Dim(ov, i) &lt;&lt; "\n";
+      }
+      
+      TF_DeleteTensor(ov);
+      std::cout &lt;&lt; "\n";
+   }
+
+&lt;/denchmark-code&gt;
+
+and here's the dump of the TF_Tensor* in the outputValues vector:
+&lt;denchmark-code&gt;TF_LoadSessionFromSavedModel status: 0:
+TF_SessionRun status: 0
+output (0x0x324f020):
+ - type: 2
+ - bytesize: 0
+ - element_count: 0
+ - data: 0x324ecc0
+ - num_dims: 2
+  - size_dim[0]: 0
+  - size_dim[1]: 2
+
+output (0x0x3031c60):
+ - type: 7
+ - bytesize: 0
+ - element_count: 0
+ - data: 0x7f32ba518189
+ - num_dims: 2
+  - size_dim[0]: 0
+  - size_dim[1]: 2
+
+output (0x0x324f7c0):
+ - type: 7
+ - bytesize: 0
+ - element_count: 0
+ - data: 0x7f32ba518189
+ - num_dims: 2
+  - size_dim[0]: 0
+  - size_dim[1]: 1
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='3' author='jamescooper-blis' date='2020-05-18T00:54:46Z'>
+		I figured it out. I wasn't setting the dims of the input tensors correctly. I now use these two functions to input a single float and single string. It seems to work and I hope they're correct.
+How up to date are the C-API tar.gz binaries?
+&lt;denchmark-code&gt;TF_Tensor* TensorflowWrapper::NewStringTensor(StringView s)
+{
+   const int OFFSET = sizeof(int64_t);
+   auto dstLen = ::TF_StringEncodedSize(s.length());
+
+   std::array&lt;int64_t, 1&gt; dims{1};  // Change at your peril.
+   TF_Tensor* t = TF_AllocateTensor(TF_STRING, dims.data(), dims.size(), OFFSET + dstLen);
+   if (t)
+   {
+      char* dst = static_cast&lt;char*&gt;(::TF_TensorData(t));
+      std::memset(dst, 0, OFFSET);
+
+      // TODO: Handle errors properly.
+      TF_Status* status = TF_NewStatus();
+      TF_StringEncode(s.data(), s.length(), dst + OFFSET, dstLen, status);
+      TF_DeleteStatus(status);
+   }
+
+   return t;
+}
+
+TF_Tensor* TensorflowWrapper::NewFloatTensor(float v)
+{
+   std::array&lt;int64_t, 1&gt; dims{1};  // Change at your peril.
+
+   TF_Tensor* t = TF_AllocateTensor(TF_FLOAT, dims.data(), dims.size(), sizeof(float));
+   if (t)
+   {
+      auto data = static_cast&lt;float*&gt;(TF_TensorData(t));
+      std::memcpy(data, &amp;v, sizeof(float));
+   }
+
+   return t;
+
+}
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='4' author='jamescooper-blis' date='2020-05-18T00:56:53Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/39587&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/39587&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

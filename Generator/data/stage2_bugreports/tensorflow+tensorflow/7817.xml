@@ -1,0 +1,234 @@
+<bug id='7817' author='akaitsuki-ii' open_date='2017-02-23T12:52:19Z' closed_time='2017-02-24T18:10:07Z'>
+	<summary>Reading data with queue is even slower than using feed_dict</summary>
+	<description>
+It seems reading data with feed_dict is inefficient in tensorflow (I found it 3-4 times slower than a theano-based implementation with a totally same network structure), I turn to a queue-based method as official recommendation. However, my experiment result give a even worse performance. Is there anything wrong ?
+&lt;denchmark-h:h3&gt;Related issue&lt;/denchmark-h&gt;
+
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/3377&gt;#3377 Moving data from CPU to GPU is slow&lt;/denchmark-link&gt;
+
+&lt;denchmark-h:h3&gt;Environment info&lt;/denchmark-h&gt;
+
+Operating System: Ubuntu 16.04
+CPU: Intel i4790-k
+GPU: Nvidia GTX 1070 (8 GB)
+Memory: 16 GB
+Tensorflow version: 1.0
+CUDA version: 8.0
+cuDNN version: 5.0
+&lt;denchmark-h:h3&gt;Implementation Example&lt;/denchmark-h&gt;
+
+
+Using feed_dict
+
+x, y = np.array(...)
+in_x, in_y = tf.placeholder(...)
+""" f() is some computation in the network, including embedding_lookup, 
+bidirectional_dynamic_rnn, dense """
+train_op = f(in_x, in_y) 
+sess = tf.Session()
+for _ in range(num_epochs): # num_epochs is 100 here
+    sess.run(train_op, {in_x: x, in_y: y})
+
+Using queue
+
+x, y = np.array(...)
+x, y = tf.convert_to_tensor(...)
+in_x, in_y = tf.train.slice_input_producer([x, y], num_epochs=100)
+in_x, in_y = tf.train.batch([in_x, in_y], batch_size=32)
+train_op = f(in_x, in_y)
+sess = tf.Session()
+coord = tf.train.Coordinator()
+threads = tf.train.start_queue_runners(sess, coord)
+try:
+    while not coord.should_stop():
+        sess.run(train_op)
+    except Exception as e:
+        coord.request_stop(e)
+    finally:
+        coord.request_stop()
+coord.join(threads)
+	</description>
+	<comments>
+		<comment id='1' author='akaitsuki-ii' date='2017-02-23T16:59:59Z'>
+		I troubleshooted similar issue &lt;denchmark-link:http://stackoverflow.com/questions/39840323/benchmark-of-howto-reading-data/39842628#39842628&gt;here&lt;/denchmark-link&gt;
+ and it was caused by Python thread scheduler choosing a bad strategy. Essentially Python would schedule computation thread that issues a single enqueue call, then this thread would block and have to be pre-empted. Python doesn't support parallel execution of Python code and pre-emption is slow so this part is a performance hit. Eventually it pre-empts dequeue (main) thread to schedule enqueue thread, which does a single enqueue call before Python decides to give execution back to main thread. This back-and-forth dance introduced 10x slowdown in the pipeline.
+One solution is to make sure that you never have queue starvation, for instance, by making enqueue part faster (ie by using enqueue many as here &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/3009&gt;#3009&lt;/denchmark-link&gt;
+ ), making dequeue part slower (ie, add more computation to  until it becomes slow enough to be bottleneck), and by letting queue runners add some things to the queue (make queue larger and add  right after )
+		</comment>
+		<comment id='2' author='akaitsuki-ii' date='2017-02-25T08:38:46Z'>
+		&lt;denchmark-link:https://github.com/yaroslavvb&gt;@yaroslavvb&lt;/denchmark-link&gt;
+ Thx for your advice.
+However, I fail to fix the problem. I try replace  with  and set   to avoid queue starvation (I assume this parameter help fix it, right ?), but my program as slow as before.
+What's more, I follow the &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/1824#issuecomment-225754659&gt;link&lt;/denchmark-link&gt;
+ that you mentioned to generate timeline. It did take a long time to generate a timeline.json file (600 MB+, with correct .json file format), but failed to be visualized using  and give a blank output. Do you have any idea of what's going wrong ?
+		</comment>
+		<comment id='3' author='akaitsuki-ii' date='2017-02-25T15:37:20Z'>
+		What I meant was -- make sure your dequeue part of the graph is slower than your enqueue part. Pre-loading the queue is nota solution on its own because if you dequeue faster than you enqueue, eventually you'll consume all the elements on the queue and be back to queue starvation (check your queue size, there's queue fullness statistic in TensorBoard and also q.size() operation). The reality is that queues are bad when your computation is extremely cheap because of the way Python multi-threading works, feed_dict may actually be better for those cases.
+		</comment>
+		<comment id='4' author='akaitsuki-ii' date='2017-02-27T10:41:44Z'>
+		&lt;denchmark-link:https://github.com/yaroslavvb&gt;@yaroslavvb&lt;/denchmark-link&gt;
+ Thank you for reminding me of checking in TensorBoard.
+I do some test and it seems that  part is not a bottleneck of the program, it's full (and capacity is large enough) all the time. There is no problem of starvation.
+And I find that  operation really cause problems, according to the compute time statistics in TensorBoard,  cost 6x compute time than my model, which result in low GPU-Util and even worse performance than using feed_dict.
+		</comment>
+		<comment id='5' author='akaitsuki-ii' date='2017-02-27T14:59:49Z'>
+		You could narrow it down by making your program single threaded - first
+preload the queue and then consume it in the same thread. If it's still
+slow, then could narrow it down to a case that spends most time in dequeue
+and is single threaded, at which point CPU profile can tell where the time
+is spent
+&lt;denchmark-link:#&gt;…&lt;/denchmark-link&gt;
+
+
+On Feb 27, 2017 2:43 AM, "akaitsuki-ii" ***@***.***&gt; wrote:
+ @yaroslavvb &lt;https://github.com/yaroslavvb&gt; Thank you for reminding me of
+ checking in TensorBoard.
+ I do some test and it seems that *enqueue* part is not a bottleneck of
+ the program, it's full (and capacity is large enough) all the time. There
+ is no problem of starvation.
+ And I find that *dequeue* operation really cause problems, according to
+ the compute time statistics in TensorBoard, *dequeue* cost 6x compute
+ time than my model, which result in low GPU-Util and even worse performance
+ than using feed_dict.
+
+ —
+ You are receiving this because you were mentioned.
+ Reply to this email directly, view it on GitHub
+ &lt;#7817 (comment)&gt;,
+ or mute the thread
+ &lt;https://github.com/notifications/unsubscribe-auth/AABaHL5LVWVVBOMnyKTCJPSkiGVC56Ioks5rgqi3gaJpZM4MJ7ZR&gt;
+ .
+
+
+
+		</comment>
+		<comment id='6' author='akaitsuki-ii' date='2017-02-27T17:36:11Z'>
+		BTW, here's an example of making reader pipeline single-threaded -- &lt;denchmark-link:https://github.com/yaroslavvb/stuff/blob/master/ericyue-slowreader/benchmark-batch.py&gt;https://github.com/yaroslavvb/stuff/blob/master/ericyue-slowreader/benchmark-batch.py&lt;/denchmark-link&gt;
+
+Especially see the line with sess.run(a_queue_qr.enqueue_ops). Restructuring the problem in this way can help rule out some Python-threads related strangeness going on
+		</comment>
+		<comment id='7' author='akaitsuki-ii' date='2017-03-04T12:22:09Z'>
+		&lt;denchmark-link:https://github.com/yaroslavvb&gt;@yaroslavvb&lt;/denchmark-link&gt;
+ Sorry for check it so late.
+I did preload the queue full enough (using single thread ) this time before start running my model and consume the queue, there is no more enqueue operation after dequeue is start.
+But it seems to be very slow for dequeue in this situation.
+The following is the graph and node metadata showed in TensorBoard. You can see that compute time of dequeue operation is 24.2ms, which is much longer than that of my model, 1.36ms.
+&lt;denchmark-link:https://cloud.githubusercontent.com/assets/8386553/23578611/322056d4-0116-11e7-9f48-621e7b6a55d0.png&gt;&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://cloud.githubusercontent.com/assets/8386553/23578630/a4d7c284-0116-11e7-81f4-7d4aec8b49cd.png&gt;&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://cloud.githubusercontent.com/assets/8386553/23578632/aecdc41e-0116-11e7-8047-501c6e3dd442.png&gt;&lt;/denchmark-link&gt;
+
+However, if I replace my model with much light operation like , dequeue will be much faster with same tensors output.
+&lt;denchmark-link:https://cloud.githubusercontent.com/assets/8386553/23578663/45ab84e8-0117-11e7-9d6f-7c6316857d2f.png&gt;&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://cloud.githubusercontent.com/assets/8386553/23578664/494bfe02-0117-11e7-94e0-a43dccceb613.png&gt;&lt;/denchmark-link&gt;
+
+I can not figure out what the problem is...?
+		</comment>
+		<comment id='8' author='akaitsuki-ii' date='2017-03-04T15:44:52Z'>
+		Can you share self contained reproducible example?
+&lt;denchmark-link:#&gt;…&lt;/denchmark-link&gt;
+
+
+On Mar 4, 2017 4:24 AM, "akaitsuki-ii" ***@***.***&gt; wrote:
+ @yaroslavvb &lt;https://github.com/yaroslavvb&gt; Sorry for check it so late.
+ I did preload the queue full enough (using single thread
+ sess.run(enqueue_ops)) this time before start running my model and
+ consume the queue, there is no more enqueue operation after dequeue is
+ start.
+ But it seems to be very slow for dequeue in this situation.
+
+ The following is the graph and node metadata showed in TensorBoard. You
+ can see that compute time of dequeue operation is 24.2ms, which is much
+ longer than that of my model, 1.36ms.
+ [image: graph]
+ &lt;https://cloud.githubusercontent.com/assets/8386553/23578611/322056d4-0116-11e7-9f48-621e7b6a55d0.png&gt;
+ [image: dequeue-status]
+ &lt;https://cloud.githubusercontent.com/assets/8386553/23578630/a4d7c284-0116-11e7-81f4-7d4aec8b49cd.png&gt;
+ [image: model-status]
+ &lt;https://cloud.githubusercontent.com/assets/8386553/23578632/aecdc41e-0116-11e7-8047-501c6e3dd442.png&gt;
+
+ However, if I replace my model with much light operation like tf.square,
+ dequeue will be much faster with same tensors output.
+ [image: graph-light]
+ &lt;https://cloud.githubusercontent.com/assets/8386553/23578663/45ab84e8-0117-11e7-9d6f-7c6316857d2f.png&gt;
+ [image: dequeue-status-light]
+ &lt;https://cloud.githubusercontent.com/assets/8386553/23578664/494bfe02-0117-11e7-94e0-a43dccceb613.png&gt;
+
+ I can not figure out what the problem is...?
+
+ —
+ You are receiving this because you are subscribed to this thread.
+ Reply to this email directly, view it on GitHub
+ &lt;#7817 (comment)&gt;,
+ or mute the thread
+ &lt;https://github.com/notifications/unsubscribe-auth/AYoxVCRAVhRooixrFahBsW1ABrHjmQ40ks5riVgYgaJpZM4MJ7ZR&gt;
+ .
+
+
+
+		</comment>
+		<comment id='9' author='akaitsuki-ii' date='2017-03-07T07:48:14Z'>
+		&lt;denchmark-link:https://github.com/yaroslavvb&gt;@yaroslavvb&lt;/denchmark-link&gt;
+
+My implementation rely on 3rd library tensorlayer and it takes me sometime to rewrite it using tensorflow only.
+You can check and download the example .py file with &lt;denchmark-link:https://www.dropbox.com/sh/ijc7lccquf1g4l7/AABX9pf5LIqkvPxplbhFRVafa?dl=0&gt;this&lt;/denchmark-link&gt;
+ Dropbox link.
+Please check different performance of  operation between  and .
+		</comment>
+		<comment id='10' author='akaitsuki-ii' date='2017-03-13T04:26:55Z'>
+		&lt;denchmark-link:https://github.com/akaitsuki-ii&gt;@akaitsuki-ii&lt;/denchmark-link&gt;
+ so I tried making a timeline for your stuff (&lt;denchmark-link:https://github.com/yaroslavvb/stuff/commit/5d2feffd62fa50d71dd2dfd314ee405c21d58a25&gt;yaroslavvb/stuff@5d2feff&lt;/denchmark-link&gt;
+), and I couldn't because your execution graph is too large. There are 942,316 ops being executed in the first session.run call. The dump of stepstats is over a GB and timeline generation chokes. So I think that's the real problem, and the "enqueue" op being slow is a false positive since tensorboard couldn't parse all the ops
+		</comment>
+		<comment id='11' author='akaitsuki-ii' date='2017-03-13T07:06:32Z'>
+		&lt;denchmark-link:https://github.com/yaroslavvb&gt;@yaroslavvb&lt;/denchmark-link&gt;
+
+Errr...In fact I did try to make timeline before and fail because of the same reason.
+There may be a mistake that do you really mean that  op being slow is false positive? As  op is not contained in  call.
+But if  op is not really the problem, why I get worse performance changing to queue-based implementation than feeding with feed_dict at each  call ?
+Is it just better using feed_dict instead of queue-based method in this situation ?
+		</comment>
+		<comment id='12' author='akaitsuki-ii' date='2017-03-13T16:25:55Z'>
+		There are about 1 million ops being executed (grep node_stats stepstats-1.json | wc), and it takes 4.72 second on my 2014 MacBook, which seems fairly fast for 1 million ops. Such large computation graphs are outside of typical range of cases TensorFlow is tuned for, so there's significant overhead involved.
+As to why I said it is a false positive, if you open stepstats-1.json generated by the commit I referenced, you will see the following
+&lt;denchmark-code&gt;    node_stats {
+      node_name: "random_shuffle_queue_DequeueMany/n"
+      all_start_micros: 1489378683948609
+      op_start_rel_micros: 1
+      op_end_rel_micros: 1
+      all_end_rel_micros: 52
+      memory {
+        allocator_name: "cpu"
+&lt;/denchmark-code&gt;
+
+So the Dequeue op takes 51 microseconds.
+As to why feed_dict is faster, it's an interesting question, and would require some digging to getto. One theory is that dequeue op requires a kernel launch, so when you already have a million ops being launched, perhaps the thread scheduling system is overloaded,  any new kernel launches are slow. Meanwhile, feed_dict approach does not add an additional op for reading data from queue, so no kernel launch.
+		</comment>
+		<comment id='13' author='akaitsuki-ii' date='2017-03-13T20:16:32Z'>
+		I'm not sure I follow the explanation for feed_dict, &lt;denchmark-link:https://github.com/yaroslavvb&gt;@yaroslavvb&lt;/denchmark-link&gt;
+ , since feed_dict translates to adding a Recv op in the graph for each thing being fed, and those still have to run.
+Dequeue on the other hand is always suspicious since it can be sometimes fast and sometimes slow (if the queue is often full but sometimes empty). It might make sense to aggregate the costs across many invocations before saying it's not the issue.
+		</comment>
+		<comment id='14' author='akaitsuki-ii' date='2017-03-13T20:48:49Z'>
+		&lt;denchmark-link:https://github.com/alextp&gt;@alextp&lt;/denchmark-link&gt;
+ Good point about feed_dict, I can &lt;denchmark-link:https://github.com/yaroslavvb/stuff/blob/master/akaitsuki-slow/feed_dict.pbtxt&gt;see&lt;/denchmark-link&gt;
+ an extra _Recv node in that graph.
+BTW that script removes that queue variability -- there's no queue runners, things are first loaded onto the queue, and then consumed from the queue in the same thread.
+		</comment>
+		<comment id='15' author='akaitsuki-ii' date='2017-07-09T20:29:51Z'>
+		Just want to add something here, I implemented a  data feeding pipeline for multi-task learning. avg. GPU utilization &gt;90% and quad-core CPU utilization &gt;95%. In case anyone interested: &lt;denchmark-link:https://hanxiao.github.io/2017/07/07/Get-10x-Speedup-in-Tensorflow-Multi-Task-Learning-using-Python-Multiprocessing/&gt;https://hanxiao.github.io/2017/07/07/Get-10x-Speedup-in-Tensorflow-Multi-Task-Learning-using-Python-Multiprocessing/&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='16' author='akaitsuki-ii' date='2018-04-22T13:01:40Z'>
+		I don't know if it is still relevant, but reading through the discussion I do not find the reason or the solution to the problem. I have a very simple network (no operations almost) and I use:
+tf.train.shuffle_batch(decoded, capacity=batch_size * 50,
+batch_size=batch_size,
+num_threads=6,
+min_after_dequeue=batch_size * 10,
+allow_smaller_final_batch=True)
+As my performance drops as I increase the batch_size almost linearly, i.e., increasing batch_size 4 times, it takes 4 times as much.
+		</comment>
+	</comments>
+</bug>

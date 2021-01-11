@@ -1,0 +1,95 @@
+<bug id='1121' author='yangkky' open_date='2018-05-04T00:21:09Z' closed_time='2018-05-04T06:26:35Z'>
+	<summary>"HMC shape error at Dirichlet sample site"</summary>
+	<description>
+I'm running into an issue when using Dirichlet latent sites in NUTS.
+The following code:
+def wdk_gp_regressor(Ks_train):
+    n_k, n_train, _ = Ks_train.size()
+    w = pyro.sample('w', dist.Dirichlet(torch.ones(n_k).to(device))).view((n_k, 1, 1))
+    alpha = pyro.sample('alpha', dist.Uniform(torch.tensor([0.0]).to(device), 
+                                              torch.tensor([30.0]).to(device)))
+    
+
+    sigma = pyro.sample('sigma', dist.Uniform(torch.tensor([1e-2]).to(device), 
+                                              torch.tensor([1.0]).to(device)))
+    # Covariance
+    cov = torch.sum((Ks_train * w), dim=0) * alpha 
+    cov += torch.eye(n_train).to(device) * (sigma + 1e-4)
+    L = torch.potrf(cov, upper=False)
+
+    # Likelihood
+    return pyro.sample('f', dist.MultivariateNormal(torch.zeros(n_train).to(device), 
+                                                                           scale_tril=L))
+    
+def conditioned_gp_regressor(gp_regressor, Ks, y_train):
+    return pyro.poutine.condition(gp_regressor, data={'f': y_train})(Ks)
+
+nuts_kernel = NUTS(conditioned_gp_regressor, step_size=1.0, adapt_step_size=True)
+lact_posterior = MCMC(nuts_kernel, num_samples=1000, warmup_steps=500).run(wdk_gp_regressor, 
+                                                                           torch.stack(Ks_train), y_train)
+Results in:
+&lt;denchmark-code&gt;~/anaconda3/envs/pytorch_p36/lib/python3.6/site-packages/pyro/ops/integrator.py in single_step_velocity_verlet(z, r, potential_fn, step_size, z_grads)
+     51 
+     52     for site_name in z_next:
+---&gt; 53         r_next[site_name] = r_next[site_name] + 0.5 * step_size * (-grads[site_name])
+     54         z_next[site_name] = z_next[site_name] + step_size * r_next[site_name]
+     55     grads, potential_energy = _grad(potential_fn, z_next)
+
+RuntimeError: The size of tensor a (25) must match the size of tensor b (24) at non-singleton dimension 0
+&lt;/denchmark-code&gt;
+
+For reference, Ks_train has size (25, 590, 590).
+	</description>
+	<comments>
+		<comment id='1' author='yangkky' date='2018-05-07T03:49:59Z'>
+		Now it runs, but I get a NaN warning. Here's code that reproduces it:
+X1 = torch.tensor([[0.5, -0.5, 0.1],
+                  [0.1, 0.6, -0.4]])
+X2 = torch.tensor([[0.5, -0.3, 0.6],
+                  [-0.1, -0.6, -0.2]])
+y12 = torch.tensor([0.4, -0.1, -0.5, 0.2])
+
+def Matern52(X1, X2, alpha, rho):
+    L2 = torch.sum(X1 ** 2, dim=1).unsqueeze(1) + torch.sum(X2 ** 2, dim=1).unsqueeze(0) - 2 * X1 @ X2.t()
+    L2 = torch.clamp(L2, min=0.0)
+    L = torch.sqrt(L2 + 1e-12)
+    sqrt5_r = 5**0.5 * L
+    return alpha * (1 + sqrt5_r / rho + (5/3) * L2 / rho ** 2) * torch.exp(-sqrt5_r / rho)
+
+def ma_gp_hs(X_obs, n_hyp, X_acc):
+    alpha = torch.tensor([1.0])
+    sigma = pyro.sample('sigma', dist.Uniform(torch.Tensor([1e-2]), torch.Tensor([1])))
+    rho = pyro.sample('rho', dist.Uniform(torch.Tensor([1e-3]), torch.Tensor([100])))
+    prior = torch.stack([torch.ones(len(X_acc)) * 0.1 for _ in range(n_hyp)])
+    probs = pyro.sample('probs', dist.Dirichlet(prior))
+    X_hyp = probs @ X_acc
+    X_train = torch.cat([X_obs, X_hyp])
+    # Covariance
+    n = len(X_train)
+    cov = Matern52(X_train, X_train, alpha, rho) + torch.eye(n) * (sigma + 1e-3)
+    L = torch.potrf(cov, upper=False)
+    # Likelihood
+    return pyro.sample('f', dist.MultivariateNormal(torch.zeros(n), scale_tril=L))
+    
+def conditioned_gp_regressor(gp_regressor, X_obs, y_train, n_hyp, X_acc):
+    return pyro.poutine.condition(gp_regressor, data={'f': y_train})(X_obs, n_hyp, X_acc)
+
+nuts_kernel = NUTS(conditioned_gp_regressor, step_size=1, adapt_step_size=True)
+hpost = MCMC(nuts_kernel, num_samples=1000, warmup_steps=500).run(ma_gp_hs, X1, y12, len(X2), X2)
+I get the following warning:
+&lt;denchmark-code&gt;INFO Starting MCMC using kernel - NUTS ...
+/Users/kevinyang/anaconda/envs/pyro/lib/python3.6/site-packages/pyro/poutine/trace_struct.py:19: UserWarning: Encountered +inf log_prob_sum at site 'probs'
+  warnings.warn("Encountered +inf log_prob_sum at site '{}'".format(name))
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='2' author='yangkky' date='2018-05-07T04:18:21Z'>
+		The warning is fine, it has just drawn a sample which when constrained to the simplex results in a boundary value of 0/1 and that ends up resulting in an inf when scored by Dirichlet.
+&lt;denchmark-code&gt;Dirichlet(torch.tensor([0.5, 0.5])).log_prob(torch.tensor([0., 1.]))
+&lt;/denchmark-code&gt;
+
+The example runs fine otherwise. Lets discuss the issue of slowness in &lt;denchmark-link:https://forum.pyro.ai/t/nuts-with-discrete-latent-site-very-slow/204/2&gt;https://forum.pyro.ai/t/nuts-with-discrete-latent-site-very-slow/204/2&lt;/denchmark-link&gt;
+.
+		</comment>
+	</comments>
+</bug>

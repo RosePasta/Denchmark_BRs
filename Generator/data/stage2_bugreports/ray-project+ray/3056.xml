@@ -1,0 +1,105 @@
+<bug id='3056' author='pcmoritz' open_date='2018-10-14T02:18:29Z' closed_time='2018-10-18T01:01:04Z'>
+	<summary>Potential problem with actor handles</summary>
+	<description>
+The following crashes XRay and makes legacy ray hang:
+import ray
+
+ray.init(use_raylet=True)
+
+@ray.remote
+class Actor(object):
+    def f(self):
+        return 1
+
+@ray.remote
+class Bctor(object):
+    def __init__(self, constructor):
+        self.actor = constructor()
+
+    def step(self):
+        ray.get(self.actor.f.remote())
+
+a = Actor.remote()
+
+b = Bctor.remote(lambda: a)
+
+ray.get(b.step.remote())
+ray.get(b.step.remote())
+	</description>
+	<comments>
+		<comment id='1' author='pcmoritz' date='2018-10-14T19:55:50Z'>
+		Can you explain what the issue is? This looks like it should work.
+		</comment>
+		<comment id='2' author='pcmoritz' date='2018-10-14T20:02:51Z'>
+		The symptom is this:
+&lt;denchmark-code&gt;F1014 12:59:52.206046 2571563904 node_manager.cc:72]  Check failed: spec.ActorCounter() == expected_task_counter Expected actor counter: 0, got: 1
+*** Check failure stack trace: ***
+    @        0x10a4cc82d  google::LogMessage::Fail()
+    @        0x10a4ca64e  google::LogMessage::SendToLog()
+    @        0x10a4cb4cf  google::LogMessage::Flush()
+    @        0x10a4cb309  google::LogMessage::~LogMessage()
+    @        0x10a4cb5c5  google::LogMessage::~LogMessage()
+    @        0x10a42c3dd  ray::RayLog::~RayLog()
+    @        0x10a47b417  ray::raylet::NodeManager::AssignTask()
+    @        0x10a47ab08  ray::raylet::NodeManager::DispatchTasks()
+    @        0x10a4828b1  ray::raylet::NodeManager::EnqueuePlaceableTask()
+    @        0x10a479abc  ray::raylet::NodeManager::SubmitTask()
+    @        0x10a47eaef  ray::raylet::NodeManager::ProcessSubmitTaskMessage()
+    @        0x10a47cbd9  ray::raylet::NodeManager::ProcessClientMessage()
+    @        0x10a3de63c  std::__1::__function::__func&lt;&gt;::operator()()
+    @        0x10a42d853  ray::ClientConnection&lt;&gt;::ProcessMessage()
+    @        0x10a430db8  boost::asio::detail::reactive_socket_recv_op&lt;&gt;::do_complete()
+    @        0x10a3d05b8  boost::asio::detail::task_io_service::do_run_one()
+    @        0x10a3d0121  boost::asio::detail::task_io_service::run()
+    @        0x10a3cb7de  main
+&lt;/denchmark-code&gt;
+
+New actor handle IDs are being created that are not registered in the backend. One possibility is that every time we call compute_actor_handle_id_non_forked, the actor counter needs to be reset too. But not sure if that's the right fix.
+		</comment>
+		<comment id='3' author='pcmoritz' date='2018-10-14T20:24:43Z'>
+		This  be the same as &lt;denchmark-link:https://github.com/ray-project/ray/issues/2115&gt;#2115&lt;/denchmark-link&gt;
+.
+		</comment>
+		<comment id='4' author='pcmoritz' date='2018-10-15T06:06:54Z'>
+		Hmm, I'm not really sure why this is happening since it looks like the actor counter should get reset &lt;denchmark-link:https://github.com/ray-project/ray/blob/master/python/ray/actor.py#L662&gt;here&lt;/denchmark-link&gt;
+. Can you check to make sure that that line is getting hit?
+		</comment>
+		<comment id='5' author='pcmoritz' date='2018-10-15T06:18:03Z'>
+		It does get reset, but only when the actor handle is unpickled. However every time a method on the unpickled actor handle is called, a new actor handle is created by compute_actor_handle_id_non_forked and for that, the counter is not reset. See here: &lt;denchmark-link:https://github.com/ray-project/ray/blob/master/python/ray/actor.py#L558&gt;https://github.com/ray-project/ray/blob/master/python/ray/actor.py#L558&lt;/denchmark-link&gt;
+
+It seems to me very dangerous to create a new actor handle id every time we call an actor handle. This can easily lead to blowup of datastructures in the raylet.
+Maybe actor_handle_id was supposed to be assigned to self._ray_actor_handle_id in the line above?
+		</comment>
+		<comment id='6' author='pcmoritz' date='2018-10-15T17:15:36Z'>
+		That seems like a bug; the actor handle should only get created once, when the handle is first unpickled. I believe that we should be setting  earlier, somewhere around &lt;denchmark-link:https://github.com/ray-project/ray/blob/master/python/ray/actor.py#L697&gt;here&lt;/denchmark-link&gt;
+. I don't really understand the use of  in that code, though.
+&lt;denchmark-link:https://github.com/robertnishihara&gt;@robertnishihara&lt;/denchmark-link&gt;
+, it looks like you wrote that commit. Can you explain what happens when  and why it is necessary?
+		</comment>
+		<comment id='7' author='pcmoritz' date='2018-10-15T18:47:32Z'>
+		Creating a new actor handle was intentional. There are a couple cases:
+
+
+We pass an actor handle into a task/actor. This is the forking=True case. It creates a new actor handle for the task/actor. In this case we generate the new actor handle ID deterministically.
+
+
+A remote function or actor class includes an actor handle in its closure (but the actor handle is not passed in). When the remote function or actor class is unpickled, we create an "uninitialized" actor handle. Then when a task actually tries to use the actor handle, we generate a new actor handle ID for it (deterministically based on the actor task ID). Note that we can't generate the actor handle ID deterministically when the actor handle is unpickled because it can be unpickled on multiple workers.
+
+
+If we want to generate actor handle IDs deterministically, then we need a separate one per task (or per actor) that uses the actor handle (we currently also do one per actor method to simplify the code, so we could reduce the redundancy a bit in the actor case).
+
+There's a third case where someone just pickles an actor handle and then unpickles it somewhere else (e.g., a different driver). This is the same code path as case 2.
+
+&lt;denchmark-link:https://github.com/pcmoritz&gt;@pcmoritz&lt;/denchmark-link&gt;
+ is right that there is a performance issue here with the explosion of actor handles. I may be overlooking some simple solution. Ideally we'd just find a way to make actor handles super lightweight.
+		</comment>
+		<comment id='8' author='pcmoritz' date='2018-10-15T19:02:18Z'>
+		One possibility might be to have pickled actor handles essentially not have any dependencies with other actor handles, they only maintain a local count of methods that have been invoked and the count is reset every time a new task starts.
+Also, one thing I wasn't sure how to handle (and which currently breaks) is what to do when an actor handle is unpickled multiple times in the same task.
+		</comment>
+		<comment id='9' author='pcmoritz' date='2018-10-18T01:01:04Z'>
+		Fixed by &lt;denchmark-link:https://github.com/ray-project/ray/pull/3074&gt;#3074&lt;/denchmark-link&gt;
+.
+		</comment>
+	</comments>
+</bug>

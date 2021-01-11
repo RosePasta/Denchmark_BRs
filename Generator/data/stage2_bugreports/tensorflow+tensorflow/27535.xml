@@ -1,0 +1,285 @@
+<bug id='27535' author='reflectored' open_date='2019-04-05T09:10:26Z' closed_time='2019-06-01T00:15:21Z'>
+	<summary>FileSystem destructor is not being called when done</summary>
+	<description>
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): No
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): CentOS 7
+Mobile device (e.g. iPhone 8, Pixel 2, Samsung Galaxy) if the issue happens on mobile device:
+TensorFlow installed from (source or binary): binary
+TensorFlow version (use command below): v1.13.1
+Python version: Python 3.6.3
+Bazel version (if compiling from source):
+GCC/Compiler version (if compiling from source):
+CUDA/cuDNN version:
+GPU model and memory:
+
+When a FileSystem is registered it is allocated in the heap, but not destroyed on exit when using a Python script.
+The FileSystem destructor (~FileSystem()) must be called on exit.
+Code to reproduce the issue
+&lt;denchmark-code&gt;--- /opt/rh/rh-python36/root/usr/lib/python3.6/site-packages/tensorflow/include/tensorflow/core/platform/file_system.h	2019-04-05 10:05:27.253673315 +0200
++++ /test/tensorflow/tensorflow/core/platform/file_system.h	2019-04-05 10:22:15.999269084 +0200
+@@ -225,7 +225,7 @@
+ 
+   FileSystem() { printf("create FileSystem\n"); }
+ 
+-  virtual ~FileSystem();
++  virtual ~FileSystem() { printf("destroy FileSystem\n"); }
+ };
+&lt;/denchmark-code&gt;
+
+Then we run python and load our FileSystem plugin:
+&lt;denchmark-code&gt;[alexey@workstation test]$ python -c "import tensorflow as tf; tf.load_library('build/lib/libfilesystem_tensorflow.so')"
+create FileSystem
+[alexey@workstation test]$
+&lt;/denchmark-code&gt;
+
+Other info / logs
+It is necessary for our custom FileSystem plugin to call some functions on destruction. It seems that C-style pointers are used when registering a FileSystem:
+
+
+
+tensorflow/tensorflow/core/platform/env.h
+
+
+        Lines 450 to 457
+      in
+      6612da8
+
+
+
+
+
+
+ template &lt;typename Factory&gt; 
+
+
+
+ struct Register { 
+
+
+
+ Register(Env* env, const string&amp; scheme) { 
+
+
+
+ // TODO(b/32704451): Don't just ignore the ::tensorflow::Status object! 
+
+
+
+     env-&gt;RegisterFileSystem(scheme, []() -&gt; FileSystem* { return new Factory; }) 
+
+
+
+         .IgnoreError(); 
+
+
+
+   } 
+
+
+
+ }; 
+
+
+
+
+
+
+
+
+tensorflow/tensorflow/core/platform/file_system.h
+
+
+         Line 336
+      in
+      6612da8
+
+
+
+
+
+
+ typedef std::function&lt;FileSystem*()&gt; Factory; 
+
+
+
+
+
+The scheme is actually mapped to a unique pointer to the class:
+
+
+
+tensorflow/tensorflow/core/platform/env.cc
+
+
+         Line 64
+      in
+      6612da8
+
+
+
+
+
+
+ if (!registry_.emplace(string(scheme), std::unique_ptr&lt;FileSystem&gt;(factory())) 
+
+
+
+
+
+But I suspect that move could be the issue:
+
+
+
+tensorflow/tensorflow/core/platform/env.cc
+
+
+         Line 114
+      in
+      6612da8
+
+
+
+
+
+
+ return file_system_registry_-&gt;Register(scheme, std::move(factory)); 
+
+
+
+
+
+	</description>
+	<comments>
+		<comment id='1' author='reflectored' date='2019-04-12T16:57:21Z'>
+		(I'm not a good assignee for this issue.)
+		</comment>
+		<comment id='2' author='reflectored' date='2019-04-30T23:21:04Z'>
+		&lt;denchmark-link:https://github.com/mihaimaruseac&gt;@mihaimaruseac&lt;/denchmark-link&gt;
+ recently looked through all of filesystem code.
+Maybe he can help.
+		</comment>
+		<comment id='3' author='reflectored' date='2019-04-30T23:21:16Z'>
+		&lt;denchmark-link:https://github.com/gunan&gt;@gunan&lt;/denchmark-link&gt;
+ since you've looked at filesystems recently do you know who could look into this issue? A cursory reading of the code shows the right destructors all in the right places and nothing which would be able to prevent the destructors from running.
+This will be a more serious problem once we make a C API for file systems, I think.
+		</comment>
+		<comment id='4' author='reflectored' date='2019-05-01T00:29:33Z'>
+		I assigned it to myself. I hit this same issue while preparing the filesystem API proof of concept so I have some idea about what's happening.
+I'll run some tests tomorrow and update.
+		</comment>
+		<comment id='5' author='reflectored' date='2019-05-07T22:01:50Z'>
+		Sorry for the delay. I confirmed that the destructors are not properly called by doing the following changes:
+diff --git a/tensorflow/core/platform/env_test.cc b/tensorflow/core/platform/env_test.cc
+index 593727e8..19865268 100644
+--- a/tensorflow/core/platform/env_test.cc
++++ b/tensorflow/core/platform/env_test.cc
+@@ -284,6 +284,16 @@ TEST_F(DefaultEnvTest, SleepForMicroseconds) {
+ 
+ class TmpDirFileSystem : public NullFileSystem {
+  public:
++  TmpDirFileSystem() {
++    buff = malloc(42);
++    printf("TmpDirFileSystem created\n");
++  }
++
++  ~TmpDirFileSystem() {
++    free(buff);
++    printf("TmpDirFileSystem deleted\n");
++  }
++
+   Status FileExists(const string&amp; dir) override {
+     StringPiece scheme, host, path;
+     io::ParseURI(dir, &amp;scheme, &amp;host, &amp;path);
+@@ -316,6 +326,7 @@ class TmpDirFileSystem : public NullFileSystem {
+ 
+  private:
+   bool flushed_ = false;
++  void *buff;
+ };
+ 
+ REGISTER_FILE_SYSTEM("tmpdirfs", TmpDirFileSystem);
+And then bazel test //tensorflow/core:platform_env_test. The constructor message is printed, but not the destructor. Curiously, there's no memory leak reported either.
+I'll investigate further.
+		</comment>
+		<comment id='6' author='reflectored' date='2019-05-08T17:46:07Z'>
+		Reduced all the code to
+#include&lt;memory&gt;
+#include&lt;unordered_map&gt;
+
+class FileSystem {
+ public:
+  FileSystem() { std::cout &lt;&lt; "FileSystem constructor called\n"; }
+  ~FileSystem() { std::cout &lt;&lt; "FileSystem destructor called\n"; }
+};
+
+class FileSystemRegistry {
+ public:
+  typedef std::function&lt;FileSystem*()&gt; Factory;
+
+  FileSystemRegistry() { std::cout &lt;&lt; "FileSystemRegistry constructor called\n"; }
+  ~FileSystemRegistry() { std::cout &lt;&lt; "FileSystemRegistry destructor called\n"; }
+
+  bool Register(const std::string&amp; scheme, Factory factory) {
+    return registry_.emplace(std::string(scheme), std::unique_ptr&lt;FileSystem&gt;(factory())).second;
+  }
+
+ private:
+  mutable std::unordered_map&lt;std::string, std::unique_ptr&lt;FileSystem&gt;&gt; registry_;
+};
+
+class Env {
+ public:
+  Env() : file_system_registry_(new FileSystemRegistry) { std::cout &lt;&lt; "Env constructor called\n"; }
+  ~Env() { std::cout &lt;&lt; "Env destructor called\n"; }
+
+  static Env* Default() {
+    static Env* default_env = new Env;
+    return default_env;
+  }
+
+  bool RegisterFileSystem(const std::string&amp; scheme, FileSystemRegistry::Factory factory) {
+    return file_system_registry_-&gt;Register(scheme, std::move(factory));
+  }
+
+ private:
+  std::unique_ptr&lt;FileSystemRegistry&gt; file_system_registry_;
+};
+
+int main () {
+  Env::Default()-&gt;RegisterFileSystem("x", []() -&gt; FileSystem* { return new FileSystem; });
+  return 0;
+}
+and of course the destructors don't get called. Valgrind reports still reachable memory bytes as it should.
+I think I have an idea of the root cause of this, will run one more experiment and be back in at most an hour or so.
+		</comment>
+		<comment id='7' author='reflectored' date='2019-05-08T19:10:32Z'>
+		Ok, so the Env destructor is not called and that causes all the other relevant destructors to not be called either. The Env destructor is not called because of the static instance.
+I have a fix incoming, but we also need to consider if we want to call  destructor (as now it is &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/17e49b339b2b9a58ed967c69b7acb714dcd9b465/tensorflow/core/platform/posix/env.cc#L57&gt;marked as illegal to delete Env instance&lt;/denchmark-link&gt;
+)
+		</comment>
+		<comment id='8' author='reflectored' date='2019-05-08T19:34:36Z'>
+		Also, &lt;denchmark-link:https://github.com/reflectored&gt;@reflectored&lt;/denchmark-link&gt;
+, since you're working with filesystems, you might want to also look at &lt;denchmark-link:https://github.com/tensorflow/community/pull/101&gt;a proposed modularization C API&lt;/denchmark-link&gt;
+ for them as feedback is welcomed.
+		</comment>
+		<comment id='9' author='reflectored' date='2019-05-08T19:38:38Z'>
+		&lt;denchmark-link:https://github.com/mihaimaruseac&gt;@mihaimaruseac&lt;/denchmark-link&gt;
+ Yeah I actually stumbled upon that in your profile. I will take a look at that.
+		</comment>
+		<comment id='10' author='reflectored' date='2019-05-08T21:21:50Z'>
+		So, there is an issue with forcing Env destructor to be called: we will surely get into fiascos based on the order of calling static destructors. Instead, it is better if you use atexit to directly call the destructor/resource deinitializer of the filesystem, instead of relying on the destructor chain.
+		</comment>
+		<comment id='11' author='reflectored' date='2019-06-01T00:15:21Z'>
+		I think we should close this, as solution and reasoning behind why destructor is not called are given above.
+		</comment>
+		<comment id='12' author='reflectored' date='2019-06-01T00:15:22Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=27535&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=27535&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

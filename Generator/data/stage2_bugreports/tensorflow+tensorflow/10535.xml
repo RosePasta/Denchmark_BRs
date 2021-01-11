@@ -1,0 +1,486 @@
+<bug id='10535' author='laoreja' open_date='2017-06-08T13:50:49Z' closed_time='2018-02-08T22:29:30Z'>
+	<summary>tf.nn.conv3d_transpose really slow on i7 CPU with 100+G free memory</summary>
+	<description>
+&lt;denchmark-h:h3&gt;System information&lt;/denchmark-h&gt;
+
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): Yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Linux Ubuntu 16.04
+TensorFlow installed from (source or binary): virtualenv pip
+TensorFlow version (use command below): 1.1.0
+Bazel version (if compiling from source):
+CUDA/cuDNN version: 8.0
+GPU model and memory: on CPU
+Exact command to reproduce:
+
+&lt;denchmark-h:h3&gt;Describe the problem&lt;/denchmark-h&gt;
+
+It takes about 10 mins to do the tf.nn.conv3d_transpose computation.
+The input size is [1, 97, 128, 256, 32], kernel size is 333, strides is [1, 2, 2, 2, 1], and the output size is [1, 193, 256, 512, 1].
+At first my model runs with normal speed. Before this layer, there is several tf.nn.conv3d and tf.nn.conv3d_transpose computation.
+After this step's computation, it seems the computation become really slow down.
+But my model runs smoothly on 12G GPU, if using 4 GPUs, 1.8 examples/sec.
+I notice a similar issue &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/3128&gt;#3128&lt;/denchmark-link&gt;
+. That issue also reports some problem on CPU, but not on GPU. Is that issue resolved?
+&lt;denchmark-h:h3&gt;Source code / logs&lt;/denchmark-h&gt;
+
+Since I am training a large model on a large dataset. I will only include the model's code. If is needed, I will include more codes.
+The computationally cost layer is the last layer in the variable_scope learning_regularization, right before the scope soft_argmin in def _build_model.
+For more details, I am reimplementing &lt;denchmark-link:https://arxiv.org/pdf/1703.04309.pdf&gt;https://arxiv.org/pdf/1703.04309.pdf&lt;/denchmark-link&gt;
+.
+from collections import namedtuple
+
+import numpy as np
+import tensorflow as tf
+import six
+
+from tensorflow.python.training import moving_averages
+
+# If a model is trained using multiple GPUs, prefix all Op names with tower_name
+# to differentiate the operations. Note that this prefix is removed from the
+# names of the summaries when visualizing a model.
+TOWER_NAME = 'tower'
+
+# Batch normalization. Constant governing the exponential moving average of
+# the 'global' mean and variance for all activations.
+BATCHNORM_MOVING_AVERAGE_DECAY = 0.9997
+
+# The decay to use for the moving average.
+MOVING_AVERAGE_DECAY = 0.9999
+
+
+HParams = namedtuple('HParams',
+                     ['batch_size', 'lrn_rate',
+                     'weight_decay_rate',
+                     'relu_leakiness', 'optimizer', 'max_disparity'])
+
+
+class GCNet(object):
+  """GCNet model."""
+
+  def __init__(self, hps, left_images, right_images, gt_disparity, mask, mode): 
+    """ResNet constructor.
+
+    Args:
+      hps: Hyperparameters.
+      images: Batches of images. [batch_size, image_size, image_size, 3]
+      labels: Batches of labels. [batch_size, num_classes]
+      mode: One of 'train', 'eval' and 'predict'.
+    """
+    self.hps = hps
+    self._left_images = left_images
+    self._right_images = right_images
+    self.gt_disparity = gt_disparity
+    self.mask = mask
+    self.mode = mode
+    self.debug_op_list = []  
+
+    self._extra_train_ops = []
+    
+  def build_graph_to_loss(self):
+    self._build_model()
+    self._build_loss_op()
+
+  def _stride_arr(self, stride):
+    """Map a stride scalar to the stride array for tf.nn.conv2d."""
+    return [1, stride, stride, 1]
+    
+  def _stride_3d_arr(self, stride):
+    """Map a stride scalar to the stride array for tf.nn.conv2d."""
+    return [1, stride, stride, stride, 1]
+
+  def _build_model(self):
+    """Build the core model within the graph."""
+
+    layer_idx = 1
+    with tf.variable_scope('unary_features', reuse=False):
+      with tf.variable_scope('layer_'+str(layer_idx)):
+        layer_idx += 1
+        left_x = self._left_images
+        left_x = self._conv('conv', left_x, 5, 3, 32, self._stride_arr(2))
+        left_x = self._relu(left_x, self.hps.relu_leakiness)
+        left_x = self._batch_norm('bn', left_x)
+      tf.add_to_collection('shapes', tf.shape(left_x))
+        
+      for i in six.moves.range(8):
+        left_x, layer_idx = self._unary_feat_residual(left_x, 3, 32, 32, self._stride_arr(1), layer_idx)
+        tf.add_to_collection('shapes', tf.shape(left_x))
+    
+      with tf.variable_scope('layer_'+str(layer_idx)):
+        layer_idx += 1
+        left_x = self._conv('conv', left_x, 3, 32, 32, self._stride_arr(1))
+      tf.add_to_collection('shapes', tf.shape(left_x))
+    
+    layer_idx = 1    
+    with tf.variable_scope('unary_features', reuse=True):
+      with tf.variable_scope('layer_'+str(layer_idx)):
+        layer_idx += 1
+        right_x = self._left_images
+        right_x = self._conv('conv', right_x, 5, 3, 32, self._stride_arr(2))
+        right_x = self._relu(right_x, self.hps.relu_leakiness)
+        right_x = self._batch_norm('bn', right_x)
+        
+      for i in six.moves.range(8):
+        right_x, layer_idx = self._unary_feat_residual(right_x, 3, 32, 32, self._stride_arr(1), layer_idx)
+
+      with tf.variable_scope('layer_'+str(layer_idx)):
+        layer_idx += 1
+        right_x = self._conv('conv', right_x, 3, 32, 32, self._stride_arr(1))
+      
+    with tf.variable_scope('cost_volumn'):
+      left_cost_volume = tf.stack([tf.identity(left_x)] * (self.hps.max_disparity/2+1), axis=1, name='left_stack')
+      right_cost_volume = []
+      cur_width = tf.shape(right_x)[2]
+
+      for depth in six.moves.range(self.hps.max_disparity/2+1):
+        right_cost_volume.append(tf.pad(tf.slice(right_x, [0, 0, 0, 0], [-1, -1, cur_width - depth, -1], name='right_slice_'+str(depth)),
+                                        [[0, 0], [0, 0], [depth, 0], [0, 0]],
+                                        name='right_pad_'+str(depth)
+                                        ))
+      right_cost_volume = tf.stack(right_cost_volume, axis=1, name='right_stack')
+      x = tf.concat([left_cost_volume, right_cost_volume], 4)
+      tf.add_to_collection('shapes', tf.shape(x))
+      
+          
+    with tf.variable_scope('learning_regularization'):
+      stored_features = []
+
+      in_filters = [64, 64, 64, 64]
+      out_filters = [32, 64, 64, 64]
+      in_filters_stride_2 = [64, 64, 64, 64]
+      out_filters_stride_2 = [64, 64, 64, 128]
+      for i in six.moves.range(4):
+        tmp_x, layer_idx = self._regularization_subsample(x, 3, in_filters[i], out_filters[i], self._stride_3d_arr(1), layer_idx)
+        tf.add_to_collection('shapes', tf.shape(tmp_x))
+        stored_features.append(tmp_x)
+        
+        with tf.variable_scope('layer_'+str(layer_idx)):
+          layer_idx += 1
+          x = self._conv3d('conv3d', x, 3, in_filters_stride_2[i], out_filters_stride_2[i], self._stride_3d_arr(2))
+          x = self._relu(x, self.hps.relu_leakiness)
+          x = self._batch_norm('bn', x)
+          tf.add_to_collection('shapes', tf.shape(x))
+
+      
+      assert stored_features[0] is not stored_features[1]
+
+      for i in six.moves.range(2):
+        with tf.variable_scope('layer_'+str(layer_idx)):
+          layer_idx += 1
+          x = self._conv3d('conv3d', x, 3, 128, 128, self._stride_3d_arr(1))
+          x = self._relu(x, self.hps.relu_leakiness)
+          x = self._batch_norm('bn', x)
+          tf.add_to_collection('shapes', tf.shape(x))
+
+      transposed_in_filters = [128, 64, 64, 64]
+      transposed_out_filters = [64, 64, 64, 32]
+      
+      for i in six.moves.range(4):
+        x, layer_idx = self._regularization_upsample(x, stored_features[-i-1], 3, transposed_in_filters[i], transposed_out_filters[i], self._stride_3d_arr(2), layer_idx)
+        tf.add_to_collection('shapes', tf.shape(x))
+      
+      with tf.variable_scope('layer_'+str(layer_idx)):
+        layer_idx += 1
+        input_shape = tf.shape(self.gt_disparity)
+        x = self._conv3d_trans('conv_trans', x, 3, 32, 1, self._stride_3d_arr(2), [input_shape[0], self.hps.max_disparity+1, input_shape[1], input_shape[2], 1])
+        tf.add_to_collection('shapes', tf.shape(x))
+        self.debug_op_list.append(tf.shape(x))
+
+    
+    with tf.variable_scope('soft_argmin'):
+        x = tf.squeeze(x, squeeze_dims=[4], name='squeeze')
+        tf.add_to_collection('shapes', tf.shape(x))
+        x = tf.transpose(x, perm=[0, 2, 3, 1], name='transpose')
+        tf.add_to_collection('shapes', tf.shape(x))
+        x = tf.nn.softmax(x, dim=-1, name='softmax')
+        tf.add_to_collection('shapes', tf.shape(x))
+
+        multiplier = tf.range(0, self.hps.max_disparity+1, dtype=tf.float32, name='depth_range')
+        x = tf.multiply(x, multiplier, name='softmax_mul_depth')
+        tf.add_to_collection('shapes', tf.shape(x))
+        self.predicted_disparity = tf.reduce_sum(x, axis=3, name='reduce_sum')       
+        tf.add_to_collection('shapes', tf.shape(self.predicted_disparity))
+    self.shapes = tf.get_collection('shapes')
+    self.debug_op_list.append(self.shapes)
+
+  def _build_loss_op(self):
+    with tf.variable_scope('loss'):
+      self.abs_loss = tf.reduce_mean(tf.abs((self.gt_disparity - self.predicted_disparity) * self.mask), name='abs_loss')
+      self.total_loss = self.abs_loss + self._decay()
+
+      
+  def _add_loss_summaries(self):
+    """Add summaries for losses in CIFAR-10 model.
+
+    Generates moving average for all losses and associated summaries for
+    visualizing the performance of the network.
+
+    Args:
+      total_loss: Total loss from loss().
+    Returns:
+      loss_averages_op: op for generating moving averages of losses.
+    """
+    # Compute the moving average of all individual losses and the total loss.
+    loss_averages = tf.train.ExponentialMovingAverage(0.9, name='loss_avg')
+    self.loss_averages_op = loss_averages.apply([self.abs_loss, self.total_loss])
+
+    # Attach a scalar summary to all individual losses and the total loss; do the
+    # same for the averaged version of the losses.
+    for l in [self.abs_loss, self.total_loss]:
+      # Name each loss as '(raw)' and name the moving average version of the loss
+      # as the original loss name.
+      tf.summary.scalar(l.op.name + ' (raw)', l)
+      tf.summary.scalar(l.op.name, loss_averages.average(l))
+    
+  def _build_train_op(self, global_step):
+    """Build training specific ops for the graph."""
+    self.lrn_rate = tf.constant(self.hps.lrn_rate, tf.float32)
+    tf.summary.scalar('learning_rate', self.lrn_rate)
+
+    loss_averages_op = self._add_loss_summaries()
+    
+    with tf.control_dependencies([loss_averages_op]):
+      if self.hps.optimizer == 'sgd':
+        optimizer = tf.train.GradientDescentOptimizer(self.lrn_rate)
+      elif self.hps.optimizer == 'mom':
+        optimizer = tf.train.MomentumOptimizer(self.lrn_rate, 0.9)
+      elif self.hps.optimizer == 'RMSProp':
+        optimizer = tf.train.RMSPropOptimizer(self.lrn_rate, decay=0.9, momentum=0.9, epsilon=1)
+        
+        trainable_variables = tf.trainable_variables()
+        grads = optimizer.compute_gradients(self.total_loss, trainable_variables)
+
+
+    apply_op = optimizer.apply_gradients(
+        grads,
+        global_step=global_step, 
+        name='train_step')
+        
+    # Track the moving averages of all trainable variables.
+    variable_averages = tf.train.ExponentialMovingAverage(
+        MOVING_AVERAGE_DECAY, global_step)
+    variables_averages_op = variable_averages.apply(tf.trainable_variables())
+
+    with tf.control_dependencies([apply_op, variables_averages_op]):
+      self.train_op = tf.no_op(name='train')
+
+  def _regularization_upsample(self, x, feature, filter_size, in_filter, out_filter, stride, layer_idx):
+    with tf.variable_scope('layer_'+str(layer_idx)):
+      layer_idx += 1
+      x = self._conv3d_trans('conv_trans', x, filter_size, in_filter, out_filter, stride, tf.shape(feature))
+      x = self._relu(x, self.hps.relu_leakiness)
+      x = self._batch_norm('bn', x)
+      
+    with tf.variable_scope('residual_after_'+str(layer_idx-1)):
+      x += feature
+
+    tf.logging.debug('image after unit %s', x.get_shape())
+    return x, layer_idx
+
+  def _regularization_subsample(self, x, filter_size, in_filter, out_filter, stride, layer_idx):
+
+    with tf.variable_scope('layer_'+str(layer_idx)):
+      layer_idx += 1
+      x = self._conv3d('conv3d', x, filter_size, in_filter, out_filter, stride)
+      x = self._relu(x, self.hps.relu_leakiness)
+      x = self._batch_norm('bn', x)
+
+    with tf.variable_scope('layer_'+str(layer_idx)):
+      layer_idx += 1
+      x = self._conv3d('conv3d', x, filter_size, out_filter, out_filter, stride)
+      x = self._relu(x, self.hps.relu_leakiness)
+      x = self._batch_norm('bn', x)
+      
+    tf.logging.debug('image after unit %s', x.get_shape())
+    return x, layer_idx
+
+  def _unary_feat_residual(self, x, filter_size, in_filter, out_filter, stride, layer_idx):
+    orig_x = x
+    orig_layer_idx = layer_idx - 1
+    
+    for i in six.moves.range(2):
+      with tf.variable_scope('layer_'+str(layer_idx)):
+        layer_idx += 1
+        x = self._conv('conv', x, 3, in_filter, out_filter, stride)
+        x = self._relu(x, self.hps.relu_leakiness)
+        x = self._batch_norm('bn', x)
+          
+    with tf.variable_scope('residual_btw_'+str(layer_idx-1)+'_'+str(orig_layer_idx)):
+      x += orig_x
+
+    tf.logging.debug('image after unit %s', x.get_shape())
+    return x, layer_idx
+
+
+  def _decay(self):
+    """L2 weight decay loss."""
+    costs = []
+    for var in tf.trainable_variables():
+      if var.op.name.find(r'DW') &gt; 0:
+        costs.append(tf.nn.l2_loss(var))
+        # tf.summary.histogram(var.op.name, var)
+
+    return tf.multiply(self.hps.weight_decay_rate, tf.add_n(costs))
+
+  def _conv(self, name, x, filter_size, in_filters, out_filters, strides):
+    """Convolution."""
+    with tf.variable_scope(name):
+      n = filter_size * filter_size * out_filters
+      kernel = self._variable_on_cpu(
+          'DW', [filter_size, filter_size, in_filters, out_filters],
+          initializer=tf.random_normal_initializer(
+              stddev=np.sqrt(2.0/n)))
+      return tf.nn.conv2d(x, kernel, strides, padding='SAME')
+      
+  def _conv3d(self, name, x, filter_size, in_filters, out_filters, strides):
+    """Convolution."""
+    with tf.variable_scope(name):
+      n = filter_size * filter_size * filter_size * out_filters
+      kernel = self._variable_on_cpu(
+          'DW', [filter_size, filter_size, filter_size, in_filters, out_filters],
+           initializer=tf.random_normal_initializer(
+              stddev=np.sqrt(2.0/n)))
+      return tf.nn.conv3d(x, kernel, strides, padding='SAME')
+      
+  def _conv3d_trans(self, name, x, filter_size, in_filters, out_filters, strides, output_shape):
+    """Convolution."""
+    with tf.variable_scope(name):
+      n = filter_size * filter_size * filter_size * out_filters
+      kernel = self._variable_on_cpu(
+          'DW', [filter_size, filter_size, filter_size, out_filters, in_filters],
+            initializer=tf.random_normal_initializer(
+              stddev=np.sqrt(2.0/n)))
+      x_shape = tf.shape(x)
+      self.debug_op_list.append(tf.shape(kernel))
+      return tf.nn.conv3d_transpose(
+                x, 
+                kernel, 
+                output_shape,
+                strides, 
+                padding='SAME')
+
+  def _relu(self, x, leakiness=0.0):
+    """Relu, with optional leaky support."""
+    return tf.where(tf.less(x, 0.0), leakiness * x, x, name='leaky_relu')
+
+  # TODO(xpan): Consider batch_norm in contrib/layers/python/layers/layers.py
+  def _batch_norm(self, name, x):
+    """Batch normalization."""
+    with tf.variable_scope(name):
+      params_shape = [x.get_shape()[-1]]
+
+      beta = self._variable_on_cpu(
+          'beta', params_shape,
+          initializer=tf.constant_initializer(0.0, tf.float32))
+      gamma = self._variable_on_cpu(
+          'gamma', params_shape,
+          initializer=tf.constant_initializer(1.0, tf.float32))
+
+      if self.mode == 'train':
+        mean, variance = tf.nn.moments(x, range(len(x.get_shape())-1), name='moments')
+
+        moving_mean = self._variable_on_cpu(
+            'moving_mean', params_shape,
+            initializer=tf.constant_initializer(0.0, tf.float32),
+            trainable=False)
+        moving_variance = self._variable_on_cpu(
+            'moving_variance', params_shape,
+            initializer=tf.constant_initializer(1.0, tf.float32),
+            trainable=False)
+
+        self._extra_train_ops.append(moving_averages.assign_moving_average(
+            moving_mean, mean, BATCHNORM_MOVING_AVERAGE_DECAY))
+        self._extra_train_ops.append(moving_averages.assign_moving_average(
+            moving_variance, variance, BATCHNORM_MOVING_AVERAGE_DECAY))
+      else:
+        mean = self._variable_on_cpu(
+            'moving_mean', params_shape,
+            initializer=tf.constant_initializer(0.0, tf.float32),
+            trainable=False)
+        variance = self._variable_on_cpu(
+            'moving_variance', params_shape,
+            initializer=tf.constant_initializer(1.0, tf.float32),
+            trainable=False)
+      y = tf.nn.batch_normalization(
+          x, mean, variance, beta, gamma, 0.001)
+      y.set_shape(x.get_shape())
+      return y
+
+  def _variable_on_cpu(self, name, shape, initializer, dtype=tf.float32, trainable=True):
+    """Helper to create a Variable stored on CPU memory.
+
+    Args:
+      name: name of the variable
+      shape: list of ints
+      initializer: initializer for Variable
+
+    Returns:
+      Variable Tensor
+    """
+    with tf.device('/cpu:0'):
+      var = tf.get_variable(name, shape, initializer=initializer, dtype=dtype, trainable=trainable)
+    return var
+	</description>
+	<comments>
+		<comment id='1' author='laoreja' date='2017-06-08T17:19:42Z'>
+		Thanks for the report. How are you determining which op is slow? Do you have a &lt;denchmark-link:https://stackoverflow.com/documentation/tensorflow/3850/measure-the-execution-time-of-individual-operations#t=201706081718274193783&gt;timeline&lt;/denchmark-link&gt;
+ for the run?
+		</comment>
+		<comment id='2' author='laoreja' date='2017-06-08T21:02:19Z'>
+		My program did not give any output, so I made an debug_op_list, and add some debug ops after each layer of the model, like:
+      for i in six.moves.range(4):
+        x, layer_idx = self._regularization_upsample(x, stored_features[-i-1], 3, transposed_in_filters[i], transposed_out_filters[i], self._stride_3d_arr(2), layer_idx)
+        self.debug_op_list.append(tf.shape(x))
+      
+      with tf.variable_scope('layer_'+str(layer_idx)):
+        layer_idx += 1
+        input_shape = tf.shape(self.gt_disparity)
+        x = self._conv3d_trans('conv_trans', x, 3, 32, 1, self._stride_3d_arr(2), [input_shape[0], self.hps.max_disparity+1, input_shape[1], input_shape[2], 1])
+        self.debug_op_list.append(tf.shape(x))
+and then do
+for debug_op in model.debug_op_list:
+  sess.run(debug_op)
+The debug_op before this layer runs quickly, and I need to wait for about ten minutes to see the output of the debug_op right after this layer.
+		</comment>
+		<comment id='3' author='laoreja' date='2017-06-08T22:08:20Z'>
+		Could you collect and share a timeline as in the above-referenced instructions? Thanks!
+		</comment>
+		<comment id='4' author='laoreja' date='2017-06-09T04:10:46Z'>
+		Hi, my timeline snapshot is as follows:
+&lt;denchmark-link:https://github.com/laoreja/Reimplementation-of-GC-Net/raw/master/timeline.png&gt;&lt;/denchmark-link&gt;
+
+The timeline.json file is located at &lt;denchmark-link:https://github.com/laoreja/Reimplementation-of-GC-Net/blob/master/timeline.json&gt;https://github.com/laoreja/Reimplementation-of-GC-Net/blob/master/timeline.json&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='5' author='laoreja' date='2017-06-13T19:55:53Z'>
+		&lt;denchmark-link:https://github.com/andydavis1&gt;@andydavis1&lt;/denchmark-link&gt;
+, could you take a look at this and see if anything strikes you?
+		</comment>
+		<comment id='6' author='laoreja' date='2017-06-16T17:41:41Z'>
+		Nothing strikes me. I'd recommend trying to run an isolated 3D conv with the same shapes on the uses i7 machine, and see if its still slow (vs running the entire training step), just to isolate if the 3D Conv implementation is just slow for this shape (which could be the case).
+		</comment>
+		<comment id='7' author='laoreja' date='2017-06-17T07:44:30Z'>
+		My model has several 3D conv layers, followed by several 3D conv trans layers. I detected that the last 3D conv trans layer is extremely slow, while the previous layers are much faster.
+According to some previous issues, I guess this may be a memory related problem?
+		</comment>
+		<comment id='8' author='laoreja' date='2017-12-20T19:10:48Z'>
+		It has been 14 days with no activity and the awaiting tensorflower label was assigned. Please update the label and/or status accordingly.
+		</comment>
+		<comment id='9' author='laoreja' date='2018-01-04T19:16:40Z'>
+		It has been 14 days with no activity and the awaiting tensorflower label was assigned. Please update the label and/or status accordingly.
+		</comment>
+		<comment id='10' author='laoreja' date='2018-01-23T23:07:43Z'>
+		A member of the TensorFlow organization has replied after the stat:awaiting tensorflower label was applied.
+		</comment>
+		<comment id='11' author='laoreja' date='2018-01-25T01:44:18Z'>
+		&lt;denchmark-link:https://github.com/laoreja&gt;@laoreja&lt;/denchmark-link&gt;
+ Is this still a problem for you?  If so, have you tried the latest release of TensorFlow?
+		</comment>
+		<comment id='12' author='laoreja' date='2018-02-08T19:27:21Z'>
+		Nagging Awaiting Response: It has been 14 days with no activityand the awaiting response label was assigned. Is this still an issue?
+		</comment>
+		<comment id='13' author='laoreja' date='2018-02-08T22:29:29Z'>
+		Closing due to lack of activity. Please reopen if this is still a problem.
+		</comment>
+	</comments>
+</bug>

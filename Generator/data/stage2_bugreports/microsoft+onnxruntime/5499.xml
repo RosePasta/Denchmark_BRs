@@ -1,0 +1,131 @@
+<bug id='5499' author='j-paulus' open_date='2020-10-15T10:53:35Z' closed_time='2020-11-24T19:14:42Z'>
+	<summary>Augmented nodes in calibration for static quantization returning float when something expects int64</summary>
+	<description>
+Describe the bug
+I have converted a model from torch to ONNX (opset=11) and now experimenting with quantization to see potential benefits.
+
+Unquantized model works.
+Dynamic quantization works and the resulting model works.
+Static quantization does not work, but crashes as the routines try to load the augmented model for collecting calibration data.
+
+The full stack trace is:
+&lt;denchmark-code&gt;  File "/Users/name/opt/anaconda3/envs/onnx/lib/python3.7/site-packages/onnxruntime/quantization/quantize.py", line 171, in quantize_static
+    nodes_to_exclude)
+  File "/Users/name/opt/anaconda3/envs/onnx/lib/python3.7/site-packages/onnxruntime/quantization/calibrate.py", line 258, in calibrate
+    dict_for_quantization = calibrater.get_intermediate_outputs()
+  File "/Users/name/opt/anaconda3/envs/onnx/lib/python3.7/site-packages/onnxruntime/quantization/calibrate.py", line 110, in get_intermediate_outputs
+    session = onnxruntime.InferenceSession(self.augmented_model_path, None)
+  File "/Users/name/opt/anaconda3/envs/onnx/lib/python3.7/site-packages/onnxruntime/capi/session.py", line 195, in __init__
+    self._create_inference_session(providers, provider_options)
+  File "/Users/name/opt/anaconda3/envs/onnx/lib/python3.7/site-packages/onnxruntime/capi/session.py", line 200, in _create_inference_session
+    sess = C.InferenceSession(session_options, self._model_path, True, self._read_config_from_model)
+onnxruntime.capi.onnxruntime_pybind11_state.Fail: [ONNXRuntimeError] : 1 : FAIL : Load model from augmented_model.onnx failed:Type Error: Type (tensor(float)) of output arg (230_ReduceMin) of node (230_ReduceMin) does not match expected type (tensor(int64)).
+&lt;/denchmark-code&gt;
+
+The node name ("230_ReduceMin") varies depending on the run, so I assume the same problem is in all of them or the routine using the model. To my understanding, these nodes are the ones added by ONNXCalibrater.augment_graph(). In that function the added nodes have type TensorProto.FLOAT, e.g., line 81:
+           added_outputs.append(helper.make_tensor_value_info(reduce_min_node.output[0], TensorProto.FLOAT, ()))
+Why is some part of the code expecting int64 datatype when the augmented nodes explicitly use float?
+Urgency
+Not urgent.
+System information
+
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): macOS
+ONNX Runtime installed from (source or binary): binary from pip
+ONNX Runtime version: 1.5.1
+Python version: 3.7.9
+Visual Studio version (if applicable): N/A
+GCC/Compiler version (if compiling from source): N/A
+CUDA/cuDNN version: N/A
+GPU model and memory: N/A
+
+To Reproduce
+Unable to attach the real model, but will try to create a minimal example triggering the bug.
+The code relevant to the quantization call is:
+&lt;denchmark-code&gt;cdr = CalibrationDataProvider()
+
+quantize_static(model_input='model.onnx', model_output='model_quant.onnx', calibration_data_reader=cdr)
+&lt;/denchmark-code&gt;
+
+The implementation of CalibrationDataProvider is irrelevant as it is not called before the crash occurs.
+Expected behavior
+Model quantization to run without crashing.
+Screenshots
+If applicable, add screenshots to help explain your problem.
+Additional context
+Add any other context about the problem here. If the issue is about a particular model, please share the model details as well to facilitate debugging.
+Edit: the number in the node is the original name
+	</description>
+	<comments>
+		<comment id='1' author='j-paulus' date='2020-10-16T09:30:19Z'>
+		Update: Same crash when using 1.5.2.
+		</comment>
+		<comment id='2' author='j-paulus' date='2020-10-23T18:57:21Z'>
+		&lt;denchmark-link:https://github.com/j-paulus&gt;@j-paulus&lt;/denchmark-link&gt;
+, thanks for reporting the issue. Could you please share the model for debugging?
+		</comment>
+		<comment id='3' author='j-paulus' date='2020-10-26T07:26:18Z'>
+		&lt;denchmark-link:https://github.com/yufenglee&gt;@yufenglee&lt;/denchmark-link&gt;
+, Unfortunately, I am not allowed to share the real model where I'm encountering this issue. And since this is of a non-urgent priority, I haven't had the time to create a minimal model exhibiting the problem. This is still on my todo-list, but I cannot promise anything.
+		</comment>
+		<comment id='4' author='j-paulus' date='2020-10-26T13:18:49Z'>
+		&lt;denchmark-link:https://github.com/yufenglee&gt;@yufenglee&lt;/denchmark-link&gt;
+, This code below should trigger the error.
+It appears to be related to inquiring tensor shape and using that in operations. The size if stored as int64 tensors and since the quantization statistics computation blindly assumes everything to be float, there will be problems.
+Please note, that the issue is not only for reshape(), but also other operations using the size information as a variable. This was just an easy way to demonstrate the problem.
+&lt;denchmark-code&gt;import numpy as np
+import torch
+from onnxruntime.quantization import quantize_dynamic, quantize_static, QuantType
+from onnxruntime.quantization.calibrate import CalibrationDataReader
+
+class CalibrationDataProvider(CalibrationDataReader):
+    def __init__(self):
+        super(CalibrationDataProvider, self).__init__()
+        self.counter = 0
+
+    def get_next(self):
+        if self.counter &gt; 2:
+            return None
+        else:
+            self.counter += 1
+            return {'x': np.random.randn(2, 4).astype(np.float32)}
+
+class Model(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.n = int(1)
+
+    def forward(self, x):
+        f = x.shape[0]
+        y = x.reshape(-1, f)
+        return y
+
+model = Model().float()
+
+dummy_input = (torch.randn(2, 4), )
+torch.onnx.export(
+    model,
+    dummy_input,
+    'model.onnx',
+    input_names=('x',),
+    export_params=True,
+    training=False,
+    opset_version=11)
+
+cdr = CalibrationDataProvider()
+
+quantize_static(model_input='model.onnx',
+                model_output='model_q.onnx',
+                calibration_data_reader=cdr)
+
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='5' author='j-paulus' date='2020-11-24T19:14:42Z'>
+		Issue was fixed with &lt;denchmark-link:https://github.com/microsoft/onnxruntime/pull/5704&gt;#5704&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='6' author='j-paulus' date='2020-12-15T08:28:20Z'>
+		Now that 1.6.0 including the fix was released, I was able to verify that the bug was fixed. Thank you!
+		</comment>
+	</comments>
+</bug>

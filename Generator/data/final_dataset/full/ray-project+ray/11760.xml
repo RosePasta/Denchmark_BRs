@@ -1,0 +1,204 @@
+<bug_data>
+<bug id='11760' author='ienkovich' open_date='2020-11-02T17:01:44Z' closed_time='2020-11-11T07:44:17Z'>
+ 	<summary>[Core] Ray breaks alignment for NumPy arrays of doubles</summary>
+ 	<description>
+ &lt;denchmark-h:h3&gt;What is the problem?&lt;/denchmark-h&gt;
+ 
+ I'm using Ray 1.0.0 with Python 3.8.3 on Ubuntu 18.04
+ When I use Ray to serialize/deserialize a NumPy array of doubles, I get an unaligned NumPy array (data is not 8-byte aligned).
+ &lt;denchmark-h:h3&gt;Reproduction&lt;/denchmark-h&gt;
+ 
+ Here is a reproducer I use
+ &lt;denchmark-code&gt;import numpy as np
+ import ray
+ ray.init()
+ 
+ arr1 = np.array([10.1, 20.2, 30.3], dtype = np.double)
+ oid = ray.put(arr1)
+ arr2 = ray.get(oid)
+ 
+ ptr1 = arr1.__array_interface__["data"][0]
+ print(f"Original address: 0x{hex(ptr1)} - {'un' if ptr1 % 8 != 0 else ''}aligned")
+ assert(ptr1 % 8 == 0)
+ ptr2 = arr2.__array_interface__["data"][0]
+ print(f"Deserialized address: 0x{hex(ptr2)} - {'un' if ptr2 % 8 != 0 else ''}aligned")
+ assert(ptr2 % 8 == 0)
+ &lt;/denchmark-code&gt;
+ 
+ The output is:
+ &lt;denchmark-code&gt;Original address: 0x0x56150a88c9d0 - aligned
+ Deserialized address: 0x0x7f738756010c - unaligned
+ Traceback (most recent call last):
+   File "1.py", line 14, in &lt;module&gt;
+     assert(ptr2 % 8 == 0)
+ AssertionError
+ &lt;/denchmark-code&gt;
+ 
+ 
+  I have verified my script runs in a clean environment and reproduces the issue.
+  I have verified the issue also occurs with the latest wheels.
+ 
+ 	</description>
+ 	<comments>
+ 		<comment id='1' author='ienkovich' date='2020-11-02T18:50:58Z'>
+ 		Is this a regression from Ray 0.8 series?
+ 		</comment>
+ 		<comment id='2' author='ienkovich' date='2020-11-02T18:55:07Z'>
+ 		I think we actually want the arrays to be 64-byte aligned for performance reasons. I know we guaranteed that when we were using pyarrow for serialization. &lt;denchmark-link:https://github.com/pcmoritz&gt;@pcmoritz&lt;/denchmark-link&gt;
+  &lt;denchmark-link:https://github.com/suquark&gt;@suquark&lt;/denchmark-link&gt;
+ 
+ 		</comment>
+ 		<comment id='3' author='ienkovich' date='2020-11-02T20:00:43Z'>
+ 		Interesting, so this may have been broken for some time now.
+ 		</comment>
+ 		<comment id='4' author='ienkovich' date='2020-11-02T20:30:14Z'>
+ 		Food for thought: I've tried pickling and unpickling back (by using builtin pickle module and calling pickle.loads(pickle.dumps(arr, -1))), and unpickled array is properly aligned, while retrieved via Ray is not.
+ 		</comment>
+ 		<comment id='5' author='ienkovich' date='2020-11-03T18:48:22Z'>
+ 		&lt;denchmark-link:https://github.com/ericl&gt;@ericl&lt;/denchmark-link&gt;
+  What's the action item here?
+ 		</comment>
+ 		<comment id='6' author='ienkovich' date='2020-11-06T01:36:26Z'>
+ 		&lt;denchmark-link:https://github.com/robertnishihara&gt;@robertnishihara&lt;/denchmark-link&gt;
+  I almost sure when moving from pyarrow to pickle5, the buffer is still aligned:
+ 
+ 
+ 
+ ray/python/ray/includes/serialization.pxi
+ 
+ 
+         Lines 301 to 307
+       in
+       28e7439
+ 
+ 
+ 
+ 
+ 
+ 
+  # Increase buffer address. 
+ 
+ 
+ 
+  if view.len &lt; kMajorBufferSize: 
+ 
+ 
+ 
+  self._curr_buffer_addr = padded_length( 
+ 
+ 
+ 
+  self._curr_buffer_addr, kMinorBufferAlign) 
+ 
+ 
+ 
+  else: 
+ 
+ 
+ 
+  self._curr_buffer_addr = padded_length( 
+ 
+ 
+ 
+  self._curr_buffer_addr, kMajorBufferAlign) 
+ 
+ 
+ 
+ 
+ 
+ For large chunks, we align the buffer to 64 bytes(kMajorBufferAlign); for small chunks, we align it to 8 bytes (kMinorBufferAlign).
+ Maybe it is related to the msgpack header which is introduced recently?
+ 		</comment>
+ 		<comment id='7' author='ienkovich' date='2020-11-09T03:09:25Z'>
+ 		&lt;denchmark-link:https://github.com/suquark&gt;@suquark&lt;/denchmark-link&gt;
+  Could it be that the relative addresses are aligned, but not the start? Maybe we need to make sure to make  aligned in here: &lt;denchmark-link:https://github.com/ray-project/ray/blob/master/python/ray/includes/serialization.pxi#L360&gt;https://github.com/ray-project/ray/blob/master/python/ray/includes/serialization.pxi#L360&lt;/denchmark-link&gt;
+ 
+ Can you test that and create a PR for it?
+ 		</comment>
+ 		<comment id='8' author='ienkovich' date='2020-11-09T03:09:34Z'>
+ 		&lt;denchmark-link:https://github.com/suquark&gt;@suquark&lt;/denchmark-link&gt;
+  it's definitely not aligned right now, e.g.,
+ import ray
+ import numpy as np
+ ray.init()
+ x = ray.get(ray.put(np.zeros(10**8)))
+ assert x.ctypes.data % 64 == 0  # This is often (always?) 12 for me. Not that I tried larger arrays in case the different code paths for smaller objects change things.
+ For some reason I thought we had a test for this, but I can't find it now.
+ EDIT: I guess we added the test in Arrow.
+ &lt;denchmark-link:https://github.com/apache/arrow/blob/599b458c68dfcba38fe5448913d4bb69723e1439/python/pyarrow/tests/test_serialization.py#L1156-L1176&gt;https://github.com/apache/arrow/blob/599b458c68dfcba38fe5448913d4bb69723e1439/python/pyarrow/tests/test_serialization.py#L1156-L1176&lt;/denchmark-link&gt;
+ 
+ 		</comment>
+ 	</comments>
+ </bug>
+<commit id='b8dda0e3d09c8214db04b45852b07367615560fe' author='Siyuan (Ryans) Zhuang' date='2020-11-10 23:44:16-08:00'>
+ 	<dmm_unit complexity='0.6730769230769231' interfacing='1.0' size='0.6730769230769231'></dmm_unit>
+ 	<modification change_type='MODIFY' old_name='BUILD.bazel' new_name='BUILD.bazel'>
+ 		<file_info nloc='None' complexity='None' token_count='None'></file_info>
+ 		<modified_lines>
+ 			<added_lines>1370,1429,1430,1431,1432,1433,1434,1435,1436,1437,1438,1439,1440</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='python\ray\_raylet.pyx' new_name='python\ray\_raylet.pyx'>
+ 		<file_info nloc='None' complexity='None' token_count='None'></file_info>
+ 		<modified_lines>
+ 			<added_lines></added_lines>
+ 			<deleted_lines>57</deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='python\ray\includes\serialization.pxi' new_name='python\ray\includes\serialization.pxi'>
+ 		<file_info nloc='None' complexity='None' token_count='None'></file_info>
+ 		<modified_lines>
+ 			<added_lines>68,69,70,204,205,206,207,208,209,210,218,219,223,224,225,232,234,236,237,238,322,323,329,331,332,333,340,341,342,343,344,345,349,350,353,354,355,356,357,358,359,360,361,362,363</added_lines>
+ 			<deleted_lines>51,52,55,56,72,73,207,213,216,220,221,222,230,232,233,234,235,236,316,317,318,320,324,325,326,332,333,341,342,343,344,345,349,350,351,353,354,355,357,358,359,360</deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='python\ray\tests\test_serialization.py' new_name='python\ray\tests\test_serialization.py'>
+ 		<file_info nloc='428' complexity='99' token_count='3170'></file_info>
+ 		<method name='test_buffer_alignment' parameters=''>
+ 				<method_info nloc='17' complexity='8' token_count='239' nesting_level='0' start_line='546' end_line='568'></method_info>
+ 			<added_lines>546,547,548,549,550,551,552,553,554,555,556,557,558,559,560,561,562,563,564,565,566,567,568</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines>569,570</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='src\ray\common\buffer.h' new_name='src\ray\common\buffer.h'>
+ 		<file_info nloc='77' complexity='20' token_count='509'></file_info>
+ 		<method name='ray::LocalMemoryBuffer::LocalMemoryBuffer' parameters='data,size,copy_data'>
+ 				<method_info nloc='13' complexity='2' token_count='82' nesting_level='2' start_line='68' end_line='80'></method_info>
+ 			<added_lines>72,73,74,75</added_lines>
+ 			<deleted_lines>68,69,70,71,80</deleted_lines>
+ 		</method>
+ 		<method name='ray::LocalMemoryBuffer::LocalMemoryBuffer' parameters='size'>
+ 				<method_info nloc='5' complexity='1' token_count='36' nesting_level='2' start_line='83' end_line='87'></method_info>
+ 			<added_lines>84,85,86</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<method name='ray::LocalMemoryBuffer::~LocalMemoryBuffer' parameters=''>
+ 				<method_info nloc='6' complexity='2' token_count='22' nesting_level='2' start_line='97' end_line='102'></method_info>
+ 			<added_lines>97,98,99,100,101,102</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines>22,23,24,54,117</added_lines>
+ 			<deleted_lines>81,82,93,108</deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='src\ray\protobuf\serialization.proto' new_name='src\ray\protobuf\serialization.proto'>
+ 		<file_info nloc='None' complexity='None' token_count='None'></file_info>
+ 		<modified_lines>
+ 			<added_lines>24,25,26,38,39,42,45,46,47,48,49,50,51,87,91,93</added_lines>
+ 			<deleted_lines>24,25,26,37,38,40,41,44,46,47,49,84,85,87,88,89,93,95</deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='ADD' old_name='None' new_name='src\ray\thirdparty\aligned_alloc.c'>
+ 		<file_info nloc='34' complexity='8' token_count='217'></file_info>
+ 	</modification>
+ 	<modification change_type='ADD' old_name='None' new_name='src\ray\thirdparty\aligned_alloc.h'>
+ 		<file_info nloc='5' complexity='0' token_count='25'></file_info>
+ 	</modification>
+ </commit>
+</bug_data>

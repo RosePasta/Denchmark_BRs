@@ -1,0 +1,123 @@
+<bug id='10692' author='richardliaw' open_date='2020-09-10T01:44:50Z' closed_time='2020-09-10T08:03:53Z'>
+	<summary>[autoscaler] monitor.py has a memory/thread leak</summary>
+	<description>
+&lt;denchmark-h:h3&gt;What is the problem?&lt;/denchmark-h&gt;
+
+With this cluster yaml, you can watch monitor.py via htop quickly eat up all of the available memory.
+It also seems to be creating hundreds of NodeUpdater threads.
+Ray version and other system information (Python version, TensorFlow version, OS): master latest wheels
+&lt;denchmark-h:h3&gt;Reproduction (REQUIRED)&lt;/denchmark-h&gt;
+
+Please provide a script that can be run to reproduce the issue. The script should have no external library dependencies (i.e., use fake or mock data / environments):
+&lt;denchmark-code&gt;cluster_name: memoryleak
+min_workers: 2
+max_workers: 2
+initial_workers: 2
+autoscaling_mode: default
+target_utilization_fraction: 0.8
+idle_timeout_minutes: 60
+provider:
+  type: aws
+  region: us-east-1
+  cache_stopped_nodes: false
+auth:
+  ssh_user: ubuntu
+head_node:
+  BlockDeviceMappings:
+  - DeviceName: /dev/sda1
+    Ebs:
+      VolumeSize: 300
+      DeleteOnTermination: true
+      VolumeType: gp2
+  ImageId: latest_dlami
+  InstanceType: t3.xlarge
+worker_nodes:
+  BlockDeviceMappings:
+  - DeviceName: /dev/sda1
+    Ebs:
+      VolumeSize: 300
+      DeleteOnTermination: true
+      VolumeType: gp2
+  ImageId: latest_dlami
+  InstanceType: t3.xlarge
+file_mounts: {}
+cluster_synced_files:
+- ~/my-cluster-synced-file
+file_mounts_sync_continuously: true
+initialization_commands: []
+setup_commands:
+- pip install --user -U https://s3-us-west-2.amazonaws.com/ray-wheels/latest/ray-0.9.0.dev0-cp37-cp37m-manylinux1_x86_64.whl
+head_setup_commands:
+- tmux new-session -d "python3 -m http.server"
+- pip install --user -U https://s3-us-west-2.amazonaws.com/ray-wheels/latest/ray-0.9.0.dev0-cp37-cp37m-manylinux1_x86_64.whl
+- sleep 5
+- curl localhost:8000 -o ~/my-cluster-synced-file
+worker_setup_commands: []
+&lt;/denchmark-code&gt;
+
+cc &lt;denchmark-link:https://github.com/ericl&gt;@ericl&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/wuisawesome&gt;@wuisawesome&lt;/denchmark-link&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='richardliaw' date='2020-09-10T01:48:47Z'>
+		&lt;denchmark-link:https://github.com/wuisawesome&gt;@wuisawesome&lt;/denchmark-link&gt;
+ could this be related to your new reloading code that creates a new node provider on config update?
+		</comment>
+		<comment id='2' author='richardliaw' date='2020-09-10T02:35:45Z'>
+		Just did some digging - we cannot create providers constantly, as is currently done in autoscaler.reset().
+&lt;denchmark-code&gt;==&gt; /tmp/ray/session_2020-09-10_02-30-21_292916_30660/logs/monitor.err &lt;==
+  File "/home/ubuntu/.local/lib/python3.7/site-packages/ray/monitor.py", line 368, in &lt;module&gt;
+    monitor.run()
+  File "/home/ubuntu/.local/lib/python3.7/site-packages/ray/monitor.py", line 313, in run
+    self._run()
+  File "/home/ubuntu/.local/lib/python3.7/site-packages/ray/monitor.py", line 268, in _run
+    self.autoscaler.update()
+  File "/home/ubuntu/.local/lib/python3.7/site-packages/ray/autoscaler/autoscaler.py", line 120, in update
+    self.reset(errors_fatal=False)
+  File "/home/ubuntu/.local/lib/python3.7/site-packages/ray/autoscaler/autoscaler.py", line 302, in reset
+    self.config["cluster_name"])
+  File "/home/ubuntu/.local/lib/python3.7/site-packages/ray/autoscaler/node_provider.py", line 148, in get_node_provider
+    return provider_cls(provider_config, cluster_name)
+  File "/home/ubuntu/.local/lib/python3.7/site-packages/ray/autoscaler/aws/node_provider.py", line 55, in __init__
+    traceback.print_stack()
+
+==&gt; /tmp/ray/session_2020-09-10_02-30-21_292916_30660/logs/monitor.out &lt;==
+Creating a new NODE PROVIDER!
+
+==&gt; /tmp/ray/session_2020-09-10_02-30-21_292916_30660/logs/monitor.err &lt;==
+  File "/home/ubuntu/.local/lib/python3.7/site-packages/ray/monitor.py", line 368, in &lt;module&gt;
+    monitor.run()
+  File "/home/ubuntu/.local/lib/python3.7/site-packages/ray/monitor.py", line 313, in run
+    self._run()
+  File "/home/ubuntu/.local/lib/python3.7/site-packages/ray/monitor.py", line 268, in _run
+    self.autoscaler.update()
+  File "/home/ubuntu/.local/lib/python3.7/site-packages/ray/autoscaler/autoscaler.py", line 120, in update
+    self.reset(errors_fatal=False)
+  File "/home/ubuntu/.local/lib/python3.7/site-packages/ray/autoscaler/autoscaler.py", line 302, in reset
+    self.config["cluster_name"])
+  File "/home/ubuntu/.local/lib/python3.7/site-packages/ray/autoscaler/node_provider.py", line 148, in get_node_provider
+    return provider_cls(provider_config, cluster_name)
+  File "/home/ubuntu/.local/lib/python3.7/site-packages/ray/autoscaler/aws/node_provider.py", line 55, in __init__
+    traceback.print_stack()
+&lt;/denchmark-code&gt;
+
+Seems like this is a necessary fix (or at least you need to clean up the existing provider):
+&lt;denchmark-code&gt;@@ -295,9 +297,9 @@ class StandardAutoscaler:
+             self.config = new_config
+             self.runtime_hash = new_runtime_hash
+             self.file_mounts_contents_hash = new_file_mounts_contents_hash
+-
+-            self.provider = get_node_provider(self.config["provider"],
+-                                              self.config["cluster_name"])
++            if not self.provider:
++                self.provider = get_node_provider(self.config["provider"],
++                                                  self.config["cluster_name"])
+             # Check whether we can enable the resource demand scheduler.
+             if "available_node_types" in self.config:
+                 self.available_node_types = self.config["available_node_types"]
+&lt;/denchmark-code&gt;
+
+		</comment>
+	</comments>
+</bug>

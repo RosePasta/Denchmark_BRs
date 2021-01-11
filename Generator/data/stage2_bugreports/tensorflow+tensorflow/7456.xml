@@ -1,0 +1,368 @@
+<bug id='7456' author='YiMX' open_date='2017-02-13T04:43:54Z' closed_time='2017-05-08T17:43:22Z'>
+	<summary>Training using multiple GPUs returns Inf values for loss and Nan for grads.</summary>
+	<description>
+I have two Tesla K80 cards (2 GPUs per card) and I spent few days testing a MNIST classification model using multiple GPUs. What I found is that the training process would always diverge (got Nan for grads and Inf for loss) when I use two GPUs which are in the same card, however when I allocated two GPUs to my training operation from different cards, it would lead to convergence. By the way, everything worked well on a single GPU.
+I am not sure about how GPUs compute those networks and it is really weird two GPUs from the same card make my model diverge and from different cards can make it converge.
+The output for divergence is like the below:
+2017-02-13 12:30:11.255323: step 10, loss = 5799703749333771039308345507840.00 (980.7 examples/sec; 0.102 sec/batch)
+2017-02-13 12:30:14.131089: step 20, loss = 2102245862526597403246592.00 (793.5 examples/sec; 0.126 sec/batch)
+2017-02-13 12:30:16.995940: step 30, loss = 2.30 (787.6 examples/sec; 0.127 sec/batch)
+W tensorflow/core/framework/op_kernel.cc:975] Invalid argument: Nan in summary histogram for: layer2/weights_1
+	 [[Node: layer2/weights_1 = HistogramSummary[T=DT_FLOAT, _device="/job:localhost/replica:0/task:0/cpu:0"](layer2/weights_1/tag, layer2/weights/read/_117)]]
+I used cpu to preprocess the input data read from tfreords. My code for computing the average grads:
+def average_gradients(tower_grads):
+    average_grads = []
+    for grad_and_vars in zip(*tower_grads):
+        grads = []
+        for g, _ in grad_and_vars:
+            expanded_g = tf.expand_dims(g, 0)
+            grads.append(expanded_g)
+        grad = tf.concat(0, grads)
+        grad = tf.reduce_mean(grad, 0)
+        v = grad_and_vars[0][1]
+        grad_and_var = (grad, v)
+        average_grads.append(grad_and_var)
+    return average_grads 
+The training_op:
+def main(argv=None): 
+    with tf.Graph().as_default(), tf.device('/cpu:0'):
+        x, y_ = get_input()
+        regularizer = tf.contrib.layers.l2_regularizer(REGULARAZTION_RATE)
+        
+        global_step = tf.get_variable('global_step', [], initializer=tf.constant_initializer(0), trainable=False)
+        learning_rate = tf.train.exponential_decay(
+            LEARNING_RATE_BASE, global_step, 60000 / BATCH_SIZE, LEARNING_RATE_DECAY)       
+        
+        opt = tf.train.GradientDescentOptimizer(learning_rate)
+        
+        tower_grads = []
+        for i in range(N_GPU):
+            with tf.device('/gpu:%d' % i):
+                with tf.name_scope('GPU_%d' % i) as scope:
+                    cur_loss = get_loss(x, y_, regularizer, scope)
+                    tf.get_variable_scope().reuse_variables()
+                    grads = opt.compute_gradients(cur_loss)
+                    tower_grads.append(grads)
+        
+        grads = average_gradients(tower_grads)
+        for grad, var in grads:
+            if grad is not None:
+            	tf.summary.histogram('gradients_on_average/%s' % var.op.name, grad)
+
+        apply_gradient_op = opt.apply_gradients(grads, global_step=global_step)
+        for var in tf.trainable_variables():
+            tf.summary.histogram(var.op.name, var)
+
+        variable_averages = tf.train.ExponentialMovingAverage(MOVING_AVERAGE_DECAY, global_step)
+        variables_averages_op = variable_averages.apply(tf.trainable_variables())
+        train_op = tf.group(apply_gradient_op, variables_averages_op)
+	</description>
+	<comments>
+		<comment id='1' author='YiMX' date='2017-02-14T22:29:52Z'>
+		What's your peer-to-peer matrix like (printed when you use tensorflow). I expect that if you use two chips from same card, it would configure it for peer to peer transfer and use DMA to transfer data. So perhaps there's some difference when using DMA that causes the discrepancy
+		</comment>
+		<comment id='2' author='YiMX' date='2017-02-15T06:43:31Z'>
+		Peer to peer matrix, GPU 0 and 1 caused the discrepancy, 1 and 2 worked well.
+I tensorflow/core/common_runtime/gpu/gpu_device.cc:906] DMA: 0 1 2 3 
+I tensorflow/core/common_runtime/gpu/gpu_device.cc:916] 0:   Y Y N N 
+I tensorflow/core/common_runtime/gpu/gpu_device.cc:916] 1:   Y Y N N 
+I tensorflow/core/common_runtime/gpu/gpu_device.cc:916] 2:   N N Y Y 
+I tensorflow/core/common_runtime/gpu/gpu_device.cc:916] 3:   N N Y Y
+		</comment>
+		<comment id='3' author='YiMX' date='2017-02-15T14:49:19Z'>
+		One possibility is that there's something happening with variable sync. IE, if TensorFlow is reading from GPU variable while another op is writing to it at the same time. Normally, in such situation, the variable would be partially updated, but updates do not cross boundaries of individual components. &lt;denchmark-link:https://github.com/poxvoculi&gt;@poxvoculi&lt;/denchmark-link&gt;
+ is there an easy way to rule out GPU variable read reading a scalar in the middle of DMA write happening to it?
+		</comment>
+		<comment id='4' author='YiMX' date='2017-02-15T17:51:45Z'>
+		&lt;denchmark-link:https://github.com/zheng-xq&gt;@zheng-xq&lt;/denchmark-link&gt;
+
+I have experienced a similar problem that I have not yet been able to fully diagnose.  Briefly, I've experienced NaNs on k80s and p100s that I suspect are due to simultaneous read/write operations on the same memory area resulting in corrupt values.  But I don't really have proof of this.  In my case, it occurs when using GPUDirect to DMA out of a GPU while the GPU is also doing compute.  My best understanding of these devices is that memory operations should be atomic at the cache line level: if DMA reads are asynchronous with writes, the read should get the value prior to the write or after, but never a mixture of before/after bits.  Since I'm seeing NaNs downstream in the gradient computations I guess in principle it's possible that they result from too much asynchrony in the computation (i.e. the computation sees legitimate values mixed from multiple phases, rather than corrupt values), but I'm doubtful.
+My working solution is to make a temporary local copy on the GPU of a value prior to DMA'ing it off device.  This causes the NaNs to go away, at the cost of extra memory use.
+According to the NVIDIA documentation I've seen, the two GPU dies on one k80 card "should" act like two separate GPUs, and communication between them still uses DMA via the PCI bus.  So, the differences you see may be due to timing rather than fundamentally different memory access behavior.
+You might try the temporary copy technique to see whether it avoids the problem.  I'd be interested in any further insights you gain into this problem.
+		</comment>
+		<comment id='5' author='YiMX' date='2017-02-16T09:48:46Z'>
+		I also trained the full imagenet model on the same machine using multiple gpus, but this problem did not occur. The only difference in my view is the processing speeds of MNIST model and inception.
+		</comment>
+		<comment id='6' author='YiMX' date='2017-02-16T09:57:10Z'>
+		&lt;denchmark-link:https://github.com/poxvoculi&gt;@poxvoculi&lt;/denchmark-link&gt;
+ Regarding your working solution, could you be more specific? Did you change the TensorFlow code or just changed some system configure?
+		</comment>
+		<comment id='7' author='YiMX' date='2017-02-16T18:07:58Z'>
+		In my case I changed the TensorFlow source code in C++.   I'm working on a part of the internal system that is not (yet) open source, so I can't give you a code snippet to apply, but the basic idea is to copy values into a temporary write-once buffer and use that for the source whenever a Tensor is to be used by an Op on another device..     There is not a system config in TF to do this,  If it turns out to be a general problem affecting many users, I could make one.
+The easiest way to try this would be to examine your program and look for every place where the output of an Op on one device becomes an input to an Op on a different device.  In each such case, create a distinct, identical value not with Id (because that doesn't force a copy), but by adding 0 (or mul by 1.0), then use that copy value as the input to the other Op.  Make sure that the copy is local to the  device where the first value was produced, so the DMA from one device to another reads from the copy.
+		</comment>
+		<comment id='8' author='YiMX' date='2017-02-16T18:12:44Z'>
+		PS: I had a brief discussion with &lt;denchmark-link:https://github.com/zheng-xq&gt;@zheng-xq&lt;/denchmark-link&gt;
+ about this, and he says that ops typically don't write to GPU directly across GPU boundaries, even with DMA enabled. IE, if you do GPU0 assign to GPU1 variable, it'll allocate a temporary tensor on GPU1, use DMA to initialize it, then copy temporary tensor on GPU1 to variable on GPU1
+		</comment>
+		<comment id='9' author='YiMX' date='2017-02-17T10:01:21Z'>
+		&lt;denchmark-link:https://github.com/yaroslavvb&gt;@yaroslavvb&lt;/denchmark-link&gt;
+ Thanks very much! I am not familiar with memory and GPU, could you please be more specific about how to implement it?
+		</comment>
+		<comment id='10' author='YiMX' date='2017-02-17T13:45:26Z'>
+		&lt;denchmark-link:https://github.com/YiMX&gt;@YiMX&lt;/denchmark-link&gt;
+ I think Paul is suggesting to do the following, instead of
+&lt;denchmark-code&gt;with tf.device("gpu:1"):
+  a =   gpu_0_tensor + b
+&lt;/denchmark-code&gt;
+
+to do this
+&lt;denchmark-code&gt;with tf.device("gpu:1"):
+  gpu_0_tensor_moved = gpu_0 + 0
+  a = gpu_0_tensor_moved + b
+&lt;/denchmark-code&gt;
+
+The gpu_0_tensor_moved is a copy of gpu_0_tensor created on gpu1, so that now a+b works on Tensors on the same device. Do this to enough tensors so that every other operation only works on tensors from the same GPU
+		</comment>
+		<comment id='11' author='YiMX' date='2017-02-17T19:12:26Z'>
+		Actually what I'm suggesting is this:
+Instead of
+&lt;denchmark-code&gt;with tf.device("gpu:0"):
+    a = Foo()
+    with tf.device("gpu:1"):
+        b = Bar()
+        c = Baz(a, b)
+
+&lt;/denchmark-code&gt;
+
+Do
+&lt;denchmark-code&gt;with tf.device("gpu:0"):
+    a = Foo()
+    a_copy = a + 0.0
+    with tf.device("gpu:1"):
+        b = Bar()
+        c = Baz(a_copy, b)
+&lt;/denchmark-code&gt;
+
+The idea being to create an immediate one-time-use, read-only copy of any value that's going to be used on another device.  The copy should be local to the same device as the original value.
+		</comment>
+		<comment id='12' author='YiMX' date='2017-02-17T22:45:19Z'>
+		&lt;denchmark-link:https://github.com/YiMX&gt;@YiMX&lt;/denchmark-link&gt;
+ , let us know if &lt;denchmark-link:https://github.com/poxvoculi&gt;@poxvoculi&lt;/denchmark-link&gt;
+'s suggestion solves your problem. Thanks!
+		</comment>
+		<comment id='13' author='YiMX' date='2017-02-19T08:47:55Z'>
+		I tried your ideas to specify those variables, but the problem still exists, even if I split the loop into the below form to let every variable have a unique name.
+with tf.device('/gpu:0'):
+     with tf.name_scope('GPU_0') as scope:
+        loss0 = get_loss(x_splits[0], y_splits[0], regularizer, scope, reuse_variables)
+        reuse_variables = True
+        grads0 = opt.compute_gradients(loss0)
+        tower_grads.append(grads0)
+
+with tf.device('/gpu:1'):
+    with tf.name_scope('GPU_1') as scope:
+        loss1 = get_loss(x_splits[1], y_splits[1], regularizer, scope, reuse_variables)
+        reuse_variables = True
+        grads1 = opt.compute_gradients(loss1)
+        tower_grads.append(grads1)
+		</comment>
+		<comment id='14' author='YiMX' date='2017-02-22T01:51:46Z'>
+		I think you've made explicit what the original code did, but haven't introduced any new temporary local copies.  What I'm suggesting is intrusive to the code, to the degree that values go back and forth between devices.
+My apologies if I don't understand your example well, I rarely work with TF at this level.  I think 'tower_grads' is located on the CPU, and a separate instance of 'grads' is located on each GPU.
+The line
+tower_grads.append(grads)
+is going to force an inter-device copy from each GPU to the CPU.  Try substituting
+&lt;denchmark-code&gt;      grads_copy = grads + 0.0
+      tower_grads.append(grads_copy)
+&lt;/denchmark-code&gt;
+
+I think the average_gradients function is computing entirely on the CPU, if I'm wrong, you'll need some tmp copies in there too.
+Frankly, it doesn't look likely that this is going to solve your problem.  I'd be more hopeful if the source of the inter-device copy were a Var.  Is is possible that opt.compute_gradients() or opt.apply_gradients is hiding some inter-device copies?
+		</comment>
+		<comment id='15' author='YiMX' date='2017-02-23T10:00:21Z'>
+		I added some copies, but there was something wrong if I did this to grads because it is a list not a value (I got errors of NotimplementError at apply_gradient_op = opt.apply_gradients(grads, global_step=global_step)). I am still working on this, but something I found might be useful. This time I changed
+grads = average_gradients(tower_grads)
+to
+grads = tower_grads[0]
+It worked but grads = tower_grads[1] still caused discrepancy. The problem I think might be caused by the second GPU.
+		</comment>
+		<comment id='16' author='YiMX' date='2017-06-05T20:32:46Z'>
+		Any update? I'm currently having this problem. Worked fine on CPU but NaN on GPUs.
+		</comment>
+		<comment id='17' author='YiMX' date='2017-06-05T21:17:59Z'>
+		Can you clarify: What program are you running, on which release, hardware platform, etc.?
+		</comment>
+		<comment id='18' author='YiMX' date='2017-06-05T22:29:49Z'>
+		Apologies, my problem is actually much better described in this thread &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/2037&gt;#2037&lt;/denchmark-link&gt;
+ - I'll follow up there.
+		</comment>
+		<comment id='19' author='YiMX' date='2017-08-10T05:18:02Z'>
+		Any update? I've been struggling with this problem for a while. I have 8 M40 cards and the problem is very similar with &lt;denchmark-link:https://github.com/YiMX&gt;@YiMX&lt;/denchmark-link&gt;
+. Everything works well on single card but diverging when using multiple cards together. The most weird part is that when I allocate computation on two different gpus between which the peer to peer access is not supported, everything works well again. For example, it works well on gpu0 with gpu4 or 5 or 6, but fails on gpu0 with gpu1 or 2 or 3.
+The peer to peer matrix
+DMA
+~~0 1 2 3 4 5 6 7
+0:   Y Y Y Y N N N N
+1:   Y Y Y Y N N N N
+2:   Y Y Y Y N N N N
+3:   Y Y Y Y N N N N
+4:   N N N N Y Y Y Y
+5:   N N N N Y Y Y Y
+6:   N N N N Y Y Y Y
+7:   N N N N Y Y Y Y
+		</comment>
+		<comment id='20' author='YiMX' date='2017-08-10T08:31:43Z'>
+		Ok, it finally got solved.
+In my case, The bug is pear to pear data access between gpu0 and gpu1,2,3 doesn't work. This abnormalty can be verified with "simpleP2P" test. The test reports an "verification error" with nan in my case. But the reason behind this behaviour could be various. For me, it's because there's a conflict of virtual memory existing between one of my cpu and gpu0, which can be  solved by simply disabling the VT-d function. After that, the simplep2p test got pased and NAN problem for the training disapeared.
+		</comment>
+		<comment id='21' author='YiMX' date='2017-11-22T03:33:57Z'>
+		I had a same problem and solved by disable ACSCtl.
+Check your ACSCtl status.
+Ref:
+&lt;denchmark-link:https://devtalk.nvidia.com/default/topic/883054/multi-gpu-peer-to-peer-access-failing-on-tesla-k80-/&gt;https://devtalk.nvidia.com/default/topic/883054/multi-gpu-peer-to-peer-access-failing-on-tesla-k80-/&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://github.com/twitter/torch-ipc/issues/17&gt;twitter/torch-ipc#17&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='22' author='YiMX' date='2018-01-19T22:16:08Z'>
+		Is there any news? I have a similar problem as &lt;denchmark-link:https://github.com/YiMX&gt;@YiMX&lt;/denchmark-link&gt;
+  with 8 Tesla P100.
+I pass the simpleP2P test. I use TensorFlow 1.4.1 and Cuda 8.0.
+Here are two of the error messages (shortened) I get,
+with tf.add_check_numerics_ops():
+&lt;denchmark-code&gt;...
+InvalidArgumentError (see above for traceback): tower_0/local3/L2Loss:0 : 
+Tensor had Inf values
+[[Node: CheckNumerics_173 = CheckNumerics[T=DT_FLOAT, 
+message="tower_0/local3/L2Loss:0", 
+_device="/job:localhost/replica:0/task:0/device:CPU:0"]
+(tower_0/local3/L2Loss/_209, ^CheckNumerics_172)]]
+&lt;/denchmark-code&gt;
+
+and with tf.check_numerics() :
+&lt;denchmark-code&gt;...
+InvalidArgumentError (see above for traceback): NaN: average_gradients(expanded_g) : 
+Tensor had Inf and NaN values
+ [[Node: CheckNumerics_30 = CheckNumerics[T=DT_FLOAT, 
+message="NaN: average_gradients(expanded_g)", 
+_device="/job:localhost/replica:0/task:0/device:CPU:0"](ExpandDims_30)]]
+[[Node: tower_6/total_loss/_2216 = _Send[T=DT_FLOAT, 
+client_terminated=false, 
+recv_device="/job:localhost/replica:0/task:0/device:CPU:0", 
+send_device="/job:localhost/replica:0/task:0/device:GPU:6", 
+send_device_incarnation=1, 
+tensor_name="edge_4923_tower_6/total_loss",
+ _device="/job:localhost/replica:0/task:0/device:GPU:6"](tower_6/total_loss)]]
+&lt;/denchmark-code&gt;
+
+The output from simpleP2P:
+&lt;denchmark-code&gt;`[./simpleP2P] - Starting...
+Checking for multiple GPUs...
+CUDA-capable device count: 8
+&gt; GPU0 = "Tesla P100-PCIE-16GB" IS  capable of Peer-to-Peer (P2P)
+&gt; GPU1 = "Tesla P100-PCIE-16GB" IS  capable of Peer-to-Peer (P2P)
+&gt; GPU2 = "Tesla P100-PCIE-16GB" IS  capable of Peer-to-Peer (P2P)
+&gt; GPU3 = "Tesla P100-PCIE-16GB" IS  capable of Peer-to-Peer (P2P)
+&gt; GPU4 = "Tesla P100-PCIE-16GB" IS  capable of Peer-to-Peer (P2P)
+&gt; GPU5 = "Tesla P100-PCIE-16GB" IS  capable of Peer-to-Peer (P2P)
+&gt; GPU6 = "Tesla P100-PCIE-16GB" IS  capable of Peer-to-Peer (P2P)
+&gt; GPU7 = "Tesla P100-PCIE-16GB" IS  capable of Peer-to-Peer (P2P)
+
+Checking GPU(s) for support of peer to peer memory access...
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU0) -&gt; Tesla P100-PCIE-16GB (GPU1) : Yes
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU0) -&gt; Tesla P100-PCIE-16GB (GPU2) : Yes
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU0) -&gt; Tesla P100-PCIE-16GB (GPU3) : Yes
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU0) -&gt; Tesla P100-PCIE-16GB (GPU4) : No
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU0) -&gt; Tesla P100-PCIE-16GB (GPU5) : No
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU0) -&gt; Tesla P100-PCIE-16GB (GPU6) : No
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU0) -&gt; Tesla P100-PCIE-16GB (GPU7) : No
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU1) -&gt; Tesla P100-PCIE-16GB (GPU0) : Yes
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU1) -&gt; Tesla P100-PCIE-16GB (GPU2) : Yes
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU1) -&gt; Tesla P100-PCIE-16GB (GPU3) : Yes
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU1) -&gt; Tesla P100-PCIE-16GB (GPU4) : No
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU1) -&gt; Tesla P100-PCIE-16GB (GPU5) : No
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU1) -&gt; Tesla P100-PCIE-16GB (GPU6) : No
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU1) -&gt; Tesla P100-PCIE-16GB (GPU7) : No
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU2) -&gt; Tesla P100-PCIE-16GB (GPU0) : Yes
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU2) -&gt; Tesla P100-PCIE-16GB (GPU1) : Yes
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU2) -&gt; Tesla P100-PCIE-16GB (GPU3) : Yes
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU2) -&gt; Tesla P100-PCIE-16GB (GPU4) : No
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU2) -&gt; Tesla P100-PCIE-16GB (GPU5) : No
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU2) -&gt; Tesla P100-PCIE-16GB (GPU6) : No
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU2) -&gt; Tesla P100-PCIE-16GB (GPU7) : No
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU3) -&gt; Tesla P100-PCIE-16GB (GPU0) : Yes
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU3) -&gt; Tesla P100-PCIE-16GB (GPU1) : Yes
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU3) -&gt; Tesla P100-PCIE-16GB (GPU2) : Yes
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU3) -&gt; Tesla P100-PCIE-16GB (GPU4) : No
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU3) -&gt; Tesla P100-PCIE-16GB (GPU5) : No
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU3) -&gt; Tesla P100-PCIE-16GB (GPU6) : No
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU3) -&gt; Tesla P100-PCIE-16GB (GPU7) : No
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU4) -&gt; Tesla P100-PCIE-16GB (GPU0) : No
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU4) -&gt; Tesla P100-PCIE-16GB (GPU1) : No
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU4) -&gt; Tesla P100-PCIE-16GB (GPU2) : No
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU4) -&gt; Tesla P100-PCIE-16GB (GPU3) : No
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU4) -&gt; Tesla P100-PCIE-16GB (GPU5) : Yes
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU4) -&gt; Tesla P100-PCIE-16GB (GPU6) : Yes
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU4) -&gt; Tesla P100-PCIE-16GB (GPU7) : Yes
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU5) -&gt; Tesla P100-PCIE-16GB (GPU0) : No
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU5) -&gt; Tesla P100-PCIE-16GB (GPU1) : No
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU5) -&gt; Tesla P100-PCIE-16GB (GPU2) : No
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU5) -&gt; Tesla P100-PCIE-16GB (GPU3) : No
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU5) -&gt; Tesla P100-PCIE-16GB (GPU4) : Yes
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU5) -&gt; Tesla P100-PCIE-16GB (GPU6) : Yes
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU5) -&gt; Tesla P100-PCIE-16GB (GPU7) : Yes
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU6) -&gt; Tesla P100-PCIE-16GB (GPU0) : No
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU6) -&gt; Tesla P100-PCIE-16GB (GPU1) : No
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU6) -&gt; Tesla P100-PCIE-16GB (GPU2) : No
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU6) -&gt; Tesla P100-PCIE-16GB (GPU3) : No
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU6) -&gt; Tesla P100-PCIE-16GB (GPU4) : Yes
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU6) -&gt; Tesla P100-PCIE-16GB (GPU5) : Yes
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU6) -&gt; Tesla P100-PCIE-16GB (GPU7) : Yes
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU7) -&gt; Tesla P100-PCIE-16GB (GPU0) : No
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU7) -&gt; Tesla P100-PCIE-16GB (GPU1) : No
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU7) -&gt; Tesla P100-PCIE-16GB (GPU2) : No
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU7) -&gt; Tesla P100-PCIE-16GB (GPU3) : No
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU7) -&gt; Tesla P100-PCIE-16GB (GPU4) : Yes
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU7) -&gt; Tesla P100-PCIE-16GB (GPU5) : Yes
+&gt; Peer access from Tesla P100-PCIE-16GB (GPU7) -&gt; Tesla P100-PCIE-16GB (GPU6) : Yes
+Enabling peer access between GPU0 and GPU1...
+Checking GPU0 and GPU1 for UVA capabilities...
+&gt; Tesla P100-PCIE-16GB (GPU0) supports UVA: Yes
+&gt; Tesla P100-PCIE-16GB (GPU1) supports UVA: Yes
+Both GPUs can support UVA, enabling...
+Allocating buffers (64MB on GPU0, GPU1 and CPU Host)...
+Creating event handles...
+cudaMemcpyPeer / cudaMemcpy between GPU0 and GPU1: 12.16GB/s
+Preparing host buffer and memcpy to GPU0...
+Run kernel on GPU1, taking source data from GPU0 and writing to GPU1...
+Run kernel on GPU0, taking source data from GPU1 and writing to GPU0...
+Copy data back to host from GPU0 and verify results...
+Disabling peer access...
+Shutting down...
+Test passed
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='23' author='YiMX' date='2018-01-19T23:08:46Z'>
+		I got similar problems earlier and solved it by removing nccl from LD_LIBRARY_PATH. I'm not sure what's going on, but it seems to be conflicting with the NCCL version that TF was compiled with. Also, certain versions of cudnn can also give NaN.
+		</comment>
+		<comment id='24' author='YiMX' date='2018-01-20T22:07:20Z'>
+		Thanks for the fast answer. I think I've solved my problem. It wasn't the graphics card but the optimization algorithm that was responsible for the errors. I changed it from tf.train.GradientDescentOptimizer() with tf.train.exponential_decay() to tf.train.AdamOptimizer(). Now I don't get any more NaN errors.
+		</comment>
+		<comment id='25' author='YiMX' date='2018-07-12T17:48:52Z'>
+		&lt;denchmark-link:https://github.com/milanfeind&gt;@milanfeind&lt;/denchmark-link&gt;
+ why do you think SGD had problem with multiple GPUs?
+		</comment>
+		<comment id='26' author='YiMX' date='2018-11-21T05:09:02Z'>
+		I also meet this problem with the offical lexample
+&lt;denchmark-link:https://github.com/tensorflow/models/blob/master/tutorials/image/cifar10/cifar10_multi_gpu_train.py&gt;https://github.com/tensorflow/models/blob/master/tutorials/image/cifar10/cifar10_multi_gpu_train.py&lt;/denchmark-link&gt;
+
+I try to write another program follow the cifar10_multi_gpu_train.py, but I get NaN loss error.
+&lt;denchmark-code&gt;tf version 1.12.0
+Ubuntu 16.04.5 LTS
+2 1080 Ti cards
+CUDA-9.1/cuDNN-7.0.5
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='27' author='YiMX' date='2019-12-01T02:58:35Z'>
+		I have the same problem. The environment is: Ubuntu 16.04, 2 GTX 1080Ti cards, tensorflow 1.15, compiled from source with cuda 10.0+cudnn 7.6.4.
+(1) When using one card with batch_size=2, the training is OK.
+(2) When uisng two cards with batch_size=2, the training is OK.
+Then I copied the code to another machine (which has V100, four GPU cards.
+(3) training with four cards with batch_size=4, the training will stop with Nan after several iterations.
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,244 @@
+<bug_data>
+<bug id='1856' author='w4nderlust' open_date='2020-05-17T21:51:10Z' closed_time='2020-05-20T03:22:39Z'>
+ 	<summary>AttentionWrapper with non LSTM cells returns ValueError</summary>
+ 	<description>
+ System information
+ 
+ OS Platform and Distribution: Ubuntu 20.04
+ TensorFlow version and how it was installed (source or binary): 2.2.0
+ TensorFlow-Addons version and how it was installed (source or binary): 0.10.0
+ Python version: 3.7.7
+ Is GPU used? (yes/no): yes
+ 
+ Describe the bug
+ Working with &lt;denchmark-link:https://github.com/jimthompson5802&gt;@jimthompson5802&lt;/denchmark-link&gt;
+  on this PR &lt;denchmark-link:https://github.com/ludwig-ai/ludwig/pull/699&gt;ludwig-ai/ludwig#699&lt;/denchmark-link&gt;
+  we discovered an issue with seq2seq attention.
+ In seq2seq decoding with attention, one has to wrap the recurrent cell with an AttentionWrapper.
+ Right now if you do so with any cell type other than LSTMCell (so with SimpleRNNCell and GRUCell), you get a:
+ &lt;denchmark-code&gt;ValueError: The two structures don't have the same nested structure.
+ 
+ First structure: type=AttentionWrapperState str=AttentionWrapperState(cell_state=&lt;tf.Tensor: shape=(128, 256), dtype=float32, dtype=float32)&gt;, attention=&lt;tf.Tensor: shape=(128, 256), dtype=float32, dtype=float32)&gt;, alignments=&lt;tf.Tensor: shape=(128, 256), dtype=float32, dtype=float32)&gt;, alignment_history=(), attention_state=&lt;tf.Tensor: shape=(128, 256), dtype=float32, dtype=float32)&gt;)
+ 
+ Second structure: type=AttentionWrapperState str=AttentionWrapperState(cell_state=[&lt;tf.Tensor: shape=(128, 256), dtype=float32, dtype=float32)&gt;], attention=&lt;tf.Tensor: shape=(128, 256), dtype=float32, dtype=float32)&gt;, alignments=&lt;tf.Tensor: shape=(128, 128), dtype=float32, dtype=float32)&gt;, alignment_history=(), attention_state=&lt;tf.Tensor: shape=(128, 128), dtype=float32, dtype=float32)&gt;)
+ 
+ More specifically: Substructure "type=list str=[&lt;tf.Tensor: shape=(128, 256), dtype=float32, dtype=float32)&gt;]" is a sequence, while substructure "type=EagerTensor str=tf.Tensor(
+ [[0. 0. 0. ... 0. 0. 0.]
+  [0. 0. 0. ... 0. 0. 0.]
+  [0. 0. 0. ... 0. 0. 0.]
+  ...
+  [0. 0. 0. ... 0. 0. 0.]
+  [0. 0. 0. ... 0. 0. 0.]
+  [0. 0. 0. ... 0. 0. 0.]], shape=(128, 256), dtype=float32)" is not
+ Entire first structure:
+ AttentionWrapperState(cell_state=., attention=., alignments=., alignment_history=(), attention_state=.)
+ Entire second structure:
+ AttentionWrapperState(cell_state=[.], attention=., alignments=., alignment_history=(), attention_state=.)
+ &lt;/denchmark-code&gt;
+ 
+ This suggests that the AttentionWrapper works well with LSTMCell because it returns a state that's a list of two tensors, but it doesn't work with SimpleRNN and GRU because the state they return is just a Tensor, not a list of length 1 containing one tensor.
+ I believe there are 2 solutions: one is making all cells return states as a list of tensors. This will be good and it will guarantee homogeneity. The other option is to correct the AttentionWrapper to work both with cells that retunr lists of tensors as states like LSTM and cells that return just a tensor as state like SimpleRNN and GRU.
+ For more context about the use of this in the original PR, plese refer at the comments starting from  &lt;denchmark-link:https://github.com/uber/ludwig/pull/699#issuecomment-629736171&gt;this one&lt;/denchmark-link&gt;
+ .
+ Code to reproduce the issue
+ Here is a script to reproduce the issue.
+ &lt;denchmark-code&gt;import numpy as np
+ import tensorflow as tf
+ from tensorflow import keras
+ import tensorflow_addons as tfa
+ 
+ # ValueError exception raised for both SimpleRNNCell and GRUCell
+ 
+ RNN_CELL_CLASS = keras.layers.SimpleRNNCell  # Raises ValueError Exception
+ # RNN_CELL_CLASS = keras.layers.GRUCell      # Raises ValueError Exception
+ # RNN_CELL_CLASS = keras.layers.LSTMCell     # Does not raise an error
+ 
+ VOCAB_SIZE = 100
+ EMBED_SIZE = 10
+ RNN_UNITS = 256
+ INPUT_SEQUENCE_SIZE = 10
+ OUTPUT_SEQUENCE_SIZE = 15
+ BATCH_SIZE = 128
+ 
+ targets = tf.convert_to_tensor(
+     np.random.randint(VOCAB_SIZE, size=OUTPUT_SEQUENCE_SIZE * BATCH_SIZE)
+     .reshape(BATCH_SIZE, OUTPUT_SEQUENCE_SIZE),
+     dtype=tf.float32
+ )
+ encoder_outputs = tf.zeros([BATCH_SIZE, RNN_UNITS], dtype=tf.float32)
+ if RNN_CELL_CLASS._keras_api_names[0] == 'keras.layers.LSTMCell':
+     encoder_state = [tf.zeros([BATCH_SIZE, RNN_UNITS], dtype=tf.float32),
+                      tf.zeros([BATCH_SIZE, RNN_UNITS], dtype=tf.float32)]
+ else:
+     encoder_state = tf.zeros([BATCH_SIZE, RNN_UNITS], dtype=tf.float32)
+     # note this returns error also if:
+     # encoder_state = [tf.zeros([BATCH_SIZE, RNN_UNITS], dtype=tf.float32)]
+ 
+ embeddings_dec = keras.layers.Embedding(VOCAB_SIZE, EMBED_SIZE)
+ decoder_cell = RNN_CELL_CLASS(RNN_UNITS)
+ output_layer = keras.layers.Dense(VOCAB_SIZE)
+ 
+ sampler = tfa.seq2seq.sampler.TrainingSampler()
+ attention_mechanism = tfa.seq2seq.LuongAttention(units=RNN_UNITS)
+ #attention_mechanism = tfa.seq2seq.BahdanauAttention(units=RNN_UNITS)  # gives same error
+ decoder_cell = tfa.seq2seq.AttentionWrapper(
+     decoder_cell,
+     attention_mechanism,
+     attention_layer_size=RNN_UNITS
+ )
+ 
+ decoder = tfa.seq2seq.basic_decoder.BasicDecoder(
+     decoder_cell,
+     sampler,
+     output_layer=output_layer
+ )
+ 
+ # setup for Attention
+ attention_mechanism.setup_memory(
+     encoder_outputs,
+     memory_sequence_length=tf.ones(
+         [BATCH_SIZE], dtype=tf.int32) * INPUT_SEQUENCE_SIZE
+ )
+ 
+ decoder_initial_state = decoder_cell.get_initial_state(
+     batch_size=BATCH_SIZE,
+     dtype=tf.float32
+ )
+ decoder_initial_state = decoder_initial_state.clone(
+     cell_state=encoder_state
+ )
+ 
+ decoder_emb_inp = embeddings_dec(targets)
+ 
+ # Following statement generates exception
+ # ValueError: The two structures don't have the same nested structure
+ # for SimpleRNNCell and GRUCell
+ (
+     final_outputs,
+     final_state,
+     final_sequence_lengths
+ ) = decoder(
+     decoder_emb_inp,
+     initial_state=decoder_initial_state,
+     sequence_length=tf.ones([BATCH_SIZE],
+                             dtype=tf.int32) * OUTPUT_SEQUENCE_SIZE
+ )
+ 
+ &lt;/denchmark-code&gt;
+ 
+ Note that changing the value of RNN_CELL changes the outcome:
+ &lt;denchmark-code&gt;RNN_CELL_CLASS = keras.layers.SimpleRNNCell  # Raises ValueError Exception
+ # RNN_CELL_CLASS = keras.layers.GRUCell      # Raises ValueError Exception
+ # RNN_CELL_CLASS = keras.layers.LSTMCell     # Does not raise an error
+ &lt;/denchmark-code&gt;
+ 
+ Moreover, assigning `encoder_state both as a tensor or as a list does not work:
+ &lt;denchmark-code&gt;encoder_state = tf.zeros([BATCH_SIZE, RNN_UNITS], dtype=tf.float32)
+ # encoder_state = tf.zeros([BATCH_SIZE, RNN_UNITS], dtype=tf.float32)
+ &lt;/denchmark-code&gt;
+ 
+ Finally, also note that this is independnent of the type of attention used, the same error is return for both LuongAttention and BahdanauAttention.
+ Also here's a version of the same script where attention is not used, it works for all different kinds of cells:
+ &lt;denchmark-code&gt;import numpy as np
+ import tensorflow as tf
+ from tensorflow import keras
+ import tensorflow_addons as tfa
+ 
+ RNN_CELL_CLASS = keras.layers.SimpleRNNCell    # Does not raise an error
+ # RNN_CELL_CLASS = keras.layers.GRUCell        # Does not raise an error
+ # RNN_CELL_CLASS = keras.layers.LSTMCell       # Does not raise an error
+ 
+ VOCAB_SIZE = 100
+ EMBED_SIZE = 10
+ RNN_UNITS = 256
+ INPUT_SEQUENCE_SIZE = 10
+ OUTPUT_SEQUENCE_SIZE = 15
+ BATCH_SIZE = 128
+ 
+ targets = tf.convert_to_tensor(
+     np.random.randint(VOCAB_SIZE, size=OUTPUT_SEQUENCE_SIZE * BATCH_SIZE)
+     .reshape(BATCH_SIZE, OUTPUT_SEQUENCE_SIZE),
+     dtype=tf.float32
+ )
+ encoder_outputs = tf.zeros([BATCH_SIZE, RNN_UNITS], dtype=tf.float32)
+ if RNN_CELL_CLASS._keras_api_names[0] == 'keras.layers.LSTMCell':
+     encoder_state = [tf.zeros([BATCH_SIZE, RNN_UNITS], dtype=tf.float32),
+                      tf.zeros([BATCH_SIZE, RNN_UNITS], dtype=tf.float32)]
+ else:
+     # encoder_state = tf.zeros([BATCH_SIZE, RNN_UNITS], dtype=tf.float32)
+     encoder_state = [tf.zeros([BATCH_SIZE, RNN_UNITS], dtype=tf.float32)]
+ 
+ embeddings_dec = keras.layers.Embedding(VOCAB_SIZE, EMBED_SIZE)
+ decoder_cell = RNN_CELL_CLASS(RNN_UNITS)
+ output_layer = keras.layers.Dense(VOCAB_SIZE)
+ 
+ sampler = tfa.seq2seq.sampler.TrainingSampler()
+ 
+ decoder = tfa.seq2seq.basic_decoder.BasicDecoder(
+     decoder_cell,
+     sampler,
+     output_layer=output_layer
+ )
+ 
+ decoder_initial_state = encoder_state
+ 
+ decoder_emb_inp = embeddings_dec(targets)
+ 
+ (
+     final_outputs,
+     final_state,
+     final_sequence_lengths
+ ) = decoder(
+     decoder_emb_inp,
+     initial_state=decoder_initial_state,
+     sequence_length=tf.ones([BATCH_SIZE],
+                             dtype=tf.int32) * OUTPUT_SEQUENCE_SIZE
+ )
+ 
+ &lt;/denchmark-code&gt;
+ 
+ 	</description>
+ 	<comments>
+ 		<comment id='1' author='w4nderlust' date='2020-05-19T08:40:29Z'>
+ 		
+ I believe there are 2 solutions: one is making all cells return states as a list of tensors. This will be good and it will guarantee homogeneity. The other option is to correct the AttentionWrapper to work both with cells that retunr lists of tensors as states like LSTM and cells that return just a tensor as state like SimpleRNN and GRU.
+ 
+ I believe TensorFlow should be more consistent here and always return the same state structure. But to unblock the situation I added a workaround in the PR referenced above: we ensure that the cell state structure always matches the initial structure (as returned by cell.get_initial_state).
+ 		</comment>
+ 		<comment id='2' author='w4nderlust' date='2020-05-19T17:23:06Z'>
+ 		&lt;denchmark-link:https://github.com/guillaumekln&gt;@guillaumekln&lt;/denchmark-link&gt;
+  thanks, I agree with you that the interfaces should all be the same. Your PR solves the problem though, without impacting the main TF code, which makes it a good candidate for a solution, thank you very much.
+ 		</comment>
+ 		<comment id='3' author='w4nderlust' date='2020-05-20T04:54:45Z'>
+ 		Thanks to everyone involved in this fix
+ 		</comment>
+ 	</comments>
+ </bug>
+<commit id='f3d0416fbe3f4c607f4c1ebc2b7554a941ff02a2' author='Guillaume Klein' date='2020-05-19 23:22:38-04:00'>
+ 	<dmm_unit complexity='0.7692307692307693' interfacing='0.7692307692307693' size='0.7692307692307693'></dmm_unit>
+ 	<modification change_type='MODIFY' old_name='tensorflow_addons\seq2seq\attention_wrapper.py' new_name='tensorflow_addons\seq2seq\attention_wrapper.py'>
+ 		<file_info nloc='1278' complexity='147' token_count='6497'></file_info>
+ 		<method name='call' parameters='self,inputs,state,kwargs'>
+ 				<method_info nloc='71' complexity='9' token_count='376' nesting_level='1' start_line='2001' end_line='2112'></method_info>
+ 			<added_lines>2049,2050,2051</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines></added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='tensorflow_addons\seq2seq\tests\attention_wrapper_test.py' new_name='tensorflow_addons\seq2seq\tests\attention_wrapper_test.py'>
+ 		<file_info nloc='766' complexity='37' token_count='6096'></file_info>
+ 		<method name='test_attention_wrapper_with_gru_cell' parameters=''>
+ 				<method_info nloc='10' complexity='1' token_count='98' nesting_level='0' start_line='925' end_line='934'></method_info>
+ 			<added_lines>925,926,927,928,929,930,931,932,933,934</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines>923,924</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ </commit>
+</bug_data>

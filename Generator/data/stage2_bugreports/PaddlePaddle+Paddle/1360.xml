@@ -1,0 +1,105 @@
+<bug id='1360' author='reyoung' open_date='2017-02-17T10:07:57Z' closed_time='2018-02-07T12:55:48Z'>
+	<summary>Paddle SparseRowCpuMatrix::addTo SIGSEGV when width of matrix cannot be divided by 32.</summary>
+	<description>
+The log message shows below.
+&lt;denchmark-code&gt;[WARNING 2017-02-17 17:31:41,513 layers.py:1252] NOTE: the gru memory layer's size is set by previous input layer, and should be input size / 3. Set size explicitly will be ignored.
+[INFO 2017-02-17 17:31:41,516 networks.py:1466] The input order is [bidword_seq, label]
+[INFO 2017-02-17 17:31:41,516 networks.py:1472] The output order is [__cost_0__]
+I0217 17:31:41.518110 26649 Trainer.cpp:125] ignore sparse_remote_update=true due to  --local=true
+I0217 17:31:41.518137 26649 Trainer.cpp:173] trainer mode: SgdSparseCpuTraining
+I0217 17:31:55.190280 26649 PyDataProvider2.cpp:243] loading dataprovider dataprovider::process
+[INFO 2017-02-17 17:31:56,881 dataprovider.py:20] dict len : 1972305
+I0217 17:31:56.881968 26649 PyDataProvider2.cpp:243] loading dataprovider dataprovider::process
+[INFO 2017-02-17 17:31:58,100 dataprovider.py:20] dict len : 1972305
+I0217 17:31:58.100997 26649 GradientMachine.cpp:135] Initing parameters..
+I0217 17:32:31.008913 26649 GradientMachine.cpp:142] Init parameters done.
+I0217 17:32:32.164254  3860 ThreadLocal.cpp:40] thread use undeterministic rand seed:3861
+*** Aborted at 1487323962 (unix time) try "date -d @1487323962" if you are using GNU date ***
+PC: @           0x798110 paddle::simd::internal::addToImpl()
+*** SIGSEGV (@0x0) received by PID 26649 (TID 0x7f41619ea700) from PID 0; stack trace: ***
+    @     0x7f46ad8be160 (unknown)
+    @           0x798110 paddle::simd::internal::addToImpl()
+    @           0x78c9ed paddle::SparseRowCpuMatrix::addTo()
+    @           0x70b117 paddle::TrainerThread::mergeGradSparse()
+    @           0x70b58b paddle::TrainerThread::mergeCpuGradients()
+    @           0x70bda7 paddle::TrainerThread::backward()
+    @           0x70c02d paddle::TrainerThread::computeThread()
+    @     0x7f46acbd28a0 execute_native_thread_routine
+    @     0x7f46ad8b61c3 start_thread
+    @     0x7f46ac34312d __clone
+/home/work/yangyaming/programs/paddle_internal_release_tools/idl/paddle/output/bin/paddle_local: line 109: 26649 Segmentation fault      ${DEBUGGER} $MYDIR/../opt/paddle/bin/paddle_trainer ${@:2}
+&lt;/denchmark-code&gt;
+
+The buggy code is &lt;denchmark-link:https://github.com/PaddlePaddle/Paddle/blob/develop/paddle/math/SparseRowMatrix.cpp#L183&gt;here&lt;/denchmark-link&gt;
+. This bug because  method uses plain  instruct, the input buffer must be aligned by 32. If matrix dimension cannot be divided by 32. It will cause SIGSEGV.
+The possible fixes could be.
+dest = dest.rowBuf(id)
+local = getLocalRow(i)
+while dest % 32 !=0:
+    *dest += *local
+    ++dest
+    ++local
+simd::addTo(dest, local, this-&gt;width_);
+	</description>
+	<comments>
+		<comment id='1' author='reyoung' date='2017-02-20T09:52:09Z'>
+		For
+extern __m256 _mm256_load_ps(float const *a);
+pointer to a memory location that can hold constant float32 values; the address must be 32-byte aligned
+
+the address for the allocated memory is already 32-byte aligned. Is that true? @reyoung
+
+    CHECK_EQ(posix_memalign(&amp;ptr, 32ul, size), 0)
+
+the width of the matrix cannot be divided by 32 should work too. addto_avx from SIMDFunctions.cpp
+
+static void addto_avx(float* a, const float* b, size_t len) {
+  int offset = len % 32;
+
+  __m256 ma0, ma1, ma2, ma3;
+  __m256 mb0, mb1, mb2, mb3;
+
+  for (unsigned int k = 0; k &lt; len / 32; k++, a += 32, b += 32) {
+    ma0 = _mm256_load_ps(a);
+    ma1 = _mm256_load_ps(a + 8);
+    ma2 = _mm256_load_ps(a + 16);
+    ma3 = _mm256_load_ps(a + 24);
+
+    mb0 = _mm256_load_ps(b);
+    mb1 = _mm256_load_ps(b + 8);
+    mb2 = _mm256_load_ps(b + 16);
+    mb3 = _mm256_load_ps(b + 24);
+
+    ma0 = _mm256_add_ps(ma0, mb0);
+    ma1 = _mm256_add_ps(ma1, mb1);
+    ma2 = _mm256_add_ps(ma2, mb2);
+    ma3 = _mm256_add_ps(ma3, mb3);
+
+    _mm256_store_ps(a, ma0);
+    _mm256_store_ps(a + 8, ma1);
+    _mm256_store_ps(a + 16, ma2);
+    _mm256_store_ps(a + 24, ma3);
+  }
+
+  for (int i = 0; i &lt; offset; i++) a[i] += b[i];
+
+  return;
+}
+		</comment>
+		<comment id='2' author='reyoung' date='2017-02-20T10:51:19Z'>
+		The width is not divided by eight is not working because the simd::addTo method may be invoked in the different row of the sparse matrix. Each row of the sparse matrix is not aligned in 32 if width cannot be divided by 8.
+For example, Matrix A contains 2 row and width is 6, the Matrix address could be
+&lt;denchmark-code&gt;.------.
+| 0x00 |
+|------|
+| 0x06 |
+`------'
+&lt;/denchmark-code&gt;
+
+When we get the second row of this matrix and invoke simd::addTo. It will trigger SIGSEGV.
+		</comment>
+		<comment id='3' author='reyoung' date='2017-02-20T11:01:46Z'>
+		嗯，static void addto_avx(float* a, const float* b, size_t len)这接口，如果float *a不是对齐的会有问题。
+		</comment>
+	</comments>
+</bug>

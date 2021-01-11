@@ -1,0 +1,369 @@
+<bug id='34025' author='ywpkwon' open_date='2019-11-06T00:45:43Z' closed_time='2020-04-06T03:54:06Z'>
+	<summary>Understanding warning "5 out of the last 5 calls to &amp;lt;function XXX&amp;gt; triggered tf.function retracing"</summary>
+	<description>
+System information
+
+Have I written custom code: Yes, below.
+Linux Ubuntu 16.04
+TensorFlow 2.1.0-dev20191103, binary install.
+Python 3.6
+CUDA 10.0 / cnDNN 7.6.4
+4 * NVIDIA TITAN X (12GB)
+
+I defined a very simple training script with a custom loss function and .fit() as below. The loss_fn  is very simple and I think every time it takes tensors of the same shape and type. But I'm getting the following warning message. Interesting is that I'm getting the message only when training with multiple GPUs. Is it a bug? Is it harmful? Is it really affecting the computational cost?
+Warning message:
+&lt;denchmark-code&gt;WARNING:tensorflow:5 out of the last 5 calls to &lt;function loss_fn at 0x7f0070ef0e18&gt; triggered tf.function retracing. Tracing is expensive and the excessive number of tracings is likely due to passing python objects instead of tensors. Also, tf.function has experimental_re
+lax_shapes=True option that relaxes argument shapes that can avoid unnecessary retracing. Please refer to https://www.tensorflow.org/tutorials/customization/performance#python_or_tensor_args and https://www.tensorflow.org/api_docs/python/tf/function for more details.
+&lt;/denchmark-code&gt;
+
+Code:
+from __future__ import absolute_import, division, print_function, unicode_literals
+import numpy as np
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras.layers import (Conv2D, Conv3D, Dense)
+
+
+@tf.function
+def loss_fn(y_pred, y_true):
+    return tf.reduce_mean(tf.math.square(y_pred - y_true))
+
+if __name__ == "__main__":
+
+    BATCH_SIZE_PER_SYNC = 4
+    strategy = tf.distribute.MirroredStrategy()
+    num_gpus = strategy.num_replicas_in_sync
+    global_batch_size = BATCH_SIZE_PER_SYNC * num_gpus
+    print('num GPUs: {}, global batch size: {}'.format(num_gpus, global_batch_size))
+
+
+    # fake data ------------------------------------------------------
+    fakea = np.random.rand(global_batch_size, 10, 200, 200, 128).astype(np.float32)
+    targets = np.random.rand(global_batch_size, 200, 200, 14).astype(np.float32)
+
+    fakea = tf.constant(fakea)
+    targets = tf.constant(targets)
+
+    # tf.Dataset ------------------------------------------------------
+    def gen():
+        while True:
+            yield (fakea, targets)
+
+    dataset = tf.data.Dataset.from_generator(gen,
+        (tf.float32, tf.float32),
+        (tf.TensorShape(fakea.shape), tf.TensorShape(targets.shape)))
+
+    dataset = dataset.prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
+
+    # training ------------------------------------------------------
+    callbacks = [tf.keras.callbacks.TensorBoard(log_dir='./logs')]
+    training = True
+    with strategy.scope():
+        va = keras.Input(shape=(10, 200, 200, 128), dtype=tf.float32, name='va')
+        x = Conv3D(64, kernel_size=3, strides=1, padding='same')(va)
+        x = Conv3D(64, kernel_size=3, strides=1, padding='same')(x)
+        x = Conv3D(64, kernel_size=3, strides=1, padding='same')(x)
+        x = tf.reduce_max(x, axis=1, name='maxpool')                         
+        b = Conv2D(14, kernel_size=3, padding='same')(x)
+        model = keras.Model(inputs=va, outputs=b, name='net')
+        optimizer = keras.optimizers.RMSprop()
+
+        model.compile(optimizer=optimizer, loss=loss_fn)
+        model.fit(x=dataset, epochs=10, steps_per_epoch=100, callbacks=callbacks)
+	</description>
+	<comments>
+		<comment id='1' author='ywpkwon' date='2019-11-22T19:45:44Z'>
+		I get the same error if trying to predict in a for-loop (due to variable length inputs).
+I have to call model.predict(np.expand_dims(xi, axis = 0)) on each sample individually, or tensorflow will attempt to concatenate predictions and fail.
+This is probably calling something several times, when it shouldn't.
+		</comment>
+		<comment id='2' author='ywpkwon' date='2020-02-05T21:36:55Z'>
+		I have the same issue when training my model. Any updates on this?
+		</comment>
+		<comment id='3' author='ywpkwon' date='2020-03-06T16:51:14Z'>
+		same issue
+		</comment>
+		<comment id='4' author='ywpkwon' date='2020-03-09T06:18:55Z'>
+		same here, only with multi gpu setup, singel gpu has no warnings
+		</comment>
+		<comment id='5' author='ywpkwon' date='2020-03-23T20:33:13Z'>
+		I think the warning is red herring. The function is traced on every GPU, so presumably if one has 5 or more than 5 GPUs on the machine, the warning will be printed out. Perhaps try adding a print statement inside the tf.function (&lt;denchmark-link:https://www.tensorflow.org/tutorials/customization/performance&gt;https://www.tensorflow.org/tutorials/customization/performance&lt;/denchmark-link&gt;
+), and see how many times the function has actually been traced? As long as it not traced per step, it should be fine. If you have less than 5 GPUs though, it might be a bug.
+		</comment>
+		<comment id='6' author='ywpkwon' date='2020-03-25T08:37:15Z'>
+		When calling a simple RNN with input sequences of various lengths, it seems that the model gets traced once for each sequence length, as you can see in &lt;denchmark-link:https://colab.research.google.com/drive/1Aj51rVjkpUesVz3dSTvih7kW9CT_QjRA&gt;this Colab&lt;/denchmark-link&gt;
+. Here's the code:
+import tensorflow as tf
+from tensorflow import keras
+
+model = keras.models.Sequential([
+    keras.layers.SimpleRNN(10, return_sequences=True, input_shape=[None, 4]),
+    keras.layers.Dense(1)
+])
+model.compile(loss="mse", optimizer="nadam")
+
+X_train = tf.random.uniform(shape=[100, 50, 4])
+y_train = tf.random.uniform(shape=[100, 1])
+model.fit(X_train, y_train)
+
+for length in range(1, 20):
+    X_new = tf.random.uniform([1, length, 4])
+    model.predict(X_new)
+I get the dreaded warning:
+&lt;denchmark-code&gt;WARNING:tensorflow:5 out of the last 5 calls to &lt;function _make_execution_function.&lt;locals&gt;.distributed_function at 0x7fe3de7c0268&gt; triggered tf.function retracing. Tracing is expensive and the excessive number of tracings is likely due to passing python objects instead of tensors. Also, tf.function has experimental_relax_shapes=True option that relaxes argument shapes that can avoid unnecessary retracing. Please refer to https://www.tensorflow.org/tutorials/customization/performance#python_or_tensor_args and https://www.tensorflow.org/api_docs/python/tf/function for more details.
+WARNING:tensorflow:6 out of the last 6 calls to &lt;function _make_execution_function.&lt;locals&gt;.distributed_function at 0x7fe3de7c0268&gt; triggered tf.function retracing. Tracing is expensive and the excessive number of tracings is likely due to passing python objects instead of tensors. Also, tf.function has experimental_relax_shapes=True option that relaxes argument shapes that can avoid unnecessary retracing. Please refer to https://www.tensorflow.org/tutorials/customization/performance#python_or_tensor_args and https://www.tensorflow.org/api_docs/python/tf/function for more details.
+...
+&lt;/denchmark-code&gt;
+
+Perhaps there's a way to force the model to use a single graph instead of tracing a new one for each input shape?
+		</comment>
+		<comment id='7' author='ywpkwon' date='2020-03-25T12:47:00Z'>
+		
+I think the warning is red herring. The function is traced on every GPU
+
+I think we had the same idea, exactly as I stated here &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/33649&gt;#33649&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='8' author='ywpkwon' date='2020-03-26T03:38:52Z'>
+		Hi &lt;denchmark-link:https://github.com/bela127&gt;@bela127&lt;/denchmark-link&gt;
+ and &lt;denchmark-link:https://github.com/ckkuang&gt;@ckkuang&lt;/denchmark-link&gt;
+ ,
+In my code example, I'm not using any GPU at all. Just calling an RNN with input sequences of varying lengths.
+		</comment>
+		<comment id='9' author='ywpkwon' date='2020-03-26T15:41:26Z'>
+		UPDATE:
+is it possible its only a problem with the:
+keras.layers.SimpleRNN(10, return_sequences=True, input_shape=[None, 4])
+Im not sure but return_sequences=TRUE when im correct will return the hole RNN Sequence, not just the last element, so for different sized inputs you will get different sized outputs.
+Dens needs a fixed sized input.
+So it will be retraced every time.
+when you try to use the same dense layer for every single output you cant do this with Sequential, because it would be a parallel operation. If this is the case i my have a solution for you...
+OLD:
+yes i see &lt;denchmark-link:https://github.com/ageron&gt;@ageron&lt;/denchmark-link&gt;
+,
+had the same problem with Keras functional api, it seams the functional keras api has problems with variable length inputs, different than the batchdim
+a workaround is using the layer class api and subclass Keras Layer.
+here you can update the call method with tf.function annotation with "relax_shape:
+@tf.function( experimental_relax_shapes=True)
+or explicit:
+self.call = tf.function(self.call,input_signature=[(tf.TensorSpec([None, None, None, 3], dtype=tf.float32), (tf.TensorSpec([None], dtype=tf.float32), tf.TensorSpec([None, 15, 3], dtype=tf.float32)), tf.TensorSpec([], dtype=tf.float32), tf.TensorSpec([], dtype=tf.float32))])
+in __init__ or build
+But i agree the functional api should although support this.
+		</comment>
+		<comment id='10' author='ywpkwon' date='2020-04-02T19:34:14Z'>
+		I am also getting this error on a classical functional model without tf.function and variable-length inputs in a for loop using predict. This happens only in tf 2.2.0rc2, and as soon as I switch back to tf 2.1 the problem disappears.
+		</comment>
+		<comment id='11' author='ywpkwon' date='2020-04-05T02:58:16Z'>
+		I am also facing the same issue with Tensorflow 2.2.0-rc2 while training with variable lengths in a loop.
+		</comment>
+		<comment id='12' author='ywpkwon' date='2020-04-06T03:54:06Z'>
+		&lt;denchmark-link:https://github.com/ywpkwon&gt;@ywpkwon&lt;/denchmark-link&gt;
+ I tried the code you originally linked in a colab with tf-nightly-gpu and I don't see the warnings anymore. Please re-open if you still see the warning.
+&lt;denchmark-link:https://github.com/ageron&gt;@ageron&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/bela127&gt;@bela127&lt;/denchmark-link&gt;
+, others- Please file a separate ticket for the RNN issue or other issues without multi GPU.
+		</comment>
+		<comment id='13' author='ywpkwon' date='2020-04-06T03:54:07Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/34025&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/34025&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='14' author='ywpkwon' date='2020-04-06T07:25:19Z'>
+		&lt;denchmark-link:https://github.com/guptapriya&gt;@guptapriya&lt;/denchmark-link&gt;
+
+Here is a new code snippet you can use to reproduce the issue in tf 2.2.0rc2:
+from random import randint
+
+import tensorflow as tf
+from tensorflow.keras.layers import Conv1D
+from tensorflow.keras.models import Sequential
+
+model = Sequential()
+model.add(Conv1D(8, 3))
+model.build([None, 12, 1])
+
+predict_tensors = [
+    tf.random.normal([randint(1, 8), randint(4, 40), 1])
+    for _ in range(10)
+]
+for t in predict_tensors:
+    _ = model.predict(t)
+I am using Python 3.6.8, on Ubuntu 16.04, without GPU and tf installed from pip.
+This got me the following warnings:
+&lt;denchmark-code&gt;WARNING: Logging before flag parsing goes to stderr.
+W0406 09:22:52.525994 139643050075904 def_function.py:598] 5 out of the last 6 calls to &lt;function Model.make_predict_function.&lt;locals&gt;.predict_function at 0x7f00a7fc1268&gt; triggered tf.function retracing. Tracing is expensive and the excessive number of tracings is likely due to passing python objects instead of tensors. Also, tf.function has experimental_relax_shapes=True option that relaxes argument shapes that can avoid unnecessary retracing. Please refer to https://www.tensorflow.org/tutorials/customization/performance#python_or_tensor_args and https://www.tensorflow.org/api_docs/python/tf/function for more details.
+W0406 09:22:52.615050 139643050075904 def_function.py:598] 6 out of the last 7 calls to &lt;function Model.make_predict_function.&lt;locals&gt;.predict_function at 0x7f00a7fc1268&gt; triggered tf.function retracing. Tracing is expensive and the excessive number of tracings is likely due to passing python objects instead of tensors. Also, tf.function has experimental_relax_shapes=True option that relaxes argument shapes that can avoid unnecessary retracing. Please refer to https://www.tensorflow.org/tutorials/customization/performance#python_or_tensor_args and https://www.tensorflow.org/api_docs/python/tf/function for more details.
+W0406 09:22:52.653312 139643050075904 def_function.py:598] 7 out of the last 8 calls to &lt;function Model.make_predict_function.&lt;locals&gt;.predict_function at 0x7f00a7fc1268&gt; triggered tf.function retracing. Tracing is expensive and the excessive number of tracings is likely due to passing python objects instead of tensors. Also, tf.function has experimental_relax_shapes=True option that relaxes argument shapes that can avoid unnecessary retracing. Please refer to https://www.tensorflow.org/tutorials/customization/performance#python_or_tensor_args and https://www.tensorflow.org/api_docs/python/tf/function for more details.
+W0406 09:22:52.706550 139643050075904 def_function.py:598] 8 out of the last 10 calls to &lt;function Model.make_predict_function.&lt;locals&gt;.predict_function at 0x7f00a7fc1268&gt; triggered tf.function retracing. Tracing is expensive and the excessive number of tracings is likely due to passing python objects instead of tensors. Also, tf.function has experimental_relax_shapes=True option that relaxes argument shapes that can avoid unnecessary retracing. Please refer to https://www.tensorflow.org/tutorials/customization/performance#python_or_tensor_args and https://www.tensorflow.org/api_docs/python/tf/function for more details.
+&lt;/denchmark-code&gt;
+
+Do you want me to file a separate ticket? I think it looks like the same issue.
+		</comment>
+		<comment id='15' author='ywpkwon' date='2020-04-14T22:05:45Z'>
+		&lt;denchmark-link:https://github.com/zaccharieramzi&gt;@zaccharieramzi&lt;/denchmark-link&gt;
+ - yes please file a separate ticket as this is a Keras issue without distribution strategy. The error message might be the same but the root causes are different.
+		</comment>
+		<comment id='16' author='ywpkwon' date='2020-04-20T01:27:35Z'>
+		I have same issue with my model trained with MirroredStrategy().
+Using TF2.1 with four TitanXp
+&lt;denchmark-code&gt;WARNING:tensorflow:11 out of the last 11 calls to &lt;function _make_execution_function.&lt;locals&gt;.distributed_function at 0x7f85182bab00&gt; triggered tf.function retracing. Tracing is expensive and the excessive number of tracings is likely due to passing python objects instead of tensors. Also, tf.function has experimental_relax_shapes=True option that relaxes argument shapes that can avoid unnecessary retracing. Please refer to https://www.tensorflow.org/tutorials/customization/performance#python_or_tensor_args and https://www.tensorflow.org/api_docs/python/tf/function for more details.
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='17' author='ywpkwon' date='2020-04-20T20:32:59Z'>
+		&lt;denchmark-link:https://github.com/SangwonSUH&gt;@SangwonSUH&lt;/denchmark-link&gt;
+, are you using variable inputs (see &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/38561&gt;#38561&lt;/denchmark-link&gt;
+)?
+		</comment>
+		<comment id='18' author='ywpkwon' date='2020-04-21T01:47:43Z'>
+		
+@SangwonSUH, are you using variable inputs (see #38561)?
+
+Yes, I do
+&lt;denchmark-code&gt;tf.keras.layers.Input((128, None, 6))
+&lt;/denchmark-code&gt;
+
+I will fix the input layer of my model, and try prediction again.
+Thank you!
+		</comment>
+		<comment id='19' author='ywpkwon' date='2020-04-24T13:44:47Z'>
+		
+I have same issue with my model trained with MirroredStrategy().
+Using TF2.1 with four TitanXp
+WARNING:tensorflow:11 out of the last 11 calls to &lt;function _make_execution_function.&lt;locals&gt;.distributed_function at 0x7f85182bab00&gt; triggered tf.function retracing. Tracing is expensive and the excessive number of tracings is likely due to passing python objects instead of tensors. Also, tf.function has experimental_relax_shapes=True option that relaxes argument shapes that can avoid unnecessary retracing. Please refer to https://www.tensorflow.org/tutorials/customization/performance#python_or_tensor_args and https://www.tensorflow.org/api_docs/python/tf/function for more details.
+
+
+I have a very similar issue using MirroredStrategy:
+WARNING:tensorflow:11 out of the last 11 calls to &lt;function Model.make_predict_function.&lt;locals&gt;.predict_function at 0x7f9dc8698598&gt; triggered tf.function retracing.
+However, I placed a print statement inside the tf.function distributed training step and it appears to only be executed twice - matching the number of GPUs I am distributing onto. It may be an erroneous message, which is annoying, as it spams the output.
+I do notice that mirroredstrategy is significantly (10x) slower than using a single GPU, which I did not expect.
+		</comment>
+		<comment id='20' author='ywpkwon' date='2020-04-24T13:54:32Z'>
+		you have to place the print statement in make_predict_function not in distributed training step
+for debugging the statement should be placed in the exact function that is mentioned in the message:
+WARNING:tensorflow:11 out of the last 11 calls to &lt;function Model.make_predict_function.&lt;locals&gt;.predict_function at 0x7f9dc8698598&gt; triggered tf.function retracing.
+I guess it relay is traced every time if it does not stop appearing in the output after a few runs, that is why your training is so slow.
+		</comment>
+		<comment id='21' author='ywpkwon' date='2020-04-24T14:08:53Z'>
+		
+you have to place the print statement in make_predict_function not in distributed training step
+for debugging the statement should be placed in the exact function that is mentioned in the message:
+WARNING:tensorflow:11 out of the last 11 calls to &lt;function Model.make_predict_function.&lt;locals&gt;.predict_function at 0x7f9dc8698598&gt; triggered tf.function retracing.
+I guess it relay is traced every time if it does not stop appearing in the output after a few runs, that is why your training is so slow.
+
+I cannot place a print function inside make_predict_function as that isn't anything I've written - it's tensorflow code. Also note it is 'predict_function' that is causing the issue. This implies that it's the input causing the retracing.
+However, the error also only appears when distributing, not when running on one GPU.
+		</comment>
+		<comment id='22' author='ywpkwon' date='2020-04-24T14:14:18Z'>
+		tf.functions can only handle a pre defined input shape, if the shape changes, or if diferent python objects get passed, tensorflow automagically rebuilds the function.
+so i would suggest you check and print all the input parameter that get passed to Model.make_predict_function.&lt;locals&gt;.predict_function if a input is no tensor or if the shape changes you have found the problem
+		</comment>
+		<comment id='23' author='ywpkwon' date='2020-04-24T14:16:33Z'>
+		
+tf.functions can only handle a pre defined input shape, if the shape changes, or if diferent python objects get passed, tensorflow automagically rebuilds the function.
+so i would suggest you check and print all the input parameter that get passed to Model.make_predict_function.&lt;locals&gt;.predict_function if a input is no tensor or if the shape changes you have found the problem
+
+The inputs to my training function that calls strategy.run() print out to:
+&lt;denchmark-code&gt;PerReplica:{ 
+  0: Tensor("reals:0", shape=(16, 256, 256, 3), dtype=float32)
+  1: Tensor("reals_1:0", shape=(16, 256, 256, 3), dtype=float32)
+} 
+&lt;/denchmark-code&gt;
+
+However, I don't think I have any control over this, as these come directly from a distributed tf.dataset.
+If we print out the input for the actual distributed training function, we see as expected:
+&lt;denchmark-code&gt;Tensor("reals:0", shape=(16, 256, 256, 3), dtype=float32)
+Tensor("reals_1:0", shape=(16, 256, 256, 3), dtype=float32)  
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='24' author='ywpkwon' date='2020-04-24T14:23:57Z'>
+		the training loop code could be helpful, but i think this is not a bug and could be a question for stack overflow.
+one way or the other, could you post a minimal example of your training loop code, that reproduces your issue, so one can check if its a bug or a implementation error on your side?
+		</comment>
+		<comment id='25' author='ywpkwon' date='2020-04-24T14:46:29Z'>
+		
+the training loop code could be helpful, but i think this is not a bug and could be a question for stack overflow.
+one way or the other, could you post a minimal example of your training loop code, that reproduces your issue, so one can check if its a bug or a implementation error on your side?
+
+This is all I'm really doing:
+&lt;denchmark-code&gt;dataset = strategy.experimental_distribute_dataset(dataset)
+
+@tf.function(experimental_relax_shapes=True)
+def distributed_train_step(self, data):
+    per_replica_losses = self.strategy.run(self.train_op, args=(data,))
+    reduced_loss = self.strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses, axis=0)
+
+    return reduced_loss
+
+for batch in dataset:
+    distributed_train_step(batch)
+&lt;/denchmark-code&gt;
+
+My trainop is standard, calls model(inputs) and calculates a simple loss. The only 'strange' thing I may be doing is generating some noise inside the training op using tf.random.normal and calling model2(noise) but I fail to see how a tensorflow op could cause this issue,
+		</comment>
+		<comment id='26' author='ywpkwon' date='2020-04-24T16:20:30Z'>
+		like i said earlier, the input to or what ever happens in your : Model.make_predict_function.&lt;locals&gt;.predict_function courses the retracing.
+with only the code you have provided a reproduction of the issue is not possible.
+the relevant information is inside Model.make_predict_function.&lt;locals&gt;.predict_function and the inputs to this function.
+this is where the issue originates, are you using any python code in your model or do you produce differently shaped outputs inside the model? what model are you using?
+one thing im missing in your training loop is the with strategy: block, do you have this in your code? your model should be created inside this scope and the loop should run in the scope, the rest of your training loop seams to be fine.
+		</comment>
+		<comment id='27' author='ywpkwon' date='2020-05-22T03:54:11Z'>
+		me too.. how to solve this problem ?
+		</comment>
+		<comment id='28' author='ywpkwon' date='2020-07-20T15:27:20Z'>
+		I have the same problem too... model.predict_on_batch(input) gives the warning as
+"WARNING:tensorflow:8 out of the last 8 calls to &lt;function Model.make_predict_function..predict_function at 0x7f8fe3fdc940&gt; triggered tf.function retracing. Tracing is expensive and the excessive number of tracings is likely due to passing python objects instead of tensors. Also, tf.function has experimental_relax_shapes=True option that relaxes argument shapes that can avoid unnecessary retracing. Please refer to &lt;denchmark-link:https://www.tensorflow.org/tutorials/customization/performance#python_or_tensor_args&gt;https://www.tensorflow.org/tutorials/customization/performance#python_or_tensor_args&lt;/denchmark-link&gt;
+ and &lt;denchmark-link:https://www.tensorflow.org/api_docs/python/tf/function&gt;https://www.tensorflow.org/api_docs/python/tf/function&lt;/denchmark-link&gt;
+ for more details."
+How to solve this problem??
+		</comment>
+		<comment id='29' author='ywpkwon' date='2020-08-10T21:32:47Z'>
+		I was getting this same warning message. Using a LSTM model with variable sequence lengths. Upgrading from TF 2.2 to TF 2.3 seems to have fixed it.
+		</comment>
+		<comment id='30' author='ywpkwon' date='2020-10-14T13:23:57Z'>
+		Am using only 1 gpu and still am facing this retracing issue.
+After trying out verious fixes to this problem by searching over the internet, nothing worked. Including tf-nightly-gpu since its first of all not detecting my gpu.
+So I have just downgraded from tf 2.3.0 to tf 2.2.1 and it has fixed this issue for now.
+		</comment>
+		<comment id='31' author='ywpkwon' date='2020-11-15T16:06:47Z'>
+		same problem with tf 2.3.0, without gpu
+		</comment>
+		<comment id='32' author='ywpkwon' date='2020-11-19T08:58:12Z'>
+		Same here. Any updates?
+		</comment>
+		<comment id='33' author='ywpkwon' date='2020-12-08T09:33:49Z'>
+		same here with tf 2.3.1 without GPU:
+WARNING:tensorflow:6 out of the last 12 calls to &lt;function Model.make_predict_function..predict_function at 0x7fc1f07e1ca0&gt; triggered tf.function retracing.
+I did pass tensors with different shapes into the predict function because I have different batch sizes. But how to solve it? Align all the batches to the same size?
+		</comment>
+		<comment id='34' author='ywpkwon' date='2020-12-18T12:59:48Z'>
+		Facing same issue, when I try to read different size images in colab.
+		</comment>
+		<comment id='35' author='ywpkwon' date='2020-12-18T13:52:08Z'>
+		&lt;denchmark-link:https://github.com/vikxoxo&gt;@vikxoxo&lt;/denchmark-link&gt;
+
+
+Facing same issue, when I try to read different size images in colab.
+
+yes, that is normal, a tf-function can only compute the input for a fixed size.
+if you use different sized images the function needs to be traced for every image size, which is slow and that is why you get a warning.
+most layers do not (yet) support variable image shapes, some just cant (mathematical)
+		</comment>
+		<comment id='36' author='ywpkwon' date='2020-12-18T14:00:53Z'>
+		&lt;denchmark-link:https://github.com/RuralHunter&gt;@RuralHunter&lt;/denchmark-link&gt;
+
+
+I did pass tensors with different shapes into the predict function because I have different batch sizes. But how to solve it? Align all the batches to the same size?
+
+for batch dimensions it is a little  bit difference, if all your operations in your model support a variable batch dimension it can work without retracing.
+but if you build your own layer and make it a tf-function you have to take special care that it supports a variable dimension.
+info is here: &lt;denchmark-link:https://www.tensorflow.org/api_docs/python/tf/function&gt;https://www.tensorflow.org/api_docs/python/tf/function&lt;/denchmark-link&gt;
+
+you will need:  or  
+		</comment>
+	</comments>
+</bug>

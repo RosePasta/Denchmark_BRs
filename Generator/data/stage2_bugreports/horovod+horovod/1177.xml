@@ -1,0 +1,114 @@
+<bug id='1177' author='aj-prime' open_date='2019-06-28T01:21:03Z' closed_time='2019-07-08T23:30:00Z'>
+	<summary>Horovod GradientTape performance for Tensorflow</summary>
+	<description>
+Environment:
+
+Framework: Tensorflow
+Framework version: 1.12
+Horovod version:0.16.4
+MPI version: Mvapich-GDR 2.3.1
+CUDA version: 9.2
+NCCL version:
+Python version: 3.6
+OS and version: Red Hat Enterprise Linux Server, 7.5 (Maipo)
+GCC version: xl/2019.02.07
+Architecture: Power9, V100 GPU
+
+Your question:
+I have modified tensorflow_mnist_eager.py script in the examples to print images per sec.
+Batch size: 32
+#GPUs    Perf(images/sec)
+1               2216
+2              425
+4              640
+It looks like there is an initial overhead of distributing the DNN training.
+Is it the expected behavior?
+	</description>
+	<comments>
+		<comment id='1' author='aj-prime' date='2019-06-28T01:41:14Z'>
+		This is not expected.  &lt;denchmark-link:https://github.com/tgaddair&gt;@tgaddair&lt;/denchmark-link&gt;
+, could you take a look?
+		</comment>
+		<comment id='2' author='aj-prime' date='2019-06-28T01:44:35Z'>
+		&lt;denchmark-link:https://github.com/aj-prime&gt;@aj-prime&lt;/denchmark-link&gt;
+, by the way, any reason you're not using NCCL?
+		</comment>
+		<comment id='3' author='aj-prime' date='2019-06-28T01:50:23Z'>
+		&lt;denchmark-link:https://github.com/alsrgv&gt;@alsrgv&lt;/denchmark-link&gt;
+ No specific reason
+		</comment>
+		<comment id='4' author='aj-prime' date='2019-06-28T01:55:37Z'>
+		&lt;denchmark-link:https://github.com/aj-prime&gt;@aj-prime&lt;/denchmark-link&gt;
+, NCCL will give you better performance on GPU compared to MPI.  That said, I do see a slowdown of Eager TF compared to a regular TF even with NCCL in my environment.
+		</comment>
+		<comment id='5' author='aj-prime' date='2019-06-28T02:16:44Z'>
+		&lt;denchmark-link:https://github.com/alsrgv&gt;@alsrgv&lt;/denchmark-link&gt;
+ I am trying to setup horovod with NCCL. Is the slowdown as severe as MV2-GDR?
+		</comment>
+		<comment id='6' author='aj-prime' date='2019-06-28T02:50:29Z'>
+		&lt;denchmark-link:https://github.com/aj-prime&gt;@aj-prime&lt;/denchmark-link&gt;
+, I have not tried MV2-GDR, so not sure.  What kind of performance are you seeing with Graph TensorFlow MNIST example?
+		</comment>
+		<comment id='7' author='aj-prime' date='2019-06-28T03:11:51Z'>
+		&lt;denchmark-link:https://github.com/alsrgv&gt;@alsrgv&lt;/denchmark-link&gt;
+ For tensorflow_mnist.py script with batch size 32, I am getting following numbers
+1 GPU:   11292
+2 GPUs: 12300
+4 GPUs: 20080
+		</comment>
+		<comment id='8' author='aj-prime' date='2019-06-28T14:11:58Z'>
+		OK, that's much better.  We'll look into the eager mode performance.
+		</comment>
+		<comment id='9' author='aj-prime' date='2019-06-28T21:42:15Z'>
+		Hey &lt;denchmark-link:https://github.com/aj-prime&gt;@aj-prime&lt;/denchmark-link&gt;
+, can you try running &lt;denchmark-link:https://github.com/horovod/horovod/blob/master/examples/tensorflow_synthetic_benchmark.py&gt;tensorflow_synthetic_benchmark.py&lt;/denchmark-link&gt;
+ with  and without?  That uses ResNet50, which might provide more interesting data.
+		</comment>
+		<comment id='10' author='aj-prime' date='2019-06-29T01:23:59Z'>
+		hello &lt;denchmark-link:https://github.com/tgaddair&gt;@tgaddair&lt;/denchmark-link&gt;
+
+I ran tensorflow_synthetic_benchmark.py in the graph and eager mode. Here are the results
+Graph Mode
+1 GPU: 336.7 +-0.3
+2 GPUS: 574.3 +-3.2
+4 GPUs: 1090.5 +-13.1
+Eager Mode
+1 GPU: 257.1 +-0.6
+2 GPUs: 249.5 +-11.5
+4 GPUs: 447.2 +-56.4
+		</comment>
+		<comment id='11' author='aj-prime' date='2019-07-03T20:25:35Z'>
+		Those numbers look a lot better, though still not great (but there's some significant performance penalties to eager execution in TensorFlow at present).  One thing we do in the synthetic benchmarks but not the MNIST example is device placement: with tf.device(device):.
+Without device placement, allreduce happens on CPU, which can slow things down considerably.  Can you try adding with tf.device('GPU'): to your MNIST benchmark and see if that makes any difference?
+It could also be simply due to the fact that ResNet50 is a more complex model, so more of the time will be spent in computation vs communication.
+I'll see if I can repro on our end.
+		</comment>
+		<comment id='12' author='aj-prime' date='2019-07-05T07:12:44Z'>
+		&lt;denchmark-link:https://github.com/aj-prime&gt;@aj-prime&lt;/denchmark-link&gt;
+, we figured out why  had a very bad performance.  We recompiled  that contains allreduce subgraph.  This is getting fixed in &lt;denchmark-link:https://github.com/horovod/horovod/pull/1193&gt;#1193&lt;/denchmark-link&gt;
+
+There is another issue in eager mode though.  In graph mode, TensorFlow can start reducing gradients for layers close to the loss while the rest of gradients are still getting computed.  This ensures proper ordering of allreduce operations.  In eager mode, allreduce starts after all the gradients are computed, which causes an additional delay &amp; randomized ordering of gradient reductions.
+Because of that, it's recommended to wrap the whole training step in @tf.function, like this:
+@tf.function
+def training_step(images, labels, first_batch):
+    with tf.GradientTape() as tape:
+        logits = mnist_model(images, training=True)
+        loss_value = loss(labels, logits)
+
+    # Horovod: add Horovod Distributed GradientTape.
+    tape = hvd.DistributedGradientTape(tape)
+
+    grads = tape.gradient(loss_value, mnist_model.trainable_variables)
+    opt.apply_gradients(zip(grads, mnist_model.trainable_variables))
+
+    # Horovod: broadcast initial variable states from rank 0 to all other processes.
+    # This is necessary to ensure consistent initialization of all workers when
+    # training is started with random weights or restored from a checkpoint.
+    if first_batch:
+        hvd.broadcast_variables(mnist_model.variables, root_rank=0)
+        hvd.broadcast_variables(opt.variables(), root_rank=0)
+
+    return loss_value
+		</comment>
+	</comments>
+</bug>

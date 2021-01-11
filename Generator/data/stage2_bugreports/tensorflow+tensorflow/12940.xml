@@ -1,0 +1,272 @@
+<bug id='12940' author='imaxpayne' open_date='2017-09-09T23:13:16Z' closed_time='2018-01-24T14:53:54Z'>
+	<summary>tf.nn.separable_conv2d is slower than conv2d on GPU</summary>
+	<description>
+&lt;denchmark-h:h3&gt;System information&lt;/denchmark-h&gt;
+
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow):Yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Ubuntu 16.04
+TensorFlow installed from (source or binary): binary
+TensorFlow version (use command below): TF 1.3
+Python version: 3.6
+Bazel version (if compiling from source):
+CUDA/cuDNN version: CUDA8.0 /cuDNN6
+GPU model and memory: GTX1080ti  11G
+
+&lt;denchmark-h:h3&gt;Describe the problem&lt;/denchmark-h&gt;
+
+In theory, separable_conv2d should be more efficient than conv2d, but when I test a simple model on Cifar10, the result shows that nn.separable_conv2d run slower on GPU, but is indeed faster on CPU.
+Here is my test results on GPU:
+&lt;denchmark-code&gt;training time for normal_conv after 2000 step: 8.18395892999979 sec
+time for normal_conv after one forward step:  0.003980965999289765 sec
+training time for separable_conv after 2000 step: 9.158266903999902 sec
+time for separable_conv after one forward step:  0.0036441169995669043 sec
+
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h3&gt;Source code / logs&lt;/denchmark-h&gt;
+
+Below is a fully self-contained example, I first define a model with two  conv2d , than I define another model with one conv2d followed by one  separable_conv2d, both model have 32 channels for each conv_layer and identical fc_layer.
+&lt;denchmark-code&gt;import tensorflow as tf
+import timeit
+import numpy as np
+from tensorflow.contrib.keras.python.keras.datasets.cifar10 import load_data
+
+(x_train, y_train), (x_val, y_val) = load_data()
+learning_rate = 0.001
+num_steps = 1000
+n_classes = 10
+batch_size = 32
+
+def reformat(labels):
+    # Map 0 to [1.0, 0.0, 0.0 ...], 1 to [0.0, 1.0, 0.0 ...]
+    labels = (np.arange(n_classes) == labels[:,None]).astype(np.float32)
+    return  labels.reshape(labels.shape[0],10)
+train_labels = reformat(y_train)
+tf.reset_default_graph()
+x = tf.placeholder(tf.float32, [None, 32, 32, 3])
+y = tf.placeholder(tf.float32, [None, 10])
+weights1 = {}
+weights2 = {}
+dtype = tf.float32
+with tf.name_scope('INIT_OP'):
+    conv_initializer =  tf.contrib.layers.xavier_initializer_conv2d(dtype=dtype)
+    fc_initializer =  tf.contrib.layers.xavier_initializer(dtype=dtype)
+
+k = 3
+kernel = 16
+
+# Define weights for normal ConvNet
+with tf.name_scope('VARIABLES_1'):
+    weights1['conv1'] = tf.get_variable('conv1', [k, k, 3, kernel], initializer=conv_initializer, dtype=dtype, trainable=True)
+    weights1['b1'] = tf.get_variable('b1', initializer=tf.zeros([kernel]))
+    weights1['conv2'] = tf.get_variable('conv2', [k, k, kernel, kernel], initializer=conv_initializer, dtype=dtype, trainable=True)
+    weights1['b2'] = tf.get_variable('b2', initializer=tf.zeros([kernel]))
+
+    weights1['wd1'] = tf.get_variable('wd1', [8*8*kernel, 512], initializer=fc_initializer, dtype=dtype, trainable=True)
+    weights1['bd1'] = tf.get_variable('bd1',  initializer=tf.zeros([512]) )
+    weights1['wd2'] = tf.get_variable('wd2', [512, 10], initializer=fc_initializer, dtype=dtype, trainable=True)
+    weights1['bd2'] = tf.get_variable('bd2',  initializer=tf.zeros([10]) )
+
+
+#Define weights for separable ConvNet
+with tf.name_scope('VARIABLES_sep'):
+    weights2['conv1'] = tf.get_variable('2_conv1', [k, k, 3, kernel], initializer=conv_initializer, dtype=dtype, trainable=True)
+    weights2['conv_dw2'] = tf.get_variable('conv_dw2', [k, k, kernel, 1], initializer=conv_initializer, dtype=dtype, trainable=True)
+    weights2['conv_pw2'] = tf.get_variable('conv_pw2', [1, 1, kernel, kernel], initializer=conv_initializer, dtype=dtype, trainable=True)
+
+    weights2['b1'] = tf.get_variable('2_b1', initializer=tf.zeros([kernel]))
+    weights2['b2'] = tf.get_variable('2_b2', initializer=tf.zeros([kernel]))
+
+    weights2['wd1'] = tf.get_variable('2_wd1', [8*8*kernel, 512], initializer=fc_initializer, dtype=dtype, trainable=True)
+    weights2['bd1'] = tf.get_variable('2_bd1',  initializer=tf.zeros([512]) )
+    weights2['wd2'] = tf.get_variable('2_wd2', [512, 10], initializer=fc_initializer, dtype=dtype, trainable=True)
+    weights2['bd2'] = tf.get_variable('2_bd2',  initializer=tf.zeros([10]) )
+
+def forward_conv_sep( inp, weights):
+    hidden = conv_block(inp, weights2['conv1'], weights2['b1'])
+    hidden = maxpool2d(hidden)
+    hidden = conv_block_dw(hidden, weights2['conv_dw2'], weights2['conv_pw2'], weights2['b2'])
+    hidden = maxpool2d(hidden)
+    hidden = tf.reshape( hidden, [-1, np.prod([int(dim) for dim in hidden.get_shape()[1:]])] )
+    fc1 = tf.matmul(hidden, weights2['wd1']) + weights2['bd1']
+    fc1 = tf.nn.relu(fc1)
+    return tf.matmul(fc1, weights2['wd2']) + weights2['bd2']
+
+def forward_conv( inp, weights):
+    hidden = conv_block(inp, weights1['conv1'], weights1['b1'])
+    hidden = maxpool2d(hidden)
+    hidden = conv_block(hidden, weights1['conv2'], weights1['b2'])
+    hidden = maxpool2d(hidden)
+    hidden = tf.reshape( hidden, [-1, np.prod([int(dim) for dim in hidden.get_shape()[1:]])] )
+    fc1 = tf.matmul(hidden, weights1['wd1']) + weights1['bd1']
+    fc1 = tf.nn.relu(fc1)
+    return tf.matmul(fc1, weights1['wd2']) + weights1['bd2']
+
+
+def conv_block_dw(inp, cweight_w, cweight_p, bweight):
+    no_stride =  [1,1,1,1]
+    conv_output = tf.nn.separable_conv2d(inp, cweight_w, cweight_p, no_stride, 'SAME') + bweight
+    return tf.nn.relu(conv_output)
+
+def conv_block(inp, cweight, bweight, activation=tf.nn.relu):
+    no_stride =  [1,1,1,1]
+    conv_output = tf.nn.conv2d(inp, cweight, no_stride, 'SAME') + bweight
+    return tf.nn.relu(conv_output)
+
+def maxpool2d(inp, k=2):
+    return tf.nn.max_pool(inp, ksize=[1, k, k, 1], strides=[1, k, k, 1],
+                          padding='SAME')
+
+#logits for normal ConvNet
+with tf.name_scope("forward_conv"):
+    pred1 = forward_conv(x, weights1)
+
+#Cost for normal ConvNet
+with tf.name_scope("cost1"):
+    loss1 = tf.nn.softmax_cross_entropy_with_logits(logits=pred1, labels=y)
+    cost1 = tf.reduce_mean(loss1)
+
+#training op for normal ConvNet
+with tf.name_scope('train_op1'):
+    train_op1 = tf.train.RMSPropOptimizer(learning_rate, 0.9).minimize(cost1)    
+
+#logits for separable ConvNet
+with tf.name_scope("forward_conv_sep"):
+    pred2 = forward_conv_sep(x, weights2)
+
+#Cost for separable ConvNet
+with tf.name_scope("cost2"):
+    loss2 = tf.nn.softmax_cross_entropy_with_logits(logits=pred2, labels=y)
+    cost2 = tf.reduce_mean(loss2)
+
+# training op for separable ConvNet
+with tf.name_scope('train_op2'):
+    train_op2 = tf.train.RMSPropOptimizer(learning_rate, 0.9).minimize(cost2)
+
+
+with tf.name_scope('INIT'):
+    init = tf.global_variables_initializer()
+
+
+with tf.Session() as sess:
+
+    sess.run(init)
+
+    #train normal ConvNet for 2000 steps
+    start = timeit.default_timer()
+    for step in range(num_steps):
+        r = np.random.choice(y_train.shape[0], batch_size, replace=False)
+        batch_data = x_train[r]
+        batch_labels = train_labels[r]
+
+        feed_dict = {x : batch_data, y: batch_labels}
+        _ , l = sess.run([train_op1,cost1], feed_dict=feed_dict)
+
+    stop = timeit.default_timer()
+    print ('training time for normal_conv after '+str(num_steps)+' step:',stop - start) 
+
+
+    start = timeit.default_timer()
+    feed_dict = {x : batch_data, y: batch_labels}
+    predictions1 = sess.run(pred1, feed_dict=feed_dict)
+    stop = timeit.default_timer()
+    print ('time for normal_conv after one forward step: ',stop - start)
+
+
+
+    # train separable ConvNet for 2000 steps
+    start = timeit.default_timer()
+    for step in range(num_steps):
+        r = np.random.choice(y_train.shape[0], batch_size, replace=False)
+        batch_data = x_train[r]
+        batch_labels = train_labels[r]
+
+        feed_dict = {x : batch_data, y: batch_labels}
+        _ , l = sess.run([train_op2,cost2], feed_dict=feed_dict)
+
+
+    stop = timeit.default_timer()
+    print ('training time for sep_conv after '+str(num_steps)+' step:',stop - start) 
+
+    start = timeit.default_timer()
+    feed_dict = {x : batch_data, y: batch_labels}
+    predictions = sess.run(pred2, feed_dict=feed_dict)
+    stop = timeit.default_timer()
+    print ('time for sep_conv after one forward step: ',stop - start)
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='imaxpayne' date='2017-09-14T01:04:11Z'>
+		&lt;denchmark-link:https://github.com/vrv&gt;@vrv&lt;/denchmark-link&gt;
+ my recollection is that there are some issues with backprop for separable convolutions on GPUs, which had been somewhat improved lately. Can you comment please on the state of the art?
+		</comment>
+		<comment id='2' author='imaxpayne' date='2017-09-14T03:42:01Z'>
+		I'm not aware of any specific issues, kernels get faster as important models need them!  In general, convolutions of different sizes will have different performance characteristics, and it's possible our separable convolution implementations may be slow for some combinations of shapes.  I'm not sure whether that's the case here, but it could be.  I also don't know whether theory matches practice here, since separable convolutions are less compute dense than normal convolutions.  I believe the benefits you get are that you get to use fewer parameters to express a larger capacity convolution.
+		</comment>
+		<comment id='3' author='imaxpayne' date='2017-09-14T11:53:30Z'>
+		At what kernel sizes will convolutions be computed via FFT instead of directly? Anyway, a speedup by doing a separable convolution is more noticeable for larger kernels, so for small kernels the overhead involved in doing two convolutions might be larger than the speedup, especially for what I assume is a highly-optimized convolution setting with the 3x3 kernel (&lt;denchmark-link:https://arxiv.org/abs/1509.09308&gt;Winograd&lt;/denchmark-link&gt;
+).
+Essentially, for a [m, n] kernel it would take m*n calculations for a convolution and m+n calculations for the separable convolution, if I'm not mistaken.
+		</comment>
+		<comment id='4' author='imaxpayne' date='2017-10-05T14:37:10Z'>
+		&lt;denchmark-link:https://github.com/carlthome&gt;@carlthome&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/vrv&gt;@vrv&lt;/denchmark-link&gt;
+  I do notice that when the number of filters get larger (128 or 192 etc. ), separable_conv2d is faster than conv2d, but in my case, I applied separable_conv2d on cifar10 with small number of filters, and it is actually slower than conv2d on my GPU, what could be the cause?
+		</comment>
+		<comment id='5' author='imaxpayne' date='2017-10-05T14:46:25Z'>
+		Same principle. For small kernels matrices the overhead involved in doing two convolutions might be larger than the speedup.
+		</comment>
+		<comment id='6' author='imaxpayne' date='2017-10-05T15:01:01Z'>
+		Understood, thanks for the explanation!
+		</comment>
+		<comment id='7' author='imaxpayne' date='2017-12-20T01:09:58Z'>
+		It has been 14 days with no activity and the awaiting tensorflower label was assigned. Please update the label and/or status accordingly.
+		</comment>
+		<comment id='8' author='imaxpayne' date='2018-01-03T19:13:59Z'>
+		It has been 14 days with no activity and the awaiting tensorflower label was assigned. Please update the label and/or status accordingly.
+		</comment>
+		<comment id='9' author='imaxpayne' date='2018-01-18T19:19:42Z'>
+		Nagging Awaiting TensorFlower: It has been 14 days with no activity and the awaiting tensorflower label was assigned. Please update the label and/or status accordingly.
+		</comment>
+		<comment id='10' author='imaxpayne' date='2018-01-23T23:19:37Z'>
+		A member of the TensorFlow organization has replied after the stat:awaiting tensorflower label was applied.
+		</comment>
+		<comment id='11' author='imaxpayne' date='2018-10-16T02:01:55Z'>
+		Why is this closed?  I implemented UNet with separable conv2d and it was around 80% slower than using a standard conv2d.  Is there anything in the works to optimize this like using groups?
+		</comment>
+		<comment id='12' author='imaxpayne' date='2018-12-09T03:21:41Z'>
+		I am getting immense slowdown as well, is there a more efficient implementation known?
+		</comment>
+		<comment id='13' author='imaxpayne' date='2019-08-21T19:15:49Z'>
+		Same problem. &lt;denchmark-link:https://github.com/HouseOfFinwe&gt;@HouseOfFinwe&lt;/denchmark-link&gt;
+ Did you figure out to fix this?
+		</comment>
+		<comment id='14' author='imaxpayne' date='2019-08-21T20:33:56Z'>
+		&lt;denchmark-link:https://github.com/keunwoochoi&gt;@keunwoochoi&lt;/denchmark-link&gt;
+ I did not, please let me know if either of you managed.
+		</comment>
+		<comment id='15' author='imaxpayne' date='2019-08-21T20:58:38Z'>
+		&lt;denchmark-link:https://github.com/HouseOfFinwe&gt;@HouseOfFinwe&lt;/denchmark-link&gt;
+ Ok thanks. &lt;denchmark-link:https://github.com/tensorlayer/tensorlayer/issues/416#issuecomment-374180396&gt;tensorlayer/tensorlayer#416 (comment)&lt;/denchmark-link&gt;
+ says the speed issue was fixed in tf 1.5, but I'm having it with 1.13 now. Do you remember which versions have you tried?
+		</comment>
+		<comment id='16' author='imaxpayne' date='2019-08-21T23:33:01Z'>
+		Sadly I do not
+		</comment>
+		<comment id='17' author='imaxpayne' date='2019-10-19T16:10:30Z'>
+		
+@HouseOfFinwe Ok thanks. tensorlayer/tensorlayer#416 (comment) says the speed issue was fixed in tf 1.5, but I'm having it with 1.13 now. Do you remember which versions have you tried?
+
+Still exited on 1.14.
+		</comment>
+		<comment id='18' author='imaxpayne' date='2019-12-25T04:04:05Z'>
+		why close ??? still happen with tf1.13
+		</comment>
+		<comment id='19' author='imaxpayne' date='2020-02-10T23:48:59Z'>
+		This should be fixed by &lt;denchmark-link:https://github.com/tensorflow/tensorflow/pull/33836&gt;#33836&lt;/denchmark-link&gt;
+. It currently requires tf-nightly but will ship in the coming 2.2 release.
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,116 @@
+<bug id='3279' author='linnanwang' open_date='2015-11-04T03:13:32Z' closed_time='2017-01-17T18:58:27Z'>
+	<summary>deadlock @ multiGPU caffe</summary>
+	<description>
+Hello Guys,
+It comes to my attention that the following scenario might happen:
+prefetch_full_  might be empty while a solver is trying to retrieve batch from it, resulting in a wait deadlock. It is weird that there are items in prefetch_free_. From InternalThreadEntry in base_data_layer.cpp, it is prefetch_full_ pushing into the first element of prefetch_free_.
+Any ideas why it is happening? Thank you.
+	</description>
+	<comments>
+		<comment id='1' author='linnanwang' date='2015-11-04T19:30:25Z'>
+		The data prefetch layer has an independent thread that takes from the free queue, loads the batch, and pushes to the full queue.   So yes, the solver should be waiting until there is a batch to execute.
+Are you seeing a deadlock in practice?  If so, C++ or Python paths?
+		</comment>
+		<comment id='2' author='linnanwang' date='2015-11-04T19:44:55Z'>
+		yes, I saw it under c++ codes inside caffe. I'm implementing a new solver.
+I saw prefetch_full is decreasing until it to be 0. Then there is a wait lock forever.
+My question is, where is it possible to cause prefect_full not being populated? And the queue of prefetch_free is subsequently getting longer. Any thought on this? Thank you.
+		</comment>
+		<comment id='3' author='linnanwang' date='2015-11-04T19:52:55Z'>
+		I do see a solver pull the fetch_full more than prefetch_free in a iteration... This is causing the queue to deplete, any suggestions to resolve it?
+		</comment>
+		<comment id='4' author='linnanwang' date='2015-11-04T20:25:51Z'>
+		Queue depletion is the IO/decode bottleneck.  This doesn't mean we don't have a bug somewhere in this code, but i haven't seen a deadlock if the data layer is initialized.
+To see if you really have a deadlock, instrument the BasePrefetchingDataLayer::InternalThreadEntry code to see if it's waiting for real on a free prefetch buffer to fill.
+		</comment>
+		<comment id='5' author='linnanwang' date='2015-11-04T20:38:23Z'>
+		I managed to trigger a deadlock when messing with the prefetch size, so we do have a bug hiding here.
+		</comment>
+		<comment id='6' author='linnanwang' date='2015-11-04T20:42:53Z'>
+		Yes, it is because the implementation of blocking queue. The inter thread communication inside caffe with a thread wait mechanism, in my humble perspective, complicates a simple logic. From the engineering perspective, I prefer the simple while reliable one. Say using the barrier to do the synchronization. (not referring to the blocking queue, instead, the NVIDIA multiGPU caffe is using wait to sync among multiGPU). Never mind, I'm still need to figure out why another GPU conduct more forward than others.
+		</comment>
+		<comment id='7' author='linnanwang' date='2015-11-04T20:47:11Z'>
+		I shall look into this some time next week.
+		</comment>
+		<comment id='8' author='linnanwang' date='2015-11-04T22:34:10Z'>
+		Thank you, is this branch Caffe support multiGPUs? Thank you.
+		</comment>
+		<comment id='9' author='linnanwang' date='2015-11-04T22:43:48Z'>
+		We apologize that we are going to be quite overwhelmed with CVPR submission in the next 48 hours. I'll address this issue after that.
+		</comment>
+		<comment id='10' author='linnanwang' date='2015-11-04T22:45:26Z'>
+		good luck with your paper
+		</comment>
+		<comment id='11' author='linnanwang' date='2015-11-06T01:01:48Z'>
+		The plot thickens.  The deadlock comes between the interaction in the data reader thread and the solvers initializing.  There were changes to the data loader and solver initialization in the final merge compared to the initial work &lt;denchmark-link:https://github.com/cypof&gt;@cypof&lt;/denchmark-link&gt;
+ and I did.  I can see things stuck on the solvers not interacting with the sync queue.
+See the code in DataReader::Body::InternalThreadEntry(), things get stuck for me in the first loop waiting for the solvers to come up.  This code was inserted to try to solve the reproducibility issues and not allow the solvers to get out of sync.  Somethings is busted in the handshake here.
+Repro: set PREFETCH_COUNT to 8, 4 GPU solvers, AlexNet training prototxt.  Hang right off the bat.
+		</comment>
+		<comment id='12' author='linnanwang' date='2015-11-07T13:12:36Z'>
+		I don't think using blocking queue design is a good idea here. The data prefetch thread actually got blocked by queue sync, and it only fetch data in the start of an iteration. Because data layer needs pull out a batch and put it back.
+nonblocking queue is highly recommended. Since you guys are using boost, they have APIs.
+		</comment>
+		<comment id='13' author='linnanwang' date='2015-11-07T15:12:22Z'>
+		&lt;denchmark-link:https://github.com/linnanwang&gt;@linnanwang&lt;/denchmark-link&gt;
+ See also an old discussion thread starting from &lt;denchmark-link:https://github.com/BVLC/caffe/pull/1568#issuecomment-68297163&gt;#1568 (comment)&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='14' author='linnanwang' date='2015-11-07T22:36:31Z'>
+		I am looking into this issue this weekend.
+		</comment>
+		<comment id='15' author='linnanwang' date='2015-11-08T00:40:41Z'>
+		&lt;denchmark-link:https://github.com/ronghanghu&gt;@ronghanghu&lt;/denchmark-link&gt;
+  Thank you, but I fixed my particular problem now. So, it is okay to let the current Caffe stay the way it is.
+		</comment>
+		<comment id='16' author='linnanwang' date='2015-11-08T03:08:02Z'>
+		There is still very much a bug in this code.  Looks like this is more or less from a cross merge issue between the original multi-gpu work and how the prefetch worked and the final committed code.  This could also have been caused by a change in how the sub batches are handled in the final code.
+The main issue is that the code check in assumes each solver loads a datareader and that is not the case as we only load a datareader per source as far as I can tell in the merged code.  Moreover, there is a race in the initialization handshake.
+All solver sync should be done at the solver level and nothing should be in the data loaders and it will break more complex multiple solver setups.  e.g. in the case of the current code, all sync is already done at the P2P level.
+It will take a little time to rewrite the solver and data_reader setup to fix this and make things more clear.
+		</comment>
+		<comment id='17' author='linnanwang' date='2015-11-08T19:34:41Z'>
+		
+The main issue is that the code check in assumes each solver loads a datareader and that is not the case as we only load a datareader per source as far as I can tell in the merged code. Moreover, there is a race in the initialization handshake.
+
+I see the issue. Thank you!
+
+All solver sync should be done at the solver level and nothing should be in the data loaders and it will break more complex multiple solver setups. e.g. in the case of the current code, all sync is already done at the P2P level. It will take a little time to rewrite the solver and data_reader setup to fix this and make things more clear.
+
+I am trying to find a solution, and to have discussions with other developers, which may take a while. Everyone are welcome to provide suggestions.
+		</comment>
+		<comment id='18' author='linnanwang' date='2015-11-08T22:39:33Z'>
+		But is this brach Caffe supports multiGPU? NVCaffe is the only multiGPU caffe branch I found so far.
+		</comment>
+		<comment id='19' author='linnanwang' date='2015-11-08T22:46:34Z'>
+		Hey &lt;denchmark-link:https://github.com/thatguymike&gt;@thatguymike&lt;/denchmark-link&gt;
+ ,
+I saw you from NVIDIA. I'm not sure if you're aware of cuBLAS-XT? Do you know any guys from that team?
+		</comment>
+		<comment id='20' author='linnanwang' date='2015-11-08T23:24:29Z'>
+		
+But is this brach Caffe supports multiGPU? NVCaffe is the only multiGPU caffe branch I found so far.
+
+Yes, this brach Caffe supports multiGPU. Multi-GPU is merged in &lt;denchmark-link:https://github.com/BVLC/caffe/pull/2903&gt;#2903&lt;/denchmark-link&gt;
+.
+		</comment>
+		<comment id='21' author='linnanwang' date='2015-11-09T21:42:17Z'>
+		&lt;denchmark-link:https://github.com/ronghanghu&gt;@ronghanghu&lt;/denchmark-link&gt;
+ If so, why there is no argument to specify GPUS in caffe executable?
+say -gpus
+		</comment>
+		<comment id='22' author='linnanwang' date='2015-11-09T21:46:34Z'>
+		The -gpu argument can take in multiple indices like -gpu 0,1,3 or -gpu all.
+		</comment>
+		<comment id='23' author='linnanwang' date='2015-11-09T22:08:56Z'>
+		I see. Thank you. I would recommend changing it to -gpus as it's more logic in this way.
+		</comment>
+		<comment id='24' author='linnanwang' date='2015-11-09T22:37:53Z'>
+		We had that debate in the original merge.  The original multi-GPU work actually had "-gpus"
+		</comment>
+		<comment id='25' author='linnanwang' date='2017-01-17T18:58:27Z'>
+		Closing now that &lt;denchmark-link:https://github.com/BVLC/caffe/pull/4563&gt;#4563&lt;/denchmark-link&gt;
+ is in and this issue was raised with the old parallelism.
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,138 @@
+<bug id='6223' author='AlexDBlack' open_date='2018-08-21T02:38:34Z' closed_time='2018-09-21T06:14:49Z'>
+	<summary>SameDiff: libnd4j execution issues</summary>
+	<description>
+There is some differences between the SameDiff/Java execution and libnd4j execution for some of the TF import unit tests:
+&lt;denchmark-link:https://user-images.githubusercontent.com/2360237/44376558-6d967d80-a53c-11e8-9526-84964554cf2a.png&gt;&lt;/denchmark-link&gt;
+
+Issues seem to be:
+
+for testKeepDims() below, I'm getting more output arrays than variables (3 arrays for 2 variables)
+Reductions, with keepDims: 'keepDims' doesn't seem to be used - libnd4j returns rank 0, not rank 3 (shape [1,1,1] for [3,4,5].reduce(keepDims=true,0,1,2)
+Range op: seems to fail for scalar case
+
+&lt;denchmark-code&gt;    @Test
+    public void testKeepDims(){
+
+        SameDiff sd = SameDiff.create();
+        SDVariable var = sd.var("in", Nd4j.rand(new int[]{3,4,5}));
+        SDVariable sum = var.sum(true); //[1,1,1] out
+
+
+        ExecutorConfiguration configuration = ExecutorConfiguration.builder()
+                .executionMode(ExecutionMode.SEQUENTIAL)
+                .profilingMode(OpExecutioner.ProfilingMode.DISABLED)
+                .gatherTimings(true)
+                .outputMode(OutputMode.VARIABLE_SPACE)
+                .build();
+        GraphExecutioner executioner = new NativeGraphExecutioner();
+        INDArray[] results = executioner.executeGraph(sd, configuration);
+        List&lt;SDVariable&gt; varList = sd.variables();
+        sd.exec();
+
+        System.out.println("libnd4j shape: " + Arrays.toString(results[2].shape()) + ", SameDiff shape: " + Arrays.toString(varList.get(1).getArr().shape()));
+
+        assertEquals(varList.size(), results.length);   //2 variables in graph, but 3 result arrays :/
+
+        for(int i=0; i&lt;results.length; i++ ){
+            System.out.println("i = " + i + ", var=" + varList.get(i));
+            System.out.println("libnd4j shape: " + Arrays.toString(results[i].shape()) + ", SameDiff shape: " + Arrays.toString(varList.get(i).getArr().shape()));
+            System.out.println("Libnd4j:\n" + results[i]);
+            System.out.println("Java:\n" + varList.get(i).getArr());
+        }
+    }
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='AlexDBlack' date='2018-08-21T05:27:02Z'>
+		Edit: Part of the fix is simple enough:
+(a) We're missing tArgs during export
+(b) BaseAccumulation "keepDims" is a tArg too that needs to be handled
+The other issue here is that variables are repeated multiple times in the output after execution.
+For example, the code above has nodes/variables ["in", "reduce_sum", "reduce_sum"] - i.e., result is present multiple times.
+Similaryl, code below has nodes/variables ["range_1", "reduce_sum_1", "range_1", "reduce_sum_1"] with values [[0], [0], [1], [0]] - which is incorrect (should be all 1s).
+After stepping through this in the debugger, I can't see a cause from the java side - i.e., there's no repetition in the exporting of variables/functions.
+&lt;denchmark-code&gt;    @Test
+    public void testRange(){
+
+        SameDiff sd = SameDiff.create();
+        SDVariable var = sd.range(1, 2, 1);
+        SDVariable sum = var.sum(true);
+
+
+        ExecutorConfiguration configuration = ExecutorConfiguration.builder()
+                .executionMode(ExecutionMode.SEQUENTIAL)
+                .profilingMode(OpExecutioner.ProfilingMode.DISABLED)
+                .gatherTimings(true)
+                .outputMode(OutputMode.VARIABLE_SPACE)
+                .build();
+        GraphExecutioner executioner = new NativeGraphExecutioner();
+        INDArray[] results = executioner.executeGraph(sd, configuration);
+        List&lt;SDVariable&gt; varList = sd.variables();
+        sd.exec();
+
+        System.out.println("libnd4j shape: " + Arrays.toString(results[2].shape()) + ", SameDiff shape: " + Arrays.toString(varList.get(1).getArr().shape()));
+
+        assertEquals(varList.size(), results.length);   //2 variables in graph, but 3 result arrays :/
+
+        for(int i=0; i&lt;results.length; i++ ){
+            System.out.println("i = " + i + ", var=" + varList.get(i));
+            System.out.println("libnd4j shape: " + Arrays.toString(results[i].shape()) + ", SameDiff shape: " + Arrays.toString(varList.get(i).getArr().shape()));
+            System.out.println("Libnd4j:\n" + results[i]);
+            System.out.println("Java:\n" + varList.get(i).getArr());
+        }
+    }
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='2' author='AlexDBlack' date='2018-08-22T07:34:30Z'>
+		Probably related: "mse" variable result here is 0 for NativeGraphExecutioner, non-zero for 'standard' execution mode.
+&lt;denchmark-code&gt;    @Test
+    public void test(){
+
+        for(boolean nativeExec : new boolean[]{false, true}) {
+            int nIn = 10;
+            int nOut = 2;
+            int minibatch = 3;
+            SameDiff sd = SameDiff.create();
+            Nd4j.getRandom().setSeed(12345);
+            SDVariable input = sd.var("input", Nd4j.rand(minibatch, nIn));
+            SDVariable labels = sd.var("labels", Nd4j.rand(minibatch, nOut));
+            SDVariable weights = sd.var("weights", new long[]{nIn, nOut}, new XavierInitScheme('c', nIn, nOut));
+            SDVariable bias = sd.var("bias");
+            SDVariable out = input.mmul(weights).add(bias);
+            SDVariable mse = sd.square(labels.sub(out)).mean("mse");
+
+            if(!nativeExec) {
+                sd.exec();
+            } else {
+
+                GraphExecutioner executioner = new NativeGraphExecutioner();
+
+                ExecutorConfiguration execConfig = ExecutorConfiguration.builder()
+                        .outputMode(OutputMode.VARIABLE_SPACE)      //Returns all variables from C++ call
+                        .executionMode(ExecutionMode.AUTO)
+                        .profilingMode(OpExecutioner.ProfilingMode.DISABLED).build();
+
+                executioner.executeGraph(sd, execConfig);
+            }
+
+            System.out.println("=============================");
+            for (SDVariable v : sd.variables()) {
+                System.out.println(v.getVarName());
+                System.out.println(v.getArr());
+            }
+        }
+    }
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='3' author='AlexDBlack' date='2018-09-21T06:14:49Z'>
+		Closing this as a duplicate of: &lt;denchmark-link:https://github.com/deeplearning4j/deeplearning4j/issues/6465&gt;https://github.com/deeplearning4j/deeplearning4j/issues/6465&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='4' author='AlexDBlack' date='2018-10-21T06:55:08Z'>
+		This thread has been automatically locked since there has not been any recent activity after it was closed. Please open a new issue for related bugs.
+		</comment>
+	</comments>
+</bug>

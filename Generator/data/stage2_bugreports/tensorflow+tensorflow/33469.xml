@@ -1,0 +1,229 @@
+<bug id='33469' author='whhu' open_date='2019-10-17T14:47:26Z' closed_time='2019-10-24T03:30:48Z'>
+	<summary>Simultaneous fetching of collective_ops and global_step triggers "Skipping rendezvous re-initialization"</summary>
+	<description>
+System information
+
+Have I written custom code: Yes
+OS Platform and Distribution: Linux CentOS 7.6.1810
+Mobile device if the issue happens on mobile device: No
+TensorFlow installed from: Binary
+TensorFlow version: v1.13.1-0-g6612da8951
+Python version: 3.6.8
+Bazel version: None
+GCC/Compiler version: None
+CUDA/cuDNN version: None
+GPU model and memory: None
+
+Describe the current behavior
+collective_ops.all_reduce and global_step can be fetched successfully when the operations are carried out separately by a session. Nevertheless, the calling will trigger an info or occasionally fail when the two tensors are fetched simultaneously in a session run.
+regularly raise info:
+2019-10-17 17:33:58.119365: I tensorflow/core/distributed_runtime/base_rendezvous_mgr.cc:159] Skipping rendezvous re-initialization.
+occasionally raise failure:
+2019-10-17 17:35:07.980957: I tensorflow/core/distributed_runtime/base_rendezvous_mgr.cc:159] Skipping rendezvous re-initialization.
+2019-10-17 17:35:07.982111: W tensorflow/core/common_runtime/base_collective_executor.cc:203] BaseCollectiveExecutor::StartAbort Aborted: Cleanup 34190423657599268
+         [[{{node _send_worker0/CollectiveReduce_0}}]]
+task 1: sync_op and global_step [0.5, 0]
+INFO:tensorflow:An error was raised. This may be due to a preemption in a connected worker or parameter server. The current session will be closed and a new session will be created. This error may also occur due to a gRPC failure caused by high memory or network bandwidth usage in the parameter servers. If this error occurs repeatedly, try increasing the number of parameter servers assigned to the job. Error: Cleanup 34190423657599268
+         [[{{node _send_worker0/CollectiveReduce_0}}]]
+Full logs are attached below.
+Describe the expected behavior
+Value is fetched without warnings.
+Code to reproduce the issue
+"""Illustrate AllReduce"""
+
+import os
+import multiprocessing as mp
+import time
+import tensorflow as tf
+from tensorflow.python.ops import collective_ops
+
+MP_METHOD = 'fork'
+NUM_PROCESSES = 2
+CHIEF_INDEX = 0
+JOB = 'worker'
+DELAY = 0.01
+
+def process_fn(hosts, task_index):
+    """allreduce process"""
+    tf.logging.set_verbosity(tf.logging.INFO)
+
+    cluster_spec = tf.train.ClusterSpec({JOB: hosts})
+    workers = list()
+    for task, _ in enumerate(hosts):
+        workers.append(tf.DeviceSpec(
+            job=JOB, replica=0, task=task, device_type='cpu', device_index=0))
+
+    collective_group_leader, _, _ = \
+        workers[0].to_string().partition('/device')
+    config = tf.ConfigProto()
+    config.experimental.collective_group_leader = collective_group_leader
+    server = tf.train.Server(cluster_spec, config=config,
+                             job_name='worker', task_index=task_index)
+    with tf.Graph().as_default():
+        creator_fn = tf.train.ChiefSessionCreator
+        if task_index != CHIEF_INDEX:
+            creator_fn = tf.train.WorkerSessionCreator
+        session_creator = creator_fn(master=server.target, config=config)
+
+        with tf.device(workers[task_index]), \
+                tf.variable_scope('worker{}'.format(task_index)):
+            token = tf.constant(task_index, dtype=tf.float32)
+            sync_op = collective_ops.all_reduce(
+                token, NUM_PROCESSES, 0, 0, 'Add', 'Div')
+
+        with tf.device(workers[0]), tf.variable_scope('worker0'):
+            global_step = tf.train.get_or_create_global_step()
+
+        with tf.train.MonitoredSession(
+                session_creator=session_creator, hooks=[]) \
+                as mon_sess:
+            time.sleep((task_index + 1) * DELAY)
+            ret = mon_sess.run(sync_op)  # successful
+            print('task {}: sync_op {}.'.format(task_index, ret))
+
+            ret = mon_sess.run(global_step)  # successful
+            print('task {}: global_step {}'.format(task_index, ret))
+
+            ret = mon_sess.run([sync_op, global_step])  # failed
+            print('task {}: sync_op and global_step {}'.format(task_index, ret))
+
+            mon_sess.run(sync_op)
+            print('task {}: finalized.'.format(task_index))
+            time.sleep(DELAY)
+
+def start_process():
+    """start process"""
+
+    port = 60000
+    host_fmt = 'localhost:{}'
+    hosts = list()
+    for process_index in range(NUM_PROCESSES):
+        hosts.append(host_fmt.format(port + process_index))
+    mp_ctx = mp.get_context(MP_METHOD)
+    processes = list()
+    for process_index in range(NUM_PROCESSES):
+        process = mp_ctx.Process(target=process_fn,
+                                 args=(hosts, process_index,))
+        processes.append(process)
+        process.start()
+        time.sleep(DELAY)
+    for process in processes:
+        process.join()
+
+if __name__ == '__main__':
+    start_process()
+Other info / logs
+Full log with regular info of Skipping rendezvous re-initialization, processes exit successfully:
+tf-1.13) [huwh1@huwh1-centos worksync]$ python ./tf_distribute_re-initialization.py
+2019-10-17 17:33:57.919229: I tensorflow/core/platform/cpu_feature_guard.cc:141] Your CPU supports instructions that this TensorFlow binary was not compiled to use: AVX2 FMA
+2019-10-17 17:33:57.931531: I tensorflow/core/platform/cpu_feature_guard.cc:141] Your CPU supports instructions that this TensorFlow binary was not compiled to use: AVX2 FMA
+2019-10-17 17:33:57.935766: I tensorflow/core/platform/profile_utils/cpu_utils.cc:94] CPU Frequency: 3408000000 Hz
+2019-10-17 17:33:57.936208: I tensorflow/compiler/xla/service/service.cc:150] XLA service 0x378c150 executing computations on platform Host. Devices:
+2019-10-17 17:33:57.936241: I tensorflow/compiler/xla/service/service.cc:158]   StreamExecutor device (0): &lt;undefined&gt;, &lt;undefined&gt;
+2019-10-17 17:33:57.938117: I tensorflow/core/distributed_runtime/rpc/grpc_channel.cc:252] Initialize GrpcChannelCache for job worker -&gt; {0 -&gt; localhost:60000, 1 -&gt; localhost:60001}
+2019-10-17 17:33:57.939150: I tensorflow/core/distributed_runtime/rpc/grpc_server_lib.cc:391] Started server with target: grpc://localhost:60000
+2019-10-17 17:33:57.949331: I tensorflow/core/platform/profile_utils/cpu_utils.cc:94] CPU Frequency: 3408000000 Hz
+2019-10-17 17:33:57.949702: I tensorflow/compiler/xla/service/service.cc:150] XLA service 0x378c2a0 executing computations on platform Host. Devices:
+2019-10-17 17:33:57.949723: I tensorflow/compiler/xla/service/service.cc:158]   StreamExecutor device (0): &lt;undefined&gt;, &lt;undefined&gt;
+2019-10-17 17:33:57.951578: I tensorflow/core/distributed_runtime/rpc/grpc_channel.cc:252] Initialize GrpcChannelCache for job worker -&gt; {0 -&gt; localhost:60000, 1 -&gt; localhost:60001}
+2019-10-17 17:33:57.952724: I tensorflow/core/distributed_runtime/rpc/grpc_server_lib.cc:391] Started server with target: grpc://localhost:60001
+WARNING:tensorflow:From /home/huwh1/virtualenv/tf-1.13/lib/python3.6/site-packages/tensorflow/python/framework/op_def_library.py:263: colocate_with (from tensorflow.python.framework.ops) is deprecated and will be removed in a future version.
+Instructions for updating:
+Colocations handled automatically by placer.
+WARNING:tensorflow:From /home/huwh1/virtualenv/tf-1.13/lib/python3.6/site-packages/tensorflow/python/framework/op_def_library.py:263: colocate_with (from tensorflow.python.framework.ops) is deprecated and will be removed in a future version.
+Instructions for updating:
+Colocations handled automatically by placer.
+INFO:tensorflow:Graph was finalized.
+2019-10-17 17:33:58.053372: I tensorflow/core/distributed_runtime/master_session.cc:1192] Start master session 96a54c0a4de96215 with config: experimental { collective_group_leader: "/job:worker/replica:0/task:0" }
+INFO:tensorflow:Running local_init_op.
+INFO:tensorflow:Done running local_init_op.
+INFO:tensorflow:Graph was finalized.
+2019-10-17 17:33:58.072731: I tensorflow/core/distributed_runtime/master_session.cc:1192] Start master session 543a2da8fd7ecd53 with config: experimental { collective_group_leader: "/job:worker/replica:0/task:0" }
+INFO:tensorflow:Running local_init_op.
+INFO:tensorflow:Done running local_init_op.
+task 1: sync_op 0.5.
+task 0: sync_op 0.5.
+task 0: global_step 0
+task 1: global_step 0
+2019-10-17 17:33:58.119365: I tensorflow/core/distributed_runtime/base_rendezvous_mgr.cc:159] Skipping rendezvous re-initialization.
+task 1: sync_op and global_step [0.5, 0]
+task 0: sync_op and global_step [0.5, 0]
+task 1: finalized.
+task 0: finalized.
+Full log with occasionally warning BaseCollectiveExecutor::StartAbort Aborted, processes hang:
+(tf-1.13) [huwh1@huwh1-centos worksync]$ python ./tf_distribute_re-initialization.py
+2019-10-17 17:35:07.780731: I tensorflow/core/platform/cpu_feature_guard.cc:141] Your CPU supports instructions that this TensorFlow binary was not compiled to use: AVX2 FMA
+2019-10-17 17:35:07.793013: I tensorflow/core/platform/cpu_feature_guard.cc:141] Your CPU supports instructions that this TensorFlow binary was not compiled to use: AVX2 FMA
+2019-10-17 17:35:07.795259: I tensorflow/core/platform/profile_utils/cpu_utils.cc:94] CPU Frequency: 3408000000 Hz
+2019-10-17 17:35:07.795603: I tensorflow/compiler/xla/service/service.cc:150] XLA service 0x30ea150 executing computations on platform Host. Devices:
+2019-10-17 17:35:07.795627: I tensorflow/compiler/xla/service/service.cc:158]   StreamExecutor device (0): &lt;undefined&gt;, &lt;undefined&gt;
+2019-10-17 17:35:07.797198: I tensorflow/core/distributed_runtime/rpc/grpc_channel.cc:252] Initialize GrpcChannelCache for job worker -&gt; {0 -&gt; localhost:60000, 1 -&gt; localhost:60001}
+2019-10-17 17:35:07.798176: I tensorflow/core/distributed_runtime/rpc/grpc_server_lib.cc:391] Started server with target: grpc://localhost:60000
+2019-10-17 17:35:07.810391: I tensorflow/core/platform/profile_utils/cpu_utils.cc:94] CPU Frequency: 3408000000 Hz
+2019-10-17 17:35:07.810780: I tensorflow/compiler/xla/service/service.cc:150] XLA service 0x30ea2a0 executing computations on platform Host. Devices:
+2019-10-17 17:35:07.810805: I tensorflow/compiler/xla/service/service.cc:158]   StreamExecutor device (0): &lt;undefined&gt;, &lt;undefined&gt;
+2019-10-17 17:35:07.812369: I tensorflow/core/distributed_runtime/rpc/grpc_channel.cc:252] Initialize GrpcChannelCache for job worker -&gt; {0 -&gt; localhost:60000, 1 -&gt; localhost:60001}
+2019-10-17 17:35:07.813640: I tensorflow/core/distributed_runtime/rpc/grpc_server_lib.cc:391] Started server with target: grpc://localhost:60001
+WARNING:tensorflow:From /home/huwh1/virtualenv/tf-1.13/lib/python3.6/site-packages/tensorflow/python/framework/op_def_library.py:263: colocate_with (from tensorflow.python.framework.ops) is deprecated and will be removed in a future version.
+Instructions for updating:
+Colocations handled automatically by placer.
+WARNING:tensorflow:From /home/huwh1/virtualenv/tf-1.13/lib/python3.6/site-packages/tensorflow/python/framework/op_def_library.py:263: colocate_with (from tensorflow.python.framework.ops) is deprecated and will be removed in a future version.
+Instructions for updating:
+Colocations handled automatically by placer.
+INFO:tensorflow:Graph was finalized.
+2019-10-17 17:35:07.902323: I tensorflow/core/distributed_runtime/master_session.cc:1192] Start master session b8c8018638e2809a with config: experimental { collective_group_leader: "/job:worker/replica:0/task:0" }
+INFO:tensorflow:Running local_init_op.
+INFO:tensorflow:Done running local_init_op.
+INFO:tensorflow:Graph was finalized.
+2019-10-17 17:35:07.921347: I tensorflow/core/distributed_runtime/master_session.cc:1192] Start master session 41eee7eda589977d with config: experimental { collective_group_leader: "/job:worker/replica:0/task:0" }
+INFO:tensorflow:Running local_init_op.
+INFO:tensorflow:Done running local_init_op.
+task 1: sync_op 0.5.
+task 0: sync_op 0.5.
+task 0: global_step 0
+task 1: global_step 0
+2019-10-17 17:35:07.980957: I tensorflow/core/distributed_runtime/base_rendezvous_mgr.cc:159] Skipping rendezvous re-initialization.
+2019-10-17 17:35:07.982111: W tensorflow/core/common_runtime/base_collective_executor.cc:203] BaseCollectiveExecutor::StartAbort Aborted: Cleanup 34190423657599268
+         [[{{node _send_worker0/CollectiveReduce_0}}]]
+task 1: sync_op and global_step [0.5, 0]
+INFO:tensorflow:An error was raised. This may be due to a preemption in a connected worker or parameter server. The current session will be closed and a new session will be created. This error may also occur due to a gRPC failure caused by high memory or network bandwidth usage in the parameter servers. If this error occurs repeatedly, try increasing the number of parameter servers assigned to the job. Error: Cleanup 34190423657599268
+         [[{{node _send_worker0/CollectiveReduce_0}}]]
+INFO:tensorflow:Graph was finalized.
+2019-10-17 17:35:07.986279: I tensorflow/core/distributed_runtime/master_session.cc:1192] Start master session 82ea6dbd6778bbf4 with config: experimental { collective_group_leader: "/job:worker/replica:0/task:0" }
+INFO:tensorflow:Running local_init_op.
+INFO:tensorflow:Done running local_init_op.
+A related issue can be found &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/33321&gt;#33321&lt;/denchmark-link&gt;
+.
+	</description>
+	<comments>
+		<comment id='1' author='whhu' date='2019-10-17T14:55:35Z'>
+		I hope this issue is clear enough to be supported.  &lt;denchmark-link:https://github.com/ravikyram&gt;@ravikyram&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='2' author='whhu' date='2019-10-22T21:36:08Z'>
+		I believe the "skipping rendezvous re-initialization" message was benign and has been fixed in &lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/bcb615c42a6215037ed7f1c81316bc0960e76269&gt;bcb615c&lt;/denchmark-link&gt;
+.  Can you try to rerun your program with a nightly build to confirm?
+		</comment>
+		<comment id='3' author='whhu' date='2019-10-22T21:36:43Z'>
+		cc &lt;denchmark-link:https://github.com/haoyuz&gt;@haoyuz&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/qqfish&gt;@qqfish&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='4' author='whhu' date='2019-10-23T07:37:10Z'>
+		It works perfectly. Thanks very much! 👍
+Maybe we should migrate to the compat.v1 module in tf-2.0.
+		</comment>
+		<comment id='5' author='whhu' date='2019-10-23T10:22:29Z'>
+		&lt;denchmark-link:https://github.com/whhu&gt;@whhu&lt;/denchmark-link&gt;
+
+Please, let me know if we can close this issue since it looks to be fixed. Thanks!
+		</comment>
+		<comment id='6' author='whhu' date='2019-10-24T03:30:49Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/33469&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/33469&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

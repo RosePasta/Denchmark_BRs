@@ -1,0 +1,191 @@
+<bug id='2317' author='SkidanovAlex' open_date='2016-06-02T18:28:22Z' closed_time='2018-04-03T00:58:39Z'>
+	<summary>(info.type) != (kNotInitialized)</summary>
+	<description>
+Hi,
+I'm hitting a bug, for which I can't create a small repro. I have a rather complex model with several LSTMs and attentions mixed up together, and as part of the model I have a Concat operation. When I run the model, I hit an error on line 650 in graph_executor.cc: (info.type) != (kNotInitialized). The op that fails is a Concat of four inputs, all of shape (1, 200), along the 2-st axis (one-based), with inputs coming from Embedding or FullyConnected ops, or element wise multiplication.
+I added some tracing info:
+&lt;denchmark-code&gt;CHECK_NE(info.type, kNotInitialized) &lt;&lt; graph_.nodes[nid].name &lt;&lt; " i=" &lt;&lt; i &lt;&lt; " nid=" &lt;&lt; nid &lt;&lt; " ord=" &lt;&lt; ord &lt;&lt; " total=" &lt;&lt; graph_.nodes[nid].inputs.size() &lt;&lt; " shape=" &lt;&lt; info.shape &lt;&lt; " prev node=" &lt;&lt; graph_.nodes[topo_order_[i - 1]].name;
+&lt;/denchmark-code&gt;
+
+(ord is an extra counter that counts iterations of the for (StaticGraph::DataEntry e : graph_.nodes[nid].inputs) {)
+And this is what I observe:
+&lt;denchmark-code&gt;(info.type) != (kNotInitialized) attn_single_concat_backward i=912 nid=910 ord=2 total=4 shape=(1,200) prev node=fullyconnected106_backward
+&lt;/denchmark-code&gt;
+
+Here's where it gets interesting:
+
+Note that the ord=2, which means that the third input to the Concat op is not initialized. If I swap the first and the third inputs to the Concat and rerun it, it still fails on ord=2. So it seems like there's nothing wrong with the second input per se, since replacing it with previously working first input still makes it fail on the same ordinal.
+If I rearrange inputs to the Concat further, sometimes total becomes equal to three (in other words, a Concat op that has num_args=4 somehow only has three inputs?)
+
+I understand that this is not enough information to debug it. So I have some questions that would help me get more info:
+
+Inputs to the *_backward operations are the inputs to the corresponding symbol, right? If yes, what can explain the fact that I see 3 reported inputs to a Concat op that has num_args=4?
+What is the meaning of kNotInitialized? The input to the op is an output of another op. Does it suggest that the corresponding output is somehow unreachable?
+
+	</description>
+	<comments>
+		<comment id='1' author='SkidanovAlex' date='2016-06-02T18:40:27Z'>
+		To add an extra data point, that I think is very relevant:
+I have a smaller version of the same model that works. Here's a line from the model:
+&lt;denchmark-code&gt;flow = mx.sym.Concat(in1, in2, in3, in4, num_args=4)
+&lt;/denchmark-code&gt;
+
+If I change this code to:
+&lt;denchmark-code&gt;outputs.append(mx.sym.BlockGrad(in3))
+flow = mx.sym.Concat(in1, in2, in3, in4, num_args=4)
+&lt;/denchmark-code&gt;
+
+It starts hitting the same issue as above on the Concat op. Note that even though I block the grad, the input to the Concat is NOT the output of BlockGrad. So seems like blocking grads on that particular argument starts breaking stuff. Note that if I change it to (reorder in2 and in3):
+&lt;denchmark-code&gt;outputs.append(mx.sym.BlockGrad(in3))
+flow = mx.sym.Concat(in1, in3, in2, in4, num_args=4)
+&lt;/denchmark-code&gt;
+
+it still fails, and still with ord=2, even though the in3 is now the second argument (with ordinal=1), so it makes me suspect that ordinal has nothing to do with the order of inputs to the Concat.
+Finally, if I change it to:
+&lt;denchmark-code&gt;outputs.append(mx.sym.BlockGrad(in2))
+flow = mx.sym.Concat(in1, in3, in2, in4, num_args=4)
+&lt;/denchmark-code&gt;
+
+Then it does not fail. So it is specific to in3. If I block any of in1, in2 and in4, it works, but if I block in3 it breaks. The difference in them that in1, in2 and in4 come from Embedding and FullyConnected layers, while in3 comes from a pointwise multiplication of some activations over SliceChannel output.
+		</comment>
+		<comment id='2' author='SkidanovAlex' date='2016-06-02T18:55:11Z'>
+		&lt;denchmark-link:https://github.com/tqchen&gt;@tqchen&lt;/denchmark-link&gt;
+ Any ideas?
+		</comment>
+		<comment id='3' author='SkidanovAlex' date='2016-06-02T19:14:13Z'>
+		The last time this happens. I recall it was due to some output of slice
+channel not binded for gradient and in gradient construction, the supposed
+to be initialized slice channel output gradient was not initialized(
+because it did not get binded)
+On Thu, Jun 2, 2016 at 11:55 AM Eric Junyuan Xie &lt;denchmark-link:mailto:notifications@github.com&gt;notifications@github.com&lt;/denchmark-link&gt;
+
+wrote:
+
+@tqchen https://github.com/tqchen Any ideas?
+—
+You are receiving this because you were mentioned.
+Reply to this email directly, view it on GitHub
+#2317 (comment), or mute
+the thread
+https://github.com/notifications/unsubscribe/ACdUIKeKTrVmufq6hVPvAwZaSUlXapbzks5qHycZgaJpZM4Is2Er
+.
+
+		</comment>
+		<comment id='4' author='SkidanovAlex' date='2016-06-02T19:16:07Z'>
+		Can we set gradient input to any unused output to 0?
+		</comment>
+		<comment id='5' author='SkidanovAlex' date='2016-06-02T19:19:01Z'>
+		&lt;denchmark-link:https://github.com/tqchen&gt;@tqchen&lt;/denchmark-link&gt;
+, it seems relevant, I will try to dig there. I try to  on all dangling outputs, but might have missed some.
+I though, however, that dangling outputs result in errors before the binding starts.
+		</comment>
+		<comment id='6' author='SkidanovAlex' date='2016-06-02T22:07:22Z'>
+		I confirmed that I have no dangling outputs.
+Most interesting thing is that if I replace
+&lt;denchmark-code&gt;flow = mx.sym.Concat(in1, in2, in3, in4, num_args=4)
+&lt;/denchmark-code&gt;
+
+with
+&lt;denchmark-code&gt;flow = mx.sym.Concat(in1, in2, num_args=2)
+flow = mx.sym.Concat(flow, in3, num_args=2)
+flow = mx.sym.Concat(flow, in4, num_args=2)
+&lt;/denchmark-code&gt;
+
+Then the issue doesn't repro anymore.
+I have another issue that might be relevant or not. When I switch to multiple Concats  to get around the kNotInitialized error, I hit another issue:
+&lt;denchmark-code&gt;  what():  [15:03:37] src/engine/./threaded_engine.h:306: [15:03:37] src/operator/./embedding-inl.h:85: Check failed: (req[embedding::kData]) == (kNullOp) Embedding layer doesn't support calculate data gradient 1
+&lt;/denchmark-code&gt;
+
+An extra 1 at the end is my debug output -- it's the actual type (and stands for kWriteTo). All my Embedding layers only accept mx.sym.Variable as inputs, so none of their inputs should be kWriteTo. However, some of my Embedding layers share their inputs. If I duplicate shared inputs (so that each Variable is fed to at most one Embedding), the issue goes away.
+With both hacks in place my models runs, but the fact that the hacks work suggests that both issues are real bugs, and not just a result of me forgetting some dangling outputs.
+		</comment>
+		<comment id='7' author='SkidanovAlex' date='2016-06-02T22:31:24Z'>
+		&lt;denchmark-link:https://github.com/tqchen&gt;@tqchen&lt;/denchmark-link&gt;
+ Looks like implicit copy for branching is not handled correctly for all cases?
+		</comment>
+		<comment id='8' author='SkidanovAlex' date='2016-06-04T06:42:21Z'>
+		For the second bug, it seems the embedding layer is trying to compute gradient w.r.t the data.
+		</comment>
+		<comment id='9' author='SkidanovAlex' date='2016-06-05T15:51:11Z'>
+		I think &lt;denchmark-link:https://github.com/sxjscience&gt;@sxjscience&lt;/denchmark-link&gt;
+ could be correct about the second one. Could due to the fact that the gradient aggregations is computed
+		</comment>
+		<comment id='10' author='SkidanovAlex' date='2016-06-06T16:23:04Z'>
+		&lt;denchmark-link:https://github.com/tqchen&gt;@tqchen&lt;/denchmark-link&gt;
+, so you suggesting that if a certain variable is fed into multiple nodes, the code that handles aggregations automatically marks it as , because it will compute an aggregation?
+So the fix would be to change that code to recognize that all the nodes that the variable is fed into do not propagate gradient back? Do you know where the code that handles aggregations is located?
+		</comment>
+		<comment id='11' author='SkidanovAlex' date='2016-06-15T01:19:22Z'>
+		We also have a very large and complicated model, and we see the same error (info.type) != (kNotInitialized). I checked and it happens for a concat node.
+I'm using the latest master branch, but we have been seeing this error since early March. The same code base was working fine for earlier builds. I believe the last Windows release that didn't have this issue was either 0229 or 0321 (I can check if necessary).
+I checked the commits since then but nothing strikes me as suspicious. But given Alex's findings above, maybe this information can help?
+		</comment>
+		<comment id='12' author='SkidanovAlex' date='2016-06-15T02:44:53Z'>
+		I found a workaround for our case which definitely points to concat being the issue. We were using concat to duplicate a symbol N times on axis 1 (which worked fine for earlier builds but now fails). Now I did the same thing with mx.symbol.broadcast_axis(symbol, axis = 1, size = N) and it worked without any issues.
+So, this fails:
+list = []
+for _ in range(0, N):
+list.append(symbol)
+net = mx.symbol.Concat(*list, num_args = N, dim = 1)
+while this works:
+net = mx.symbol.broadcast_axis(symbol, axis = 1, size = N)
+		</comment>
+		<comment id='13' author='SkidanovAlex' date='2016-06-15T02:58:48Z'>
+		My guess is that the concat op cannot handle correctly the case when the inputs contain duplicates? E.g concat(a, b) will be OK but concat(a, a) will be problematic ?
+		</comment>
+		<comment id='14' author='SkidanovAlex' date='2016-06-15T03:02:37Z'>
+		Very likely - although it used to work fine. We use concat extensively (without duplicates) but only this one seems to have an issue
+		</comment>
+		<comment id='15' author='SkidanovAlex' date='2016-06-15T03:16:44Z'>
+		&lt;denchmark-link:https://github.com/sxjscience&gt;@sxjscience&lt;/denchmark-link&gt;
+, in my case no input was the same, but some of them depended in the same nodes.  I think toposort somehow screws up such cases.
+		</comment>
+		<comment id='16' author='SkidanovAlex' date='2016-07-02T14:23:51Z'>
+		&lt;denchmark-link:https://github.com/cemkeskin&gt;@cemkeskin&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/SkidanovAlex&gt;@SkidanovAlex&lt;/denchmark-link&gt;
+ Any update on this issue? I've tested  and the backward seems to be correct.
+		</comment>
+		<comment id='17' author='SkidanovAlex' date='2016-07-14T18:35:40Z'>
+		I hit this issue again. I just started debugging it, and here's some early info: I am using a very simple graph: (array of 33 inputs) =&gt; concat of 33 =&gt; concat with another input =&gt; convolution =&gt; fc =&gt; softmax
+Now, when I get the abovementioned CHECK_NE failure, the offending node is concat52_backward, which is the backward node corresponding to the concatenation of 33 inputs. Obviously, the backward node is expected to have precisely one input, and that input is expected to point to concat53_backward, node corresponding to the second concat in my graph. However instead it has 33 inputs, the first one indeed going into concat53_backward, and the remaining 32 going into concat52_backward, in other words it has 32 unexpected inputs pointing to itself (effectively creating a loop).
+I am trying to figure out where they come from, but may be someone here who knows the code better can give me some pointers or guess possible reasons?
+The second concat backward node (concat53_backward) has one input, and that input is connected to the convolution, as expected.
+		</comment>
+		<comment id='18' author='SkidanovAlex' date='2016-07-14T18:54:46Z'>
+		&lt;denchmark-link:https://github.com/SkidanovAlex&gt;@SkidanovAlex&lt;/denchmark-link&gt;
+ Thanks for your work! It'll be really helpful if you can find a repeatable example.
+		</comment>
+		<comment id='19' author='SkidanovAlex' date='2016-07-14T19:59:45Z'>
+		The bug I'm hitting right now is in CreateGradSumNode. It reproes if Concat concatenates 8 nodes, all of which are the same.
+CreateGradSumNode introduces edges between its inputs. In my case all those nodes are the same, and thus the connections that are introduced are self-loops. That code is wrong in a more general case: the inputs to the node might have more complex dependencies, and introducing new edges blindly can in general create cycles.
+Locally I just set  to a larger value to disable that behavior, I guess &lt;denchmark-link:https://github.com/tqchen&gt;@tqchen&lt;/denchmark-link&gt;
+ is way more qualified than I to fix the fundamental issue.
+		</comment>
+		<comment id='20' author='SkidanovAlex' date='2016-07-15T10:47:08Z'>
+		&lt;denchmark-link:https://github.com/SkidanovAlex&gt;@SkidanovAlex&lt;/denchmark-link&gt;
+ Here's the example code I get from your description. Concatenating 8 nodes will trigger the addto optimization. No such problem when  is not triggered .
+import mxnet as mx
+a = mx.sym.Variable('a')
+b = mx.sym.Concat(a, a, a, a, a, a, a, a, num_args=8, dim=0)
+exe = b.simple_bind(ctx=mx.cpu(), a=(10, 10, 10))
+Output
+&lt;denchmark-code&gt;Check failed: (info.type) != (kNotInitialized)
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='21' author='SkidanovAlex' date='2017-09-28T04:25:52Z'>
+		&lt;denchmark-link:https://github.com/piiswrong&gt;@piiswrong&lt;/denchmark-link&gt;
+ I find that we still seem to have this bug in the latest master.
+		</comment>
+		<comment id='22' author='SkidanovAlex' date='2017-09-30T16:39:19Z'>
+		&lt;denchmark-link:https://github.com/sxjscience&gt;@sxjscience&lt;/denchmark-link&gt;
+ Does this PR help? &lt;denchmark-link:https://github.com/apache/incubator-mxnet/pull/8055&gt;#8055&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='23' author='SkidanovAlex' date='2018-04-03T00:58:39Z'>
+		&lt;denchmark-link:https://github.com/apache/incubator-mxnet/pull/8055&gt;#8055&lt;/denchmark-link&gt;
+ fixes the example test case &lt;denchmark-link:https://github.com/sxjscience&gt;@sxjscience&lt;/denchmark-link&gt;
+ provides. I'm gonna close it for now. Feel free to reopen it
+		</comment>
+	</comments>
+</bug>

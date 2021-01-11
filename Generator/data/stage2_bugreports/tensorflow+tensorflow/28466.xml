@@ -1,0 +1,242 @@
+<bug id='28466' author='ziyigogogo' open_date='2019-05-07T07:43:59Z' closed_time='2019-06-14T08:40:29Z'>
+	<summary>tf.distribute behave inconsistent when using custom loss(BUG?)</summary>
+	<description>
+System information
+
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): win10
+TensorFlow installed from (source or binary): pip
+TensorFlow version (use command below): 2.0 alpha gpu
+Python version: 3.7
+
+Describe the current behavior
+UPDATE:
+I tried the latest nightly building, still no luck and now more error info showed:
+&lt;denchmark-code&gt;tensorflow.python.framework.errors_impl.InternalError: Failed copying input tensor from /job:localhost/replica:0/task:0/device:CPU:0 to /job:localhost/replica:0/task:0/device:GPU:0 in order to run DeleteIterator: No unary variant device copy function found for direction: 1 and Variant type_index: class tensorflow::data::IteratorResource::Deleter [Op:DeleteIterator]
+&lt;/denchmark-code&gt;
+
+Below is on alpha 2.0 gpu
+I'm trying to transfer my tf1.0 code to 2.0 these days. And want to make use of the distribution strategy to optimize the multi-gpu training scheme. Simply description here:
+
+My goal is adopting a complex loss that computed by args more than just (y_true, y_pred) in a distribution manner
+
+My older version implementation of the custom-loss is following  &lt;denchmark-link:https://github.com/tensorflow/addons/issues/26#issuecomment-473139603&gt;@fchollet suggestion&lt;/denchmark-link&gt;
+ by using add_loss/add_metric function.However if i want to use tf.distribution, the add_loss way is not allowed:
+&lt;denchmark-code&gt;ValueError: We currently do not support compiling the model with distribution strategy if `model.add_loss(tensor)` or `model.add_metric(tensor)` has been called.
+&lt;/denchmark-code&gt;
+
+So, I am using another working-around from &lt;denchmark-link:https://towardsdatascience.com/advanced-keras-constructing-complex-custom-losses-and-metrics-c07ca130a618&gt;here&lt;/denchmark-link&gt;
+
+A working simplified code is:
+&lt;denchmark-code&gt;import tensorflow as tf
+from tensorflow.python import keras
+from tensorflow.python.keras import layers as KL
+from tensorflow.python.keras import models as KM
+import numpy as np
+print(tf.__version__)
+
+def my_custom_loss_wrapper(input_weight):
+    def real_loss(y_true, y_pred):
+        # expand the out put of binary_crossentropy(64,64) to (64,64,1) to match the shape of input_weight
+        bce_loss = tf.expand_dims(keras.losses.binary_crossentropy(y_true, y_pred), axis=-1)
+        return bce_loss * input_weight
+
+    return real_loss
+
+fake_img = np.ones((64, 64, 3))
+fake_label = np.ones((64, 64, 1))
+fake_weight = np.ones((64, 64, 1)) * 5
+dataset = tf.data.Dataset.from_tensors(((fake_img, fake_weight), fake_label)).repeat(100).batch(10)
+
+img_input = KL.Input(shape=(64, 64, 3))
+weight_input = KL.Input(shape=(64, 64, 1))
+x = KL.Conv2D(32, (3, 3), strides=2, padding="same")(img_input)
+x = KL.Conv2DTranspose(32, (3, 3), strides=2, padding="same")(x)
+mask = KL.Conv2D(1, (1, 1), strides=1, activation="sigmoid", name="mask")(x)
+model = KM.Model(inputs=[img_input, weight_input], outputs=mask)
+model.compile(
+    loss=my_custom_loss_wrapper(weight_input),  # return a function real_loss(y_true, y_pred)
+    optimizer='sgd'
+)
+model.fit(dataset, epochs=1000)
+&lt;/denchmark-code&gt;
+
+Since above code is working good, let's enable the distribution strategy:
+&lt;denchmark-code&gt;strategy = tf.distribute.MirroredStrategy(
+    cross_device_ops=tf.distribute.HierarchicalCopyAllReduce()
+)
+with strategy.scope():
+    img_input = KL.Input(shape=(64, 64, 3))
+    weight_input = KL.Input(shape=(64, 64, 1))
+    x = KL.Conv2D(32, (3, 3), strides=2, padding="same")(img_input)
+    x = KL.Conv2DTranspose(32, (3, 3), strides=2, padding="same")(x)
+    mask = KL.Conv2D(1, (1, 1), strides=1, activation="sigmoid", name="mask")(x)
+    model = KM.Model(inputs=[img_input, weight_input], outputs=mask)
+    model.compile(
+        # loss="mse",
+        loss=my_custom_loss_wrapper(weight_input),  # return a function real_loss(y_true, y_pred)
+        optimizer='sgd'
+    )
+model.fit(dataset, epochs=1000)
+&lt;/denchmark-code&gt;
+
+No luck this time:
+&lt;denchmark-code&gt;tensorflow.python.framework.errors_impl.InvalidArgumentError: You must feed a value for placeholder tensor 'input_2' with dtype float and shape [?,64,64,1]
+	 [[{{node input_2}}]]
+	 [[mask_sample_weights_1/_11]] [Op:__inference_keras_scratch_graph_1609]
+&lt;/denchmark-code&gt;
+
+I was trying to debug this by trace the  values in this &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/f7e3da0d6a284399ef2d6e79f4dbe61b32ae70f5/tensorflow/python/keras/engine/training_arrays.py&gt;file &lt;/denchmark-link&gt;
+, however it's exactly same with the non-distributed version. And the training engine just cannot get the "input_2". Which I double checked do have values match the type and shape in   .
+My very personal guess is that in the strategy scope, the context somehow nested and the feeding data process therefore failed when custom loss involved with another layer of the model like in my example "input_weight" except y_true and y_pred. If i don use the input_weight values in the function, the other code can still work.
+&lt;denchmark-code&gt;def my_custom_loss_wrapper(input_weight):
+    def real_loss(y_true, y_pred):
+        # expand the out put of binary_crossentropy(64,64) to (64,64,1) to match the shape of input_weight
+        bce_loss = tf.expand_dims(keras.losses.binary_crossentropy(y_true, y_pred), axis=-1)
+        return bce_loss
+    return real_loss
+&lt;/denchmark-code&gt;
+
+I dont know if this the reason why add_loss not supported by tf.distribution now. Any thought is appreciated!
+Describe the expected behavior
+Custom loss with multiple input layer works consistent in both distribute and non-distribute env.
+	</description>
+	<comments>
+		<comment id='1' author='ziyigogogo' date='2019-05-10T06:51:22Z'>
+		&lt;denchmark-link:https://github.com/ziyigogogo&gt;@ziyigogogo&lt;/denchmark-link&gt;
+ I ran the below codes and respective log is attached.
+&lt;denchmark-code&gt;import tensorflow as tf
+from tensorflow.python import keras
+from tensorflow.python.keras import layers as KL
+from tensorflow.python.keras import models as KM
+import numpy as np
+print(tf.__version__)
+
+def my_custom_loss_wrapper(input_weight):
+    def real_loss(y_true, y_pred):
+        # expand the out put of binary_crossentropy(64,64) to (64,64,1) to match the shape of input_weight
+        bce_loss = tf.expand_dims(keras.losses.binary_crossentropy(y_true, y_pred), axis=-1)
+        return bce_loss * input_weight
+
+    return real_loss
+
+fake_img = np.ones((64, 64, 3))
+fake_label = np.ones((64, 64, 1))
+fake_weight = np.ones((64, 64, 1)) * 5
+dataset = tf.data.Dataset.from_tensors(((fake_img, fake_weight), fake_label)).repeat(100).batch(10)
+strategy = tf.distribute.MirroredStrategy(
+    cross_device_ops=tf.distribute.HierarchicalCopyAllReduce()
+)
+with strategy.scope():
+    img_input = KL.Input(shape=(64, 64, 3))
+    weight_input = KL.Input(shape=(64, 64, 1))
+    x = KL.Conv2D(32, (3, 3), strides=2, padding="same")(img_input)
+    x = KL.Conv2DTranspose(32, (3, 3), strides=2, padding="same")(x)
+    mask = KL.Conv2D(1, (1, 1), strides=1, activation="sigmoid", name="mask")(x)
+    model = KM.Model(inputs=[img_input, weight_input], outputs=mask)
+    model.compile(
+        # loss="mse",
+        loss=my_custom_loss_wrapper(weight_input),  # return a function real_loss(y_true, y_pred)
+        optimizer='sgd'
+    )
+model.fit(dataset, epochs=1000)
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h2&gt;Log: 2.0.0-alpha0
+W0510 06:40:37.825564 139900658984832 training_utils.py:1353] Expected a shuffled dataset but input dataset x is not shuffled. Please invoke shuffle() on input dataset.&lt;/denchmark-h&gt;
+
+ValueError                                Traceback (most recent call last)
+ in ()
+33         optimizer='sgd'
+34     )
+---&gt; 35 model.fit(dataset, epochs=1000)
+23 frames
+/usr/local/lib/python3.6/dist-packages/tensorflow/python/ops/math_ops.py in add_n(inputs, name)
+2781   """
+2782   if not inputs or not isinstance(inputs, (list, tuple)):
+-&gt; 2783     raise ValueError("inputs must be a list of at least one "
+2784                      "Tensor/IndexedSlices with the same dtype and shape")
+2785   inputs = ops.convert_n_to_tensor_or_indexed_slices(inputs)
+ValueError: inputs must be a list of at least one Tensor/IndexedSlices with the same dtype and shape
+&lt;denchmark-code&gt;import tensorflow as tf
+from tensorflow.python import keras
+from tensorflow.python.keras import layers as KL
+from tensorflow.python.keras import models as KM
+import numpy as np
+print(tf.__version__)
+
+def my_custom_loss_wrapper(input_weight):
+    def real_loss(y_true, y_pred):
+        # expand the out put of binary_crossentropy(64,64) to (64,64,1) to match the shape of input_weight
+        bce_loss = tf.expand_dims(keras.losses.binary_crossentropy(y_true, y_pred), axis=-1)
+        return bce_loss
+    return real_loss
+fake_img = np.ones((64, 64, 3))
+fake_label = np.ones((64, 64, 1))
+fake_weight = np.ones((64, 64, 1)) * 5
+dataset = tf.data.Dataset.from_tensors(((fake_img, fake_weight), fake_label)).repeat(100).batch(10)
+strategy = tf.distribute.MirroredStrategy(
+    cross_device_ops=tf.distribute.HierarchicalCopyAllReduce()
+)
+with strategy.scope():
+    img_input = KL.Input(shape=(64, 64, 3))
+    weight_input = KL.Input(shape=(64, 64, 1))
+    x = KL.Conv2D(32, (3, 3), strides=2, padding="same")(img_input)
+    x = KL.Conv2DTranspose(32, (3, 3), strides=2, padding="same")(x)
+    mask = KL.Conv2D(1, (1, 1), strides=1, activation="sigmoid", name="mask")(x)
+    model = KM.Model(inputs=[img_input, weight_input], outputs=mask)
+    model.compile(
+        # loss="mse",
+        loss=my_custom_loss_wrapper(weight_input),  # return a function real_loss(y_true, y_pred)
+        optimizer='sgd'
+    )
+model.fit(dataset, epochs=1000)
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h2&gt;Log:
+2.0.0-alpha0&lt;/denchmark-h&gt;
+
+RuntimeError                              Traceback (most recent call last)
+ in ()
+19     cross_device_ops=tf.distribute.HierarchicalCopyAllReduce()
+20 )
+---&gt; 21 with strategy.scope():
+22     img_input = KL.Input(shape=(64, 64, 3))
+23     weight_input = KL.Input(shape=(64, 64, 1))
+3 frames
+/usr/local/lib/python3.6/dist-packages/tensorflow/python/distribute/distribute_lib.py in _wrong_strategy_scope(strategy, context)
+117     raise RuntimeError(
+118         "Mixing different tf.distribute.Strategy objects: %s is not %s" %
+--&gt; 119         (context.strategy, strategy))
+120
+121
+RuntimeError: Mixing different tf.distribute.Strategy objects: &lt;tensorflow.python.distribute.mirrored_strategy.MirroredStrategy object at 0x7f3d2273c7b8&gt; is not &lt;tensorflow.python.distribute.mirrored_strategy.MirroredStrategy object at 0x7f3c7f68b358&gt;
+		</comment>
+		<comment id='2' author='ziyigogogo' date='2019-05-13T02:21:02Z'>
+		&lt;denchmark-link:https://github.com/muddham&gt;@muddham&lt;/denchmark-link&gt;
+  The fact is that I just cannot make the custom loss work on 2.0 alpha in any way. And the latest tf nightly enabled the add_loss&amp; add_metric again. So im using a add_loss way to achieve my target.
+So for me at least, the latest version meets my needs.
+However, there are still bugs on the thing I reported: you can make the custom_loss_function work ONLY WITHOUT distribute strategy.  This is kinda inconsistent, so if the custom_loss_function is not recommend compared with the add_loss way, TF team should throw some warning messages.
+		</comment>
+		<comment id='3' author='ziyigogogo' date='2019-06-05T20:48:05Z'>
+		Question: What is the code that fails? Does it fail without a custom loss?
+Also, does it still fail if you remove the "cross_device_ops=tf.distribute.HierarchicalCopyAllReduce()" line? We are switching to NCCL, and are planning  to deprecate it.
+		</comment>
+		<comment id='4' author='ziyigogogo' date='2019-06-13T09:36:55Z'>
+		
+Question: What is the code that fails? Does it fail without a custom loss?
+Also, does it still fail if you remove the "cross_device_ops=tf.distribute.HierarchicalCopyAllReduce()" line? We are switching to NCCL, and are planning to deprecate it.
+
+Sorry for the late response, since I am moving to use tf2.0 beta, which added support for add_loss() so that my problem is addressed. By the way, as for "cross_device_ops=tf.distribute.HierarchicalCopyAllReduce()", i have machines on both windows and linux, and on windows NCCL is not working so i used HierarchicalCopyAllReduce(). And i dont think this is related.
+		</comment>
+		<comment id='5' author='ziyigogogo' date='2019-06-14T08:40:29Z'>
+		Thanks for the update! I will close the issue then since it seems addressed.
+		</comment>
+		<comment id='6' author='ziyigogogo' date='2019-06-14T08:40:30Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=28466&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=28466&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

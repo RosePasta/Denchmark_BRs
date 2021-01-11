@@ -1,0 +1,157 @@
+<bug id='31499' author='grananqvist' open_date='2019-08-09T23:33:55Z' closed_time='2020-08-24T04:54:46Z'>
+	<summary>MultiWorkerMirroredStrategy stuck in all_reduce</summary>
+	<description>
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): MacOS Mojave
+TensorFlow installed from (source or binary): PyPi
+TensorFlow version (use command below): 1.14.0
+Python version: 3.6.5
+CUDA/cuDNN version: none. (MacOS)
+GPU model and memory: none. (MacOS)
+
+Describe the current behavior
+I am setting up a multi-worker cluster with two workers and I want to reduce the value of a tensor from each worker. Tensorflow is simply blocking on the collective all reduce operation (tensorflow.python.ops.collective_ops.all_reduce) and never synchronizes between workers.
+Describe the expected behavior
+I expect the collective op to return the sum of the tensor across each worker. More specifically, I expect the code below to print the value [[2.,3.]]
+Code to reproduce the issue
+import json
+import os
+import sys
+from multiprocessing import Process
+import tensorflow as tf
+from tensorflow.distribute.cluster_resolver import TFConfigClusterResolver
+
+tf.logging.set_verbosity('DEBUG')
+
+def test_dist(task_id):
+    resolver = TFConfigClusterResolver()
+    cluster = resolver.cluster_spec()
+    server = tf.distribute.Server(
+        cluster, job_name="worker", task_index=task_id)
+
+    dist = tf.distribute.experimental.MultiWorkerMirroredStrategy(
+        tf.distribute.experimental.CollectiveCommunication.RING)
+
+    print('num replicas', dist.num_replicas_in_sync)
+
+    with tf.device('/job:worker/task:{0}/device:CPU:0'.format(task_id)):
+        t = tf.Variable([1.0,3.0*task_id], dtype=tf.float32, name='myvar')
+
+    def sum_deltas_fn(v):
+        return tf.identity(v)
+
+    with dist.scope():
+        all_ts = dist.experimental_run_v2(sum_deltas_fn, args=[t])
+        delta_sums_results = dist.reduce(tf.distribute.ReduceOp.SUM, all_ts)
+
+        sess = tf.compat.v1.Session(server.target)
+        sess.run(tf.compat.v1.global_variables_initializer())
+
+        print('tensor', delta_sums_results)
+        print('tensor value', sess.run(delta_sums_results))
+
+test_dist(int(sys.argv[1]))
+I run two workers in one terminal each:
+&lt;denchmark-code&gt;# Terminal 1
+export TF_CONFIG='{ "cluster": { "worker": ["localhost:8027", "localhost:8028"] }, "task": {"type": "worker", "index": 0} }'
+python collective_reduce.old.py 0
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-code&gt;# Terminal 2
+export TF_CONFIG='{ "cluster": { "worker": ["localhost:8027", "localhost:8028"] }, "task": {"type": "worker", "index": 1} }'
+python collective_reduce.old.py 1
+&lt;/denchmark-code&gt;
+
+Other info / logs
+The output is:
+worker 1
+&lt;denchmark-code&gt;WARNING: Logging before flag parsing goes to stderr.
+W0809 16:15:59.427072 4541060544 deprecation_wrapper.py:119] From collective_reduce.old.py:8: The name tf.logging.set_verbosity is deprecated. Please use tf.compat.v1.logging.set_verbosity instead.
+
+2019-08-09 16:15:59.428197: I tensorflow/core/platform/cpu_feature_guard.cc:142] Your CPU supports instructions that this TensorFlow binary was not compiled to use: AVX2 FMA
+2019-08-09 16:15:59.431492: I tensorflow/core/distributed_runtime/rpc/grpc_channel.cc:250] Initialize GrpcChannelCache for job worker -&gt; {0 -&gt; localhost:8027, 1 -&gt; localhost:8028}
+2019-08-09 16:15:59.432571: I tensorflow/core/distributed_runtime/rpc/grpc_server_lib.cc:365] Started server with target: grpc://localhost:8027
+I0809 16:15:59.470151 4541060544 cross_device_ops.py:1174] Device is available but not used by distribute strategy: /device:CPU:0
+W0809 16:15:59.471471 4541060544 cross_device_ops.py:1177] Not all devices in `tf.distribute.Strategy` are visible to TensorFlow.
+I0809 16:15:59.472136 4541060544 collective_all_reduce_strategy.py:226] Multi-worker CollectiveAllReduceStrategy with cluster_spec = {'worker': ['localhost:8027', 'localhost:8028']}, task_type = 'worker', task_id = 0, num_workers = 2, local_devices = ('/job:worker/task:0',), communication = CollectiveCommunication.RING
+num replicas 2
+I0809 16:15:59.488581 4541060544 cross_device_ops.py:1032] Collective batch_all_reduce: 1 all-reduces, num_workers = 2
+I0809 16:15:59.489030 4541060544 cross_device_ops.py:1053] Collective batch_all_reduce: 1 all-reduces, num_workers = 2
+tensor Tensor("allreduce/CollectiveReduce:0", shape=(2,), dtype=float32, device=/job:worker/replica:0/task:0/device:CPU:0)
+&lt;/denchmark-code&gt;
+
+worker 2
+&lt;denchmark-code&gt;WARNING: Logging before flag parsing goes to stderr.
+W0809 16:16:07.349786 4473202112 deprecation_wrapper.py:119] From collective_reduce.old.py:8: The name tf.logging.set_verbosity is deprecated. Please use tf.compat.v1.logging.set_verbosity instead.
+
+2019-08-09 16:16:07.350931: I tensorflow/core/platform/cpu_feature_guard.cc:142] Your CPU supports instructions that this TensorFlow binary was not compiled to use: AVX2 FMA
+2019-08-09 16:16:07.354157: I tensorflow/core/distributed_runtime/rpc/grpc_channel.cc:250] Initialize GrpcChannelCache for job worker -&gt; {0 -&gt; localhost:8027, 1 -&gt; localhost:8028}
+2019-08-09 16:16:07.355424: I tensorflow/core/distributed_runtime/rpc/grpc_server_lib.cc:365] Started server with target: grpc://localhost:8028
+I0809 16:16:07.392420 4473202112 cross_device_ops.py:1174] Device is available but not used by distribute strategy: /device:CPU:0
+W0809 16:16:07.393295 4473202112 cross_device_ops.py:1177] Not all devices in `tf.distribute.Strategy` are visible to TensorFlow.
+I0809 16:16:07.393734 4473202112 collective_all_reduce_strategy.py:226] Multi-worker CollectiveAllReduceStrategy with cluster_spec = {'worker': ['localhost:8027', 'localhost:8028']}, task_type = 'worker', task_id = 1, num_workers = 2, local_devices = ('/job:worker/task:1',), communication = CollectiveCommunication.RING
+num replicas 2
+I0809 16:16:07.408463 4473202112 cross_device_ops.py:1032] Collective batch_all_reduce: 1 all-reduces, num_workers = 2
+I0809 16:16:07.408880 4473202112 cross_device_ops.py:1053] Collective batch_all_reduce: 1 all-reduces, num_workers = 2
+tensor Tensor("allreduce/CollectiveReduce:0", shape=(2,), dtype=float32, device=/job:worker/replica:0/task:1/device:CPU:0)
+&lt;/denchmark-code&gt;
+
+Whether this is a bug or me doing something wrong, it is very unclear in the docs how to do anything with .
+Also, the example with setting the env variable directly with os.environ here &lt;denchmark-link:https://www.tensorflow.org/guide/distribute_strategy#setting_up_tf_config_environment_variable&gt;https://www.tensorflow.org/guide/distribute_strategy#setting_up_tf_config_environment_variable&lt;/denchmark-link&gt;
+
+does not register, and the ClusterSpec will be empty
+	</description>
+	<comments>
+		<comment id='1' author='grananqvist' date='2019-08-23T19:25:18Z'>
+		Apparently, the code works for tf 2.0
+		</comment>
+		<comment id='2' author='grananqvist' date='2019-08-27T00:12:23Z'>
+		&lt;denchmark-link:https://github.com/grananqvist&gt;@grananqvist&lt;/denchmark-link&gt;
+ If this was resolved, please close the issue. Thanks!
+		</comment>
+		<comment id='3' author='grananqvist' date='2019-08-27T00:23:48Z'>
+		&lt;denchmark-link:https://github.com/jvishnuvardhan&gt;@jvishnuvardhan&lt;/denchmark-link&gt;
+ Right.. I was looking for what change there was? Is it possible to make whatever fix there was into TF 1.x ?
+		</comment>
+		<comment id='4' author='grananqvist' date='2019-08-27T00:23:50Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=31499&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=31499&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='5' author='grananqvist' date='2019-08-27T04:20:40Z'>
+		&lt;denchmark-link:https://github.com/grananqvist&gt;@grananqvist&lt;/denchmark-link&gt;
+ I think it is better if you can run the code in  and check whether the issue persists there or not. If it persists, please open a new issue for TF1.x and reference the current issue so that community will get benefited. Thanks!
+		</comment>
+		<comment id='6' author='grananqvist' date='2019-09-12T15:50:15Z'>
+		I saw the same issue as described here, and it seems to be caused by a missing configuration of the collective_group_leader in the session config used by the server. It works for me if I do this:
+    sess_config = tf.ConfigProto()
+    # The line below sets `sess_config.experimental.collective_group_leader`
+    sess_config = dist.update_config_proto(sess_config)
+    # Pass the updated config to the server
+    server = tf.distribute.Server(
+        cluster, job_name="worker", task_index=task_id, config=sess_config)
+		</comment>
+		<comment id='7' author='grananqvist' date='2019-10-16T13:25:20Z'>
+		So I got this working for TF2.0, and thanks to &lt;denchmark-link:https://github.com/hakos&gt;@hakos&lt;/denchmark-link&gt;
+ I got it working for our TF1.x version as well.
+Now reopening this with a question because it still doesn't work without &lt;denchmark-link:https://github.com/hakos&gt;@hakos&lt;/denchmark-link&gt;
+ suggestion:
+Is this a bug, or intended? That I have to update the distribution strategy with update_config_proto with a default tf.ConfigProto to make it work, i.e. the reduce operation is unblocked and completed.
+		</comment>
+		<comment id='8' author='grananqvist' date='2020-08-24T04:54:46Z'>
+		&lt;denchmark-link:https://github.com/grananqvist&gt;@grananqvist&lt;/denchmark-link&gt;
+  Tensorflow 1.x is not actively supported. Also,Could you please check with latest TF version and let us know .Please feel free  to reopen issue if necessary.Thanks!
+		</comment>
+		<comment id='9' author='grananqvist' date='2020-08-24T04:54:48Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/31499&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/31499&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

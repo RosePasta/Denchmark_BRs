@@ -1,0 +1,154 @@
+<bug id='44784' author='lminer' open_date='2020-11-11T22:56:01Z' closed_time='2020-11-12T22:55:07Z'>
+	<summary>gradient_transformers throw autograph errors when trying to maintain state in tensorarray</summary>
+	<description>
+I'm trying to implement automatic gradient clipping, where the norm of the gradient is stored on each train step, and the gradient is clipped based off the accumulated distribution of gradient norms. However, I seem to be running into some autograph issue.
+Here's the code to reproduce the issue
+import tensorflow as tf
+import tensorflow_probability as tfp
+
+class AutoClipper:
+    def __init__(self, clip_percentile):
+        self.clip_percentile = clip_percentile
+        self.grad_history = None
+        self.i = None
+
+    def __call__(self, grads_and_vars):
+        if self.grad_history is None:
+            self.grad_history = tf.TensorArray(dtype=tf.float32, size=0, dynamic_size=True)
+            self.i = 0
+
+        grad_norms = [_get_grad_norm(g) for g, _ in grads_and_vars]
+        total_norm = tf.norm(grad_norms)
+        self.grad_history = self.grad_history.write(self.i, total_norm)
+        self.i += 1
+        clip_value = tfp.stats.percentile(self.grad_history.stack(), q=self.clip_percentile)
+        return [(tf.clip_by_norm(g, clip_value), v) for g, v in grads_and_vars]
+
+def _get_grad_norm(t, axes=None, name=None):
+    values = tf.convert_to_tensor(t.values if isinstance(t, tf.IndexedSlices) else t, name="t")
+
+    # Calculate L2-norm, clip elements by ratio of clip_norm to L2-norm
+    l2sum = tf.math.reduce_sum(values * values, axes, keepdims=True)
+    pred = l2sum &gt; 0
+    # Two-tap tf.where trick to bypass NaN gradients
+    l2sum_safe = tf.where(pred, l2sum, tf.ones_like(l2sum))
+    return tf.squeeze(tf.where(pred, tf.math.sqrt(l2sum_safe), l2sum))
+
+
+model = tf.keras.models.Sequential(
+        [
+            tf.keras.layers.Flatten(input_shape=(28, 28)),
+            tf.keras.layers.Dense(128, activation="relu"),
+            tf.keras.layers.Dropout(0.2),
+            tf.keras.layers.Dense(10),
+        ]
+    )
+
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(
+            learning_rate=0.001,
+            gradient_transformers=[AutoClipper(10)],
+        ),
+        loss="mean_absolute_error",
+        metrics=["accuracy"],
+    )
+
+    (x_train, y_train), (x_test, y_test) = tf.keras.datasets.mnist.load_data()
+    x_train, x_test = x_train / 255.0, x_test / 255.0
+
+    model.fit(x_train, y_train)
+It seems to fail when trying to update the tensorarray, but I thought tensorarrays could be created outside tf.function:
+op_name = '__inference_train_function_13337', num_outputs = 4
+inputs = [&lt;tf.Tensor: shape=(), dtype=resource, numpy=&lt;unprintable&gt;&gt;, &lt;tf.Tensor: shape=(), dtype=variant, numpy=&lt;unprintable&gt;&gt;...ensor: shape=(), dtype=resource, numpy=&lt;unprintable&gt;&gt;, &lt;tf.Tensor: shape=(), dtype=resource, numpy=&lt;unprintable&gt;&gt;, ...]
+attrs = ('executor_type', '', 'config_proto', b'\n\x07\n\x03CPU\x10\x01\n\x07\n\x03GPU\x10\x002\x02J\x008\x01\x82\x01\x00')
+ctx = &lt;tensorflow.python.eager.context.Context object at 0x7fa34a9b2f50&gt;
+name = None
+
+    def quick_execute(op_name, num_outputs, inputs, attrs, ctx, name=None):
+      """Execute a TensorFlow operation.
+    
+      Args:
+        op_name: Name of the TensorFlow operation (see REGISTER_OP in C++ code) to
+          execute.
+        num_outputs: The number of outputs of the operation to fetch.
+                     (Explicitly provided instead of being inferred for performance
+                     reasons).
+        inputs: A list of inputs to the operation. Each entry should be a Tensor, or
+          a value which can be passed to the Tensor constructor to create one.
+        attrs: A tuple with alternating string attr names and attr values for this
+          operation.
+        ctx: The value of context.context().
+        name: Customized name for the operation.
+    
+      Returns:
+        List of output Tensor objects. The list is empty if there are no outputs
+    
+      Raises:
+        An exception on error.
+      """
+      device_name = ctx.device_name
+      # pylint: disable=protected-access
+      try:
+        ctx.ensure_initialized()
+        tensors = pywrap_tfe.TFE_Py_Execute(ctx._handle, device_name, op_name,
+&gt;                                           inputs, attrs, num_outputs)
+E                                           TypeError: An op outside of the function building code is being passed
+E                                           a "Graph" tensor. It is possible to have Graph tensors
+E                                           leak out of the function building context by including a
+E                                           tf.init_scope in your function building code.
+E                                           For example, the following function will fail:
+E                                             @tf.function
+E                                             def has_init_scope():
+E                                               my_constant = tf.constant(1.)
+E                                               with tf.init_scope():
+E                                                 added = my_constant * 2
+E                                           The graph tensor has name: Adam/TensorArrayV2Write/TensorListSetItem:0
+
+./lib/python3.7/site-packages/tensorflow/python/eager/execute.py:60: TypeError
+System information
+
+tensorflow 2.4.0-rc1
+python 3.5
+ubuntu 20.04
+
+	</description>
+	<comments>
+		<comment id='1' author='lminer' date='2020-11-12T07:45:04Z'>
+		I have tried in colab with TF version 2.4-rc1 and nightly version() and was able to reproduce the issue.Please, find the gist &lt;denchmark-link:https://colab.research.google.com/gist/ravikyram/258ea3c0234e12f0c82dbd9e9f1e3b7d/untitled516.ipynb#scrollTo=07fbRaD5Zolp&gt;here&lt;/denchmark-link&gt;
+. Thanks!
+		</comment>
+		<comment id='2' author='lminer' date='2020-11-12T22:55:06Z'>
+		&lt;denchmark-link:https://github.com/lminer&gt;@lminer&lt;/denchmark-link&gt;
+ Thanks for the issue!
+I think it'd be better to do this with tf.Variables. There's a few things I think won't work with the current approach:
+(1) Access to a TensorArray element created in one tf.function call and accessed in another
+(2) Python control flow via self.i += 1
+(1) is the issue you're hitting now, (2) will mean only the first TensorArray element ever gets updated:
+&lt;denchmark-code&gt;grads_and_vars = [(tf.convert_to_tensor(1.), tf.Variable(1.))]
+autoclipper = AutoClipper(10)
+
+@tf.function
+def my_fn(gv):
+  return autoclipper(gv)
+
+my_fn(grads_and_vars)
+my_fn(grads_and_vars)
+
+print(autoclipper.i)
+&lt;/denchmark-code&gt;
+
+Instead I'd recommend creating a tf.Variable of shape N and doing running statistics over the last N batches for a similar result. Closing because I don't think this is an issue with the gradient_transformers but feel free to re-open if I've misunderstood
+		</comment>
+		<comment id='3' author='lminer' date='2020-11-12T22:55:08Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/44784&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/44784&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='4' author='lminer' date='2020-11-13T00:06:24Z'>
+		Thanks &lt;denchmark-link:https://github.com/omalleyt12&gt;@omalleyt12&lt;/denchmark-link&gt;
+ I think that fixed it.
+		</comment>
+	</comments>
+</bug>

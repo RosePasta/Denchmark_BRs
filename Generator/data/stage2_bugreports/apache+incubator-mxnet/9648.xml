@@ -1,0 +1,142 @@
+<bug id='9648' author='zhanghang1989' open_date='2018-01-31T19:26:01Z' closed_time='2018-08-06T18:20:07Z'>
+	<summary>BatchNorm Evaluation Mode Backward Fails with cudnn Enabled</summary>
+	<description>
+When installing MXNet with cudnn enabled USE_CUDNN=1. The backward of BatchNorm operator fails
+&lt;denchmark-h:h2&gt;Reproducing the error&lt;/denchmark-h&gt;
+
+&lt;denchmark-code&gt;import mxnet as mx
+import mxnet.ndarray as F
+from mxnet import autograd
+
+B,C,H,W = 4,3,2,2
+x = mx.nd.random.poisson(1,shape=(B,C,H,W)).as_in_context(mx.gpu(0))
+gamma = mx.nd.random.normal(shape=(C)).as_in_context(mx.gpu(0))
+beta = mx.nd.random.normal(shape=(C)).as_in_context(mx.gpu(0))
+mean = mx.nd.random.normal(shape=(C)).as_in_context(mx.gpu(0))
+std = mx.nd.random.normal(shape=(C)).as_in_context(mx.gpu(0))
+x.attach_grad()
+
+with autograd.record(False):
+    y = F.BatchNorm(x, gamma, beta, mean, std.square(), fix_gamma=False)     
+    loss=y.square().sum()
+loss.backward(train_mode=False)
+&lt;/denchmark-code&gt;
+
+got the error:
+terminate called after throwing an instance of 'dmlc::Error'
+  what():  [19:23:23] src/engine/./threaded_engine.h:359: [19:23:23] src/operator/nn/./cudnn/cudnn_batch_norm-inl.h:193: Check failed: ctx.is_train &amp;&amp; !param_.use_global_stats use global statistics is not yet supported in CuDNNBatchNorm
+	</description>
+	<comments>
+		<comment id='1' author='zhanghang1989' date='2018-01-31T19:30:15Z'>
+		Backward in evaluation mode should be handled differently. Current code is here:
+&lt;denchmark-link:https://github.com/apache/incubator-mxnet/blob/master/src/operator/nn/batch_norm.cu#L645-L656&gt;https://github.com/apache/incubator-mxnet/blob/master/src/operator/nn/batch_norm.cu#L645-L656&lt;/denchmark-link&gt;
+
+PyTorch had a related issue &lt;denchmark-link:https://github.com/pytorch/pytorch/issues/4284&gt;pytorch/pytorch#4284&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='2' author='zhanghang1989' date='2018-02-06T23:22:13Z'>
+		&lt;denchmark-link:https://github.com/eric-haibin-lin&gt;@eric-haibin-lin&lt;/denchmark-link&gt;
+ I think this should be labeled as 
+		</comment>
+		<comment id='3' author='zhanghang1989' date='2018-04-09T16:08:25Z'>
+		With what frequency can you reproduce?  I haven't been able to reproduce.
+		</comment>
+		<comment id='4' author='zhanghang1989' date='2018-04-14T06:55:49Z'>
+		&lt;denchmark-link:https://github.com/zhanghang1989&gt;@zhanghang1989&lt;/denchmark-link&gt;
+ related pr merged. can this be closed ?
+		</comment>
+		<comment id='5' author='zhanghang1989' date='2018-05-21T23:43:49Z'>
+		Reopen this due to CUDNN is handled wrongly &lt;denchmark-link:https://github.com/piiswrong&gt;@piiswrong&lt;/denchmark-link&gt;
+
+Related PR &lt;denchmark-link:https://github.com/apache/incubator-mxnet/pull/10470&gt;#10470&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='6' author='zhanghang1989' date='2019-08-19T10:13:46Z'>
+		Config:
+ubuntu 18.04
+python 3.6.4
+cuda_10.1.243_418.87.00_linux.run
+nvcc: NVIDIA (R) Cuda compiler driver
+Copyright (c) 2005-2017 NVIDIA Corporation
+Built on Fri_Nov__3_21:07:56_CDT_2017
+Cuda compilation tools, release 9.1, V9.1.85
+torch==1.1.0
+Code to be run:
+&lt;denchmark-code&gt;import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+import numpy as np
+
+def _upsample(x):
+    h, w = x.shape[2:]
+    return F.upsample_bilinear(x, size=(h * 2, w * 2))
+
+
+def upsample_conv(x, conv):
+    return conv(_upsample(x))
+
+class genBlock(nn.Module):
+    def __init__(self, in_channels, out_channels,
+                 activation=F.relu, hidden_channels=None, ksize=3, pad=1, upsample=False, n_classes=0):
+        super(genBlock, self).__init__()
+        self.activation = activation
+        self.upsample = upsample
+        self.learnable_sc = in_channels != out_channels or upsample
+        hidden_channels = out_channels if hidden_channels is None else hidden_channels
+        self.n_classes = n_classes
+        self.c1 = nn.Conv2d(in_channels, hidden_channels, kernel_size=ksize, padding=pad)
+        #nn.init.xavier_uniform_(self.c1.weight.data, math.sqrt(2))
+        self.c2 = nn.Conv2d(hidden_channels, out_channels, kernel_size=ksize, padding=pad)
+        #nn.init.xavier_uniform_(self.c2.weight.data, math.sqrt(2))
+        self.b1 = nn.BatchNorm2d(in_channels)
+        self.b2 = nn.BatchNorm2d(hidden_channels)
+        if self.learnable_sc:
+            self.c_sc = nn.Conv2d(in_channels, out_channels, kernel_size=ksize, padding=pad)
+    def residual(self, x):
+        h = x
+        h = self.b1(h)
+        h = self.activation(h)
+        h = upsample_conv(h, self.c1) if self.upsample else self.c1(h)
+        h = self.b2(h)
+        h = self.activation(h)
+        h = self.c2(h)
+        return h
+
+    def shortcut(self, x):
+        if self.learnable_sc:
+            x = upsample_conv(x, self.c_sc) if self.upsample else self.c_sc(x)
+            return x
+        else:
+            return x
+
+    def forward(self, input):
+        return self.residual(input) + self.shortcut(input)
+if __name__== "__main__":
+
+    noise = torch.randn(1,256, 4, 4).cuda()
+    g = genBlock(256, 256, activation=F.relu, upsample=True).cuda()
+    #g.apply(weights_init)
+    out = g(noise)
+    print(out.shape)
+&lt;/denchmark-code&gt;
+
+Traceback (most recent call last):
+File "test3.py", line 56, in 
+out = g(noise)
+File "/home/thomas/.pyenv/versions/spg3.6.4/lib/python3.6/site-packages/torch/nn/modules/module.py", line 493, in call
+result = self.forward(*input, **kwargs)
+File "test3.py", line 50, in forward
+return self.residual(input) + self.shortcut(input)
+File "test3.py", line 34, in residual
+h = self.b1(h)
+File "/home/thomas/.pyenv/versions/spg3.6.4/lib/python3.6/site-packages/torch/nn/modules/module.py", line 493, in call
+result = self.forward(*input, **kwargs)
+File "/home/thomas/.pyenv/versions/spg3.6.4/lib/python3.6/site-packages/torch/nn/modules/batchnorm.py", line 83, in forward
+exponential_average_factor, self.eps)
+File "/home/thomas/.pyenv/versions/spg3.6.4/lib/python3.6/site-packages/torch/nn/functional.py", line 1697, in batch_norm
+training, momentum, eps, torch.backends.cudnn.enabled
+RuntimeError: cuDNN error: CUDNN_STATUS_EXECUTION_FAILED
+		</comment>
+	</comments>
+</bug>

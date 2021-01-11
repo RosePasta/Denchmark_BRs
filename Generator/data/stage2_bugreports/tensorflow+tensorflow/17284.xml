@@ -1,0 +1,105 @@
+<bug id='17284' author='rightaditya' open_date='2018-02-26T21:15:35Z' closed_time='2018-03-02T20:05:14Z'>
+	<summary>tensor-valued seeds in tf.data API can result in nondeterministic results</summary>
+	<description>
+&lt;denchmark-h:h3&gt;System information&lt;/denchmark-h&gt;
+
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): Yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Linux Ubuntu 17.10
+TensorFlow installed from (source or binary): Source
+TensorFlow version (use command below): v1.5.0-11-g4588350f20 1.5.0
+Python version: 3.6.3
+Bazel version (if compiling from source): 0.11.0
+GCC/Compiler version (if compiling from source): 7.2.0
+CUDA/cuDNN version: N/A
+GPU model and memory: N/A
+Exact command to reproduce: See code below
+
+&lt;denchmark-h:h3&gt;Describe the problem&lt;/denchmark-h&gt;
+
+The tf.data API allows/requires seeds to be provided that are tf.tensors. This is an issue when the graph-level seed has been set to 0, and the provided op-level seed tensor takes on a value of 0. As noted in the comments in the code for tf.get_seed, a (0, 0) seed is problematic because the C++ ops assume this means nondeterminism. Of course, when a user is specifying these seeds, they're expecting deterministic behaviour. Unfortunately, tf.get_seed only checks for this issue for the case where the seeds are ints, not tensors. See the code below for an example.
+I would have been happy to submit a PR for this, but I have no idea where the fix should be for this bug. As I'm not especially familiar with the code base, it's not apparent whether it's even possible to have the code for tf.get_seed to check the value of a tensor seed. If not, I'm guessing the tf.data API would need to provide the checks.
+&lt;denchmark-h:h3&gt;Source code / logs&lt;/denchmark-h&gt;
+
+The following code reproduces the bug for me:
+import tensorflow as tf
+
+tf.set_random_seed(0)
+seed_tensor = tf.placeholder(tf.int64, shape=[], name='data_seed')
+data = tf.data.Dataset.range(10).shuffle(10, seed=seed_tensor)
+iterator = tf.data.Iterator.from_structure(tf.int64, tf.TensorShape([]))
+
+init = iterator.make_initializer(data)
+value = iterator.get_next()
+
+print('First run: ', end='')
+with tf.Session() as sess1:
+    sess1.run(init, feed_dict={seed_tensor: 0})
+    values = []
+    while True:
+        try:
+            values.append(str(sess1.run(value)))
+        except tf.errors.OutOfRangeError:
+            break
+
+    print(', '.join(values))
+
+print('Second run: ', end='')
+with tf.Session() as sess2:
+    sess2.run(init, feed_dict={seed_tensor: 0})
+    values = []
+    while True:
+        try:
+            values.append(str(sess2.run(value)))
+        except tf.errors.OutOfRangeError:
+            break
+
+    print(', '.join(values))
+The result I get is:
+&lt;denchmark-code&gt;First run: 8, 4, 6, 9, 1, 0, 5, 7, 3, 2
+Second run: 1, 6, 3, 0, 7, 5, 2, 9, 8, 4
+&lt;/denchmark-code&gt;
+
+I would expect the first and second runs to produce the exact same sequence, though the particular sequence might differ from environment to environment.
+If I change the feed_dict to provide a value of 0 for seed_tensor for both runs, I get the expected result:
+&lt;denchmark-code&gt;First run: 5, 2, 0, 1, 7, 4, 9, 3, 8, 6
+Second run: 5, 2, 0, 1, 7, 4, 9, 3, 8, 6
+&lt;/denchmark-code&gt;
+
+If I change the shuffle() call to take a value of 0 directly (i.e., `...shuffle(10, seed=0)), I get the expected result as well:
+&lt;denchmark-code&gt;First run: 4, 8, 7, 1, 3, 2, 6, 9, 0, 5
+Second run: 4, 8, 7, 1, 3, 2, 6, 9, 0, 5
+&lt;/denchmark-code&gt;
+
+For the record, I encountered this issue because I'm using an Iterator via Iterator.from_structure, and when I use that iterator on a Dataset.shuffle() I get the same order for each epoch. To get around this, I provided the epoch number as a seed to Dataset.shuffle(), with the first epoch being epoch 0. In my case I can avoid this bug by just starting the epoch count at 1, but it took me a while to track down, and there may be other cases where the API is used in a similar way that would be problematic for those expecting deterministic results.
+	</description>
+	<comments>
+		<comment id='1' author='rightaditya' date='2018-02-26T23:12:09Z'>
+		&lt;denchmark-link:https://github.com/mrry&gt;@mrry&lt;/denchmark-link&gt;
+ Can you look at this?
+		</comment>
+		<comment id='2' author='rightaditya' date='2018-02-26T23:34:03Z'>
+		I'm a bit confused by the code example. Why would you expect the shuffled order to be the same when you feed two different values for seed_tensor?
+It might make sense to rewrite the seed, as tf.get_seed() does, when the runtime value is 0. Is that what you're suggesting?
+		</comment>
+		<comment id='3' author='rightaditya' date='2018-02-27T00:24:45Z'>
+		&lt;denchmark-link:https://github.com/mrry&gt;@mrry&lt;/denchmark-link&gt;
+ Ugh, sorry, that's my mistake. Both fed values should be 0. I copied-and-pasted the code I was using to test it and had changed one of them but not the other. I've edited the code to reflect my intention.
+
+It might make sense to rewrite the seed, as tf.get_seed() does, when the runtime value is 0. Is that what you're suggesting?
+
+Yes, exactly. the tf.get_seed() check is insufficient if tensor-valued seeds are allowed, as it only does an identity check against 0.
+		</comment>
+		<comment id='4' author='rightaditya' date='2018-02-27T01:45:00Z'>
+		OK, that does seem like a bug, and the fix isn't too difficult. The gist is to set seed = tf.where(seed == 0, tf.constant(2 ** 31 - 1, dtype=tf.int64), seed) when seed is a tf.Tensor.
+Watch this space for a fix in the next few days.
+		</comment>
+		<comment id='5' author='rightaditya' date='2018-02-27T22:28:28Z'>
+		&lt;denchmark-link:https://github.com/mrry&gt;@mrry&lt;/denchmark-link&gt;
+ I'd be willing to submit a PR for this if no one's already working on it.
+		</comment>
+		<comment id='6' author='rightaditya' date='2018-02-27T22:33:20Z'>
+		Thanks for offering! I've already got a fix under review, so it should be merged soon.
+		</comment>
+	</comments>
+</bug>

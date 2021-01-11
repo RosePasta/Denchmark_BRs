@@ -1,0 +1,223 @@
+<bug id='11649' author='PidgeyBE' open_date='2020-10-27T16:38:09Z' closed_time='2020-10-29T18:53:11Z'>
+	<summary>Async await not working when result is fetched from another node's object store</summary>
+	<description>
+&lt;denchmark-h:h3&gt;What is the problem?&lt;/denchmark-h&gt;
+
+
+ray 1.0.0
+
+&lt;denchmark-h:h3&gt;Reproduction (REQUIRED)&lt;/denchmark-h&gt;
+
+Ray remote actor tasks can be awaited. However, this only works reliably when the driver and the actor run on the same ray node. If this is not the case, await statements can take infinitely long.
+In the script below, the OTHER_NODE custom resource is to indicate that this actor should be scheduled a node that's different from the driver of the script.
+&lt;denchmark-code&gt;import os
+import numpy as np
+import ray
+import asyncio
+
+head_service = os.environ.get('RAY_HEAD_SERVICE_HOST')
+head_port = os.environ.get('RAY_HEAD_SERVICE_PORT_REDIS_PRIMARY')
+address = f"{head_service}:{head_port}" if head_service is not None else None
+ray.init(address=address)
+
+TOTAL_IMAGES = 10
+
+@ray.remote(num_cpus=0,  resources={"OTHER_NODE": 1})
+class ResultActor:
+    def __init__(self):
+        self.results = {}
+
+    def predict(self, i, image):
+        self.results[i] = image
+    
+    async def get_async_result(self, i):
+        result = self.results.pop(i, None)
+        while result is None:
+            print(f"Awaiting {i}")
+            result = self.results.pop(i, None)
+            print(f"Done awaiting {i}")
+            await asyncio.sleep(1)
+        print(f"GOT RESULT FOR {i}")
+        return result
+
+
+result_actor = ResultActor.remote()
+
+# SEND DATA TO ResultActor
+for i in range(TOTAL_IMAGES):
+    image = (np.random.random((192, 1080, 3)) * 255).astype(np.uint8)  # ~ 0.5MB
+    result_actor.predict.remote(i, image)
+
+# Async get all data
+async def get_all_results():
+    futs = []
+    fails = 0
+    for i in range(TOTAL_IMAGES):
+        fut = result_actor.get_async_result.remote(i)
+        futs.append(fut)
+        try:
+            await asyncio.wait_for(fut, timeout=5)
+            print(f"SUCCESS {i}")
+        except:
+            print(f"FAIL {i}")
+            fails += 1
+
+    # ALTERNATIVE: Await all at the same time
+    # done, pending = await asyncio.wait(futs, timeout=5)
+    # if len(pending):
+    #     print(f"FAILED! {int(100.*len(pending)/TOTAL_IMAGES)}% tasks not succeeded!")
+
+    print(f"FAIL RATIO: {int(100.*fails/TOTAL_IMAGES)}%")
+
+
+loop = asyncio.new_event_loop()
+loop.run_until_complete(get_all_results())
+&lt;/denchmark-code&gt;
+
+The output of this script is:
+&lt;denchmark-code&gt;2020-10-27 16:31:23,203	INFO worker.py:634 -- Connecting to existing Ray cluster at address: 10.43.87.248:6379
+(pid=883, ip=10.42.0.8) GOT RESULT FOR 0
+FAIL 0
+(pid=883, ip=10.42.0.8) GOT RESULT FOR 1
+FAIL 1
+SUCCESS 2
+(pid=883, ip=10.42.0.8) GOT RESULT FOR 2
+(pid=883, ip=10.42.0.8) GOT RESULT FOR 3
+FAIL 3
+(pid=883, ip=10.42.0.8) GOT RESULT FOR 4
+FAIL 4
+(pid=883, ip=10.42.0.8) GOT RESULT FOR 5
+FAIL 5
+(pid=883, ip=10.42.0.8) GOT RESULT FOR 6
+FAIL 6
+SUCCESS 7
+(pid=883, ip=10.42.0.8) GOT RESULT FOR 7
+(pid=883, ip=10.42.0.8) GOT RESULT FOR 8
+FAIL 8
+(pid=883, ip=10.42.0.8) GOT RESULT FOR 9
+FAIL 9
+FAIL RATIO: 80%
+&lt;/denchmark-code&gt;
+
+As shown, we get print statements from the actor returning data, but the main process does not receive the data it is awaiting.
+When the Actor is scheduled on the driver node, there is no issue.
+When the data that is transfered is small (I assume &lt;100kB) there also is no issue.
+
+ I have verified my script runs in a clean environment and reproduces the issue.
+ I have verified the issue also occurs with the latest wheels.
+
+	</description>
+	<comments>
+		<comment id='1' author='PidgeyBE' date='2020-10-27T16:59:15Z'>
+		This looks really problematic. We will try to repro and get back to you ASAP.
+		</comment>
+		<comment id='2' author='PidgeyBE' date='2020-10-27T17:15:56Z'>
+		Here's a modified version that can reproduce this on a single node, using ray cluster utils:
+import os
+import numpy as np
+import ray
+import asyncio
+from ray.cluster_utils import Cluster
+
+cluster = Cluster()
+head_node = cluster.add_node()
+child_node = cluster.add_node(resources={"OTHER_NODE": 100})
+
+ray.init(address=head_node.address)
+
+TOTAL_IMAGES = 10
+
+@ray.remote(num_cpus=0,  resources={"OTHER_NODE": 1})
+class ResultActor:
+    def __init__(self):
+        self.results = {}
+
+    def predict(self, i, image):
+        self.results[i] = image
+    
+    async def get_async_result(self, i):
+        result = self.results.pop(i, None)
+        while result is None:
+            print(f"Awaiting {i}")
+            result = self.results.pop(i, None)
+            print(f"Done awaiting {i}")
+            await asyncio.sleep(1)
+        print(f"GOT RESULT FOR {i}")
+        return result
+
+
+result_actor = ResultActor.remote()
+
+# SEND DATA TO ResultActor
+for i in range(TOTAL_IMAGES):
+    image = (np.random.random((192, 1080, 3)) * 255).astype(np.uint8)  # ~ 0.5MB
+    result_actor.predict.remote(i, image)
+
+# Async get all data
+async def get_all_results():
+    futs = []
+    fails = 0
+    for i in range(TOTAL_IMAGES):
+        fut = result_actor.get_async_result.remote(i)
+        futs.append(fut)
+        try:
+            await asyncio.wait_for(fut, timeout=5)
+            print(f"SUCCESS {i}")
+        except:
+            print(f"FAIL {i}")
+            fails += 1
+
+    # ALTERNATIVE: Await all at the same time
+    # done, pending = await asyncio.wait(futs, timeout=5)
+    # if len(pending):
+    #     print(f"FAILED! {int(100.*len(pending)/TOTAL_IMAGES)}% tasks not succeeded!")
+
+    print(f"FAIL RATIO: {int(100.*fails/TOTAL_IMAGES)}%")
+
+
+loop = asyncio.new_event_loop()
+loop.run_until_complete(get_all_results())
+		</comment>
+		<comment id='3' author='PidgeyBE' date='2020-10-27T20:00:22Z'>
+		Did some more digging with &lt;denchmark-link:https://github.com/simon-mo&gt;@simon-mo&lt;/denchmark-link&gt;
+, seems like this is a subtle race condition in the mess of callbacks we're using to async await for plasma objects. Think we've identified the root cause, should be able to open a PR with a fix soon.
+		</comment>
+		<comment id='4' author='PidgeyBE' date='2020-10-28T02:59:18Z'>
+		The bug &lt;denchmark-link:https://github.com/edoakes&gt;@edoakes&lt;/denchmark-link&gt;
+ mentioned is a false alarm. The race condition actually turned out to be somewhere between two instances of  in:
+
+TaskDependencyManager::HandleRemoteDependencyCanceled
+ObjectManager::HandleObjectAdded
+
+When we comment out the CancellPull in TaskDependencyManager, the script can run reliably 100% even when I increase the number of trials and size of images.
+diff --git a/src/ray/raylet/task_dependency_manager.cc b/src/ray/raylet/task_dependency_manager.cc
+index e0b585f45..46e3af2cb 100644
+--- a/src/ray/raylet/task_dependency_manager.cc
++++ b/src/ray/raylet/task_dependency_manager.cc
+@@ -79,7 +79,7 @@ void TaskDependencyManager::HandleRemoteDependencyCanceled(const ObjectID &amp;objec
+   if (!required) {
+     auto it = required_objects_.find(object_id);
+     if (it != required_objects_.end()) {
+-      object_manager_.CancelPull(object_id);
++      // object_manager_.CancelPull(object_id);
+       reconstruction_policy_.Cancel(object_id);
+       required_objects_.erase(it);
+     }
+
+Of course this won't the right fix. But this seems to identify the root cause reliably, TaskDependencyManager tries to cancel outstanding pull requests issued by CoreWorker::Get.
+cc &lt;denchmark-link:https://github.com/edoakes&gt;@edoakes&lt;/denchmark-link&gt;
+, &lt;denchmark-link:https://github.com/stephanie-wang&gt;@stephanie-wang&lt;/denchmark-link&gt;
+ , &lt;denchmark-link:https://github.com/ijrsvt&gt;@ijrsvt&lt;/denchmark-link&gt;
+.
+		</comment>
+		<comment id='5' author='PidgeyBE' date='2020-10-28T03:18:58Z'>
+		The TaskDependencyManager cancels outstanding pull requests once the raylet tells it the object is on longer needed by any worker on that node. This is to prevent a leak where the raylet will keep asking other nodes for an object even though no one needs it. That's also why pull requests get canceled for a ray.get with a timeout.
+Took a quick look at the core worker code, and it seems like the &lt;denchmark-link:https://github.com/ray-project/ray/blob/master/src/ray/core_worker/core_worker.cc#L2282&gt;CoreWorker::PlasmaCallback&lt;/denchmark-link&gt;
+ never subscribes properly to the TaskDependencyManager. It does a Get with a timeout of 0 and then subscribes to local object notifications. But no one is pulling the object, so the local object notification never appears.
+Seems like the right thing to do is to call TaskDependencyManager::SubscribeWaitDependencies in the raylet handler for subscribing to a plasma object. That should open a pull request to remote nodes until the objects are made local. But I'm not sure how to handle corner cases: calling await on an ObjectRef with a timeout and/or needing to reopen a pull request if the object gets evicted after it's made local.
+		</comment>
+		<comment id='6' author='PidgeyBE' date='2020-10-28T03:23:28Z'>
+		That's awesome! I will try out using SubscribeWaitDependencies
+		</comment>
+	</comments>
+</bug>

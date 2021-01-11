@@ -1,0 +1,235 @@
+<bug_data>
+<bug id='17246' author='yaroslavvb' open_date='2018-02-24T23:39:54Z' closed_time='2019-03-07T00:10:47Z'>
+ 	<summary>Fetching value of Variable unnecessarily slow</summary>
+ 	<description>
+ Doing sess.run(var) is about 5x slower than sess.run(var+1).
+ python &lt;denchmark-link:https://github.com/diux-dev/cluster/blob/26f8e01bd79e49fe2d1dac342dd90493f693b85c/yuxin_numpy/variable_fetch_bug_report.py&gt;variable_fetch_bug_report.py&lt;/denchmark-link&gt;
+ 
+ 100MB variable
+ fetch_cpu_variable  : 2.5 GB/sec, min: 40.74, median: 41.33, mean: 42.08
+ fetch_cpu_variable_add: 12.6 GB/sec, min: 7.96, median: 8.54, mean: 8.71
+ fetch_cpu_variable_concat: 14.0 GB/sec, min: 7.12, median: 8.14, mean: 8.28
+ TensorFlow version info:
+ version: 1.7.0-dev20180221
+ : v1.6.0-rc1-337-gd100729
+ &lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/d100729&gt;d100729&lt;/denchmark-link&gt;
+ 
+ 	</description>
+ 	<comments>
+ 		<comment id='1' author='yaroslavvb' date='2018-02-26T19:54:38Z'>
+ 		&lt;denchmark-link:https://github.com/mrry&gt;@mrry&lt;/denchmark-link&gt;
+  Any clue what's going on here?
+ 		</comment>
+ 		<comment id='2' author='yaroslavvb' date='2018-02-26T20:31:16Z'>
+ 		Presumably it's copying when it doesn't (?) need to. &lt;denchmark-link:https://github.com/alextp&gt;@alextp&lt;/denchmark-link&gt;
+  added the optimizations for the fetch path, so might know what could be going on here.
+ 		</comment>
+ 		<comment id='3' author='yaroslavvb' date='2018-02-26T20:36:27Z'>
+ 		Does the problem also happen with resource variables? (tfe.Variable or tf.get_variable(..., use_resource=True)
+ 		</comment>
+ 		<comment id='4' author='yaroslavvb' date='2018-02-26T22:10:03Z'>
+ 		Yes, same speed is with resource variables. I also get fast fetch speed if I turn off all optimizers and fetch var+0
+ &lt;denchmark-link:https://github.com/diux-dev/cluster/blob/37d069c20fae6aeac10a53e3f801d29aebc5d6b4/yuxin_numpy/tf_numpy_benchmark.py&gt;tf_numpy_benchmark.py&lt;/denchmark-link&gt;
+ 
+ &lt;denchmark-code&gt;python tf_numpy_benchmark.py --benchmark=fetch_cpu_variable_add --size-mb=1024 --num-iters=31
+ fetch_cpu_variable_add        :  21.0 GB/sec, min: 48.83, median: 56.08, mean: 55.69
+ 
+ python tf_numpy_benchmark.py --benchmark=fetch_cpu_resource_variable --num-iters=11 --size-mb=1024
+ fetch_cpu_variable            :   2.6 GB/sec, min: 401.36, median: 404.02, mean: 403.63
+ &lt;/denchmark-code&gt;
+ 
+ I suspect that fetching variable triggers a single threaded memcpy. Meanwhile fetching "var+0" uses multiple cores, so it's essentially a multi-threaded memory copy
+ 		</comment>
+ 		<comment id='5' author='yaroslavvb' date='2018-02-26T22:58:33Z'>
+ 		The code which fetches tensors is &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/master/tensorflow/python/lib/core/ndarray_tensor.cc#L331&gt;https://github.com/tensorflow/tensorflow/blob/master/tensorflow/python/lib/core/ndarray_tensor.cc#L331&lt;/denchmark-link&gt;
+  which calls &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/master/tensorflow/c/c_api.cc#L227&gt;https://github.com/tensorflow/tensorflow/blob/master/tensorflow/c/c_api.cc#L227&lt;/denchmark-link&gt;
+  which triggers a copy if the refcount is not 1 (and it's never 1 for variables). It does the copy with normal memcpy.
+ I remember people caring passionately about us not simply forwarding the memory when tensorflow still holds a reference to it as it can break some py_func use cases and some multithreaded use cases.
+ So I guess we should use a faster memcpy?
+ 		</comment>
+ 		<comment id='6' author='yaroslavvb' date='2018-02-27T00:58:35Z'>
+ 		Yes, faster memcpy would also resolve &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/17233&gt;#17233&lt;/denchmark-link&gt;
+  , until there are better tools to create 64-byte aligned numpy arrays.
+ (PS: I wonder if this alignment requirement is moot in a first place. In PyTorch, I can inititialize tensors from unaligned numpy arrays, with memory reuse, and add them at 20 GB/second on CPU, there's no benefit in starting with aligned memory.)
+ 		</comment>
+ 		<comment id='7' author='yaroslavvb' date='2018-03-06T01:43:42Z'>
+ 		Having faster memcpy in TF also could be later worked into open-source distributed TensorFlow. Right now sending messages locally in Open-Source distributed TF is done at speed of single-threaded memcpy, so TF process can't take advantage of faster network cards (ie, AWS instances have 25 Gbps)
+ 		</comment>
+ 		<comment id='8' author='yaroslavvb' date='2018-03-20T17:48:18Z'>
+ 		BTW, here's an example of multi-threaded memcpy with some performance numbers on the same system. The time for 100MB chunk goes from 40ms to 5ms on the same system
+ &lt;denchmark-link:https://github.com/diux-dev/cluster/blob/master/psbench/memcpy.cc&gt;https://github.com/diux-dev/cluster/blob/master/psbench/memcpy.cc&lt;/denchmark-link&gt;
+ 
+ 		</comment>
+ 		<comment id='9' author='yaroslavvb' date='2018-03-20T18:03:12Z'>
+ 		On dual XeonV4
+ &lt;denchmark-code&gt;wget https://raw.githubusercontent.com/diux-dev/cluster/master/psbench/memcpy.cc
+ g++ -std=c++0x memcpy.cc -pthread -march=native -O6
+ ./a.out 1000 32
+ 
+ Stream copy 32 threads: 4.8 ms, 20.98 GB/sec
+ Stream copy 32 threads: 4.9 ms, 20.53 GB/sec
+ Stream copy 32 threads: 4.8 ms, 20.87 GB/sec
+ Stream copy 32 threads: 4.9 ms, 20.36 GB/sec
+ Stream copy 32 threads: 4.8 ms, 20.74 GB/sec
+ Stream copy 32 threads: 4.7 ms, 21.39 GB/sec
+ 
+ &lt;/denchmark-code&gt;
+ 
+ 		</comment>
+ 		<comment id='10' author='yaroslavvb' date='2018-03-20T18:14:53Z'>
+ 		A single threaded call to the system memcpy should be able to hit the memory bandwidth of the system except in two cases:
+ 
+ 
+ there are many small copies (not the case here)
+ 
+ 
+ A single large copy will normally hit the memcpy path that avoids polluting the cache (the copies will be done using streaming memory instructions), this is known to decrease absolute performance but avoids cache pollution on multiprocessor machines.  This is hardcoded behavior of glibc.  The latest versions of glibc should expose this parameter as a tunable value (I put them there, see https://www.gnu.org/software/libc/manual/html_node/Hardware-Capability-Tunables.html#Hardware-Capability-Tunables).   Can you try making the non-temporal threshold larger than your copy size?
+ 
+ 
+ I suspect what's happening is that when you shard the copy 32 times it drops below the hard-coded non temporal threshold and you're hitting the faster path (but blowing out the caches).
+ 		</comment>
+ 		<comment id='11' author='yaroslavvb' date='2018-03-20T19:54:30Z'>
+ 		That benchmark was done using a loop with calls to _mm256_stream_load_si256 and _mm256_stream_si256 rather than memcpy.
+ I tried using &lt;denchmark-link:https://github.com/diux-dev/cluster/blob/master/psbench/memcpy_classic.cc&gt;regular memcpy&lt;/denchmark-link&gt;
+  and the performance is very close, so I think stock memcpy is already using stream version.
+ However, single threaded performance is quite far from multi-threaded performance. Here's an experiment on AWS c5.18xlarge instance (dual 18-core Skylake), it runs 6x faster than single-threaded memcpy, copying 100MB array in 2.7ms. Skylakes &lt;denchmark-link:https://www.anandtech.com/show/11544/intel-skylake-ep-vs-amd-epyc-7000-cpu-battle-of-the-decade/12&gt;supposedly have&lt;/denchmark-link&gt;
+  200 GB/second memory bandwidth
+ &lt;denchmark-code&gt;wget -N https://raw.githubusercontent.com/diux-dev/cluster/master/psbench/memcpy_fast.cc
+ g++ -std=c++0x memcpy_fast.cc -pthread -march=native -O6 -o memcpy_fast
+ numactl --cpunodebind 0 --membind 0 ./memcpy_fast 100 16
+ Stream copy 16 threads: 2.7 ms, 37.33 GB/sec
+ Stream copy 16 threads: 2.7 ms, 37.41 GB/sec
+ Stream copy 16 threads: 2.7 ms, 37.19 GB/sec
+ Stream copy 16 threads: 2.7 ms, 37.27 GB/sec
+ &lt;/denchmark-code&gt;
+ 
+ This &lt;denchmark-link:http://web.archive.org/web/20131223174037/http://software.intel.com/en-us/articles/memcpy-performance/&gt;article&lt;/denchmark-link&gt;
+  talks limitations of default . Since it's precompiled, it doesn't use the latest instructions (ie, Skylakes have AVX512). Apparently  replaces  with machine optimized version
+ 		</comment>
+ 		<comment id='12' author='yaroslavvb' date='2018-03-20T20:05:22Z'>
+ 		That tunable didn't seem to make any difference for me, maybe glibc is too old (version 2.23)
+ &lt;denchmark-code&gt;export GLIBC_TUNABLES=glibc.tune.x86_non_temporal_threshold=100000000000
+ wget -N https://raw.githubusercontent.com/diux-dev/cluster/master/psbench/memcpy_classic.cc
+ g++ -std=c++0x memcpy_classic.cc -pthread -march=native -O6 -o memcpy_classic
+ ./memcpy_classic 100 
+ memcpy: 23.1 ms, 4.34 GB/sec
+ memcpy: 23.1 ms, 4.34 GB/sec
+ memcpy: 23.0 ms, 4.34 GB/sec
+ memcpy: 23.0 ms, 4.34 GB/sec
+ &lt;/denchmark-code&gt;
+ 
+ 		</comment>
+ 		<comment id='13' author='yaroslavvb' date='2018-03-20T20:40:47Z'>
+ 		Yes that's before it went in; 2.25 or 2.26 I believe.
+ That article is nearly a decade old and out of date.  The memcpy maintainer in glibc works for Intel.  There are assembly routines for every specialized architecture variant including AVX 512 in the latest versions (but AVX2 is preferred because of the large down clocks associated with using AVX 512).
+ I think your bandwidth calculation is off by a factor of 2, it only includes bytes read.
+ That being said, it does seem like I was incorrect and multi-threading does provide a benefit, especially on skylake.  However, 2.5 GB/sec from single threaded system memcpy seems way too low (even lowly skylake should get 10 GB/sec), so I don't know that we completely understand what's going on here.
+ 		</comment>
+ 		<comment id='14' author='yaroslavvb' date='2018-03-20T20:55:50Z'>
+ 		I see.
+ To summarize, currently tensorflow takes 40ms to fetch a 100MB variable on CPU, whereas copying 100MB on same machine is possible to do in 2.7ms.
+ This delay is an issue when integrating TensorFlow with other systems. For instance resnet-50 backprop is 120ms, if you use something like Ray to synchronize parameter values between machines, this extra 40ms delay is significant
+ 		</comment>
+ 		<comment id='15' author='yaroslavvb' date='2018-03-31T21:00:21Z'>
+ 		cc &lt;denchmark-link:https://github.com/tatianashp&gt;@tatianashp&lt;/denchmark-link&gt;
+ 
+ 		</comment>
+ 		<comment id='16' author='yaroslavvb' date='2018-06-07T21:06:12Z'>
+ 		I believe that &lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/879fc3440495d9388754cb7d1878caf034d03d61&gt;879fc34&lt;/denchmark-link&gt;
+  should solve this issue (or at least make it slightly better). Though solution is CPU/platform/glibc dependent, on my CPU (Intel Broadwell with HyperThreading (6 cores) dL1:32KB dL2:256KB dL3:15MB) I see ~1.7x improvement.
+ 		</comment>
+ 		<comment id='17' author='yaroslavvb' date='2018-06-12T17:12:38Z'>
+ 		Weird, is memmove doing multi-threaded copy?
+ BTW, here's the code that does 100MB copy in 2.7 ms on Skylake. Besides multi-threading, it uses stream instructions to turn off cache, cache just slows things down on large copies
+ &lt;denchmark-code&gt;wget -N https://raw.githubusercontent.com/diux-dev/cluster/master/psbench/memcpy_fast.cc
+ g++ -std=c++0x memcpy_fast.cc -pthread -march=native -O6 -o memcpy_fast
+ numactl --cpunodebind 0 --membind 0 ./memcpy_fast 100 16
+ Stream copy 16 threads: 2.7 ms, 37.33 GB/sec
+ Stream copy 16 threads: 2.7 ms, 37.41 GB/sec
+ &lt;/denchmark-code&gt;
+ 
+ 		</comment>
+ 		<comment id='18' author='yaroslavvb' date='2018-06-12T18:04:37Z'>
+ 		Nope, they both are single threaded, but memmove is using sse3 instruction to copy memory, while memcpy is using sse2 (that's what I see in perf). This "fix" is more like an ugly workaround for the old glibc versions.
+ There is a discussion in Eigen (&lt;denchmark-link:https://bitbucket.org/eigen/eigen/pull-requests/292/adds-a-fast-memcpy-function-to-eigen/diff&gt;https://bitbucket.org/eigen/eigen/pull-requests/292/adds-a-fast-memcpy-function-to-eigen/diff&lt;/denchmark-link&gt;
+ ), but that change was later rolled back because it's not  guaranteed to be faster.
+ 		</comment>
+ 		<comment id='19' author='yaroslavvb' date='2018-06-28T17:30:55Z'>
+ 		I'm closing this issue now since I think &lt;denchmark-link:https://github.com/ezhulenev&gt;@ezhulenev&lt;/denchmark-link&gt;
+  's change fixed the problem. Please reopen if that's not the case.
+ 		</comment>
+ 		<comment id='20' author='yaroslavvb' date='2018-06-28T17:41:46Z'>
+ 		From the discussion in the eigen thread (by &lt;denchmark-link:https://github.com/rmlarsen&gt;@rmlarsen&lt;/denchmark-link&gt;
+  ), looks like the above fix is only a workaround for suckiness in certain version of glibc (where memmove is even faster than memcpy).
+ 		</comment>
+ 		<comment id='21' author='yaroslavvb' date='2018-07-16T11:00:01Z'>
+ 		The change improves single threaded copy, but it's still much faster to fetch a+0 instead of a on Skylake, because the former does multi-threaded
+ 		</comment>
+ 		<comment id='22' author='yaroslavvb' date='2018-07-17T17:50:45Z'>
+ 		BTW, I just did a benchmark with TF on DLAMI v11 (with MKL) on Skylake 18 core, and I'm seeing 10x improvement if I fetch "var+0" instead of var. Could try with nightly because of &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/20887&gt;#20887&lt;/denchmark-link&gt;
+ 
+ &lt;denchmark-code&gt;# fetching variable is slow from TF, because its single threaded
+ python tf_numpy_benchmark.py --benchmark=fetch_cpu_variable --num-iters=200
+ fetch_cpu_variable            :   2.0 GB/sec, min: 50.75, median: 50.89, mean: 50.94
+ 
+ # however, there's a trick, adding 0 to variable makes it multithreaded 10x faster
+ python tf_numpy_benchmark.py --benchmark=fetch_cpu_variable_plus0 --num-iters=200
+ fetch_cpu_variable            :  33.1 GB/sec, min:  3.02, median:  3.21, mean:  3.22
+ 
+ &lt;/denchmark-code&gt;
+ 
+ 		</comment>
+ 		<comment id='23' author='yaroslavvb' date='2018-07-17T19:03:13Z'>
+ 		Still present in tf_nightly ("b'v1.9.0-rc2-572-geadcdf91aa'")
+ 		</comment>
+ 		<comment id='24' author='yaroslavvb' date='2018-07-18T03:36:20Z'>
+ 		&lt;denchmark-link:https://github.com/yaroslavvb&gt;@yaroslavvb&lt;/denchmark-link&gt;
+  Mkl has it's own kernel for Add, if it's easy for you to do the same test with default Tensorflow, I'd be very interested to know if it's any significant difference between MKL and Eigen for such simple kernel
+ 		</comment>
+ 		<comment id='25' author='yaroslavvb' date='2018-07-18T05:45:14Z'>
+ 		Doing  I get about 8x speed-up instead of 10x by using +0 trick (tfnightly points to this commit &lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/eadcdf91aa&gt;eadcdf9&lt;/denchmark-link&gt;
+ )
+ &lt;denchmark-code&gt;# regular fetching
+ python tf_numpy_benchmark.py --benchmark=fetch_cpu_variable
+ fetch_cpu_variable            :   2.0 GB/sec, min: 49.50, median: 49.62, mean: 49.68
+ 
+ # stock tensorflow
+ python tf_numpy_benchmark.py --benchmark=fetch_cpu_variable_plus0
+ fetch_cpu_variable_plus0      :  16.2 GB/sec, min:  6.19, median:  6.94, mean:  6.94
+ 
+ # DLAMI version
+ python tf_numpy_benchmark.py --benchmark=fetch_cpu_variable_plus0
+ fetch_cpu_variable_plus0      :  25.8 GB/sec, min:  3.87, median:  4.03, mean:  4.04
+ &lt;/denchmark-code&gt;
+ 
+ 		</comment>
+ 		<comment id='26' author='yaroslavvb' date='2019-03-03T17:13:32Z'>
+ 		&lt;denchmark-link:https://github.com/yaroslavvb&gt;@yaroslavvb&lt;/denchmark-link&gt;
+  Please let us know if this this still an issue with latest TF or can we close this issue? Thanks!
+ 		</comment>
+ 		<comment id='27' author='yaroslavvb' date='2019-03-07T00:10:46Z'>
+ 		Closing due to lack of recent activity. Please open a new ticket when new information becomes available. Thanks!
+ 		</comment>
+ 	</comments>
+ </bug>
+<commit id='879fc3440495d9388754cb7d1878caf034d03d61' author='Eugene Zhulenev' date='2018-06-06 11:29:18-07:00'>
+ 	<dmm_unit complexity='0.0' interfacing='0.0' size='0.0'></dmm_unit>
+ 	<modification change_type='MODIFY' old_name='tensorflow\python\lib\core\ndarray_tensor.cc' new_name='tensorflow\python\lib\core\ndarray_tensor.cc'>
+ 		<file_info nloc='382' complexity='88' token_count='2833'></file_info>
+ 		<method name='tensorflow::FastMemcpy' parameters='dst,src,size'>
+ 				<method_info nloc='22' complexity='18' token_count='272' nesting_level='2' start_line='316' end_line='347'></method_info>
+ 			<added_lines>316,317,318,319,320,321,322,323,324,325,326,327,328,329,330,331,332,333,334,335,336,337,338,339,340,341,342,343,344,345,346,347</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<method name='tensorflow::TF_TensorToPyArray' parameters='tensor,out_ndarray'>
+ 				<method_info nloc='47' complexity='8' token_count='388' nesting_level='1' start_line='353' end_line='407'></method_info>
+ 			<added_lines>399,400</added_lines>
+ 			<deleted_lines>365,366</deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines>315,348</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ </commit>
+</bug_data>

@@ -1,0 +1,189 @@
+<bug id='7775' author='ejunprung' open_date='2020-03-27T17:01:10Z' closed_time='2020-03-31T18:20:57Z'>
+	<summary>[tune] Unable to resume training from a different machine</summary>
+	<description>
+&lt;denchmark-h:h3&gt;What is the problem?&lt;/denchmark-h&gt;
+
+Assume there are two machines: machine 1 and machine 2. We're unable to resume training from machine 2 using the output folder copied from machine 1. It results in the following error:
+(ip: 100.97.18.3) detected as stale. This is likely because the node was lost
+This error only occurs when attempting to resume from a checkpoint. If no checkpoint exists, resume=True will correctly restart training from scratch. We have attempted to manually override hostname and node_ip in experiment_state-xxxx-xx-xx_xx-xx-xx.json to no avail.
+Ray version and other system information (Python version, TensorFlow version, OS):
+Ray 0.7.6
+Tensorflow 1.13.1
+Python 3.6.9
+Ubuntu 18.04.2 LTS
+&lt;denchmark-h:h3&gt;Reproduction (REQUIRED)&lt;/denchmark-h&gt;
+
+It’s a bit difficult to provide a script. You need two machines:
+Machine 1: Partially train a model until a checkpoint is generated.
+Machine 2: Copy output folder from Machine 1 and try to resume training from Machine 2.
+Richard Liaw recommended that we test:
+&lt;denchmark-code&gt;from ray.tune.ray_trial_executor import RayTrialExecutor
+class testTrialExecutor(RayTrialExecutor):
+    def get_next_failed_trial(self):
+        """Gets the first trial found to be running on a node presumed dead.
+        Returns:
+            A Trial object that is ready for failure processing. None if
+            no failure detected.
+        """
+        return None
+tune.run(..., trial_executor=testTrialExecutor())
+&lt;/denchmark-code&gt;
+
+However, this simply restarted the run from scratch, unfortunately.
+	</description>
+	<comments>
+		<comment id='1' author='ejunprung' date='2020-03-27T17:05:59Z'>
+		Did you also include resume in the tune.run with the new executor?
+		</comment>
+		<comment id='2' author='ejunprung' date='2020-03-27T17:23:20Z'>
+		Correct. However, there's an inconsistency that I just realized.
+In tune.run, we set:
+Machine 1: resume=False
+Machine 2: resume=True
+Not sure if it matters but I'll test to see if having both as resume=True helps. I'll also test the latest RLlib soon.
+		</comment>
+		<comment id='3' author='ejunprung' date='2020-03-27T18:08:05Z'>
+		I don't think the resume matters, but you can try.
+Can you actually provide a logging output of the testTrialExecutor?
+Also, if you could do:
+&lt;denchmark-code&gt;import logging
+logger = logging.getLogger("ray.tune")
+logger.setLevel("DEBUG")
+&lt;/denchmark-code&gt;
+
+before executing, that would be super helpful!
+		</comment>
+		<comment id='4' author='ejunprung' date='2020-03-31T18:20:56Z'>
+		&lt;denchmark-link:https://github.com/richardliaw&gt;@richardliaw&lt;/denchmark-link&gt;
+ Sorry for the delay.
+We've found all the different locations in which node information is saved and implemented a workaround to override everything. Seems to work great now. Thanks for all the help!
+		</comment>
+		<comment id='5' author='ejunprung' date='2020-03-31T21:25:15Z'>
+		Great! Can you provide a quick snippet of what you had to do, just for
+others who might want to do the same?
+&lt;denchmark-link:#&gt;…&lt;/denchmark-link&gt;
+
+
+On Tue, Mar 31, 2020 at 11:21 AM ejunprung ***@***.***&gt; wrote:
+ Closed #7775 &lt;#7775&gt;.
+
+ —
+ You are receiving this because you were mentioned.
+ Reply to this email directly, view it on GitHub
+ &lt;#7775 (comment)&gt;, or
+ unsubscribe
+ &lt;https://github.com/notifications/unsubscribe-auth/ABCRZZMARWRBHBKBEJPOXOTRKIYBVANCNFSM4LVEZ3FQ&gt;
+ .
+
+
+
+		</comment>
+		<comment id='6' author='ejunprung' date='2020-04-06T22:04:10Z'>
+		Yup, of course. See below.
+If the ability to resume from other machines could be added to later versions of RLlib, that'd be much appreciated. The workaround below is fine for now, though.
+&lt;denchmark-code&gt;import json
+import os
+import types
+from ray.utils import binary_to_hex, hex_to_binary
+from ray.tune.trial import Trial
+import ray.cloudpickle as cloudpickle
+import logging
+import socket
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+class _TuneFunctionEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, types.FunctionType):
+            return self._to_cloudpickle(obj)
+        try:
+            return super(_TuneFunctionEncoder, self).default(obj)
+        except Exception:
+            logger.debug("Unable to encode. Falling back to cloudpickle.")
+            return self._to_cloudpickle(obj)
+
+    def _to_cloudpickle(self, obj):
+        return {
+            "_type": "CLOUDPICKLE_FALLBACK",
+            "value": binary_to_hex(cloudpickle.dumps(obj))
+        }
+
+
+class _TuneFunctionDecoder(json.JSONDecoder):
+    def __init__(self, *args, **kwargs):
+        json.JSONDecoder.__init__(
+            self, object_hook=self.object_hook, *args, **kwargs)
+
+    def object_hook(self, obj):
+        if obj.get("_type") == "CLOUDPICKLE_FALLBACK":
+            return self._from_cloudpickle(obj)
+        return obj
+
+    def _from_cloudpickle(self, obj):
+        return cloudpickle.loads(hex_to_binary(obj["value"]))
+
+def _find_newest_ckpt(ckpt_dir):
+    """Returns path to most recently modified checkpoint."""
+    full_paths = [
+        os.path.join(ckpt_dir, fname) for fname in os.listdir(ckpt_dir)
+        if fname.startswith("experiment_state") and fname.endswith(".json")
+    ]
+    return max(full_paths)
+
+def _get_host():
+    return os.getenv("NODE_IP", socket.gethostbyname(socket.gethostname()))
+
+def update_checkpoint_node_info(newest_ckpt_path):
+    with open(newest_ckpt_path, "r") as f:
+        runner_state = json.load(f, cls=_TuneFunctionDecoder)
+        checkpoint_file = newest_ckpt_path
+
+    trial_states = {}
+    for trial_cp in runner_state["checkpoints"]:
+        trial = Trial(trial_cp["trainable_name"])
+
+        # save the current status of trial since trial.__setstate__ change this (RUNNING -&gt; PENDING)
+        trial_status = trial_cp["status"]
+
+        trial.__setstate__(trial_cp)
+
+        # change ip for trials that has checkpoint
+        if trial._checkpoint.value is not None:
+            trial._checkpoint.last_result["hostname"] = socket.gethostname()
+            trial._checkpoint.last_result["node_ip"] = _get_host()
+
+        trial_state = trial.__getstate__()
+        trial_state["status"] = trial_status 
+        trial_states[trial.trial_id] = trial_state
+
+    runner_state["checkpoints"] = list(trial_states.values())
+
+    tmp_file_name = os.path.join(str(Path(newest_ckpt_path).parent),
+                                     ".tmp_checkpoint")
+    with open(tmp_file_name, "w") as f:
+        json.dump(runner_state, f, indent=2, cls=_TuneFunctionEncoder)
+
+    os.rename(tmp_file_name, checkpoint_file)
+
+def update_existing_output_node_info(newest_ckpt_path):
+    with open(newest_ckpt_path, "r") as f:
+        runner_state = json.load(f)
+    if len(runner_state["checkpoints"]) == 0:
+        return False
+
+    previous_ip = runner_state["checkpoints"][0]["last_result"]["node_ip"]
+    previous_host_name = runner_state["checkpoints"][0]["last_result"]["hostname"]
+    
+    os.system("find ./* -type f -exec sed -i 's/" + previous_ip + "/" + _get_host() + "/g' {} \;")
+
+local_checkpoint_dir = os.path.join(os.getcwd(), "PPO")
+newest_ckpt_path = _find_newest_ckpt(local_checkpoint_dir)
+
+update_existing_output_node_info(newest_ckpt_path)
+update_checkpoint_node_info(newest_ckpt_path)
+&lt;/denchmark-code&gt;
+
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,367 @@
+<bug id='5063' author='WillianFuks' open_date='2020-06-11T00:03:55Z' closed_time='2020-06-17T19:12:46Z'>
+	<summary>Google Cloud Storage 403 Forbidden Error</summary>
+	<description>
+What steps did you take and what happened:
+Here's the step-by-step files to replicate the issue:
+
+create_cluster.sh
+
+&lt;denchmark-code&gt;cat &lt;&lt;EOF &gt; create_cluster.sh
+#!/bin/sh
+
+COMPUTE_ZONE="us-central1-a"
+CLUSTER_NAME="test"
+
+gcloud config set project $PROJECT_ID
+gcloud config set compute/zone $COMPUTE_ZONE
+
+gcloud container clusters create $CLUSTER_NAME \
+    --enable-autoupgrade \
+    --scopes cloud-platform \
+    --machine-type n1-standard-2 \
+    --zone=$COMPUTE_ZONE \
+    --disk-size=20GB \
+    --num-nodes=2
+
+gcloud components install kubectl
+gcloud container clusters get-credentials pysearchml --zone=$COMPUTE_ZONE
+
+export PIPELINE_VERSION=0.5.1
+kubectl apply -k "github.com/kubeflow/pipelines/manifests/kustomize/cluster-scoped-resources?ref=$PIPELINE_VERSION"
+kubectl wait --for condition=established --timeout=60s crd/applications.app.k8s.io
+kubectl apply -k "github.com/kubeflow/pipelines/manifests/kustomize/env/dev?ref=$PIPELINE_VERSION"
+EOF
+&lt;/denchmark-code&gt;
+
+
+build_sa.sh
+
+&lt;denchmark-code&gt;cat &lt;&lt;EOF &gt; build_sa.sh
+#!/bin/sh
+
+PROJECT_ID=$PROJECT_ID
+NAME="servicetest"
+
+gcloud iam service-accounts create $NAME --project $PROJECT_ID --display-name $NAME
+
+for ROLE in roles/editor roles/storage.admin roles/bigquery.admin roles/storage.objectAdmin;
+    do
+        gcloud projects add-iam-policy-binding $PROJECT_ID \
+            --member=serviceAccount:$NAME@$PROJECT_ID.iam.gserviceaccount.com \
+	    --role=$ROLE
+    done
+
+gcloud iam service-accounts keys create ./key.json --iam-account $NAME@$PROJECT_ID.iam.gserviceaccount.com
+EOF
+&lt;/denchmark-code&gt;
+
+
+Dockerfile
+
+&lt;denchmark-code&gt;cat &lt;&lt;EOF &gt; Dockerfile
+FROM python:3.7.7
+
+COPY . .
+ENV GOOGLE_APPLICATION_CREDENTIALS=./key.json
+RUN pip install google-cloud-storage
+EOF
+&lt;/denchmark-code&gt;
+
+
+run.py
+
+&lt;denchmark-code&gt;cat &lt;&lt;EOF &gt; run.py
+from google.cloud import storage
+
+
+storage_client = storage.Client.from_service_account_json('./key.json')
+bucket_obj = storage_client.bucket('bucket_name')
+print(bucket_obj.exists()) # -&gt; THIS BREAKS!!!
+EOF
+&lt;/denchmark-code&gt;
+
+
+components.yaml
+
+&lt;denchmark-code&gt;cat &lt;&lt;EOF &gt; components.yaml
+name: Testing Storage Python Access
+implementation:
+  container:
+    image: gcr.io/{PROJECT_ID}/test
+    command: ['python', 'run.py']
+EOF
+&lt;/denchmark-code&gt;
+
+
+build_docker.sh
+
+&lt;denchmark-code&gt;cat &lt;&lt;EOF &gt; build_docker.sh
+gcloud auth configure-docker
+
+docker build -t gcr.io/$PROJECT_ID/test .
+docker push gcr.io/$PROJECT_ID/test
+EOF
+&lt;/denchmark-code&gt;
+
+
+compile_pipe.sh
+
+&lt;denchmark-code&gt;cat &lt;&lt;EOF &gt; compile_pipe.sh
+dsl-compile --py pipeline.py --output pipeline.tar.gz
+EOF
+&lt;/denchmark-code&gt;
+
+
+pipeline.py
+
+&lt;denchmark-code&gt;cat &lt;&lt;EOF &gt; pipeline.py
+import os
+import pathlib
+
+from kfp import components, dsl
+
+
+PATH = pathlib.Path(__file__).parent
+
+
+def update_op_project_id_img(op):
+    project_id = os.getenv('PROJECT_ID')
+    if not project_id:
+        raise Exception('Please set an $PROJECT_ID env value.')
+    img = op.component_spec.implementation.container.image
+    img = img.format(PROJECT_ID=project_id)
+    op.component_spec.implementation.container.image = img
+    return op
+
+
+@dsl.pipeline()
+def build_lambdamart_pipeline():
+    component_path = PATH / 'component.yaml'
+    print(component_path)
+    stg_op_ = components.load_component_from_file(str(component_path))
+    stg_op_ = update_op_project_id_img(stg_op_)
+    stg_op = stg_op_().set_display_name('test')
+EOF
+&lt;/denchmark-code&gt;
+
+
+sync_pipes.sh
+
+&lt;denchmark-code&gt;cat &lt;&lt;EOF &gt; sync_pipes.sh
+gcloud container clusters get-credentials test
+kubectl describe configmap inverse-proxy-config -n kubeflow | grep googleusercontent.com
+EOF
+&lt;/denchmark-code&gt;
+
+I then make the files executable:
+&lt;denchmark-code&gt;chmod +x build_docker.sh build_sa.sh compile_pipe.sh create_cluster.sh sync_pipes.sh
+&lt;/denchmark-code&gt;
+
+and export the project id
+&lt;denchmark-code&gt;export PROJECT_ID=project_name
+&lt;/denchmark-code&gt;
+
+run gcloud login. Then I execute the files:
+&lt;denchmark-code&gt;./create_cluster.sh
+./build_sa.sh
+./build_docker.sh
+./compile_pipe.sh
+./sync_pipes.sh
+&lt;/denchmark-code&gt;
+
+The output of sync_pipes.sh is the pipelines UI host. I access it then and upload the compiled pipe.
+When running the pipeline, I finally get:
+&lt;denchmark-code&gt;Traceback (most recent call last):
+  File "run.py", line 6, in &lt;module&gt;
+    print(bucket_obj.exists())
+  File "/usr/local/lib/python3.7/site-packages/google/cloud/storage/bucket.py", line 684, in exists
+    timeout=timeout,
+  File "/usr/local/lib/python3.7/site-packages/google/cloud/_http.py", line 423, in api_request
+    raise exceptions.from_http_response(response)
+google.api_core.exceptions.Forbidden: 403 GET 
+https://storage.googleapis.com/storage/v1/b/bucket_name?fields=name
+: servicetest@(PROJECT_ID).iam.gserviceaccount.com does not have storage.buckets.get access to the Google Cloud Storage bucket.
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-link:https://user-images.githubusercontent.com/4665485/84328218-212c8f80-ab60-11ea-8c38-5076f3bacc53.png&gt;&lt;/denchmark-link&gt;
+
+The weird thing is that running locally this same code works fine. I also created a simple Flask application with the storage operation as well and deployed it to the K8 cluster and it worked fine. So far it seems that when the code is to be executed in KFP then it breaks.
+Also, I tested with a gsutil image like so:
+&lt;denchmark-code&gt;cat &lt;&lt;EOF &gt; components.yaml
+name: Export GS Op
+description: Sends input data to specified GCS bucket
+
+implementation:
+  container:
+    image: gcr.io/google.com/cloudsdktool/cloud-sdk
+    command: ['sh', '-c']
+    args: ['gsutil ls gs:// | grep pysearchml']
+EOF
+&lt;/denchmark-code&gt;
+
+And it works, which makes me think that this might be something related to the Python client. Maybe somewhere along the client credentials http request the header Authorization might be getting excluded somehow and then it ends up creating an anonymous client. Still, I'm not sure if this is indeed the case nor how to fix it.
+What did you expect to happen:
+No issues related to permission as the IAM has already been properly set and it works on the same cluster outside of the pipelines API.
+Environment:
+(Whole environment is already depicted in the previous codes samples)
+	</description>
+	<comments>
+		<comment id='1' author='WillianFuks' date='2020-06-11T00:04:02Z'>
+		Issue-Label Bot is automatically applying the labels:
+
+
+
+Label
+Probability
+
+
+
+
+kind/bug
+0.98
+
+
+platform/gcp
+0.78
+
+
+
+Please mark this comment with  or  to give our bot feedback!
+Links: &lt;denchmark-link:https://github.com/marketplace/issue-label-bot&gt;app homepage&lt;/denchmark-link&gt;
+, &lt;denchmark-link:https://github.com/marketplace/issue-label-botdata/kubeflow/kubeflow&gt;dashboard&lt;/denchmark-link&gt;
+ and &lt;denchmark-link:https://github.com/hamelsmu/MLapp&gt;code&lt;/denchmark-link&gt;
+ for this bot.
+		</comment>
+		<comment id='2' author='WillianFuks' date='2020-06-16T18:38:48Z'>
+		Hi &lt;denchmark-link:https://github.com/WillianFuks&gt;@WillianFuks&lt;/denchmark-link&gt;
+,
+&lt;denchmark-code&gt;servicetest@(PROJECT_ID).iam.gserviceaccount.com does not have storage.buckets.get access to the Google Cloud Storage bucket.
+&lt;/denchmark-code&gt;
+
+The issue is that you need to set role:  to get storage.buckets.get permission per &lt;denchmark-link:https://cloud.google.com/storage/docs/access-control/iam-roles&gt;IAM documentation&lt;/denchmark-link&gt;
+.
+HTH
+		</comment>
+		<comment id='3' author='WillianFuks' date='2020-06-16T20:38:14Z'>
+		Hi &lt;denchmark-link:https://github.com/frankyn&gt;@frankyn&lt;/denchmark-link&gt;
+ ,
+Thanks for the reply. I also tried giving this role to the sa (in the file build_sa.sh) but unfortunately it didn't work.
+When I test in directly on top of K8 then it works but when running inside the pipelines application is that I get this error message. For what I could debug so far, the issue is that when inside the pipelines, the credentials fail to complete its requests and the result is an &lt;denchmark-link:https://googleapis.dev/python/storage/latest/_modules/google/cloud/storage/client.html#Client.create_anonymous_client&gt;anonymous&lt;/denchmark-link&gt;
+ client.
+Not quite sure though why this is happening, I suspect that maybe some resource inside kfp is removing the authorization header from the packets.
+(as a side note, I tested it using the kustomization of env/dev and env/platform-agnostic but the result was the same).
+		</comment>
+		<comment id='4' author='WillianFuks' date='2020-06-16T21:13:20Z'>
+		Instead of using:
+cat &lt;&lt;EOF &gt; run.py
+from google.cloud import storage
+
+
+storage_client = storage.Client.from_service_account_json('./key.json')
+bucket_obj = storage_client.bucket('bucket_name')
+print(bucket_obj.exists()) # -&gt; THIS BREAKS!!!
+EOF
+Have you tried letting application default credentials load from GOOGLE_APPLICATION_CREDENTIALS?
+cat &lt;&lt;EOF &gt; run.py
+from google.cloud import storage
+
+storage_client = storage.Client()
+bucket_obj = storage_client.bucket('bucket_name')
+print(bucket_obj.exists())
+EOF
+		</comment>
+		<comment id='5' author='WillianFuks' date='2020-06-16T21:47:44Z'>
+		Also tried doing this approach but still it didn't work.
+Tested also building credentials from compute_engine but didn't work as well, got the same error message.
+		</comment>
+		<comment id='6' author='WillianFuks' date='2020-06-16T21:50:36Z'>
+		Thanks for clarifying, there may be one more thing to check.
+For the buckets you're accessing with the service account, are the buckets across multiple projects than the service account or live in the same project?
+If buckets live outside of the project that owns the service account, you'll need to grant the role roles/storage.admin to the service account in each of the projects or at least at the bucket level.
+		</comment>
+		<comment id='7' author='WillianFuks' date='2020-06-16T22:27:06Z'>
+		The buckets are in the same project as the one used to create the service accounts.
+Outside of kfp it works normally, just when running the code there is that it raises this exception.
+		</comment>
+		<comment id='8' author='WillianFuks' date='2020-06-17T15:24:20Z'>
+		Thanks for your patience on this. Could you enable logging for the Storage client by following instructions here: &lt;denchmark-link:https://medium.com/@franknatividad/debug-cloud-storage-client-libraries-f50f46ce7f6&gt;https://medium.com/@franknatividad/debug-cloud-storage-client-libraries-f50f46ce7f6&lt;/denchmark-link&gt;
+?
+If permissions are being set correctly, then this may help answer if something is wrong with the request.
+		</comment>
+		<comment id='9' author='WillianFuks' date='2020-06-17T18:32:44Z'>
+		Thanks &lt;denchmark-link:https://github.com/frankyn&gt;@frankyn&lt;/denchmark-link&gt;
+ for the idea and the article. I did as you suggested, here's the output:
+&lt;denchmark-code&gt;send: b'POST /token HTTP/1.1\r\nHost: oauth2.googleapis.com\r\nUser-Agent: python-requests/2.24.0\r\nAccept-Encoding: gzip, deflate\r\nAccept: */*\r\nConnection: keep-alive\r\ncontent-type: application/x-www-form-urlencoded\r\nContent-Length: 947\r\n\r\n'
+send: b'assertion=eyJ0eXAiOiAiSldUIiwgImFsZyI6ICJSUzI1NiIsICJraWQiOiAiYTI2MGJmYTAwZmM2ZjhkODE0OTQ5YTYwMTE0ZjlkY2I3ZWYzYzgyZiJ9.eyJpYXQiOiAxNTkyNDE2NDA5LCAiZXhwIjogMTU5MjQyMDAwOSwgImlzcyI6ICJweXNlYXJjaG1sQHB5c2VhcmNobWwuaWFtLmdzZXJ2aWNlYWNjb3VudC5jb20iLCAiYXVkIj(...)gYdLzVw&amp;grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer'
+reply: 'HTTP/1.1 200 OK\r\n'
+header: Content-Type: application/json; charset=UTF-8
+header: Vary: Origin
+header: Vary: X-Origin
+header: Vary: Referer
+header: Content-Encoding: gzip
+header: Date: Wed, 17 Jun 2020 17:53:29 GMT
+header: Server: scaffolding on HTTPServer2
+header: Cache-Control: private
+header: X-XSS-Protection: 0
+header: X-Frame-Options: SAMEORIGIN
+header: X-Content-Type-Options: nosniff
+header: Transfer-Encoding: chunked
+send: b'GET /storage/v1/b/false?fields=name HTTP/1.1\r\nHost: storage.googleapis.com\r\nUser-Agent: gcloud-python/1.29.0  gl-python/3.7.3 gax/1.20.1 gccl/1.29.0\r\nAccept-Encoding: gzip\r\nAccept: */*\r\nConnection: keep-alive\r\nX-Goog-API-Client: gcloud-python/1.29.0  gl-python/3.7.3 gax/1.20.1 gccl/1.29.0\r\nauthorization: Bearer ya29.c.K(...)\r\n\r\n'
+reply: 'HTTP/1.1 403 Forbidden\r\n'
+header: X-GUploader-UploadID: AAANsUl2(...)
+header: Content-Type: application/json; charset=UTF-8
+header: Date: Wed, 17 Jun 2020 17:53:29 GMT
+header: Vary: Origin
+header: Vary: X-Origin
+header: Cache-Control: no-cache, no-store, max-age=0, must-revalidate
+header: Expires: Mon, 01 Jan 1990 00:00:00 GMT
+header: Pragma: no-cache
+header: Content-Length: 420
+header: Server: UploadServer
+Traceback (most recent call last):
+  File "/pySearchML/kubeflow/components/prepare_env/run.py", line 138, in &lt;module&gt;
+    upload_data(args.bucket, args.es_host, args.force_restart)
+  File "/pySearchML/kubeflow/components/prepare_env/run.py", line 106, in upload_data
+    read_file(bucket)
+  File "/pySearchML/kubeflow/components/prepare_env/run.py", line 60, in read_file
+    if not bucket_obj.exists():
+  File "/usr/local/lib/python3.7/site-packages/google/cloud/storage/bucket.py", line 706, in exists
+    timeout=timeout,
+  File "/usr/local/lib/python3.7/site-packages/google/cloud/_http.py", line 423, in api_request
+    raise exceptions.from_http_response(response)
+google.api_core.exceptions.Forbidden: 403 GET 
+https://storage.googleapis.com/storage/v1/b/false?fields=name
+: pysearchml@${PROJECT_ID}.iam.gserviceaccount.com does not have storage.buckets.get access to the Google Cloud Storage bucket.
+&lt;/denchmark-code&gt;
+
+The interesting thing is the GET request URL is GET /storage/v1/b/false?fields=name where false should contain the project_id.
+When running the same code on Kubernetes directly I get the project_id instead of false and then it works.
+		</comment>
+		<comment id='10' author='WillianFuks' date='2020-06-17T18:49:42Z'>
+		Thanks, this helps me keep moving forward.
+In this case:
+&lt;denchmark-code&gt;/storage/v1/b/false?fields=name
+&lt;/denchmark-code&gt;
+
+Is making a GET request on bucket named false which you don't have permission for (well assuming in this case).
+How is the bucket name being set in:
+from google.cloud import storage
+
+
+storage_client = storage.Client.from_service_account_json('./key.json')
+bucket_obj = storage_client.bucket('bucket_name')
+print(bucket_obj.exists()) # -&gt; THIS BREAKS!!!
+Is it hardcoded? It might be accidentally pulling in false instead of a bucket name.
+		</comment>
+		<comment id='11' author='WillianFuks' date='2020-06-17T19:12:45Z'>
+		Hooooray!
+Thank you &lt;denchmark-link:https://github.com/frankyn&gt;@frankyn&lt;/denchmark-link&gt;
+ for the help!
+I probably made some mistake when creating the pipeline and interacting with the components instantiation. I forced the bucket name to be what I expected and then it finally worked!
+As the error message was telling about anonymous client, I went into all possible directions instead the simplest one (not sure if it'd be helpful to add this information in the error message).
+Once again, thank you for your help, now I can finally proceed :)!
+Best,
+Will
+		</comment>
+	</comments>
+</bug>

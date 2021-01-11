@@ -1,0 +1,85 @@
+<bug id='14062' author='stephenrawls' open_date='2019-02-03T19:01:25Z' closed_time='2019-02-07T06:02:20Z'>
+	<summary>Bug in Hybridize w/ Concat</summary>
+	<description>
+Hi,
+I think I found a bug in the Concat operator after calling hybridize() on my network. It is possible it is a mis-understanding on my part about how hybridization is supposed to work, however, so please let me know if that is the case.
+I have the following code (which works when model.hybridize() is commented out, and crashes when it is not):
+&lt;denchmark-code&gt;import mxnet as mx
+
+class Foo(mx.gluon.HybridBlock):
+    def __init__(self):
+        super(Foo, self).__init__()
+
+    def hybrid_forward(self, F, x, valid_lengths):
+        # Input is NCW. Ultimately Want mask of size N1W for broadcasting purposes.                                                                                       
+        # For now however keep mask as size NW and expand the extra dim later.                                                                                            
+        mask = F.ones_like(x).slice(begin=(0,0,0), end=(0,1,0)).reshape(shape=(0,-1))
+
+        # Need to insert an extra row in the W dimension                                                                                                                  
+        extra_timestep = F.ones_like(valid_lengths.reshape(0,1))
+        mask = F.concat(mask, extra_timestep, dim=1)
+        valid_lengths_p1 = valid_lengths + 1
+        mask = F.SequenceMask(mask, sequence_length=valid_lengths_p1, use_sequence_length=True, axis=1)
+        mask = mask.reshape(shape=(0,1,-1))
+
+        return mask
+
+model = Foo()
+model.hybridize()
+
+batch_size = 1
+feat_dim=2
+for seq_len in [2, 4]:
+    x = mx.nd.ones((batch_size,feat_dim,seq_len))
+    valid_lengths = mx.nd.full(shape=(batch_size), val=seq_len)
+    y = model(x, valid_lengths)
+    print(y)
+&lt;/denchmark-code&gt;
+
+The expected behavior, which occurs when I do not hybridize, is the code prints out the following:
+&lt;denchmark-code&gt;[[[1. 1. 1.]]]
+&lt;NDArray 1x1x3 @cpu(0)&gt;
+
+[[[1. 1. 1. 1. 1.]]]
+&lt;NDArray 1x1x5 @cpu(0)&gt;
+&lt;/denchmark-code&gt;
+
+The behavior that occurs when I do hybridize is a crash with the following error message:
+&lt;denchmark-code&gt;mxnet.base.MXNetError: Error in operator foo0_concat0: [10:44:05] src/operator/nn/../tensor/broadcast_reduce_op.h:151: Check failed: axis &lt; ndim &amp;&amp; axis &gt;= -ndim axis 1 exceeds the input dimension of 1
+&lt;/denchmark-code&gt;
+
+I was very careful inside my hybrid_forward function to restrict myself to dynamic shaping operators like F.ones_like(), slice() and using the special values for reshape() like 0 and -1, so that my code should work with arbitrary input shapes using the Symbolic api. So it is my understanding that hybridize() should work on this code, since I didn't do anything that depended on either the ndarray api, or hard-coded shape information.
+Can you please let me know if this is a bug, or if I have some fundamental mis-understanding of how hybridize() is supposed to work?
+(As to why I would want to use the code above ... I have a use case where it is more efficient to construct a broadcast-able mask once, and then use it many times inside a loop, versus calling SequenceMask() repeatedly in the loop, especially because SequenceMask only works when the timestep dimension is on axis 0 or axis 1, which with my data layout would mean I would need a lot of transposing back and forth inside a loop, which I would rather avoid).
+	</description>
+	<comments>
+		<comment id='1' author='stephenrawls' date='2019-02-03T19:01:29Z'>
+		Hey, this is the MXNet Label Bot.
+Thank you for submitting the issue! I will try and suggest some labels so that the appropriate MXNet community members can help resolve it.
+Here are my recommended labels: Bug
+		</comment>
+		<comment id='2' author='stephenrawls' date='2019-02-05T00:35:28Z'>
+		&lt;denchmark-link:https://github.com/mxnet-label-bot&gt;@mxnet-label-bot&lt;/denchmark-link&gt;
+ add [bug, gluon]
+		</comment>
+		<comment id='3' author='stephenrawls' date='2019-02-07T05:25:50Z'>
+		&lt;denchmark-link:https://github.com/stephenrawls&gt;@stephenrawls&lt;/denchmark-link&gt;
+ after taking a close look at the code, I think the problem mainly comes from the call on &lt;denchmark-link:https://mxnet.incubator.apache.org/versions/master/api/python/ndarray/ndarray.html#mxnet.ndarray.slice&gt;slice&lt;/denchmark-link&gt;
+. Its doc says:
+
+For an input array of shape=(d_0, d_1, ..., d_n-1), slice operation with begin=(b_0, b_1...b_m-1), end=(e_0, e_1, ..., e_m-1), and step=(s_0, s_1, ..., s_m-1), where m &lt;= n, results in an array with the shape (|e_0-b_0|/|s_0|, ..., |e_m-1-b_m-1|/|s_m-1|, d_m, ..., d_n-1).
+
+Since in the code snippet, it has begin=(0,0,0), end=(0,1,0) without step, this means the output shape would be (0,1,0). This is not supported and slice should throw an error on that.
+However, since the code did't check for it, NDArray actually returned result as in MXNet the dimension value 0 is used as a placeholder value for unknown size, which in symbolic mode (i.e. Gluon hybridized mode) would trigger further shape inference, which properly triggers the shape inference error.
+I haven't yet traced what happened in slice after getting 0 in size in the slice kernel, though that might need fix too.
+		</comment>
+		<comment id='4' author='stephenrawls' date='2019-02-07T06:02:20Z'>
+		I see, thanks.
+Basically what I wanted to do is this:
+begin=(0,0,0), end=(size_of_dim1,1,size_of_dim2) but since this is symbolic mode I can't use use the size directly, and -1 will make my size too short by 1. I happened to notice behavior of ndarray was to take the full axis when both begin &amp; end were 0, and I guess I tricked myself into thinking that was intentional behavior by ndarray, as opposed to the undefined behavior it apparently is.
+In this case I think I can use slice_axis(axis=1,begin=0,end=1) to get what I want.
+In general, it would be nice if dynamic shapes were supported and I didn't have to find "tricks" to get an array of the right shape. But this works for now.
+Thanks again!
+		</comment>
+	</comments>
+</bug>

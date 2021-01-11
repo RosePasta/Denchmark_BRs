@@ -1,0 +1,176 @@
+<bug id='33672' author='efournie' open_date='2019-10-24T07:33:44Z' closed_time='2019-10-31T07:25:45Z'>
+	<summary>Conv3D nodes not converted to float16 although automatic mixed precision is on.</summary>
+	<description>
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Windows 10
+Mobile device (e.g. iPhone 8, Pixel 2, Samsung Galaxy) if the issue happens on mobile device: no
+TensorFlow installed from (source or binary): pip install tf-nightly-gpu
+TensorFlow version (use command below): tf-nightly-gpu-2.1.0.dev20191023
+Python version: Python 3.7.4
+CUDA/cuDNN version: CUDA 10.0, cuDNN 7.6.4
+GPU model and memory: 2x NVIDIA TITAN RTX
+
+Describe the current behavior
+When automatic precision is active, 3D convolution ops are not converted to float16 and no performance gain is observed.
+In the output of the provided example, we can see that most of the nodes are not converted to float16:
+Converted 9/854 nodes to float16 precision using 2 cast(s) to float16 (excluding Const and Variable casts)
+Apart from the warmup delay during the first epoch of the training without AMP, there is no difference in the duration of epochs with and without AMP.
+Describe the expected behavior
+According to tensorflow/tensorflow/core/grappler/optimizer/auto_mixed_precision_lists.h and cuDNN release notes, 3D convolution operations on Volta architecture should benefit from AMP training with the tested versions of TF, CUDA and cuDNN.
+When debugging with TF_CPP_MIN_VLOG_LEVEL=2, I can see why the ops are not optimized:
+I tensorflow/core/grappler/optimizers/auto_mixed_precision.cc:1076] Skipping ReadVariableOp node model/conv3d/Conv3D/ReadVariableOp because it must be preserved
+I can't figure out why those items must be preserved. In the source code, I think they are marked as nodes to preserve in GrapplerItem::NodesToPreserve() in tensorflow/core/grappler/grappler_item.cc, but I could not find out the exact reason.
+Code to reproduce the issue
+&lt;denchmark-code&gt;import time
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import *
+from tensorflow.python.client import device_lib
+
+print("TensorFlow version is", tf.__version__)
+
+(x_train, y_train), (x_test, y_test) = tf.keras.datasets.cifar10.load_data()
+NUM_SAMPLES = 1000
+x_train = x_train[:NUM_SAMPLES]
+y_train = y_train[:NUM_SAMPLES]
+x_test = x_test[:NUM_SAMPLES]
+y_test = y_test[:NUM_SAMPLES]
+
+def fake3d(x):
+    return np.repeat(x[:, np.newaxis], 8, axis=1)
+
+x_train = fake3d(x_train)
+x_test = fake3d(x_test)
+
+num_classes = np.max(y_train) + 1
+y_train = tf.keras.utils.to_categorical(y_train, num_classes)
+y_test = tf.keras.utils.to_categorical(y_test, num_classes)
+
+def normalize(ndarray):
+    ndarray = ndarray.astype("float32")
+    ndarray = ndarray/255.0
+    return ndarray
+
+x_train = normalize(x_train)
+x_test = normalize(x_test)
+
+def create_model(num_classes=10):
+    # model parameters
+    act = "relu"
+    pad = "same"
+    ini = "he_uniform"
+
+    model = tf.keras.models.Sequential([
+        Conv3D(128, (3,3,3), activation=act, padding=pad, kernel_initializer=ini,
+               input_shape=(8,32,32,3)),
+        Conv3D(256, (3,3,3), activation=act, padding=pad, kernel_initializer=ini),
+        Conv3D(256, (3,3,3), activation=act, padding=pad, kernel_initializer=ini),
+        Conv3D(256, (3,3,3), activation=act, padding=pad, kernel_initializer=ini),
+        MaxPooling3D(pool_size=(2,2,2)),
+        Conv3D(256, (3,3,3), activation=act, padding=pad, kernel_initializer=ini),
+        Conv3D(256, (3,3,3), activation=act, padding=pad, kernel_initializer=ini),
+        Conv3D(512, (3,3,3), activation=act, padding=pad, kernel_initializer=ini),
+        Conv3D(512, (3,3,3), activation=act, padding=pad, kernel_initializer=ini),
+        MaxPooling3D(pool_size=(2,2,2)),
+        Conv3D(256, (3,3,3), activation=act, padding=pad, kernel_initializer=ini),
+        Conv3D(256, (3,3,3), activation=act, padding=pad, kernel_initializer=ini),
+        Conv3D(256, (3,3,3), activation=act, padding=pad, kernel_initializer=ini),
+        Conv3D(128, (3,3,3), activation=act, padding=pad, kernel_initializer=ini),
+        MaxPooling3D(pool_size=(2,4,4)),
+        Flatten(),
+        BatchNormalization(),
+        Dense(512, activation='relu'),
+        Dense(num_classes, activation="softmax")
+    ])
+
+    return model
+
+model = create_model(num_classes)
+model.summary()
+BATCH_SIZE = 320
+N_EPOCHS = 6
+opt = tf.keras.optimizers.SGD(learning_rate=0.02, momentum=0.5)
+
+def train_model(mixed_precision, optimizer):
+    model = create_model(num_classes)
+
+    if mixed_precision:
+        import tensorflow
+        optimizer = tf.train.experimental.enable_mixed_precision_graph_rewrite(optimizer)
+
+    model.compile(loss="categorical_crossentropy",
+                  optimizer=optimizer,
+                  metrics=["accuracy"])
+
+    train_start = time.time()
+
+    train_log = model.fit(x_train, y_train,
+                          batch_size=BATCH_SIZE,
+                          epochs=N_EPOCHS,
+                          use_multiprocessing=True,
+                          workers=2)
+
+    train_end = time.time()
+
+    results = {
+               "train_time": train_end-train_start,
+               "train_log": train_log}
+
+    return results
+
+fp32_results = train_model(mixed_precision=False, optimizer=opt)
+train_time = round(fp32_results["train_time"], 1)
+print("achieved in", train_time, "seconds")
+
+tf.keras.backend.clear_session()
+time.sleep(10)
+
+mp_results = train_model(mixed_precision=True, optimizer=opt)
+train_time = round(mp_results["train_time"], 1)
+print("achieved in", train_time, "seconds")
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='efournie' date='2019-10-25T06:37:29Z'>
+		&lt;denchmark-link:https://github.com/efournie&gt;@efournie&lt;/denchmark-link&gt;
+ ,
+Thank you for reporting the issue, when tried executing the given code for  i got the following error, kindly check the &lt;denchmark-link:https://colab.sandbox.google.com/gist/oanush/2eb8d6f74d21ea8897575167a06bb8cb/33672.ipynb&gt;gist&lt;/denchmark-link&gt;
+ of colab and confirm if the same is faced even from your end.Thanks!
+		</comment>
+		<comment id='2' author='efournie' date='2019-10-25T07:14:01Z'>
+		Sorry, the Titan RTX GPUs have quite a lot of memory so I set the batch size a bit too high. Editing the batch size to BATCH_SIZE = 64 in the previous program, I can run it completely. In order to run faster, I also set NUM_SAMPLES = 400.
+Unfortunately, if I am not mistaken, Google Colab notebooks use Tesla K80 GPUs which don't support automatic mixed precision. In order to reproduce the issue, the program should be run on a Volta GPU (RTX 20xx or Titan RTX or Tesla V100).
+		</comment>
+		<comment id='3' author='efournie' date='2019-10-30T21:58:38Z'>
+		The Windows TensorFlow builds are only built with cuDNN 7.6.0, while 7.6.2 is needed for float16 Conv3D to be used. Unfortunately, when determining whether Conv3D is float16, TensorFlow currently look at the version of cuDNN that TensorFlow is built against, not the version that is actually used at runtime, which is why you are not seeing Conv3D being done in float16 despite using 7.6.4.
+Until the builds are updated to at least 7.6.2, as a workaround, you can set the environmental variable:
+&lt;denchmark-code&gt;TF_AUTO_MIXED_PRECISION_GRAPH_REWRITE_WHITELIST_ADD=Conv3D,Conv3DBackpropFilter,Conv3DBackpropFilterV2,Conv3DBackpropInput,Conv3DBackpropInputV2
+&lt;/denchmark-code&gt;
+
+An easy way to do this is to add the following to the top of the Python program. Note that this will make your program a lot slower unless you are using at least cuDNN 7.6.2.
+&lt;denchmark-code&gt;import os
+os.environ['TF_AUTO_MIXED_PRECISION_GRAPH_REWRITE_WHITELIST_ADD'] = 'Conv3D,Conv3DBackpropFilter,Conv3DBackpropFilterV2,Conv3DBackpropInput,Conv3DBackpropInputV2'
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='4' author='efournie' date='2019-10-31T07:25:45Z'>
+		Thanks, with the environment variable it works.
+As it concerns an unreleased TF version, I guess I can close the issue now. Is there a way to  find out the cuDNN version that TensorFlow is built against?
+		</comment>
+		<comment id='5' author='efournie' date='2019-10-31T07:25:47Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/33672&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/33672&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='6' author='efournie' date='2019-11-01T18:30:32Z'>
+		I just committed &lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/336efe7422384d3628000433cd9b127b48c232fd&gt;336efe7&lt;/denchmark-link&gt;
+, which logs the cuDNN version. To see it, set the environmental variable TF_CPP_VMODULE to "meta_optimizer=4" (without quotes). The change won't be in the nightly builds until tomorrow.
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,262 @@
+<bug_data>
+<bug id='723' author='affranchi' open_date='2020-04-29T22:21:38Z' closed_time='2020-05-07T14:26:04Z'>
+ 	<summary>Squeeze dimension?</summary>
+ 	<description>
+ Hello,
+ I'm trying to squeeze dimension.
+ For example, if I squeeze 2x2x2 tensor into 2x2 tensor with index 1 for the second dimension,
+ (0,0) -&gt; return (0,1,0)
+ (0,1) -&gt; return (0,1,1)
+ (1,0) -&gt; return (1,1,0)
+ (1,1) -&gt; return (1,1,0)
+ I thought that I can archive this by combining submemory_desc and reshape like the below.
+ &lt;denchmark-code&gt;auto mem_desc = dnnl::memory::desc({2,2,2}, f32, tag::abc);
+ auto mem = dnnl::memory(mem_desc, engine);
+ 
+ auto squeezed_desc = mem_desc.submemory_desc({2,1,2}, {0,1,0}).reshape({2,2});
+ &lt;/denchmark-code&gt;
+ 
+ However, what I found is that this squeezed descriptor returns (0,0,0), (0,0,1), (0,1,0), (0,1,1) for reshaped index (0,0), (0,1), (1,0), (1,1). Also, if I do
+ &lt;denchmark-code&gt;auto squeezed_desc = mem_desc.submemory_desc({2,1,2}, {0,0,0}).reshape({2,2});
+ &lt;/denchmark-code&gt;
+ 
+ It returns (0,0,0), (0,0,1), (0,1,0), (0,1,1) values for reshaped index (0,0), (0,1), (1,0), (1,1).
+ Does it happen because this reshape doesn't make sense in physical layout? If so, is there any better way to squeeze dimension?
+ In addition to the question, I'm curious about submemory_desc behavior.
+ I'm trying to do 2x2 matrix multiplication and store the results in 4x4 matrix.
+ &lt;denchmark-code&gt;src_md = dnnl::memory::desc({2,2}, f32, tag::ab);
+ weights_md = dnnl::memory::desc({2,2}, f32, tag::ab);
+ dst_md = dnnl::memory::desc({4,4}, f32, tag::ab);
+ 
+ // operator descriptor
+ auto matmul_d = dnnl::matmul::desc(src_md, weights_md, dnnl::memory::desc(), dst_md.submemory_desc({2,2}, {2,2}));
+ ...
+ // execute..
+ ...
+ &lt;/denchmark-code&gt;
+ 
+ What I expect here is that the results will be placed in (2,2), (2,3), (3,2), (3,3) area. But looks it's always placed in (0,0), (0,1), (1,0), (1,1) in 4x4 matrix.
+ Looks reorder copies submemory_desc area to the other memory. Does it mean that I need to copy memory to use submemory for other operators?
+ Please, let me know if I misunderstood something.
+ Thanks,
+ Kenny
+ 	</description>
+ 	<comments>
+ 		<comment id='1' author='affranchi' date='2020-05-02T22:39:46Z'>
+ 		Hi &lt;denchmark-link:https://github.com/affranchi&gt;@affranchi&lt;/denchmark-link&gt;
+ ,
+ 
+ I thought that I can archive this by combining submemory_desc and reshape like the below.
+ auto mem_desc = dnnl::memory::desc({2,2,2}, f32, tag::abc);
+ auto mem = dnnl::memory(mem_desc, engine);
+ 
+ auto squeezed_desc = mem_desc.submemory_desc({2,1,2}, {0,1,0}).reshape({2,2});
+ 
+ 
+ To me the the code that you showed does exactly what you wanted:
+ #include &lt;stdio.h&gt;
+ #include "dnnl.hpp"
+ 
+ using namespace dnnl;
+ 
+ using dt = memory::data_type;
+ using tag = memory::format_tag;
+ 
+ memory::dim phys_offset(memory::desc &amp;md, memory::dims position) {
+     // assumption: md has plain format, i.e. no dimensions are blocked
+     memory::dim offset = md.data.offset0; // do not forget about base offset
+     for (int d = 0; d &lt; (int)md.dims().size(); ++d) {
+         offset += position[d] * md.data.format_desc.blocking.strides[d];
+     }
+     return offset;
+ }
+ 
+ int main() {
+     memory::desc mem_desc({2,2,2}, dt::f32, tag::abc);
+     memory::desc squeezed_desc = mem_desc.submemory_desc({2,1,2}, {0,1,0}).reshape({2,2});
+ 
+     printf("(position) --&gt; offset\n");
+     for (int y: {0, 1})
+     for (int x: {0, 1})
+         printf("(%d,%d) --&gt; %d\n", y, x, (int)phys_offset(squeezed_desc, {y, x}));
+ 
+     engine eng(engine::kind::cpu, 0);
+ 
+     std::vector&lt;float&gt; mem_data = {0, 1, 2, 3, 4, 5, 6, 7};
+     std::vector&lt;float&gt; out_data = {9, 9, 9, 9};
+ 
+     memory mem(mem_desc, eng, mem_data.data());
+     memory::desc out_desc({2, 2}, dt::f32, tag::ab);
+     memory out(out_desc, eng, out_data.data());
+ 
+     reorder({eng, squeezed_desc, eng, out_desc}).execute(stream(eng), mem, out);
+     printf("check out:\n"); for(auto o: out_data) printf("%.0f\n", o);
+ 
+     return 0;
+ }
+ 
+ $ g++ -std=c++11 gh723.cpp -ldnnl &amp;&amp; ./a.out
+ (position) --&gt; offset
+ (0,0) --&gt; 2
+ (0,1) --&gt; 3
+ (1,0) --&gt; 6
+ (1,1) --&gt; 7
+ check out:
+ 2
+ 3
+ 6
+ 7
+ So as you initially planned:
+ &lt;denchmark-code&gt;(0,0) -&gt; return (0,1,0)  // phys offset in the original buffer --&gt; 2
+ (0,1) -&gt; return (0,1,1)  // phys offset in the original buffer --&gt; 3
+ (1,0) -&gt; return (1,1,0)  // phys offset in the original buffer --&gt; 6
+ (1,1) -&gt; return (1,1,1)  // phys offset in the original buffer --&gt; 7
+ &lt;/denchmark-code&gt;
+ 
+ 		</comment>
+ 		<comment id='2' author='affranchi' date='2020-05-02T22:59:18Z'>
+ 		
+ What I expect here is that the results will be placed in (2,2), (2,3), (3,2), (3,3) area. But looks it's always placed in (0,0), (0,1), (1,0), (1,1) in 4x4 matrix.
+ 
+ This is a bug. With the following fix [1] the example does what you expected it to do.
+ Thanks for the report! We will fix this.
+ #include &lt;algorithm&gt;
+ #include &lt;cmath&gt;
+ #include &lt;iostream&gt;
+ #include &lt;string&gt;
+ #include &lt;vector&gt;
+ 
+ #include "dnnl.hpp"
+ 
+ using namespace dnnl;
+ 
+ using tag = memory::format_tag;
+ using dt = memory::data_type;
+ 
+ int main() {
+     dnnl::engine engine(engine::kind::cpu, 0);
+     dnnl::stream engine_stream(engine);
+ 
+     std::vector&lt;float&gt; src_data = {1, 2, 3, 4};
+     std::vector&lt;float&gt; wei_data = {1, 0, 0, 1}; // identity matrix
+     std::vector&lt;float&gt; dst_data(4 * 4, 0.f);
+ 
+     auto src_md = memory::desc({2, 2}, dt::f32, tag::ab);
+     auto wei_md = memory::desc({2, 2}, dt::f32, tag::ab);
+     auto dst_md = memory::desc({4, 4}, dt::f32, tag::ab);
+ 
+     auto src_mem = memory(src_md, engine, src_data.data());
+     auto wei_mem = memory(wei_md, engine, wei_data.data());
+     auto dst_mem = memory(dst_md, engine, dst_data.data());
+ 
+     // Create operation descriptor
+     auto matmul_d = matmul::desc(src_md, wei_md, {}, dst_md.submemory_desc({2,2}, {2,2}));
+     auto matmul_pd = matmul::primitive_desc(matmul_d, engine);
+     auto matmul_prim = matmul(matmul_pd);
+ 
+     // Primitive arguments.
+     std::unordered_map&lt;int, memory&gt; matmul_args;
+     matmul_args.insert({DNNL_ARG_SRC, src_mem});
+     matmul_args.insert({DNNL_ARG_WEIGHTS, wei_mem});
+     matmul_args.insert({DNNL_ARG_DST, dst_mem});
+     matmul_prim.execute(engine_stream, matmul_args);
+     engine_stream.wait();
+ 
+     for (int i = 0; i &lt; 4; ++i)
+     for (int j = 0; j &lt; 4; ++j)
+         printf("%.0f%c", dst_data[i * 4 + j], j == 3 ? '\n' : ' ');
+ 
+     return 0;
+ }
+ $  g++ -std=c++11 gh723_matmul.cpp -ldnnl &amp;&amp; ./a.out
+ 0 0 0 0
+ 0 0 0 0
+ 0 0 1 2
+ 0 0 3 4
+ [1] The fix: we forgot to shift the original pointers by offset0. The strides (leading dimensions) were computed correctly though.
+ diff --git a/src/cpu/matmul/gemm_f32_matmul.cpp b/src/cpu/matmul/gemm_f32_matmul.cpp
+ index f0e77b00e..69df852a3 100644
+ --- a/src/cpu/matmul/gemm_f32_matmul.cpp
+ +++ b/src/cpu/matmul/gemm_f32_matmul.cpp
+ @@ -117,17 +117,23 @@ status_t gemm_f32_matmul_t::pd_t::check_and_configure_attributes() {
+  }
+ 
+  status_t gemm_f32_matmul_t::execute_ref(const exec_ctx_t &amp;ctx) const {
+ -    const auto src = CTX_IN_MEM(const src_data_t *, DNNL_ARG_SRC);
+ -    const auto weights = CTX_IN_MEM(const weights_data_t *, DNNL_ARG_WEIGHTS);
+ -    const auto bias = CTX_IN_MEM(const char *, DNNL_ARG_BIAS);
+ +    auto src = CTX_IN_MEM(const src_data_t *, DNNL_ARG_SRC);
+ +    auto weights = CTX_IN_MEM(const weights_data_t *, DNNL_ARG_WEIGHTS);
+ +    auto bias = CTX_IN_MEM(const char *, DNNL_ARG_BIAS);
+      auto dst = CTX_OUT_MEM(dst_data_t *, DNNL_ARG_DST);
+ 
+      DEFINE_SCALES_BUFFER(scales);
+ 
+      const auto src_d = ctx.memory_mdw(DNNL_ARG_SRC, pd()-&gt;src_md());
+      const auto weights_d = ctx.memory_mdw(DNNL_ARG_WEIGHTS, pd()-&gt;weights_md());
+ +    const auto bias_d = ctx.memory_mdw(DNNL_ARG_BIAS, pd()-&gt;weights_md(1));
+      const auto dst_d = ctx.memory_mdw(DNNL_ARG_DST, pd()-&gt;dst_md());
+ 
+ +    src += src_d.offset0();
+ +    weights += weights_d.offset0();
+ +    if (bias) bias += bias_d.offset0();
+ +    dst += dst_d.offset0();
+ +
+      const gemm_based::params_t &amp;params = pd()-&gt;params();
+ 
+      const auto &amp;dst_bd = dst_d.blocking_desc();
+ 		</comment>
+ 		<comment id='3' author='affranchi' date='2020-05-03T16:31:35Z'>
+ 		&lt;denchmark-link:https://github.com/emfomenk&gt;@emfomenk&lt;/denchmark-link&gt;
+  Thank you for your answer and your work for fix.
+ Looks it's not merged yet. Could you let me know the ticket link so that I can track when it's merged? Or, could you let me know if it's merged?
+ Thanks,
+ Kenny
+ 		</comment>
+ 		<comment id='4' author='affranchi' date='2020-05-03T17:03:59Z'>
+ 		Hi &lt;denchmark-link:https://github.com/affranchi&gt;@affranchi&lt;/denchmark-link&gt;
+ ,
+ You can track this issue, which we will close with the corresponding fix promotion.
+ 		</comment>
+ 	</comments>
+ </bug>
+<commit id='a1c2fdefbd12dedf078bf50dd09c1d29424817c7' author='Fomenko, Evarist M' date='2020-05-05 17:02:04-07:00'>
+ 	<dmm_unit complexity='0.0' interfacing='1.0' size='0.0'></dmm_unit>
+ 	<modification change_type='MODIFY' old_name='src\cpu\matmul\gemm_bf16_matmul.cpp' new_name='src\cpu\matmul\gemm_bf16_matmul.cpp'>
+ 		<file_info nloc='192' complexity='54' token_count='1701'></file_info>
+ 		<method name='dnnl::impl::cpu::matmul::gemm_bf16_matmul_t&lt;dst_type&gt;::execute_ref' parameters='ctx'>
+ 				<method_info nloc='101' complexity='23' token_count='1029' nesting_level='4' start_line='131' end_line='260'></method_info>
+ 			<added_lines>133,134,135,140,141,142,143,144,145,146,147,148,149,150</added_lines>
+ 			<deleted_lines>133,134,135,148,149,150,151</deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines></added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='src\cpu\matmul\gemm_f32_matmul.cpp' new_name='src\cpu\matmul\gemm_f32_matmul.cpp'>
+ 		<file_info nloc='159' complexity='44' token_count='1429'></file_info>
+ 		<method name='dnnl::impl::cpu::matmul::gemm_f32_matmul_t::execute_ref' parameters='ctx'>
+ 				<method_info nloc='80' complexity='16' token_count='871' nesting_level='4' start_line='119' end_line='217'></method_info>
+ 			<added_lines>120,121,122,129,132,133,134,135,136,137</added_lines>
+ 			<deleted_lines>120,121,122</deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines></added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='src\cpu\matmul\gemm_x8s8s32x_matmul.cpp' new_name='src\cpu\matmul\gemm_x8s8s32x_matmul.cpp'>
+ 		<file_info nloc='251' complexity='61' token_count='2265'></file_info>
+ 		<method name='dnnl::impl::cpu::matmul::gemm_x8s8s32x_matmul_t&lt;src_type,weights_type,dst_type&gt;::execute_ref' parameters='ctx'>
+ 				<method_info nloc='136' complexity='27' token_count='1322' nesting_level='4' start_line='146' end_line='324'></method_info>
+ 			<added_lines>150,151,152,160,161,162,163,164,165,166,167,168,169,170</added_lines>
+ 			<deleted_lines>150,151,152,169,170,171,172</deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines></added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ </commit>
+</bug_data>

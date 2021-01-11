@@ -1,0 +1,185 @@
+<bug id='33233' author='paanguin' open_date='2019-10-11T07:47:33Z' closed_time='2020-09-17T18:41:16Z'>
+	<summary>[tflite2.0] tf.lite.Interpreter fails with 'post-training quantization' (tf.matmul).</summary>
+	<description>
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow):
+OS Platform and Distribution: Linux Ubuntu 16.04
+TensorFlow installed from source
+TensorFlow version (use command below): ('v2.0.0-0-g64c3d38', '2.0.0')
+Python version: 2.7.12
+Bazel version (if compiling from source): 0.24.1
+GCC/Compiler version (if compiling from source): gcc (Ubuntu 5.4.0-6ubuntu1~16.04.11) 5.4.0 20160609
+CUDA/cuDNN version: 10.0 / 7.5
+GPU model and memory: GeForce GTX TITAN
+
+
+'Post-training integer quantization' fails with tf.matmul() in a certain condition.
+(&lt;denchmark-link:https://www.tensorflow.org/lite/performance/post_training_integer_quant&gt;https://www.tensorflow.org/lite/performance/post_training_integer_quant&lt;/denchmark-link&gt;
+)
+Following code is a testing code for converting a dummy tensorflow graph with quantization. This code fails if shape_b[-1] &gt; 15 for me. When I analyzed the visualization result ((bazel run //tensorflow/lite/tools:visualize model.tflite visualized_model.html)), I think it is a result of graph transformation issue.
+Suppose that shape_b = (None, 16, 4, 5). Then each tf.matmul op is replaced by 16 FULLY_CONNECTED ops in the tflite model. And each FULLY_CONNECTED op has its own bias tensor, with shape=[5], as third input. In this case, tflite_convert works in both cases that quantization=True or quantization=False.
+When Suppose that shape_b = (None, 16, 4, 16). When quantization=True, the interpreter fails at the allocation step with following output:
+&lt;denchmark-code&gt;INFO: Initialized TensorFlow Lite runtime.
+Traceback (most recent call last):
+  File "tflite_matmul_v2.py", line 89, in &lt;module&gt;
+    main()
+  File "tflite_matmul_v2.py", line 67, in main
+    interpreter.allocate_tensors()
+  File "/home/hh1208-kang/venv_py2_tf_nightly/local/lib/python2.7/site-packages/tensorflow_core/lite/python/interpreter.py", line 244, in allocate_tensors
+    return self._interpreter.AllocateTensors()
+  File "/home/hh1208-kang/venv_py2_tf_nightly/local/lib/python2.7/site-packages/tensorflow_core/lite/python/interpreter_wrapper/tensorflow_wrap_interpreter_wrapper.py", line 106, in AllocateTensors
+    return _tensorflow_wrap_interpreter_wrapper.InterpreterWrapper_AllocateTensors(self)
+RuntimeError: tensorflow/lite/kernels/kernel_util.cc:119 std::abs(input_product_scale - bias_scale) &lt;= 1e-6 * std::min(input_product_scale, bias_scale) was not true.Node number 282 (FULLY_CONNECTED) failed to prepare.
+&lt;/denchmark-code&gt;
+
+But the code still works if quantization=False. When I check the visualization result, I noticed that the bias tensors for FULLY_CONNECTED ops are merged into a single bias tensor, with shape [16]. It seems that tflite_convert try to remove redundant zero bias tensors when it becomes large.
+However that makes problem in the quantization. Because in that case, the quantization parameters of the bias tensor is shared by all the FULLY_CONNECTED ops. Thus the check std::abs(input_product_scale - bias_scale) &lt;= 1e-6 * std::min(input_product_scale, bias_scale) fails, since 'input_product_scale' may be different in some FULLY_CONNECTED op, while 'bias_scale' are the same.
+How can I suppress the transformation behavior? I think somehow if I could prevent the transformation that merges all the bias tensors, the quantization success.
+Code to reproduce the issue
+&lt;denchmark-code&gt;import numpy as np
+import tensorflow as tf
+
+def test_tflite_model(tflite_filename, examples):
+    print("Loading TFLite interpreter for %s..." % tflite_filename)
+    interpreter = tf.lite.Interpreter(model_path=tflite_filename)
+    interpreter.allocate_tensors()
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
+    print("input details: %s" % input_details)
+    print("output details: %s" % output_details)
+
+    for i, input_tensor in enumerate(input_details):
+        interpreter.set_tensor(input_tensor['index'], examples[i])
+    interpreter.invoke()
+    model_output = []
+    for i, output_tensor in enumerate(output_details):
+        model_output.append(interpreter.get_tensor(output_tensor['index']))
+    return model_output
+
+def main():
+    nsamples=1
+    quantization=True
+    tflite_filename = "matmul_model_v2.tflite"
+    shape_a = (None, 16, 3, 4)
+    shape_b = (None, 16, 4, 15) # quantization fails if shape_b[-1] &gt;= 16
+
+    @tf.function(input_signature=[
+    	tf.TensorSpec(shape=shape_a, dtype=tf.float32, name='a'), 
+        tf.TensorSpec(shape=shape_b, dtype=tf.float32, name='b')])
+    def model(a,b):
+	c = tf.matmul(a,b) #[16, 3, 5]
+
+	def submodule(c,b):
+		nb = tf.transpose(b, [0, 1, 3, 2])
+		#nb = tf.nn.softmax(nb)
+		c = tf.matmul(c,nb) # [16,3,4]
+		c = tf.matmul(c,b)  # [16,3,5]
+		return c
+	c = submodule(c,b)
+	return c
+
+
+    def _representative_dataset_gen():
+	for i in range(50):
+		a_ = np.random.random_sample((1,)+shape_a[1:]).astype(np.float32)
+	        b_ = np.random.random_sample((1,)+shape_b[1:]).astype(np.float32)
+		yield [a_,b_]
+
+    # tflite_convert
+    cfunc = model.get_concrete_function()
+    converter = tf.lite.TFLiteConverter.from_concrete_functions([cfunc])
+    if (quantization):
+	converter.representative_dataset = _representative_dataset_gen # with quantization
+	converter.optimizations = [tf.lite.Optimize.DEFAULT]
+    tflite_model = converter.convert()
+    open(tflite_filename, "wb").write(tflite_model)
+
+    # run tensorflow model (not converted)
+    np.random.seed(1234)
+    a_ = np.random.random_sample((nsamples,)+shape_a[1:]).astype(np.float32)
+    b_ = np.random.random_sample((nsamples,)+shape_b[1:]).astype(np.float32)
+    session_output = model(a_,b_)
+
+    # load and run tflite model (converted_)
+    interpreter = tf.lite.Interpreter(model_path=tflite_filename)
+    interpreter.allocate_tensors()
+    output_details = interpreter.get_output_details()
+    output_shape = interpreter.get_tensor(output_details[0]['index']).shape
+    tflite_output = np.zeros((nsamples,)+output_shape[1:], np.float32)
+    for n in range(nsamples):
+	tflite_output[n,:] = test_tflite_model(tflite_filename, 
+		[np.expand_dims(a_[n,:],0), np.expand_dims(b_[n,:],0)])[0]
+
+    print("Input example:")
+    print(a_)
+    print(a_.shape)
+    print(b_)
+    print(b_.shape)
+    print("Session output:")
+    print(session_output)
+    print(session_output.shape)
+    print("TFLite output:")
+    print(tflite_output)
+    print(tflite_output.shape)
+    print(np.allclose(session_output, tflite_output))
+
+if __name__ == '__main__':
+    main()
+&lt;/denchmark-code&gt;
+
+Note that this code is inspired by &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/27640&gt;#27640&lt;/denchmark-link&gt;
+.
+p.s. (2019.10.17)
+I corrected the post since I made a mistake. The problem is not about converting, but about the interpreter, especially in the allocation. I'm sorry.
+	</description>
+	<comments>
+		<comment id='1' author='paanguin' date='2019-10-16T05:38:32Z'>
+		The operation responsible to this is the following line of code:
+
+
+
+tensorflow/tensorflow/lite/toco/toco_tooling.cc
+
+
+         Line 416
+      in
+      64c3d38
+
+
+
+
+
+
+ DedupeConstantArrays(model, toco_flags.dedupe_array_min_size_bytes()); 
+
+
+
+
+
+When I commented out the line, I confirmed that the reproducing code works. But I think this is a kind of temporary bypass, not the right solution.
+&lt;denchmark-code&gt;//DedupeConstantArrays(model, toco_flags.dedupe_array_min_size_bytes());
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='2' author='paanguin' date='2020-09-03T18:13:27Z'>
+		&lt;denchmark-link:https://github.com/paanguin&gt;@paanguin&lt;/denchmark-link&gt;
+,
+I was able to run the given code without any issues on TensorFlow v2.3, please find the gist of it &lt;denchmark-link:https://colab.research.google.com/gist/amahendrakar/f94691b4df92ad4940449c8b584047f5/33233.ipynb&gt;here&lt;/denchmark-link&gt;
+. Thanks!
+		</comment>
+		<comment id='3' author='paanguin' date='2020-09-10T18:16:24Z'>
+		This issue has been automatically marked as stale because it has not had recent activity. It will be closed if no further activity occurs. Thank you.
+		</comment>
+		<comment id='4' author='paanguin' date='2020-09-17T18:41:13Z'>
+		Closing as stale. Please reopen if you'd like to work on this further.
+		</comment>
+		<comment id='5' author='paanguin' date='2020-09-17T18:41:20Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/33233&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/33233&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,315 @@
+<bug id='1065' author='ericl' open_date='2017-10-03T01:05:38Z' closed_time='2018-03-23T16:42:10Z'>
+	<summary>GPU resources not released after killing actor</summary>
+	<description>
+The following crashes with
+&lt;denchmark-code&gt;Exception: Could not find a node with enough GPUs or other resources to create this actor. The local scheduler information is [ {'ClientType': 'local_scheduler', 'Deleted': False, 'DBClientID': '31dc437d6df69857fea7a9eb6f04004421039e18', 'AuxAddress': '127.0.0.1:37853', 'NumCPUs': 32.0, 'NumGPUs': 1.0, 'LocalSchedulerSocketName': '/tmp/scheduler9534802'}].
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-code&gt;import ray
+import sys
+import time
+
+@ray.remote(num_gpus=1)
+class Actor(object):
+  def __init__(self):
+    pass
+
+ray.init(num_gpus=1)
+a = Actor.remote()
+a.__ray_terminate__.remote(a._ray_actor_id.id())
+
+time.sleep(5)
+a = Actor.remote()  # crashes with not enough gpus
+&lt;/denchmark-code&gt;
+
+cc &lt;denchmark-link:https://github.com/stephanie-wang&gt;@stephanie-wang&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/robertnishihara&gt;@robertnishihara&lt;/denchmark-link&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='ericl' date='2017-10-03T02:50:52Z'>
+		That's very surprising. I can reproduce it. However, this kind of thing should be covered by our tests.. I'll look into it.
+		</comment>
+		<comment id='2' author='ericl' date='2018-02-28T03:58:21Z'>
+		Is this fixed? I still get this error when running the above.
+ray version:  0.3.1
+		</comment>
+		<comment id='3' author='ericl' date='2018-02-28T04:01:29Z'>
+		Update:  it will only work for me with time.sleep(20). It seems it takes about 15 seconds to disconnect. Is this expected?
+		</comment>
+		<comment id='4' author='ericl' date='2018-02-28T05:40:45Z'>
+		This should be fixed (and really shouldn't take 15 seconds).
+There are some bigger changes in the pipeline to handle actor creation more like the way we handle regular task placement, and when that happens the problem should definitely go away.
+		</comment>
+		<comment id='5' author='ericl' date='2018-02-28T18:11:37Z'>
+		I had this error when I was tuning neural network hyperparameters using Ray Tune with Hyperband. I later switched to an older machine with only two GPUs, and it didn't give me error when running the above snippets (disconnected after a few seconds). But I still got error when running Ray Tune.  So in the end, only part of the intended hyper-param trials are actually tested.
+Any suggestions to debug this?
+Will these changes be included in the next version?
+		</comment>
+		<comment id='6' author='ericl' date='2018-02-28T19:52:19Z'>
+		&lt;denchmark-link:https://github.com/haoyangz&gt;@haoyangz&lt;/denchmark-link&gt;
+ can you post the error and the minimal script you used?
+		</comment>
+		<comment id='7' author='ericl' date='2018-02-28T21:19:44Z'>
+		&lt;denchmark-link:https://github.com/richardliaw&gt;@richardliaw&lt;/denchmark-link&gt;
+  Thanks. The following simple script produces the error for me:
+&lt;denchmark-code&gt;import torch
+import random
+from os.path import join
+
+from torch.autograd import Variable
+import ray
+from ray.tune import Trainable, TrainingResult, register_trainable, \
+    run_experiments
+from ray.tune.hyperband import HyperBandScheduler
+
+class TwoLayerNet(torch.nn.Module):
+    def __init__(self, D_in, H, D_out):
+        super(TwoLayerNet, self).__init__()
+        self.linear1 = torch.nn.Linear(D_in, H)
+        self.linear2 = torch.nn.Linear(H, D_out)
+
+    def forward(self, x):
+        h_relu = self.linear1(x).clamp(min=0)
+        y_pred = self.linear2(h_relu)
+        return y_pred
+
+
+N, D_in, H, D_out = 64, 1000, 100, 10
+
+class MyTrainableClass(Trainable):
+    def _setup(self):
+        self.x = Variable(torch.randn(N, D_in).cuda())
+        self.y = Variable(torch.randn(N, D_out).cuda(), requires_grad=False)
+        self.model = TwoLayerNet(D_in, self.config['H'], D_out).cuda()
+        self.criterion = torch.nn.MSELoss(size_average=False)
+        self.optimizer = torch.optim.SGD(self.model.parameters(), lr=1e-4)
+
+    def _train(self):
+        y_pred = self.model(self.x)
+        loss = self.criterion(y_pred, self.y)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        return TrainingResult(mean_loss=loss.data[0], timesteps_this_iter=1)
+
+    def _save(self, checkpoint_dir):
+        path = join(checkpoint_dir, "checkpoint.pt")
+        torch.save(self.model.state_dict(), path)
+        return path
+
+    def _restore(self, checkpoint_path):
+        self.model = TwoLayerNet(D_in, self.config['H'], D_out).cuda()
+        self.model.load_state_dict(torch.load(checkpoint_path))
+
+
+register_trainable("my_class", MyTrainableClass)
+ray.init()
+hyperband = HyperBandScheduler(
+    time_attr="timesteps_total", reward_attr="episode_reward_mean",
+    max_t=100)
+
+run_experiments({
+    "hyperband_test": {
+        "run": "my_class",
+        "stop": {"training_iteration": 99999},
+        "repeat": 20,
+        "resources": {"cpu": 0, "gpu": 1},
+        "config": {
+            "H": lambda spec: 10 + int(90 * random.random()),
+        },
+    }
+}, scheduler=hyperband)
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='8' author='ericl' date='2018-03-01T23:08:13Z'>
+		&lt;denchmark-link:https://github.com/richardliaw&gt;@richardliaw&lt;/denchmark-link&gt;
+ I checked that with the default FIFO scheduler,  there is no error.
+		</comment>
+		<comment id='9' author='ericl' date='2018-03-02T17:18:08Z'>
+		Well with enough trials, it seems FIFO will also have the error but much less frequently.
+Another similar error observed under FIFO (maybe also under hyperband, not sure exactly):
+&lt;denchmark-code&gt;Traceback (most recent call last):
+  File "/cluster/zeng/code/research/software/miniconda/lib/python2.7/site-packages/ray-0.3.1-py2.7-linux-x86_64.egg/ray/worker.py", line 762, in _process_task
+    *arguments)
+  File "/cluster/zeng/code/research/software/miniconda/lib/python2.7/site-packages/ray-0.3.1-py2.7-linux-x86_64.egg/ray/actor.py", line 209, in actor_method_executor
+    method_returns = method(actor, *args)
+  File "/cluster/zeng/code/research/software/miniconda/lib/python2.7/site-packages/ray-0.3.1-py2.7-linux-x86_64.egg/ray/tune/trainable.py", line 89, in __init__
+    self._setup()
+  File "/cluster/zeng/code/research/ray_tune_wrapper/mymodel.py", line 51, in _setup
+    self.net = Net(self.config).cuda()
+  File "/cluster/zeng/code/research/software/miniconda/lib/python2.7/site-packages/torch/nn/modules/module.py", line 216, in cuda
+    return self._apply(lambda t: t.cuda(device))
+  File "/cluster/zeng/code/research/software/miniconda/lib/python2.7/site-packages/torch/nn/modules/module.py", line 146, in _apply
+    module._apply(fn)
+  File "/cluster/zeng/code/research/software/miniconda/lib/python2.7/site-packages/torch/nn/modules/module.py", line 152, in _apply
+    param.data = fn(param.data)
+  File "/cluster/zeng/code/research/software/miniconda/lib/python2.7/site-packages/torch/nn/modules/module.py", line 216, in &lt;lambda&gt;
+    return self._apply(lambda t: t.cuda(device))
+  File "/cluster/zeng/code/research/software/miniconda/lib/python2.7/site-packages/torch/_utils.py", line 69, in _cuda
+    return new_type(self.size()).copy_(self, async)
+  File "/cluster/zeng/code/research/software/miniconda/lib/python2.7/site-packages/torch/cuda/__init__.py", line 358, in _lazy_new
+    _lazy_init()
+  File "/cluster/zeng/code/research/software/miniconda/lib/python2.7/site-packages/torch/cuda/__init__.py", line 121, in _lazy_init
+    torch._C._cuda_init()
+RuntimeError: cuda runtime error (38) : no CUDA-capable device is detected at /opt/conda/conda-bld/pytorch_1512378422383/work/torch/lib/THC/THCGeneral.c:70
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='10' author='ericl' date='2018-03-02T18:00:09Z'>
+		OK I'll try to reproduce this later today
+		</comment>
+		<comment id='11' author='ericl' date='2018-03-04T09:37:21Z'>
+		OK unfortunately, I was unable to reproduce this error. Can you post the entire stdout for running the above script? I tried running the given script on a p3.2xlarge on EC2, using pytorch_p36 and pytorch_p27 and using a wheel built off of master.
+Here are the wheels that I used:
+&lt;denchmark-link:https://s3-us-west-2.amazonaws.com/ray-wheels/latest/ray-0.3.1-cp36-cp36m-manylinux1_x86_64.whl&gt;python3.6&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://s3-us-west-2.amazonaws.com/ray-wheels/latest/ray-0.3.1-cp27-cp27mu-manylinux1_x86_64.whl&gt;python2.7&lt;/denchmark-link&gt;
+
+Perhaps try these out?
+PS, the above script has a typo - you'll need to change the HyperBand instantiation to:
+&lt;denchmark-code&gt;hyperband = HyperBandScheduler(
+    time_attr="timesteps_total", reward_attr="mean_loss",
+    max_t=100)
+&lt;/denchmark-code&gt;
+
+And perhaps change the return of the training result, since hyperband expects monotonically increasing metrics:
+&lt;denchmark-code&gt;return TrainingResult(mean_loss=-loss.data[0], timesteps_this_iter=1)  #note that it is now negative
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='12' author='ericl' date='2018-03-04T14:49:58Z'>
+		Thanks for looking into this!
+Yes I found these two typos after I posted it, but as expected unfortunately they are NOT relevant to this error.
+I tried uninstalling Ray and building from your wheels but the error is still there.
+The full stdout + stderr is &lt;denchmark-link:https://s3.amazonaws.com/zengtest/log&gt;here&lt;/denchmark-link&gt;
+.
+And I am using CUDA9.0 + cudnn 7 with eight Nvidia 1080 Ti.
+		</comment>
+		<comment id='13' author='ericl' date='2018-03-04T16:24:30Z'>
+		Ok after experimenting on AWS p3.2xlarge, it seems that it works fine for python 3.6 but NOT for python 2.7.
+What I did to setup for python 2.7:
+&lt;denchmark-code&gt;conda create -n py27 python=2.7
+source activate py27
+wget https://s3-us-west-2.amazonaws.com/ray-wheels/latest/ray-0.3.1-cp27-cp27mu-manylinux1_x86_64.whl
+python install ray-0.3.1-cp27-cp27mu-manylinux1_x86_64.whl
+conda install pytorch torchvision cuda90 -c pytorch
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-link:https://github.com/richardliaw&gt;@richardliaw&lt;/denchmark-link&gt;
+  Could you help look more into this? Thanks!
+		</comment>
+		<comment id='14' author='ericl' date='2018-03-04T20:42:35Z'>
+		OK I was able to reproduce this now. Thanks! Will investigate this...
+		</comment>
+		<comment id='15' author='ericl' date='2018-03-05T21:22:54Z'>
+		Hey &lt;denchmark-link:https://github.com/haoyangz&gt;@haoyangz&lt;/denchmark-link&gt;
+, &lt;denchmark-link:https://github.com/ray-project/ray/pull/1651&gt;#1651&lt;/denchmark-link&gt;
+ should fix your issue (it works on the p3.2xlarge test case you posted).
+Do you mind trying it out? You'd have to check out the branch and build from source.
+		</comment>
+		<comment id='16' author='ericl' date='2018-03-06T01:25:40Z'>
+		&lt;denchmark-link:https://github.com/richardliaw&gt;@richardliaw&lt;/denchmark-link&gt;
+  Thanks! I just tried on our cluster and it seems to still produce errors. Compiling from scratch gives error on the AMI I am using:
+&lt;denchmark-code&gt;+ cp /home/ubuntu/ray/thirdparty/pkg/arrow/cpp/build/cpp-install/bin/plasma_store /home/ubuntu/ray/python/ray/core/src/plasma/
+error: [Errno 2] No such file or directory: './ray/pyarrow_files/pyarrow'
+&lt;/denchmark-code&gt;
+
+Could you give me the AMI that works for you and I will try on that.
+		</comment>
+		<comment id='17' author='ericl' date='2018-03-06T04:01:26Z'>
+		I'm just using the DL AMI 5.0
+		</comment>
+		<comment id='18' author='ericl' date='2018-03-06T04:06:49Z'>
+		Could you post your output from running on cluster? Just to verify that the retries are in place.
+		</comment>
+		<comment id='19' author='ericl' date='2018-03-06T04:22:16Z'>
+		Building a wheel from source following instructions &lt;denchmark-link:https://github.com/ray-project/ray/blob/master/python/README-building-wheels.md&gt;here&lt;/denchmark-link&gt;
+ and installing it resolves the compilation problem on p3.2xlarge, and it indeed works without any error.
+&lt;denchmark-link:https://s3.amazonaws.com/zengtest/log10&gt;Here&lt;/denchmark-link&gt;
+ is the log fro running on our cluster. Thanks!
+		</comment>
+		<comment id='20' author='ericl' date='2018-03-06T08:28:45Z'>
+		Looks like what is happening is that this error is thrown, probably because some GPU resources are being released asynchronously:
+&lt;denchmark-code&gt;RuntimeError: cuda runtime error (38) : no CUDA-capable device is detected at /opt/conda/conda-bld/pytorch_1512378422383/work/torch/lib/THC/THCGeneral.c:70
+&lt;/denchmark-code&gt;
+
+and the handling for this is not very well isolated, causing a mismatch of resource bookkeeping and then subsequently the local scheduler issue on a couple experiments. We should probably improve the isolation, but it also seems like only a couple trials fail and the experiment actually continues.
+For debugging purposes, can you insert the following lines into your script at the beginning of def _setup(self):? It would be great to get the logs from this.
+&lt;denchmark-code&gt;print("Ray detects {}".format(ray.utils.get_cuda_visible_devices()))
+print("Torch detects {}".format(torch.cuda.device_count()))
+print("Torch ready? {}.format(torch.cuda.is_available()))
+&lt;/denchmark-code&gt;
+
+BTW, as a quick workaround, you could try the following: in _setup(self), sleep until Torch detects an available GPU.
+		</comment>
+		<comment id='21' author='ericl' date='2018-03-06T21:00:57Z'>
+		So I add the following lines at the begining of def _setup():
+&lt;denchmark-code&gt;        print("Ray detects {}".format(ray.utils.get_cuda_visible_devices()))
+        print("Torch detects {}".format(torch.cuda.device_count()))
+        print("Torch ready? {}".format(torch.cuda.is_available()))
+
+        tried_time = 0
+        try_interval = 1
+        while not torch.cuda.is_available():
+            print("Torch is not ready, wait for {} s. Have already waited for   {} s".format(try_interval, tried_time))
+            time.sleep(try_interval)
+            tried_time += try_interval
+
+        print("Ready now! Waited for {} s".format(tried_time))
+&lt;/denchmark-code&gt;
+
+And here is the &lt;denchmark-link:https://s3.amazonaws.com/zengtest/error&gt;stderr&lt;/denchmark-link&gt;
+ and &lt;denchmark-link:https://s3.amazonaws.com/zengtest/output&gt;stdout&lt;/denchmark-link&gt;
+. It seems that the ones that failed to get the resource initially never got it later, no matter how long it waited (the ready msg "Ready now" never shows up in stdout) . From stderr, it seems they are killed/ignored because Ray waited for too long? The whole program hung forever and I had to interrupt with ctrl+c.
+		</comment>
+		<comment id='22' author='ericl' date='2018-03-06T23:06:13Z'>
+		From the stdout, only  - my_class_17_H=93 was never able to run. It looks like the rest of the trials ran successfully?
+Is that right? If so, it's weird that the program hung forever.
+		</comment>
+		<comment id='23' author='ericl' date='2018-03-06T23:13:01Z'>
+		Stdout errors aside, this line is very weird -
+Attempting to create an actor but there aren't enough available GPUs. We'll start the worker anyway without any GPUs, but this is incorrect behavior.
+Do you know where this is output?
+		</comment>
+		<comment id='24' author='ericl' date='2018-03-06T23:29:52Z'>
+		&lt;denchmark-link:https://github.com/richardliaw&gt;@richardliaw&lt;/denchmark-link&gt;
+  Per you first comment, yes that seems to be the only trial that had an error. Overall the process is very random and sometimes all the trials are fine sometimes there are a few errors.
+Per your second question, I don't know but searching in this repository I found &lt;denchmark-link:https://github.com/ray-project/ray/blob/0fcceef772a3126e027b0817988022ebda1a506e/src/local_scheduler/local_scheduler.cc#L964&gt;this&lt;/denchmark-link&gt;
+. Any idea what might be going on?
+		</comment>
+		<comment id='25' author='ericl' date='2018-03-07T02:03:57Z'>
+		Looks like there's inconsistency between the local scheduler and the Redis state. &lt;denchmark-link:https://github.com/robertnishihara&gt;@robertnishihara&lt;/denchmark-link&gt;
+ is currently working on a fix (and we'll keep you updated on a PR).
+As a temporary fix (if urgent), here are two steps that will be beneficial:
+
+
+based off of the aforementioned PR, you can modify this line to be for sec in range(1, 5), which should decrease chance of failure significantly.
+
+
+Consider putting this code in the beginning your train function - this will kill trials that were falsely started.
+
+
+&lt;denchmark-code&gt;cuda_devices = ray.utils.get_cuda_visible_devices()
+if not cuda_devices:
+    print("Ray detects {}".format(cuda_devices))
+    raise Exception("No GPU devices allocated by Ray!")
+&lt;/denchmark-code&gt;
+
+Alternatively, if the GPU is not necessary for every, you could just if-else the cuda call based off of torch.cuda.is_available(). As you'd expect, certain trials would be slower, but you'll still get some of these results.
+		</comment>
+		<comment id='26' author='ericl' date='2018-03-20T03:07:28Z'>
+		&lt;denchmark-link:https://github.com/haoyangz&gt;@haoyangz&lt;/denchmark-link&gt;
+ now that &lt;denchmark-link:https://github.com/ray-project/ray/pull/1668&gt;#1668&lt;/denchmark-link&gt;
+ is in; do you still run into errors like this for HyperBand?
+		</comment>
+		<comment id='27' author='ericl' date='2018-03-23T15:53:06Z'>
+		&lt;denchmark-link:https://github.com/richardliaw&gt;@richardliaw&lt;/denchmark-link&gt;
+ No errors now. Thanks!
+		</comment>
+		<comment id='28' author='ericl' date='2018-03-23T16:42:10Z'>
+		Awesome! Will close this issue for now.
+		</comment>
+	</comments>
+</bug>

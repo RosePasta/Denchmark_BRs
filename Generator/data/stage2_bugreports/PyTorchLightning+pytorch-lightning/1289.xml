@@ -1,0 +1,200 @@
+<bug id='1289' author='nirkra' open_date='2020-03-30T10:13:43Z' closed_time='2020-03-31T07:36:39Z'>
+	<summary>ddp not working in conjunction with torch/nn/modules/conv.py</summary>
+	<description>
+&lt;denchmark-h:h3&gt;Common bugs:&lt;/denchmark-h&gt;
+
+ddp not working in conjunction with torch/nn/modules/conv.py
+&lt;denchmark-h:h2&gt;🐛 Bug&lt;/denchmark-h&gt;
+
+PL is cowardly refusing to serialize anything that inherits from class _ConvNd
+This is probably due to the fact the pytorch is initializing tensors in init
+Please see attached init code below:
+&lt;denchmark-h:h3&gt;To Reproduce&lt;/denchmark-h&gt;
+
+add one of these models to your PL model, and try to run Trainer with DDP
+&lt;denchmark-h:h3&gt;Code&lt;/denchmark-h&gt;
+
+class _ConvNd(Module):
+&lt;denchmark-code&gt;__constants__ = ['stride', 'padding', 'dilation', 'groups', 'bias',
+                 'padding_mode', 'output_padding', 'in_channels',
+                 'out_channels', 'kernel_size']
+
+def __init__(self, in_channels, out_channels, kernel_size, stride,
+             padding, dilation, transposed, output_padding,
+             groups, bias, padding_mode):
+    super(_ConvNd, self).__init__()
+    if in_channels % groups != 0:
+        raise ValueError('in_channels must be divisible by groups')
+    if out_channels % groups != 0:
+        raise ValueError('out_channels must be divisible by groups')
+    self.in_channels = in_channels
+    self.out_channels = out_channels
+    self.kernel_size = kernel_size
+    self.stride = stride
+    self.padding = padding
+    self.dilation = dilation
+    self.transposed = transposed
+    self.output_padding = output_padding
+    self.groups = groups
+    self.padding_mode = padding_mode
+    if transposed:
+        self.weight = Parameter(torch.Tensor(
+            in_channels, out_channels // groups, *kernel_size))
+    else:
+        self.weight = Parameter(torch.Tensor(
+            out_channels, in_channels // groups, *kernel_size))
+    if bias:
+        self.bias = Parameter(torch.Tensor(out_channels))
+    else:
+        self.register_parameter('bias', None)
+    self.reset_parameters()
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='nirkra' date='2020-03-30T10:14:29Z'>
+		Hi! thanks for your contribution!, great first issue!
+		</comment>
+		<comment id='2' author='nirkra' date='2020-03-30T11:20:33Z'>
+		could you please share your env setting and minimal running example to reproduce? 🤖
+		</comment>
+		<comment id='3' author='nirkra' date='2020-03-30T14:05:56Z'>
+		Oops, apologies, the problem seems to be in the wavenet_vocoder module that was calling it.
+So, it's a not a bug probably, but I would appreciate the help.
+Ubuntu18.04, cuda==10.1, pytorch-lightning==0.7.1, torch==1.4.0, wavenet-vocoder==0.1.1
+The problem seems to be in wavenet_vocoder/modules.py:
+&lt;denchmark-code&gt;def Conv1d(in_channels, out_channels, kernel_size, dropout=0, std_mul=4.0, **kwargs):
+    m = conv.Conv1d(in_channels, out_channels, kernel_size, **kwargs)
+    std = math.sqrt((std_mul * (1.0 - dropout)) / (m.kernel_size[0] * in_channels))
+    m.weight.data.normal_(mean=0, std=std)
+    m.bias.data.zero_()
+    return nn.utils.weight_norm(m)
+&lt;/denchmark-code&gt;
+
+It's doing something similar to this:
+&lt;denchmark-code&gt;from pytorch_lightning import Trainer
+
+
+import pytorch_lightning as pl
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+import math
+
+class ToyDataset(Dataset):
+    def __len__(self):
+        return 512
+
+    def __getitem__(self, idx):
+        return torch.rand((128, 1)), torch.ones(1).long()
+
+class LightConv(pl.LightningModule):
+    def __init__(self):
+        super(LightConv, self).__init__()
+        m = nn.Conv1d(in_channels=128, out_channels=256, kernel_size=1, bias=True)
+        dropout=0
+        std_mul=4.0
+        in_channels=128
+        std = math.sqrt((std_mul * (1.0 - dropout)) / (m.kernel_size[0] * in_channels))
+        m.weight.data.normal_(mean=0, std=std)
+        m.bias.data.zero_()
+        self.cnn = nn.utils.weight_norm(m)
+
+    def prepare_data(self):
+            self.train_dataset = ToyDataset()
+            self.test_dataset = ToyDataset()
+            self.valid_dataset = ToyDataset()
+    def forward(self, x):
+        return self.cnn(x)
+
+    def train_dataloader(self):
+        return DataLoader(self.train_dataset, batch_size=32, num_workers=0,
+                          shuffle=True)
+
+    def val_dataloader(self):
+        return DataLoader(self.valid_dataset, batch_size=32, num_workers=0)
+
+    def test_dataloader(self):
+        return DataLoader(self.test_dataset, batch_size=32, num_workers=0)
+
+    def configure_optimizers(self):
+        g_optimizer = optim.Adam(self.cnn.parameters(), lr=0.0001)
+        return [g_optimizer]
+
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+        out = self.forward(x)
+        loss = F.cross_entropy(out, y)
+        return {"loss": loss} 
+
+    def test_step(self, batch, batch_idx):
+        x, y = batch
+        out = self.forward(x)
+        loss = F.cross_entropy(out, y)
+        return {"loss": loss} 
+
+if __name__ == '__main__':
+    net = LightConv()
+    trainer = Trainer(max_epochs=1,
+                    gpus=1, num_nodes=1, distributed_backend='ddp')
+    trainer.fit(net)
+    trainer.test(net)
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='4' author='nirkra' date='2020-03-31T13:53:00Z'>
+		the problem is with nn.utils.weight_norm(m) - the pytorch implementation calculates the norm(m) durning intialization and before 'forward' is run. It therefore creates a dependency between the tensors.
+to work aroung it I create my own implementation of WeightNorm, based on some older version implementation:
+&lt;denchmark-code&gt;class WeightNorm(nn.Module):
+    append_g = '_g'
+    append_v = '_v'
+
+    def __init__(self, module, weights):
+        super(WeightNorm, self).__init__()
+        self.module = module
+        self.weights = weights
+        self._reset()
+
+    def _reset(self):
+        for name_w in self.weights:
+            w = getattr(self.module, name_w)
+
+            # construct g,v such that w = g/||v|| * v
+            with torch.no_grad():
+                g = torch.norm(w)
+                v = w/g.expand_as(w)
+            g = Parameter(g.data, requires_grad=True)
+            v = Parameter(v.data, requires_grad=True)
+            name_g = name_w + self.append_g
+            name_v = name_w + self.append_v
+
+            # remove w from parameter list
+            del self.module._parameters[name_w]
+
+            # add g and v as new parameters
+            self.module.register_parameter(name_g, g)
+            self.module.register_parameter(name_v, v)
+
+    def _setweights(self):
+        for name_w in self.weights:
+            name_g = name_w + self.append_g
+            name_v = name_w + self.append_v
+            g = getattr(self.module, name_g)
+            v = getattr(self.module, name_v)
+            w = v*(g/torch.norm(v)).expand_as(v)
+            setattr(self.module, name_w, w)
+
+    def forward(self, *args):
+        self._setweights()
+        return self.module.forward(*args)
+&lt;/denchmark-code&gt;
+
+and then change
+nn.utils.weight_norm(m)
+to:
+WeightNorm(m, ['weight'])
+		</comment>
+	</comments>
+</bug>

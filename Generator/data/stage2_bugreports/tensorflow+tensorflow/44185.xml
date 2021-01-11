@@ -1,0 +1,754 @@
+<bug id='44185' author='QColeman97' open_date='2020-10-20T20:29:23Z' closed_time='2020-10-27T20:46:08Z'>
+	<summary>Multi-output custom loss model crashes: ValueError: The truth value of an array with more than one element is ambiguous. Use a.any() or a.all()  ...  Error occurred when finalizing GeneratorDataset iterator: Failed precondition: Python interpreter state is not initialized. The process may be terminated. 	 [[{{node PyFunc}}]]</summary>
+	<description>
+Please make sure that this is a bug. As per our
+GitHub Policy,
+we only address code/doc bugs, performance issues, feature requests and
+build/installation issues on GitHub. tag:bug_template
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Docker container in CentOS Linux release 7.8.2003 (Core)
+Mobile device (e.g. iPhone 8, Pixel 2, Samsung Galaxy) if the issue happens on mobile device: N/A
+TensorFlow installed from (source or binary): Docker container - tensorflow/tensorflow:latest-gpu
+TensorFlow version (use command below): 2.3.1
+Python version: Python 3.6.9
+Bazel version (if compiling from source): N/A
+GCC/Compiler version (if compiling from source): N/A
+CUDA/cuDNN version: 10.1
+GPU model and memory: 2x NVIDIA Tesla V100, 32510MiB (~34GB) of memory each
+
+You can collect some of this information using our environment capture
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/tree/master/tools/tf_env_collect.sh&gt;script&lt;/denchmark-link&gt;
+
+You can also obtain the TensorFlow version with:
+
+TF 1.0: python -c "import tensorflow as tf; print(tf.GIT_VERSION, tf.VERSION)"
+TF 2.0: python -c "import tensorflow as tf; print(tf.version.GIT_VERSION, tf.version.VERSION)"
+
+Describe the current behavior
+I'm implementing a source-separation 2-output model, and it's made with the functional API. I'm running a custom loss function which uses 2-output targets and predictions (4 in total). For my loss function to work, my model is "wrapped" within a subclassed model. It crashes during training.
+Describe the expected behavior
+I expect it not to crash during training.
+Standalone code to reproduce the issue
+Provide a reproducible test case that is the bare minimum necessary to generate
+the problem. If possible, please share a link to Colab/Jupyter/any notebook.
+&lt;denchmark-code&gt;from scipy.io import wavfile
+import scipy.signal as sg
+import matplotlib.pyplot as plt
+import tensorflow as tf
+from tensorflow.keras.layers import Input, SimpleRNN, Dense, Lambda, TimeDistributed, Layer, LSTM, Bidirectional, BatchNormalization, Concatenate
+from tensorflow.keras.models import Model
+from tensorflow.keras.activations import relu
+from tensorflow.keras.callbacks import EarlyStopping
+import numpy as np
+import datetime
+import numpy as np
+import math
+import random
+import json
+import os
+import sys
+
+
+
+# Loss function
+def discriminative_loss(piano_true, noise_true, piano_pred, noise_pred, loss_const):
+    last_dim = piano_pred.shape[1] * piano_pred.shape[2]
+    return (
+        tf.math.reduce_mean(tf.reshape(noise_pred - noise_true, shape=(-1, last_dim)) ** 2, axis=-1) - 
+        (loss_const * tf.math.reduce_mean(tf.reshape(noise_pred - piano_true, shape=(-1, last_dim)) ** 2, axis=-1)) +
+        tf.math.reduce_mean(tf.reshape(piano_pred - piano_true, shape=(-1, last_dim)) ** 2, axis=-1) -
+        (loss_const * tf.math.reduce_mean(tf.reshape(piano_pred - noise_true, shape=(-1, last_dim)) ** 2, axis=-1))
+    )
+
+
+
+def make_model(features, sequences, name='Model'):
+
+    input_layer = Input(shape=(sequences, features), dtype='float32', 
+                        name='piano_noise_mixed')
+    piano_true = Input(shape=(sequences, features), dtype='float32', 
+                       name='piano_true')
+    noise_true = Input(shape=(sequences, features), dtype='float32', 
+                       name='noise_true')
+
+    x = SimpleRNN(features // 2, 
+                  activation='relu', 
+                  return_sequences=True) (input_layer) 
+    piano_pred = TimeDistributed(Dense(features), name='piano_hat') (x)  # source 1 branch
+    noise_pred = TimeDistributed(Dense(features), name='noise_hat') (x)  # source 2 branch
+  
+    model = Model(inputs=[input_layer, piano_true, noise_true],
+                  outputs=[piano_pred, noise_pred])
+
+    return model
+
+
+
+# Model "wrapper" for many-input loss function
+class RestorationModel2(Model):
+    def __init__(self, model, loss_const):
+        super(RestorationModel2, self).__init__()
+        self.model = model
+        self.loss_const = loss_const
+       
+    def call(self, inputs):
+        return self.model(inputs)
+
+    def compile(self, optimizer, loss):
+        super(RestorationModel2, self).compile()
+        self.optimizer = optimizer
+        self.loss = loss
+
+    def train_step(self, data):
+        # Unpack data - what generator yeilds
+        x, piano_true, noise_true = data
+
+        with tf.GradientTape() as tape:
+            piano_pred, noise_pred = self.model((x, piano_true, noise_true), training=True)
+            loss = self.loss(piano_true, noise_true, piano_pred, noise_pred, self.loss_const)
+
+        trainable_vars = self.model.trainable_variables
+        gradients = tape.gradient(loss, trainable_vars)
+        self.optimizer.apply_gradients(zip(gradients, trainable_vars))
+        
+        return {'loss': loss}
+
+    def test_step(self, data):
+        x, piano_true, noise_true = data
+
+        piano_pred, noise_pred = self.model((x, piano_true, noise_true), training=False)
+        loss = self.loss(piano_true, noise_true, piano_pred, noise_pred, self.loss_const)
+        
+        return {'loss': loss}
+
+
+
+def make_imp_model(features, sequences, loss_const=0.05, 
+                   optimizer=tf.keras.optimizers.RMSprop(clipvalue=0.7),
+                   name='Restoration Model', epsilon=10 ** (-10)):
+    
+    # NEW Semi-imperative model
+    model = RestorationModel2(make_model(features, sequences, name='Training Model'),
+                              loss_const=loss_const)
+
+    model.compile(optimizer=optimizer, loss=discriminative_loss)
+
+    return model
+
+
+
+# MODEL TRAIN &amp; EVAL FUNCTION
+def evaluate_source_sep(train_generator, validation_generator,
+                        num_train, num_val, n_feat, n_seq, batch_size, 
+                        loss_const, epochs=20, 
+                        optimizer=tf.keras.optimizers.RMSprop(clipvalue=0.75),
+                        patience=10, epsilon=10 ** (-10)):
+   
+    print('Making model...')    # IMPERATIVE MODEL - Customize Fit
+    model = make_imp_model(n_feat, n_seq, loss_const=loss_const, optimizer=optimizer, epsilon=epsilon)
+    
+    print('Going into training now...')
+    hist = model.fit(train_generator,
+                     steps_per_epoch=math.ceil(num_train / batch_size),
+                     epochs=epochs,
+                     validation_data=validation_generator,
+                     validation_steps=math.ceil(num_val / batch_size),
+                     callbacks=[EarlyStopping('val_loss', patience=patience, mode='min')])
+    print(model.summary())
+
+
+
+# NEURAL NETWORK DATA GENERATOR
+def my_dummy_generator(num_samples, batch_size, train_seq, train_feat):
+
+    while True:
+        for offset in range(0, num_samples, batch_size):
+
+            # Initialise x, y1 and y2 arrays for this batch
+            x, y1, y2 = (np.empty((batch_size, train_seq, train_feat)),
+                            np.empty((batch_size, train_seq, train_feat)),
+                            np.empty((batch_size, train_seq, train_feat)))
+
+            yield (x, y1, y2)
+
+
+
+def main():
+    epsilon = 10 ** (-10)
+    train_batch_size = 5
+    loss_const, epochs, val_split = 0.05, 10, 0.25
+    optimizer = tf.keras.optimizers.RMSprop(clipvalue=0.9)
+
+    TRAIN_SEQ_LEN, TRAIN_FEAT_LEN = 1847, 2049
+    TOTAL_SMPLS = 60 
+
+    # Validation &amp; Training Split
+    indices = list(range(TOTAL_SMPLS))
+    val_indices = indices[:math.ceil(TOTAL_SMPLS * val_split)]
+    num_val = len(val_indices)
+    num_train = TOTAL_SMPLS - num_val
+   
+    train_seq, train_feat = TRAIN_SEQ_LEN, TRAIN_FEAT_LEN
+    print('Train Input Stats:')
+    print('N Feat:', train_feat, 'Seq Len:', train_seq, 'Batch Size:', train_batch_size)
+
+    # Create data generators and evaluate model with them
+    train_generator = my_dummy_generator(num_train,
+                        batch_size=train_batch_size, train_seq=train_seq,
+                        train_feat=train_feat)
+    validation_generator = my_dummy_generator(num_val,
+                        batch_size=train_batch_size, train_seq=train_seq,
+                        train_feat=train_feat)
+
+    evaluate_source_sep(train_generator, validation_generator, num_train, num_val,
+                            n_feat=train_feat, n_seq=train_seq, 
+                            batch_size=train_batch_size, 
+                            loss_const=loss_const, epochs=epochs,
+                            optimizer=optimizer, epsilon=epsilon)
+
+if __name__ == '__main__':
+    main()
+
+&lt;/denchmark-code&gt;
+
+Other info / logs Include any logs or source code that would be helpful to
+diagnose the problem. If including tracebacks, please include the full
+traceback. Large logs and files should be attached.
+Matplotlib created a temporary config/cache directory at /tmp/matplotlib-w351htm7 because the default path (/.config/matplotlib) is not a writable directory; it is highly recommended to set the MPLCONFIGDIR environment variable to a writable directory, in particular to speed up the import of Matplotlib and to better support multiprocessing.
+2020-10-20 20:59:48.073656: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcudart.so.10.1
+Train Input Stats:
+N Feat: 2049 Seq Len: 1847 Batch Size: 5
+Making model...
+2020-10-20 20:59:49.685893: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcuda.so.1
+2020-10-20 20:59:51.341091: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1716] Found device 0 with properties:
+pciBusID: 0000:27:00.0 name: Tesla V100S-PCIE-32GB computeCapability: 7.0
+coreClock: 1.597GHz coreCount: 80 deviceMemorySize: 31.75GiB deviceMemoryBandwidth: 1.03TiB/s
+2020-10-20 20:59:51.343325: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1716] Found device 1 with properties:
+pciBusID: 0000:83:00.0 name: Tesla V100S-PCIE-32GB computeCapability: 7.0
+coreClock: 1.597GHz coreCount: 80 deviceMemorySize: 31.75GiB deviceMemoryBandwidth: 1.03TiB/s
+2020-10-20 20:59:51.343415: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcudart.so.10.1
+2020-10-20 20:59:51.346449: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcublas.so.10
+2020-10-20 20:59:51.349214: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcufft.so.10
+2020-10-20 20:59:51.349659: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcurand.so.10
+2020-10-20 20:59:51.352344: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcusolver.so.10
+2020-10-20 20:59:51.353860: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcusparse.so.10
+2020-10-20 20:59:51.359411: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcudnn.so.7
+2020-10-20 20:59:51.367984: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1858] Adding visible gpu devices: 0, 1
+2020-10-20 20:59:51.368576: I tensorflow/core/platform/cpu_feature_guard.cc:142] This TensorFlow binary is optimized with oneAPI Deep Neural Network Library (oneDNN)to use the following CPU instructions in performance-critical operations:  AVX2 FMA
+To enable them in other operations, rebuild TensorFlow with the appropriate compiler flags.
+2020-10-20 20:59:51.405603: I tensorflow/core/platform/profile_utils/cpu_utils.cc:104] CPU Frequency: 2245615000 Hz
+2020-10-20 20:59:51.435047: I tensorflow/compiler/xla/service/service.cc:168] XLA service 0x4c0cdc0 initialized for platform Host (this does not guarantee that XLA will be used). Devices:
+2020-10-20 20:59:51.435197: I tensorflow/compiler/xla/service/service.cc:176]   StreamExecutor device (0): Host, Default Version
+2020-10-20 20:59:51.659719: I tensorflow/compiler/xla/service/service.cc:168] XLA service 0x44a7910 initialized for platform CUDA (this does not guarantee that XLA will be used). Devices:
+2020-10-20 20:59:51.659822: I tensorflow/compiler/xla/service/service.cc:176]   StreamExecutor device (0): Tesla V100S-PCIE-32GB, Compute Capability 7.0
+2020-10-20 20:59:51.659849: I tensorflow/compiler/xla/service/service.cc:176]   StreamExecutor device (1): Tesla V100S-PCIE-32GB, Compute Capability 7.0
+2020-10-20 20:59:51.665940: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1716] Found device 0 with properties:
+pciBusID: 0000:27:00.0 name: Tesla V100S-PCIE-32GB computeCapability: 7.0
+coreClock: 1.597GHz coreCount: 80 deviceMemorySize: 31.75GiB deviceMemoryBandwidth: 1.03TiB/s
+2020-10-20 20:59:51.668089: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1716] Found device 1 with properties:
+pciBusID: 0000:83:00.0 name: Tesla V100S-PCIE-32GB computeCapability: 7.0
+coreClock: 1.597GHz coreCount: 80 deviceMemorySize: 31.75GiB deviceMemoryBandwidth: 1.03TiB/s
+2020-10-20 20:59:51.668184: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcudart.so.10.1
+2020-10-20 20:59:51.668387: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcublas.so.10
+2020-10-20 20:59:51.668620: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcufft.so.10
+2020-10-20 20:59:51.668671: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcurand.so.10
+2020-10-20 20:59:51.668786: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcusolver.so.10
+2020-10-20 20:59:51.668836: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcusparse.so.10
+2020-10-20 20:59:51.668883: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcudnn.so.7
+2020-10-20 20:59:51.677143: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1858] Adding visible gpu devices: 0, 1
+2020-10-20 20:59:51.677300: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcudart.so.10.1
+2020-10-20 20:59:52.875191: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1257] Device interconnect StreamExecutor with strength 1 edge matrix:
+2020-10-20 20:59:52.875315: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1263]      0 1
+2020-10-20 20:59:52.875346: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1276] 0:   N Y
+2020-10-20 20:59:52.875557: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1276] 1:   Y N
+2020-10-20 20:59:52.882402: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1402] Created TensorFlow device (/job:localhost/replica:0/task:0/device:GPU:0 with 30132 MB memory) -&gt; physical GPU (device: 0, name: Tesla V100S-PCIE-32GB, pci bus id: 0000:27:00.0, compute capability: 7.0)
+2020-10-20 20:59:52.885327: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1402] Created TensorFlow device (/job:localhost/replica:0/task:0/device:GPU:1 with 30132 MB memory) -&gt; physical GPU (device: 1, name: Tesla V100S-PCIE-32GB, pci bus id: 0000:83:00.0, compute capability: 7.0)
+Going into training now...
+2020-10-20 20:59:53.516824: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcublas.so.10
+Epoch 1/10
+9/9 [==============================] - ETA: 0s - loss: 0.0000e+00Traceback (most recent call last):
+File "dlnn_brahms_restore_clean.py", line 212, in 
+main()
+File "dlnn_brahms_restore_clean.py", line 209, in main
+optimizer=optimizer, epsilon=epsilon)
+File "dlnn_brahms_restore_clean.py", line 158, in evaluate_source_sep
+callbacks=[EarlyStopping('val_loss', patience=patience, mode='min')])
+File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/keras/engine/training.py", line 108, in _method_wrapper
+return method(self, *args, **kwargs)
+File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/keras/engine/training.py", line 1137, in fit
+callbacks.on_epoch_end(epoch, epoch_logs)
+File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/keras/callbacks.py", line 416, in on_epoch_end
+callback.on_epoch_end(epoch, numpy_logs)
+File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/keras/callbacks.py", line 1664, in on_epoch_end
+if self.monitor_op(current - self.min_delta, self.best):
+ValueError: The truth value of an array with more than one element is ambiguous. Use a.any() or a.all()
+2020-10-20 21:00:05.825863: W tensorflow/core/kernels/data/generator_dataset_op.cc:103] Error occurred when finalizing GeneratorDataset iterator: Failed precondition: Python interpreter state is not initialized. The process may be terminated.
+[[{{node PyFunc}}]]
+	</description>
+	<comments>
+		<comment id='1' author='QColeman97' date='2020-10-21T18:27:35Z'>
+		The problem is that in the callback your current is an array and self.min_delta is just an int.
+
+
+
+tensorflow/tensorflow/python/keras/callbacks.py
+
+
+        Lines 1762 to 1765
+      in
+      c587b9a
+
+
+
+
+
+
+ current = self.get_monitor_value(logs) 
+
+
+
+ if current is None: 
+
+
+
+ return 
+
+
+
+ if self.monitor_op(current - self.min_delta, self.best): 
+
+
+
+
+
+		</comment>
+		<comment id='2' author='QColeman97' date='2020-10-21T19:56:43Z'>
+		I also got an similar error
+&lt;denchmark-code&gt;  File "src/models/efficientNet2.py", line 129, in &lt;module&gt;
+    callbacks=callbacks_list
+  File "/opt/conda/lib/python3.7/site-packages/tensorflow/python/keras/engine/training.py", line 108, in _method_wrapper
+    return method(self, *args, **kwargs)
+  File "/opt/conda/lib/python3.7/site-packages/tensorflow/python/keras/engine/training.py", line 1122, in fit
+    steps_per_execution=self._steps_per_execution)
+  File "/opt/conda/lib/python3.7/site-packages/tensorflow/python/keras/engine/data_adapter.py", line 1117, in __init__
+    model=model)
+  File "/opt/conda/lib/python3.7/site-packages/tensorflow/python/keras/engine/data_adapter.py", line 786, in __init__
+    peek, x = self._peek_and_restore(x)
+  File "/opt/conda/lib/python3.7/site-packages/tensorflow/python/keras/engine/data_adapter.py", line 843, in _peek_and_restore
+    peek = next(x)
+  File "/home/gl/EfficientNetCana/src/models/cromai/generator.py", line 339, in get_next_batch
+    self.apply_labels()
+  File "/home/gl/EfficientNetCana/src/models/cromai/generator.py", line 328, in apply_labels
+    self.XY = self.img_data_gen.flow(self.X, self.Y, self.batch_size)
+  File "/opt/conda/lib/python3.7/site-packages/tensorflow/python/keras/preprocessing/image.py", line 866, in flow
+    subset=subset)
+  File "/opt/conda/lib/python3.7/site-packages/tensorflow/python/keras/preprocessing/image.py", line 461, in __init__
+    **kwargs)
+  File "/opt/conda/lib/python3.7/site-packages/keras_preprocessing/image/numpy_array_iterator.py", line 126, in __init__
+    'with shape', self.x.shape)
+ValueError: ('Input data in `NumpyArrayIterator` should have rank 4. You passed an array with shape', (0,))
+2020-10-21 19:29:44.298458: W tensorflow/core/kernels/data/generator_dataset_op.cc:103] Error occurred when finalizing GeneratorDataset iterator: Failed precondition: Python interpreter state is not initialized. The process may be terminated.
+	 [[{{node PyFunc}}]]
+&lt;/denchmark-code&gt;
+
+in my case I was able to train the model changing the batch size (not ideal but worked).
+		</comment>
+		<comment id='3' author='QColeman97' date='2020-10-21T20:54:50Z'>
+		&lt;denchmark-link:https://github.com/Gabrielllopes&gt;@Gabrielllopes&lt;/denchmark-link&gt;
+ I don't think it is similar.
+		</comment>
+		<comment id='4' author='QColeman97' date='2020-10-21T21:26:50Z'>
+		&lt;denchmark-link:https://github.com/Gabrielllopes&gt;@Gabrielllopes&lt;/denchmark-link&gt;
+ sorry for the false bug alarm if that's the case.
+Does this mean it's impossible to use model.fit() if you have a custom loss dealing with all multi-output targets? I couldn't find this on the documentation.
+		</comment>
+		<comment id='5' author='QColeman97' date='2020-10-22T00:06:48Z'>
+		&lt;denchmark-link:https://github.com/QColeman97&gt;@QColeman97&lt;/denchmark-link&gt;
+ Can you try to run your example on  cause It seems to have other errors.
+		</comment>
+		<comment id='6' author='QColeman97' date='2020-10-22T10:26:50Z'>
+		&lt;denchmark-link:https://github.com/QColeman97&gt;@QColeman97&lt;/denchmark-link&gt;
+ I modified you example also to run to the next TF version.
+I think that problem is that you are producing a   in the log dictionary with an array of batch size len.
+The monitor is expected to be a single value.
+		</comment>
+		<comment id='7' author='QColeman97' date='2020-10-25T22:15:57Z'>
+		&lt;denchmark-link:https://github.com/bhack&gt;@bhack&lt;/denchmark-link&gt;
+ I changed my loss to only return a single value now.
+&lt;denchmark-code&gt;def discriminative_loss(piano_true, noise_true, piano_pred, noise_pred, loss_const):
+    last_dim = piano_pred.shape[1] * piano_pred.shape[2]
+    return (
+        tf.math.reduce_mean(tf.reshape(noise_pred - noise_true, shape=(-1, last_dim)) ** 2) - 
+        (loss_const * tf.math.reduce_mean(tf.reshape(noise_pred - piano_true, shape=(-1, last_dim)) ** 2)) +
+        tf.math.reduce_mean(tf.reshape(piano_pred - piano_true, shape=(-1, last_dim)) ** 2) -
+        (loss_const * tf.math.reduce_mean(tf.reshape(piano_pred - noise_true, shape=(-1, last_dim)) ** 2))
+    )
+&lt;/denchmark-code&gt;
+
+Here is the new output on tf-nightly:
+Matplotlib created a temporary config/cache directory at /tmp/matplotlib-k5_af0cg because the default path (/.config/matplotlib) is not a writable directory; it is highly recommended to set the MPLCONFIGDIR environment variable to a writable directory, in particular to speed up the import of Matplotlib and to better support multiprocessing.
+2020-10-25 22:12:04.932403: I tensorflow/stream_executor/platform/default/dso_loader.cc:49] Successfully opened dynamic library libcudart.so.11.0
+Train Input Stats:
+N Feat: 2049 Seq Len: 1847 Batch Size: 5
+Making model...
+2020-10-25 22:12:06.998388: I tensorflow/compiler/jit/xla_cpu_device.cc:41] Not creating XLA devices, tf_xla_enable_xla_devices not set
+2020-10-25 22:12:07.000269: I tensorflow/stream_executor/platform/default/dso_loader.cc:49] Successfully opened dynamic library libcuda.so.1
+2020-10-25 22:12:07.018113: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1720] Found device 0 with properties:
+pciBusID: 0000:27:00.0 name: Tesla V100S-PCIE-32GB computeCapability: 7.0
+coreClock: 1.597GHz coreCount: 80 deviceMemorySize: 31.75GiB deviceMemoryBandwidth: 1.03TiB/s
+2020-10-25 22:12:07.020319: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1720] Found device 1 with properties:
+pciBusID: 0000:83:00.0 name: Tesla V100S-PCIE-32GB computeCapability: 7.0
+coreClock: 1.597GHz coreCount: 80 deviceMemorySize: 31.75GiB deviceMemoryBandwidth: 1.03TiB/s
+2020-10-25 22:12:07.020408: I tensorflow/stream_executor/platform/default/dso_loader.cc:49] Successfully opened dynamic library libcudart.so.11.0
+2020-10-25 22:12:07.025238: I tensorflow/stream_executor/platform/default/dso_loader.cc:49] Successfully opened dynamic library libcublas.so.11
+2020-10-25 22:12:07.025333: I tensorflow/stream_executor/platform/default/dso_loader.cc:49] Successfully opened dynamic library libcublasLt.so.11
+2020-10-25 22:12:07.027602: I tensorflow/stream_executor/platform/default/dso_loader.cc:49] Successfully opened dynamic library libcufft.so.10
+2020-10-25 22:12:07.028092: I tensorflow/stream_executor/platform/default/dso_loader.cc:49] Successfully opened dynamic library libcurand.so.10
+2020-10-25 22:12:07.032374: I tensorflow/stream_executor/platform/default/dso_loader.cc:49] Successfully opened dynamic library libcusolver.so.10
+2020-10-25 22:12:07.033319: I tensorflow/stream_executor/platform/default/dso_loader.cc:49] Successfully opened dynamic library libcusparse.so.11
+2020-10-25 22:12:07.033639: I tensorflow/stream_executor/platform/default/dso_loader.cc:49] Successfully opened dynamic library libcudnn.so.8
+2020-10-25 22:12:07.039718: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1862] Adding visible gpu devices: 0, 1
+2020-10-25 22:12:07.040347: I tensorflow/core/platform/cpu_feature_guard.cc:142] This TensorFlow binary is optimized with oneAPI Deep Neural Network Library (oneDNN) to use the following CPU instructions in performance-critical operations:  AVX2 FMA
+To enable them in other operations, rebuild TensorFlow with the appropriate compiler flags.
+2020-10-25 22:12:07.069815: I tensorflow/compiler/jit/xla_gpu_device.cc:99] Not creating XLA devices, tf_xla_enable_xla_devices not set
+2020-10-25 22:12:07.482667: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1720] Found device 0 with properties:
+pciBusID: 0000:27:00.0 name: Tesla V100S-PCIE-32GB computeCapability: 7.0
+coreClock: 1.597GHz coreCount: 80 deviceMemorySize: 31.75GiB deviceMemoryBandwidth: 1.03TiB/s
+2020-10-25 22:12:07.484845: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1720] Found device 1 with properties:
+pciBusID: 0000:83:00.0 name: Tesla V100S-PCIE-32GB computeCapability: 7.0
+coreClock: 1.597GHz coreCount: 80 deviceMemorySize: 31.75GiB deviceMemoryBandwidth: 1.03TiB/s
+2020-10-25 22:12:07.484950: I tensorflow/stream_executor/platform/default/dso_loader.cc:49] Successfully opened dynamic library libcudart.so.11.0
+2020-10-25 22:12:07.485125: I tensorflow/stream_executor/platform/default/dso_loader.cc:49] Successfully opened dynamic library libcublas.so.11
+2020-10-25 22:12:07.485220: I tensorflow/stream_executor/platform/default/dso_loader.cc:49] Successfully opened dynamic library libcublasLt.so.11
+2020-10-25 22:12:07.485355: I tensorflow/stream_executor/platform/default/dso_loader.cc:49] Successfully opened dynamic library libcufft.so.10
+2020-10-25 22:12:07.485501: I tensorflow/stream_executor/platform/default/dso_loader.cc:49] Successfully opened dynamic library libcurand.so.10
+2020-10-25 22:12:07.485644: I tensorflow/stream_executor/platform/default/dso_loader.cc:49] Successfully opened dynamic library libcusolver.so.10
+2020-10-25 22:12:07.485823: I tensorflow/stream_executor/platform/default/dso_loader.cc:49] Successfully opened dynamic library libcusparse.so.11
+2020-10-25 22:12:07.486045: I tensorflow/stream_executor/platform/default/dso_loader.cc:49] Successfully opened dynamic library libcudnn.so.8
+2020-10-25 22:12:07.491806: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1862] Adding visible gpu devices: 0, 1
+2020-10-25 22:12:07.492050: I tensorflow/stream_executor/platform/default/dso_loader.cc:49] Successfully opened dynamic library libcudart.so.11.0
+2020-10-25 22:12:09.256059: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1261] Device interconnect StreamExecutor with strength 1 edge matrix:
+2020-10-25 22:12:09.256148: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1267]      0 1
+2020-10-25 22:12:09.256180: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1280] 0:   N Y
+2020-10-25 22:12:09.256399: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1280] 1:   Y N
+2020-10-25 22:12:09.361347: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1406] Created TensorFlow device (/job:localhost/replica:0/task:0/device:GPU:0 with 793 MB memory) -&gt; physical GPU (device: 0, name: Tesla V100S-PCIE-32GB, pci bus id: 0000:27:00.0, compute capability: 7.0)
+2020-10-25 22:12:09.366430: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1406] Created TensorFlow device (/job:localhost/replica:0/task:0/device:GPU:1 with 29702 MB memory) -&gt; physical GPU (device: 1, name: Tesla V100S-PCIE-32GB, pci bus id: 0000:83:00.0, compute capability: 7.0)
+Going into training now...
+Traceback (most recent call last):
+File "dlnn_brahms_restore_clean.py", line 219, in 
+main()
+File "dlnn_brahms_restore_clean.py", line 216, in main
+optimizer=optimizer, epsilon=epsilon)
+File "dlnn_brahms_restore_clean.py", line 165, in evaluate_source_sep
+callbacks=[EarlyStopping('val_loss', patience=patience, mode='min')])
+File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/keras/engine/training.py", line 1064, in fit
+steps_per_execution=self._steps_per_execution)
+File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/keras/engine/data_adapter.py", line 1112, in init
+model=model)
+File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/keras/engine/data_adapter.py", line 787, in init
+lambda x: model(x, training=False), args=(concrete_x,))
+File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/distribute/distribute_lib.py", line 1259, in run
+return self._extended.call_for_each_replica(fn, args=args, kwargs=kwargs)
+File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/distribute/distribute_lib.py", line 2730, in call_for_each_replica
+return self._call_for_each_replica(fn, args, kwargs)
+File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/distribute/distribute_lib.py", line 3417, in _call_for_each_replica
+return fn(*args, **kwargs)
+File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/autograph/impl/api.py", line 572, in wrapper
+return func(*args, **kwargs)
+File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/keras/engine/data_adapter.py", line 787, in 
+lambda x: model(x, training=False), args=(concrete_x,))
+File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/keras/engine/base_layer.py", line 1007, in call
+outputs = call_fn(inputs, *args, **kwargs)
+File "dlnn_brahms_restore_clean.py", line 103, in call
+return self.model(inputs)
+File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/keras/engine/base_layer.py", line 993, in call
+input_spec.assert_input_compatibility(self.input_spec, inputs, self.name)
+File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/keras/engine/input_spec.py", line 207, in assert_input_compatibility
+' input tensors. Inputs received: ' + str(inputs))
+ValueError: Layer model expects 3 input(s), but it received 1 input tensors. Inputs received: [&lt;tf.Tensor: shape=(5, 1847, 2049), dtype=float32, numpy=
+array([[[0., 0., 0., ..., 0., 0., 0.],
+[0., 0., 0., ..., 0., 0., 0.],
+[0., 0., 0., ..., 0., 0., 0.],
+...,
+[0., 0., 0., ..., 0., 0., 0.],
+[0., 0., 0., ..., 0., 0., 0.],
+[0., 0., 0., ..., 0., 0., 0.]],
+&lt;denchmark-code&gt;   [[0., 0., 0., ..., 0., 0., 0.],
+    [0., 0., 0., ..., 0., 0., 0.],
+    [0., 0., 0., ..., 0., 0., 0.],
+    ...,
+    [0., 0., 0., ..., 0., 0., 0.],
+    [0., 0., 0., ..., 0., 0., 0.],
+    [0., 0., 0., ..., 0., 0., 0.]],
+
+   [[0., 0., 0., ..., 0., 0., 0.],
+    [0., 0., 0., ..., 0., 0., 0.],
+    [0., 0., 0., ..., 0., 0., 0.],
+    ...,
+    [0., 0., 0., ..., 0., 0., 0.],
+    [0., 0., 0., ..., 0., 0., 0.],
+    [0., 0., 0., ..., 0., 0., 0.]],
+
+   [[0., 0., 0., ..., 0., 0., 0.],
+    [0., 0., 0., ..., 0., 0., 0.],
+    [0., 0., 0., ..., 0., 0., 0.],
+    ...,
+    [0., 0., 0., ..., 0., 0., 0.],
+    [0., 0., 0., ..., 0., 0., 0.],
+    [0., 0., 0., ..., 0., 0., 0.]],
+
+   [[0., 0., 0., ..., 0., 0., 0.],
+    [0., 0., 0., ..., 0., 0., 0.],
+    [0., 0., 0., ..., 0., 0., 0.],
+    ...,
+    [0., 0., 0., ..., 0., 0., 0.],
+    [0., 0., 0., ..., 0., 0., 0.],
+    [0., 0., 0., ..., 0., 0., 0.]]], dtype=float32)&gt;]
+&lt;/denchmark-code&gt;
+
+Exception ignored in: &lt;bound method Buckets.del of &lt;tensorflow.python.eager.monitoring.ExponentialBuckets object at 0x7f9c0bfbfee8&gt;&gt;
+Traceback (most recent call last):
+File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/eager/monitoring.py", line 407, in del
+AttributeError: 'NoneType' object has no attribute 'TFE_MonitoringDeleteBuckets'
+		</comment>
+		<comment id='8' author='QColeman97' date='2020-10-25T22:21:38Z'>
+		&lt;denchmark-link:https://github.com/QColeman97&gt;@QColeman97&lt;/denchmark-link&gt;
+ It is working now. Do you meant with tf-nightly?
+		</comment>
+		<comment id='9' author='QColeman97' date='2020-10-25T22:39:14Z'>
+		For nightly you need to do other related changes like probably to yield [x, y1, y2] in your my_dummy_generator
+		</comment>
+		<comment id='10' author='QColeman97' date='2020-10-25T23:16:33Z'>
+		&lt;denchmark-link:https://github.com/bhack&gt;@bhack&lt;/denchmark-link&gt;
+ I meant with tf-nightly, yes.
+I see. This is my output with tf 2.3.1 with single value loss (do I just not have enough compute power?):
+Matplotlib created a temporary config/cache directory at /tmp/matplotlib-_8mmg1gr because the default path (/.config/matplotlib) is not a writable directory; it is highly recommended to set the MPLCONFIGDIR environment variable to a writable directory, in particular to speed up the import of Matplotlib and to better support multiprocessing.
+2020-10-25 23:07:01.505866: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcudart.so.10.1
+Train Input Stats:
+N Feat: 2049 Seq Len: 1847 Batch Size: 5
+Making model...
+2020-10-25 23:07:03.082774: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcuda.so.1
+2020-10-25 23:07:03.104389: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1716] Found device 0 with properties:
+pciBusID: 0000:27:00.0 name: Tesla V100S-PCIE-32GB computeCapability: 7.0
+coreClock: 1.597GHz coreCount: 80 deviceMemorySize: 31.75GiB deviceMemoryBandwidth: 1.03TiB/s
+2020-10-25 23:07:03.106598: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1716] Found device 1 with properties:
+pciBusID: 0000:83:00.0 name: Tesla V100S-PCIE-32GB computeCapability: 7.0
+coreClock: 1.597GHz coreCount: 80 deviceMemorySize: 31.75GiB deviceMemoryBandwidth: 1.03TiB/s
+2020-10-25 23:07:03.106682: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcudart.so.10.1
+2020-10-25 23:07:03.110026: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcublas.so.10
+2020-10-25 23:07:03.113600: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcufft.so.10
+2020-10-25 23:07:03.114134: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcurand.so.10
+2020-10-25 23:07:03.117347: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcusolver.so.10
+2020-10-25 23:07:03.118928: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcusparse.so.10
+2020-10-25 23:07:03.125340: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcudnn.so.7
+2020-10-25 23:07:03.131473: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1858] Adding visible gpu devices: 0, 1
+2020-10-25 23:07:03.132171: I tensorflow/core/platform/cpu_feature_guard.cc:142] This TensorFlow binary is optimized with oneAPI Deep Neural Network Library (oneDNN)to use the following CPU instructions in performance-critical operations:  AVX2 FMA
+To enable them in other operations, rebuild TensorFlow with the appropriate compiler flags.
+2020-10-25 23:07:03.172811: I tensorflow/core/platform/profile_utils/cpu_utils.cc:104] CPU Frequency: 2245615000 Hz
+2020-10-25 23:07:03.202965: I tensorflow/compiler/xla/service/service.cc:168] XLA service 0x5e41c90 initialized for platform Host (this does not guarantee that XLA will be used). Devices:
+2020-10-25 23:07:03.203094: I tensorflow/compiler/xla/service/service.cc:176]   StreamExecutor device (0): Host, Default Version
+2020-10-25 23:07:03.451461: I tensorflow/compiler/xla/service/service.cc:168] XLA service 0x56dd930 initialized for platform CUDA (this does not guarantee that XLA will be used). Devices:
+2020-10-25 23:07:03.451568: I tensorflow/compiler/xla/service/service.cc:176]   StreamExecutor device (0): Tesla V100S-PCIE-32GB, Compute Capability 7.0
+2020-10-25 23:07:03.451680: I tensorflow/compiler/xla/service/service.cc:176]   StreamExecutor device (1): Tesla V100S-PCIE-32GB, Compute Capability 7.0
+2020-10-25 23:07:03.453587: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1716] Found device 0 with properties:
+pciBusID: 0000:27:00.0 name: Tesla V100S-PCIE-32GB computeCapability: 7.0
+coreClock: 1.597GHz coreCount: 80 deviceMemorySize: 31.75GiB deviceMemoryBandwidth: 1.03TiB/s
+2020-10-25 23:07:03.455757: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1716] Found device 1 with properties:
+pciBusID: 0000:83:00.0 name: Tesla V100S-PCIE-32GB computeCapability: 7.0
+coreClock: 1.597GHz coreCount: 80 deviceMemorySize: 31.75GiB deviceMemoryBandwidth: 1.03TiB/s
+2020-10-25 23:07:03.455851: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcudart.so.10.1
+2020-10-25 23:07:03.456096: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcublas.so.10
+2020-10-25 23:07:03.456342: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcufft.so.10
+2020-10-25 23:07:03.456430: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcurand.so.10
+2020-10-25 23:07:03.456675: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcusolver.so.10
+2020-10-25 23:07:03.456720: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcusparse.so.10
+2020-10-25 23:07:03.456774: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcudnn.so.7
+2020-10-25 23:07:03.462476: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1858] Adding visible gpu devices: 0, 1
+2020-10-25 23:07:03.462557: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcudart.so.10.1
+2020-10-25 23:07:05.240595: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1257] Device interconnect StreamExecutor with strength 1 edge matrix:
+2020-10-25 23:07:05.240691: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1263]      0 1
+2020-10-25 23:07:05.240722: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1276] 0:   N Y
+2020-10-25 23:07:05.240898: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1276] 1:   Y N
+2020-10-25 23:07:05.245076: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1402] Created TensorFlow device (/job:localhost/replica:0/task:0/device:GPU:0 with 797 MB memory) -&gt; physical GPU (device: 0, name: Tesla V100S-PCIE-32GB, pci bus id: 0000:27:00.0, compute capability: 7.0)
+2020-10-25 23:07:05.248527: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1402] Created TensorFlow device (/job:localhost/replica:0/task:0/device:GPU:1 with 29706 MB memory) -&gt; physical GPU (device: 1, name: Tesla V100S-PCIE-32GB, pci bus id: 0000:83:00.0, compute capability: 7.0)
+Going into training now...
+2020-10-25 23:07:05.881489: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcublas.so.10
+Epoch 1/10
+2020-10-25 23:07:19.615180: W tensorflow/core/common_runtime/bfc_allocator.cc:431] Allocator (GPU_0_bfc) ran out of memory trying to allocate 72.18MiB (rounded to 75690240)requested by op gradient_tape/pow_1/mul
+Current allocation summary follows.
+2020-10-25 23:07:19.615968: I tensorflow/core/common_runtime/bfc_allocator.cc:970] BFCAllocator dump for GPU_0_bfc
+2020-10-25 23:07:19.616015: I tensorflow/core/common_runtime/bfc_allocator.cc:977] Bin (256): 	Total Chunks: 5563, Chunks in use: 5563. 1.36MiB allocated for chunks. 1.36MiB in use in bin. 36.2KiB client-requested in use in bin.
+2020-10-25 23:07:19.616144: I tensorflow/core/common_runtime/bfc_allocator.cc:977] Bin (512): 	Total Chunks: 0, Chunks in use: 0. 0B allocated for chunks. 0B in use in bin. 0B client-requested in use in bin.
+2020-10-25 23:07:19.616264: I tensorflow/core/common_runtime/bfc_allocator.cc:977] Bin (1024): 	Total Chunks: 1, Chunks in use: 1. 1.2KiB allocated for chunks. 1.2KiB in use in bin. 1.0KiB client-requested in use in bin.
+2020-10-25 23:07:19.616493: I tensorflow/core/common_runtime/bfc_allocator.cc:977] Bin (2048): 	Total Chunks: 0, Chunks in use: 0. 0B allocated for chunks. 0B in use in bin. 0B client-requested in use in bin.
+2020-10-25 23:07:19.616821: I tensorflow/core/common_runtime/bfc_allocator.cc:977] Bin (4096): 	Total Chunks: 4, Chunks in use: 4. 16.0KiB allocated for chunks. 16.0KiB in use in bin. 16.0KiB client-requested in use in bin.
+2020-10-25 23:07:19.616862: I tensorflow/core/common_runtime/bfc_allocator.cc:977] Bin (8192): 	Total Chunks: 7, Chunks in use: 6. 62.5KiB allocated for chunks. 49.5KiB in use in bin. 48.0KiB client-requested in use in bin.
+2020-10-25 23:07:19.616899: I tensorflow/core/common_runtime/bfc_allocator.cc:977] Bin (16384): 	Total Chunks: 1849, Chunks in use: 1849. 36.11MiB allocated for chunks. 36.11MiB in use in bin. 36.11MiB client-requested in use in bin.
+2020-10-25 23:07:19.616941: I tensorflow/core/common_runtime/bfc_allocator.cc:977] Bin (32768): 	Total Chunks: 1847, Chunks in use: 1847. 72.60MiB allocated for chunks. 72.60MiB in use in bin. 72.16MiB client-requested in use in bin.
+2020-10-25 23:07:19.617275: I tensorflow/core/common_runtime/bfc_allocator.cc:977] Bin (65536): 	Total Chunks: 1, Chunks in use: 1. 64.5KiB allocated for chunks. 64.5KiB in use in bin. 40.0KiB client-requested in use in bin.
+2020-10-25 23:07:19.617321: I tensorflow/core/common_runtime/bfc_allocator.cc:977] Bin (131072): 	Total Chunks: 0, Chunks in use: 0. 0B allocated for chunks. 0B in use in bin. 0B client-requested in use in bin.
+2020-10-25 23:07:19.617369: I tensorflow/core/common_runtime/bfc_allocator.cc:977] Bin (262144): 	Total Chunks: 0, Chunks in use: 0. 0B allocated for chunks. 0B in use in bin. 0B client-requested in use in bin.
+2020-10-25 23:07:19.617418: I tensorflow/core/common_runtime/bfc_allocator.cc:977] Bin (524288): 	Total Chunks: 0, Chunks in use: 0. 0B allocated for chunks. 0B in use in bin. 0B client-requested in use in bin.
+2020-10-25 23:07:19.617453: I tensorflow/core/common_runtime/bfc_allocator.cc:977] Bin (1048576): 	Total Chunks: 0, Chunks in use: 0. 0B allocated for chunks. 0B in use in bin. 0B client-requested in use in bin.
+2020-10-25 23:07:19.617594: I tensorflow/core/common_runtime/bfc_allocator.cc:977] Bin (2097152): 	Total Chunks: 0, Chunks in use: 0. 0B allocated for chunks. 0B in use in bin. 0B client-requested in use in bin.
+2020-10-25 23:07:19.617643: I tensorflow/core/common_runtime/bfc_allocator.cc:977] Bin (4194304): 	Total Chunks: 4, Chunks in use: 4. 16.00MiB allocated for chunks. 16.00MiB in use in bin. 16.00MiB client-requested in use in bin.
+2020-10-25 23:07:19.617679: I tensorflow/core/common_runtime/bfc_allocator.cc:977] Bin (8388608): 	Total Chunks: 10, Chunks in use: 10. 80.04MiB allocated for chunks. 80.04MiB in use in bin. 80.04MiB client-requested in use in bin.
+2020-10-25 23:07:19.617728: I tensorflow/core/common_runtime/bfc_allocator.cc:977] Bin (16777216): 	Total Chunks: 0, Chunks in use: 0. 0B allocated for chunks. 0B in use in bin. 0B client-requested in use in bin.
+2020-10-25 23:07:19.617785: I tensorflow/core/common_runtime/bfc_allocator.cc:977] Bin (33554432): 	Total Chunks: 2, Chunks in use: 1. 72.13MiB allocated for chunks. 36.07MiB in use in bin. 36.07MiB client-requested in use in bin.
+2020-10-25 23:07:19.617832: I tensorflow/core/common_runtime/bfc_allocator.cc:977] Bin (67108864): 	Total Chunks: 7, Chunks in use: 7. 519.12MiB allocated for chunks. 519.12MiB in use in bin. 505.29MiB client-requested in use in bin.
+2020-10-25 23:07:19.617917: I tensorflow/core/common_runtime/bfc_allocator.cc:977] Bin (134217728): 	Total Chunks: 0, Chunks in use: 0. 0B allocated for chunks. 0B in use in bin. 0B client-requested in use in bin.
+2020-10-25 23:07:19.617989: I tensorflow/core/common_runtime/bfc_allocator.cc:977] Bin (268435456): 	Total Chunks: 0, Chunks in use: 0. 0B allocated for chunks. 0B in use in bin. 0B client-requested in use in bin.
+2020-10-25 23:07:19.618034: I tensorflow/core/common_runtime/bfc_allocator.cc:993] Bin for 72.18MiB was 64.00MiB, Chunk State:
+2020-10-25 23:07:19.618097: I tensorflow/core/common_runtime/bfc_allocator.cc:1006] Next region of size 836239360
+2020-10-25 23:07:19.618123: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01b6000000 of size 1280 next 1
+2020-10-25 23:07:19.618137: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01b6000500 of size 4194304 next 5
+2020-10-25 23:07:19.618149: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01b6400500 of size 256 next 8
+2020-10-25 23:07:19.618161: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01b6400600 of size 256 next 13
+2020-10-25 23:07:19.618172: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01b6400700 of size 256 next 20
+2020-10-25 23:07:19.618184: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01b6400800 of size 256 next 21
+2020-10-25 23:07:19.618196: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01b6400900 of size 256 next 22
+2020-10-25 23:07:19.618207: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01b6400a00 of size 256 next 23
+2020-10-25 23:07:19.618219: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01b6400b00 of size 256 next 24
+2020-10-25 23:07:19.618230: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01b6400c00 of size 256 next 624
+2020-10-25 23:07:19.618241: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01b6400d00 of size 256 next 1867
+2020-10-25 23:07:19.618252: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01b6400e00 of size 256 next 1866
+2020-10-25 23:07:19.618263: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01b6400f00 of size 256 next 1868
+2020-10-25 23:07:19.618275: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01b6401000 of size 256 next 27
+2020-10-25 23:07:19.618287: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01b6401100 of size 256 next 28
+2020-10-25 23:07:19.618299: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01b6401200 of size 256 next 29
+2020-10-25 23:07:19.618310: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01b6401300 of size 256 next 30
+2020-10-25 23:07:19.618323: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01b6401400 of size 256 next 31
+2020-10-25 23:07:19.618334: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01b6401500 of size 256 next 11
+...
+2020-10-25 23:07:30.264760: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01cbe26800 of size 20480 next 9204
+2020-10-25 23:07:30.264788: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01cbe2b800 of size 20480 next 9208
+2020-10-25 23:07:30.264822: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01cbe30800 of size 20480 next 9212
+2020-10-25 23:07:30.264850: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01cbe35800 of size 20480 next 9216
+2020-10-25 23:07:30.264885: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01cbe3a800 of size 20480 next 9220
+2020-10-25 23:07:30.264912: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01cbe3f800 of size 20480 next 9224
+2020-10-25 23:07:30.264946: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01cbe44800 of size 20480 next 9228
+2020-10-25 23:07:30.264978: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01cbe49800 of size 20480 next 9232
+2020-10-25 23:07:30.265012: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01cbe4e800 of size 20480 next 9236
+2020-10-25 23:07:30.265039: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01cbe53800 of size 20480 next 9240
+2020-10-25 23:07:30.265067: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01cbe58800 of size 20480 next 9244
+2020-10-25 23:07:30.265101: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01cbe5d800 of size 20480 next 9247
+2020-10-25 23:07:30.265128: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01cbe62800 of size 256 next 9248
+2020-10-25 23:07:30.265155: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01cbe62900 of size 20480 next 9250
+2020-10-25 23:07:30.265190: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01cbe67900 of size 20480 next 9252
+2020-10-25 23:07:30.265218: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01cbe6c900 of size 20480 next 9256
+2020-10-25 23:07:30.265246: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01cbe71900 of size 20480 next 9260
+2020-10-25 23:07:30.265273: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01cbe76900 of size 20480 next 9264
+2020-10-25 23:07:30.265308: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01cbe7b900 of size 20480 next 9268
+2020-10-25 23:07:30.265335: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01cbe80900 of size 20480 next 9272
+2020-10-25 23:07:30.265362: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01cbe85900 of size 20480 next 9276
+2020-10-25 23:07:30.265396: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01cbe8a900 of size 20480 next 9280
+2020-10-25 23:07:30.265425: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01cbe8f900 of size 20480 next 9284
+2020-10-25 23:07:30.265458: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01cbe94900 of size 20480 next 9288
+2020-10-25 23:07:30.265486: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01cbe99900 of size 20480 next 9295
+2020-10-25 23:07:30.265523: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] Free  at 7f01cbe9e900 of size 37806080 next 9291
+2020-10-25 23:07:30.265557: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01ce2ac900 of size 37826560 next 9292
+2020-10-25 23:07:30.265585: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01d06bf900 of size 75690240 next 9293
+2020-10-25 23:07:30.265620: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01d4eeea00 of size 75690240 next 9294
+2020-10-25 23:07:30.265647: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01d971db00 of size 75690240 next 9296
+2020-10-25 23:07:30.265682: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01ddf4cc00 of size 75690240 next 9297
+2020-10-25 23:07:30.265710: I tensorflow/core/common_runtime/bfc_allocator.cc:1026] InUse at 7f01e277bd00 of size 90194688 next 18446744073709551615
+2020-10-25 23:07:30.265751: I tensorflow/core/common_runtime/bfc_allocator.cc:1031]      Summary of in-use Chunks by size:
+2020-10-25 23:07:30.265783: I tensorflow/core/common_runtime/bfc_allocator.cc:1034] 5567 Chunks of size 256 totalling 1.36MiB
+2020-10-25 23:07:30.265813: I tensorflow/core/common_runtime/bfc_allocator.cc:1034] 1 Chunks of size 1280 totalling 1.2KiB
+2020-10-25 23:07:30.265850: I tensorflow/core/common_runtime/bfc_allocator.cc:1034] 4 Chunks of size 4096 totalling 16.0KiB
+2020-10-25 23:07:30.265885: I tensorflow/core/common_runtime/bfc_allocator.cc:1034] 6 Chunks of size 8448 totalling 49.5KiB
+2020-10-25 23:07:30.265914: I tensorflow/core/common_runtime/bfc_allocator.cc:1034] 1849 Chunks of size 20480 totalling 36.11MiB
+2020-10-25 23:07:30.265949: I tensorflow/core/common_runtime/bfc_allocator.cc:1034] 1 Chunks of size 38144 totalling 37.2KiB
+2020-10-25 23:07:30.265978: I tensorflow/core/common_runtime/bfc_allocator.cc:1034] 1846 Chunks of size 41216 totalling 72.56MiB
+2020-10-25 23:07:30.266014: I tensorflow/core/common_runtime/bfc_allocator.cc:1034] 1 Chunks of size 66048 totalling 64.5KiB
+2020-10-25 23:07:30.266042: I tensorflow/core/common_runtime/bfc_allocator.cc:1034] 3 Chunks of size 4194304 totalling 12.00MiB
+2020-10-25 23:07:30.266077: I tensorflow/core/common_runtime/bfc_allocator.cc:1034] 1 Chunks of size 4198400 totalling 4.00MiB
+2020-10-25 23:07:30.266106: I tensorflow/core/common_runtime/bfc_allocator.cc:1034] 10 Chunks of size 8392704 totalling 80.04MiB
+2020-10-25 23:07:30.266134: I tensorflow/core/common_runtime/bfc_allocator.cc:1034] 1 Chunks of size 37826560 totalling 36.07MiB
+2020-10-25 23:07:30.266163: I tensorflow/core/common_runtime/bfc_allocator.cc:1034] 6 Chunks of size 75690240 totalling 433.10MiB
+2020-10-25 23:07:30.266191: I tensorflow/core/common_runtime/bfc_allocator.cc:1034] 1 Chunks of size 90194688 totalling 86.02MiB
+2020-10-25 23:07:30.266225: I tensorflow/core/common_runtime/bfc_allocator.cc:1038] Sum Total of in-use chunks: 761.43MiB
+2020-10-25 23:07:30.266257: I tensorflow/core/common_runtime/bfc_allocator.cc:1040] total_region_allocated_bytes_: 836239360 memory_limit_: 836239360 available bytes: 0 curr_region_allocation_bytes_: 1672478720
+2020-10-25 23:07:30.266294: I tensorflow/core/common_runtime/bfc_allocator.cc:1046] Stats:
+Limit:                       836239360
+InUse:                       798420992
+MaxInUse:                    798434048
+NumAllocs:                       22334
+MaxAllocSize:                 90194688
+Reserved:                            0
+PeakReserved:                        0
+LargestFreeBlock:                    0
+2020-10-25 23:07:30.266892: W tensorflow/core/common_runtime/bfc_allocator.cc:439] ********************************************____***************************************************x
+2020-10-25 23:07:30.266948: W tensorflow/core/framework/op_kernel.cc:1767] OP_REQUIRES failed at tile_ops.cc:223 : Resource exhausted: OOM when allocating tensor with shape[5,3784503] and type float on /job:localhost/replica:0/task:0/device:GPU:0 by allocator GPU_0_bfc
+Traceback (most recent call last):
+File "dlnn_brahms_restore_clean.py", line 219, in 
+main()
+File "dlnn_brahms_restore_clean.py", line 216, in main
+optimizer=optimizer, epsilon=epsilon)
+File "dlnn_brahms_restore_clean.py", line 165, in evaluate_source_sep
+callbacks=[EarlyStopping('val_loss', patience=patience, mode='min')])
+File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/keras/engine/training.py", line 108, in _method_wrapper
+return method(self, *args, **kwargs)
+File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/keras/engine/training.py", line 1098, in fit
+tmp_logs = train_function(iterator)
+File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/eager/def_function.py", line 780, in call
+result = self._call(*args, **kwds)
+File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/eager/def_function.py", line 840, in _call
+return self._stateless_fn(*args, **kwds)
+File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/eager/function.py", line 2829, in call
+return graph_function._filtered_call(args, kwargs)  # pylint: disable=protected-access
+File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/eager/function.py", line 1848, in _filtered_call
+cancellation_manager=cancellation_manager)
+File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/eager/function.py", line 1924, in _call_flat
+ctx, args, cancellation_manager=cancellation_manager))
+File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/eager/function.py", line 550, in call
+ctx=ctx)
+File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/eager/execute.py", line 60, in quick_execute
+inputs, attrs, num_outputs)
+tensorflow.python.framework.errors_impl.ResourceExhaustedError:  OOM when allocating tensor with shape[5,3784503] and type float on /job:localhost/replica:0/task:0/device:GPU:0 by allocator GPU_0_bfc
+[[node gradient_tape/pow_1/mul (defined at dlnn_brahms_restore_clean.py:119) ]]
+Hint: If you want to see a list of allocated tensors when OOM happens, add report_tensor_allocations_upon_oom to RunOptions for current allocation info.
+[Op:__inference_train_function_23861]
+Errors may have originated from an input operation.
+Input Source operations connected to node gradient_tape/pow_1/mul:
+pow_1/y (defined at dlnn_brahms_restore_clean.py:36)
+Function call stack:
+train_function
+2020-10-25 23:07:30.436665: W tensorflow/core/kernels/data/generator_dataset_op.cc:103] Error occurred when finalizing GeneratorDataset iterator: Failed precondition: Python interpreter state is not initialized. The process may be terminated.
+[[{{node PyFunc}}]]
+		</comment>
+		<comment id='11' author='QColeman97' date='2020-10-25T23:44:27Z'>
+		Yes this is about GPU memory OOM when allocating tensor with shape.
+		</comment>
+		<comment id='12' author='QColeman97' date='2020-10-27T20:42:38Z'>
+		&lt;denchmark-link:https://github.com/bhack&gt;@bhack&lt;/denchmark-link&gt;
+ thanks for your help. Not to go down the rabbit-hole but, to validate this I lowered my batch size (for no OOM error), and ran this on my actual data (noisy audio mixes for source separation) and the verdict is that I see my loss and validation loss remain NaN over all epochs no matter how much I clip the gradient - trying clipvalues in range from [0.1, 20].
+I was able to achieve real-numbered loss in my previous implementation of this model with gradient clipping. Do you know why this model gives me bad results?
+FYI I only used the Keras functional API to make my previous model, which didn't let me put loss inside of model.compile() (because of an error saying the eager tensor my loss function returned was incompatible with the Keras DAG working with symbolic tensors) so I used model.add_loss() instead - this I believe hogged GPU memory and caused my OOM errors to begin with.
+These are the two outputs of my model (clear source &amp; noisy source) which are zero-valued from NaN loss:
+&lt;denchmark-link:https://user-images.githubusercontent.com/25238854/97261351-44409e80-17e4-11eb-965e-3b83af24a3cd.png&gt;&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://user-images.githubusercontent.com/25238854/97261431-6f2af280-17e4-11eb-9b9c-0c2e30cfd467.png&gt;&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='13' author='QColeman97' date='2020-10-27T20:45:02Z'>
+		I think this Is another problem. You can try on stackoverflow
+		</comment>
+		<comment id='14' author='QColeman97' date='2020-10-27T20:46:08Z'>
+		No problem, thanks for all the help.
+		</comment>
+		<comment id='15' author='QColeman97' date='2020-10-27T20:46:10Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/44185&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/44185&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='16' author='QColeman97' date='2020-11-09T07:13:22Z'>
+		For all interested, solution to this problem: &lt;denchmark-link:https://github.com/keras-team/keras/issues/14140#issuecomment-713660704&gt;keras-team/keras#14140 (comment)&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

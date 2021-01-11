@@ -1,0 +1,232 @@
+<bug id='16155' author='Gabriel-Kang' open_date='2018-01-16T10:55:34Z' closed_time='2018-05-02T20:57:47Z'>
+	<summary>[Bug] slim.tfexample_decoder.TFExampleDecoder() crashes if RAW image with float type is used.</summary>
+	<description>
+&lt;denchmark-h:h3&gt;System information&lt;/denchmark-h&gt;
+
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): No.
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): 16.04
+TensorFlow installed from (source or binary): binary
+TensorFlow version (use command below): 'unkown', '1.4.0-rc0'
+Python version: 2.7.13
+Bazel version (if compiling from source):
+GCC/Compiler version (if compiling from source):
+CUDA/cuDNN version: 9.0/7.0.3
+GPU model and memory: Pascal Titan X
+Exact command to reproduce:
+
+&lt;denchmark-h:h3&gt;Describe the problem&lt;/denchmark-h&gt;
+
+To feed raw images with floating type saved in tfrecord, I am using slim.tfexample_decoder.TFExampleDecoder().
+The problem is if I set the dtype of raw image to tf.float32, the function doesn't work with following error messages.
+&lt;denchmark-code&gt;Traceback (most recent call last):
+  File "train.py", line 475, in &lt;module&gt;
+    tf.app.run()
+  File "/home/jhkang/tools/anaconda3/lib/python3.6/site-packages/tensorflow/python/platform/app.py", line 48, in run
+    _sys.exit(main(_sys.argv[:1] + flags_passthrough))
+  File "train.py", line 304, in main
+    common_queue_min=10 * FLAGS.batch_size)
+  File "/home/jhkang/tools/anaconda3/lib/python3.6/site-packages/tensorflow/contrib/slim/python/slim/data/dataset_data_provider.py", line 97, in __init__
+    tensors = dataset.decoder.decode(data, items)
+  File "/home/jhkang/tools/anaconda3/lib/python3.6/site-packages/tensorflow/contrib/slim/python/slim/data/tfexample_decoder.py", line 427, in decode
+    outputs.append(handler.tensors_to_item(keys_to_tensors))
+  File "/home/jhkang/tools/anaconda3/lib/python3.6/site-packages/tensorflow/contrib/slim/python/slim/data/tfexample_decoder.py", line 324, in tensors_to_item
+    return self._decode(image_buffer, image_format)
+  File "/home/jhkang/tools/anaconda3/lib/python3.6/site-packages/tensorflow/contrib/slim/python/slim/data/tfexample_decoder.py", line 353, in _decode
+    pred_fn_pairs, default=decode_image, exclusive=True)
+  File "/home/jhkang/tools/anaconda3/lib/python3.6/site-packages/tensorflow/python/ops/control_flow_ops.py", line 3262, in case
+    case_seq = _build_case()
+  File "/home/jhkang/tools/anaconda3/lib/python3.6/site-packages/tensorflow/python/ops/control_flow_ops.py", line 3257, in _build_case
+    strict=strict, name="If_%d" % i)
+  File "/home/jhkang/tools/anaconda3/lib/python3.6/site-packages/tensorflow/python/util/deprecation.py", line 316, in new_func
+    return func(*args, **kwargs)
+  File "/home/jhkang/tools/anaconda3/lib/python3.6/site-packages/tensorflow/python/ops/control_flow_ops.py", line 1902, in cond
+    (val_x.dtype.name, val_y.dtype.name))
+ValueError: Outputs of true_fn and false_fn must have the same type: float32, uint8
+
+&lt;/denchmark-code&gt;
+
+To see what the problem is, I checked the slim/data/tfexample_decoder.py.
+I figured out that there is a case() function in  _decode() of class Image, and if I set dtype for the raw image as other than uint8, then, the returning tensors' dtypes from decode_image() and decode_raw() used in case() are always mis-matched. You can check the code in below.
+&lt;denchmark-code&gt; def _decode(self, image_buffer, image_format):
+    """Decodes the image buffer.
+    Args:
+      image_buffer: The tensor representing the encoded image tensor.
+      image_format: The image format for the image in `image_buffer`. If image
+        format is `raw`, all images are expected to be in this format, otherwise
+        this op can decode a mix of `jpg` and `png` formats.
+    Returns:
+      A tensor that represents decoded image of self._shape, or
+      (?, ?, self._channels) if self._shape is not specified.
+    """
+    def decode_image():
+      """Decodes a png or jpg based on the headers."""
+      return image_ops.decode_image(image_buffer, self._channels)
+
+    def decode_raw():
+      """Decodes a raw image."""
+      return parsing_ops.decode_raw(image_buffer, out_type=self._dtype)
+
+    pred_fn_pairs = {
+        math_ops.logical_or(
+            math_ops.equal(image_format, 'raw'),
+            math_ops.equal(image_format, 'RAW')): decode_raw,
+    }
+    image = control_flow_ops.case(
+        pred_fn_pairs, default=decode_image, exclusive=True)
+
+    image.set_shape([None, None, self._channels])
+    if self._shape is not None:
+      image = array_ops.reshape(image, self._shape)
+
+    return image
+&lt;/denchmark-code&gt;
+
+The returning tensor of  return image_ops.decode_image(image_buffer, self._channels) only supports uint8 type of tensors.
+To fix this problem, I changed the previous code into the following code.
+return math_ops.cast(image_ops.decode_image(image_buffer, self._channels), self._dtype)
+&lt;denchmark-h:h3&gt;Source code / logs&lt;/denchmark-h&gt;
+
+I am attaching my source code for feeding dataset from tfrecord using slim.
+&lt;denchmark-code&gt;from __future__ import absolute_import, division, print_function
+
+import os
+
+import tensorflow as tf
+
+from datasets import dataset_utils
+
+slim = tf.contrib.slim
+
+_FILE_PATTERN = '%s_*.tfrecord'
+
+SPLITS_TO_SIZES = {'train': 24523, 'validation': 6130} # lineGT 20180112
+_NUM_CLASSES = 10
+
+_ITEMS_TO_DESCRIPTIONS = {
+    'intensity': 'an intensity map',
+    'heightmap': 'an heightmap map',
+    'label': 'Ground truth segmentation mask',
+}
+
+
+def get_split(split_name, dataset_dir, file_pattern=None, reader=None):
+  if split_name not in SPLITS_TO_SIZES:
+    raise ValueError('split name %s was not recognized.' % split_name)
+
+  if not file_pattern:
+    file_pattern = _FILE_PATTERN
+  file_pattern = os.path.join(dataset_dir, file_pattern % split_name)
+  print(file_pattern)
+  # Allowing None in the signature so that dataset_factory can use the
+  # default.
+  if reader is None:
+    reader = tf.TFRecordReader
+
+  keys_to_features = {
+      'image/intensity':
+          tf.FixedLenFeature(
+              (), tf.string, default_value=''),
+      'image/format':
+          tf.FixedLenFeature(
+              (), tf.string, default_value='raw'),
+      'image/height':
+          tf.FixedLenFeature(
+              (), tf.int64, default_value=0),
+      'image/width':
+          tf.FixedLenFeature(
+              (), tf.int64, default_value=0),
+      'image/mask':
+          tf.FixedLenFeature(
+              (), tf.string, default_value=''),
+      'image/mask/format':
+          tf.FixedLenFeature(
+              (), tf.string, default_value='raw'),
+      'image/heightmap':
+          tf.FixedLenFeature(
+              (), tf.string, default_value=''),
+      'image/heightmap/format':
+          tf.FixedLenFeature(
+              (), tf.string, default_value='raw'),
+      'image/filename':
+          tf.FixedLenFeature(
+              (), tf.string, default_value=''),
+  }
+
+  items_to_handlers = {
+      'intensity':
+          slim.tfexample_decoder.Image(
+            'image/intensity', 'image/format', channels=1, dtype=tf.float32),
+      'heightmap':
+          slim.tfexample_decoder.Image(
+            'image/heightmap', 'image/heightmap/format', channels=1, dtype=tf.float32),
+      'label':
+          slim.tfexample_decoder.Image(
+            'image/mask', 'image/mask/format', channels=1),
+      'height':
+          slim.tfexample_decoder.Tensor('image/height'),
+      'width':
+          slim.tfexample_decoder.Tensor('image/width'),
+      'fileid':
+          slim.tfexample_decoder.Tensor('image/filename'),
+  }
+
+  decoder = slim.tfexample_decoder.TFExampleDecoder(keys_to_features,
+                                                    items_to_handlers)
+
+  labels_to_names = None
+
+  return slim.dataset.Dataset(
+      data_sources=file_pattern,
+      reader=reader,
+      decoder=decoder,
+      num_samples=SPLITS_TO_SIZES[split_name],
+      items_to_descriptions=_ITEMS_TO_DESCRIPTIONS,
+      num_classes=_NUM_CLASSES,
+      labels_to_names=labels_to_names)
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='Gabriel-Kang' date='2018-01-17T21:43:04Z'>
+		&lt;denchmark-link:https://github.com/sguada&gt;@sguada&lt;/denchmark-link&gt;
+, could you please take a look. It seems like if this is desirable it would be great if the original poster &lt;denchmark-link:https://github.com/Gabriel-Kang&gt;@Gabriel-Kang&lt;/denchmark-link&gt;
+ could contribute a fix. What do you think?
+		</comment>
+		<comment id='2' author='Gabriel-Kang' date='2018-02-06T07:36:10Z'>
+		Nagging Awaiting TensorFlower: It has been 14 days with no activity and the awaiting tensorflower label was assigned. Please update the label and/or status accordingly.
+		</comment>
+		<comment id='3' author='Gabriel-Kang' date='2018-02-20T19:38:37Z'>
+		Nagging Awaiting TensorFlower: It has been 14 days with no activity and the awaiting tensorflower label was assigned. Please update the label and/or status accordingly.
+		</comment>
+		<comment id='4' author='Gabriel-Kang' date='2018-03-07T13:16:24Z'>
+		Nagging Awaiting TensorFlower: It has been 14 days with no activity and the awaiting tensorflower label was assigned. Please update the label and/or status accordingly.
+		</comment>
+		<comment id='5' author='Gabriel-Kang' date='2018-03-25T00:48:34Z'>
+		Nagging TensorFlower: It has been 14 days with no activity and the awaiting tensorflower label was assigned. Please update the label and/or status accordingly.
+		</comment>
+		<comment id='6' author='Gabriel-Kang' date='2018-03-25T04:16:02Z'>
+		If you save images as Floats then they are just Tensors, so try using the slim.tfexample_decoder.Tensor decoder instead.
+		</comment>
+		<comment id='7' author='Gabriel-Kang' date='2018-04-17T12:47:01Z'>
+		Nagging Assignee &lt;denchmark-link:https://github.com/bignamehyp&gt;@bignamehyp&lt;/denchmark-link&gt;
+: It has been 14 days with no activity and this issue has an assignee. Please update the label and/or status accordingly.
+		</comment>
+		<comment id='8' author='Gabriel-Kang' date='2018-04-24T17:58:31Z'>
+		This appears to also be an issue with other datatypes, e.g. uint16
+		</comment>
+		<comment id='9' author='Gabriel-Kang' date='2018-05-02T20:57:28Z'>
+		Please try using the slim.tfexample_decoder.Tensor decoder instead.
+		</comment>
+		<comment id='10' author='Gabriel-Kang' date='2018-06-01T18:31:02Z'>
+		I have a similar problem with JPEGs - if I set dtype to float32, I get this error
+		</comment>
+		<comment id='11' author='Gabriel-Kang' date='2018-06-01T19:04:32Z'>
+		jpegs cannot be float32
+		</comment>
+		<comment id='12' author='Gabriel-Kang' date='2018-06-06T19:00:17Z'>
+		Yeah, I figured that out, and now I'm using tf.convert_image_dtype() on them before feeding them to my network.
+I wonder if it'd make sense to add this "intelligence" to the decoder though.
+		</comment>
+	</comments>
+</bug>

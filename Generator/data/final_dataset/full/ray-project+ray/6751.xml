@@ -1,0 +1,304 @@
+<bug_data>
+<bug id='6751' author='kfstorm' open_date='2020-01-08T15:17:13Z' closed_time='2020-01-13T17:38:01Z'>
+ 	<summary>`__ray_kill__` does not work as expected</summary>
+ 	<description>
+ Related PR: &lt;denchmark-link:https://github.com/ray-project/ray/pull/6523&gt;#6523&lt;/denchmark-link&gt;
+ 
+ &lt;denchmark-h:h2&gt;Analysis&lt;/denchmark-h&gt;
+ 
+ In the test case test_kill, the specified timeout value of ray.wait is too small, so it's very likely that the actor is not created yet when reached the timeout. So the remote call to hang is still pending to be pushed and the assertion assert len(ready) == 0 can be passed.
+ 
+ 
+ 
+ ray/python/ray/tests/test_actor.py
+ 
+ 
+         Lines 1423 to 1429
+       in
+       0a5d010
+ 
+ 
+ 
+ 
+ 
+ 
+  actor = Actor.remote() 
+ 
+ 
+ 
+  result = actor.hang.remote() 
+ 
+ 
+ 
+  ready, _ = ray.wait([result], timeout=0.1) 
+ 
+ 
+ 
+  assert len(ready) == 0 
+ 
+ 
+ 
+  actor.__ray_kill__() 
+ 
+ 
+ 
+  with pytest.raises(ray.exceptions.RayActorError): 
+ 
+ 
+ 
+  ray.get(result) 
+ 
+ 
+ 
+ 
+ 
+ Then the __ray_kill__ operation is initiated, the kill operation is first cached at local. After the actor is alive, the kill operation is pushed to the remote actor prior to the previous remote task, because in CoreWorkerDirectActorTaskSubmitter::SendPendingTasks, the KillActor messages are always sent before any actor tasks.
+ 
+ 
+ 
+ ray/src/ray/core_worker/transport/direct_actor_transport.cc
+ 
+ 
+         Lines 125 to 144
+       in
+       0a5d010
+ 
+ 
+ 
+ 
+ 
+ 
+  // Check if there is a pending force kill. If there is, send it and disconnect the 
+ 
+ 
+ 
+  // client. 
+ 
+ 
+ 
+  if (pending_force_kills_.find(actor_id) != pending_force_kills_.end()) { 
+ 
+ 
+ 
+    rpc::KillActorRequest request; 
+ 
+ 
+ 
+    request.set_intended_actor_id(actor_id.Binary()); 
+ 
+ 
+ 
+  RAY_CHECK_OK(client-&gt;KillActor(request, nullptr)); 
+ 
+ 
+ 
+    pending_force_kills_.erase(actor_id); 
+ 
+ 
+ 
+  } 
+ 
+ 
+ 
+  
+ 
+ 
+ 
+  // Submit all pending requests. 
+ 
+ 
+ 
+  auto &amp;requests = pending_requests_[actor_id]; 
+ 
+ 
+ 
+  auto head = requests.begin(); 
+ 
+ 
+ 
+  while (head != requests.end() &amp;&amp; head-&gt;first == next_send_position_[actor_id]) { 
+ 
+ 
+ 
+  auto request = std::move(head-&gt;second); 
+ 
+ 
+ 
+    head = requests.erase(head); 
+ 
+ 
+ 
+  
+ 
+ 
+ 
+  auto num_returns = request-&gt;task_spec().num_returns(); 
+ 
+ 
+ 
+  auto task_id = TaskID::FromBinary(request-&gt;task_spec().task_id()); 
+ 
+ 
+ 
+  PushActorTask(*client, std::move(request), actor_id, task_id, num_returns); 
+ 
+ 
+ 
+  } 
+ 
+ 
+ 
+ 
+ 
+ At the remote side, the worker receives the KillActor message first and just invokes the CoreWorker::Shutdown, and then both the io_service_ and the task_execution_service_ are stopped. The hang function never get the chance to run.
+ 
+ 
+ 
+ ray/src/ray/core_worker/core_worker.cc
+ 
+ 
+         Lines 1156 to 1157
+       in
+       0a5d010
+ 
+ 
+ 
+ 
+ 
+ 
+  RAY_LOG(INFO) &lt;&lt; "Got KillActor, shutting down..."; 
+ 
+ 
+ 
+  Shutdown(); 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ ray/src/ray/core_worker/core_worker.cc
+ 
+ 
+         Lines 259 to 264
+       in
+       0a5d010
+ 
+ 
+ 
+ 
+ 
+ 
+  void CoreWorker::Shutdown() { 
+ 
+ 
+ 
+    io_service_.stop(); 
+ 
+ 
+ 
+  if (worker_type_ == WorkerType::WORKER) { 
+ 
+ 
+ 
+      task_execution_service_.stop(); 
+ 
+ 
+ 
+    } 
+ 
+ 
+ 
+  } 
+ 
+ 
+ 
+ 
+ 
+ Eventually, the test case will pass but it can't verify that the __ray_kill__ works.
+ &lt;denchmark-h:h2&gt;Test case update&lt;/denchmark-h&gt;
+ 
+ If we change the timeout value to 5, the test case will fail with below message. That's because ray.get(ray.ObjectID.from_random()) actually throws an UnreconstructableError, not Never returns as the comment says.
+ &gt;       assert len(ready) == 0
+ E       assert 1 == 0
+ E         -1
+ E         +0
+ 
+ python/ray/tests/test_actor.py:1426: AssertionError
+ Then we change the implementation of hang to an infinite loop with time.sleep(1), now the test case hangs forever as I expected, but the worker still won't quit. I think it's because the hang function is still running and task_execution_service_.stop() won't abort the execution of hang.
+ Final diff:
+ diff --git a/python/ray/tests/test_actor.py b/python/ray/tests/test_actor.py
+ index 9c43c65fc..98956b297 100644
+ --- a/python/ray/tests/test_actor.py
+ +++ b/python/ray/tests/test_actor.py
+ @@ -1418,11 +1418,14 @@ def test_kill(ray_start_regular):
+      class Actor:
+          def hang(self):
+              # Never returns.
+ -            ray.get(ray.ObjectID.from_random())
+ +            while True:
+ +                time.sleep(1)
+  
+      actor = Actor.remote()
+      result = actor.hang.remote()
+ -    ready, _ = ray.wait([result], timeout=0.1)
+ +    ready, _ = ray.wait([result], timeout=5)
+ +    if len(ready) &gt; 0:
+ +        print(ray.get(result))
+      assert len(ready) == 0
+      actor.__ray_kill__()
+      with pytest.raises(ray.exceptions.RayActorError):
+ 	</description>
+ 	<comments>
+ 		<comment id='1' author='kfstorm' date='2020-01-08T17:25:59Z'>
+ 		Probably kill should have an option to immediately quit the actor instead of doing clean shutdown?
+ 		</comment>
+ 		<comment id='2' author='kfstorm' date='2020-01-08T23:01:31Z'>
+ 		Thanks for reporting this &lt;denchmark-link:https://github.com/kfstorm&gt;@kfstorm&lt;/denchmark-link&gt;
+ . Seems like the simplest solution is to just called  in the kill handler, though that would mean we no longer perform normal cleanup. I think that's acceptable given that this is a "last resort" force kill though. Thoughts?
+ 		</comment>
+ 		<comment id='3' author='kfstorm' date='2020-01-09T00:46:07Z'>
+ 		Since there’s no graceful way to abort the executing task, I totally agree that we can just exit the process.
+ 		</comment>
+ 		<comment id='4' author='kfstorm' date='2020-01-10T01:01:10Z'>
+ 		Please see this PR: &lt;denchmark-link:https://github.com/ray-project/ray/pull/6760&gt;#6760&lt;/denchmark-link&gt;
+ 
+ By the way, thanks for the detailed bug report!
+ 		</comment>
+ 	</comments>
+ </bug>
+<commit id='a950e95c7d38df32311da90b20208e2d35b7aa08' author='Edward Oakes' date='2020-01-13 11:37:59-06:00'>
+ 	<dmm_unit complexity='1.0' interfacing='0.25' size='0.25'></dmm_unit>
+ 	<modification change_type='MODIFY' old_name='python\ray\tests\test_actor.py' new_name='python\ray\tests\test_actor.py'>
+ 		<file_info nloc='995' complexity='262' token_count='7533'></file_info>
+ 		<method name='test_kill' parameters='ray_start_regular'>
+ 				<method_info nloc='11' complexity='1' token_count='78' nesting_level='0' start_line='1412' end_line='1425'></method_info>
+ 			<added_lines>1416,1417,1421</added_lines>
+ 			<deleted_lines>1416,1417,1421</deleted_lines>
+ 		</method>
+ 		<method name='test_kill.hang' parameters='self'>
+ 				<method_info nloc='3' complexity='2' token_count='14' nesting_level='2' start_line='1415' end_line='1417'></method_info>
+ 			<added_lines>1416,1417</added_lines>
+ 			<deleted_lines>1416,1417</deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines></added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='src\ray\core_worker\core_worker.cc' new_name='src\ray\core_worker\core_worker.cc'>
+ 		<file_info nloc='983' complexity='164' token_count='7900'></file_info>
+ 		<method name='ray::CoreWorker::HandleKillActor' parameters='request,reply,send_reply_callback'>
+ 				<method_info nloc='20' complexity='3' token_count='133' nesting_level='1' start_line='1142' end_line='1161'></method_info>
+ 			<added_lines>1156,1157,1158,1159,1160</added_lines>
+ 			<deleted_lines>1156,1157</deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines></added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ </commit>
+</bug_data>

@@ -1,0 +1,237 @@
+<bug id='377' author='yutkin' open_date='2020-02-03T19:53:38Z' closed_time='2020-07-20T13:54:52Z'>
+	<summary>Memory leak when using Python API</summary>
+	<description>
+I'm trying to use Python API for a face detection task. All works fine, except persistent memory leak:
+&lt;denchmark-link:https://user-images.githubusercontent.com/2982775/73734422-ae914a80-474e-11ea-9b1c-b04446c7b54c.png&gt;&lt;/denchmark-link&gt;
+
+In this script, an image is reading once from a file system and then used for model inference in an infinite loop.
+To reproduce just build and run this Dockerfile:
+FROM python:3.7 as builder
+
+RUN apt-get update &amp;&amp; apt-get install -y --no-install-recommends \
+	wget \
+	git \
+	build-essential \
+    cmake \
+    curl \
+    wget \
+    libssl-dev \
+    ca-certificates \
+    git \
+    libboost-regex-dev \
+    gcc-multilib \
+    g++-multilib \
+    libgtk2.0-dev \
+    pkg-config \
+    unzip \
+    automake \
+    libtool \
+    autoconf \
+    libcairo2-dev \
+    libpango1.0-dev \
+    libglib2.0-dev \
+    libgtk2.0-dev \
+    libswscale-dev \
+    libavcodec-dev \
+    libavformat-dev \
+    libgstreamer1.0-0 \
+    gstreamer1.0-plugins-base \
+    libusb-1.0-0-dev \
+    libopenblas-dev \
+    libpng-dev
+
+WORKDIR /opt
+
+ARG OPENCV_VERSION="4.2.0"
+ENV OPENCV_VERSION $OPENCV_VERSION
+
+RUN pip install numpy
+
+RUN wget -qO opencv.zip https://github.com/opencv/opencv/archive/${OPENCV_VERSION}.zip &amp;&amp; \
+            unzip -q opencv.zip &amp;&amp; \
+            wget -qO opencv_contrib.zip https://github.com/opencv/opencv_contrib/archive/${OPENCV_VERSION}.zip &amp;&amp; \
+            unzip -q opencv_contrib.zip &amp;&amp; \
+            rm opencv.zip opencv_contrib.zip &amp;&amp; \
+            cd opencv-${OPENCV_VERSION} &amp;&amp; \
+            mkdir build &amp;&amp; cd build &amp;&amp; \
+            cmake -D CMAKE_BUILD_TYPE=RELEASE \
+                  -D CMAKE_INSTALL_PREFIX=/opt/cv \
+                  -D OPENCV_EXTRA_MODULES_PATH=../../opencv_contrib-${OPENCV_VERSION}/modules \
+                  -D WITH_JASPER=OFF \
+                  -D BUILD_DOCS=OFF \
+                  -D BUILD_EXAMPLES=OFF \
+                  -D BUILD_TESTS=OFF \
+                  -D BUILD_PERF_TESTS=OFF \
+                  -D BUILD_opencv_java=NO \
+                  -D BUILD_opencv_python=YES \
+                  -D BUILD_opencv_python2=NO \
+                  -D BUILD_opencv_python3=YES \
+                  -D PYTHON3_EXECUTABLE=$(which python3.7) \
+                  -D PYTHON_INCLUDE_DIR=/usr/local/include/python3.7m \
+                  -D PYTHON_LIBRARY=/usr/local/lib/libpython3.7m.so \
+                  -D PYTHON3_NUMPY_INCLUDE_DIRS=/usr/local/lib/python3.7/site-packages/numpy/core/include/ \
+                  -D OPENCV_GENERATE_PKGCONFIG=ON .. &amp;&amp; \
+            make -j $(nproc --all) &amp;&amp; \
+            make preinstall &amp;&amp; make install &amp;&amp; ldconfig &amp;&amp; \
+            cd / &amp;&amp; rm -rf opencv*
+
+
+ENV OpenCV_DIR=/opt/cv
+
+RUN git clone --depth=1 https://github.com/opencv/dldt.git &amp;&amp; \
+	cd dldt/inference-engine &amp;&amp; \
+	git submodule init &amp;&amp; \
+	git submodule update --recursive &amp;&amp; \
+	pip install -r ie_bridges/python/requirements.txt &amp;&amp; \
+	mkdir build &amp;&amp; cd build &amp;&amp; \
+	cmake \
+	-DCMAKE_BUILD_TYPE=Release \
+	-DENABLE_CLDNN=OFF \
+	-DENABLE_MKL_DNN=ON \
+	-DENABLE_PYTHON=ON \
+	-DENABLE_OPENCV=ON \
+	-DPYTHON_EXECUTABLE=`which python3.7` \
+	-DPYTHON_LIBRARY=/usr/local/lib/libpython3.7m.so \
+	-DPYTHON_INCLUDE_DIR=/usr/local/include/python3.7m .. &amp;&amp; \
+	make --jobs=$(nproc --all)
+
+RUN wget -q https://download.01.org/opencv/2019/open_model_zoo/R3/20190905_163000_models_bin/face-detection-retail-0004/FP32/face-detection-retail-0004.bin &amp;&amp; \
+    wget -q https://download.01.org/opencv/2019/open_model_zoo/R3/20190905_163000_models_bin/face-detection-retail-0004/FP32/face-detection-retail-0004.xml &amp;&amp; \
+    wget -q https://upload.wikimedia.org/wikipedia/ru/2/24/Lenna.png
+
+FROM python:3.7-slim
+
+WORKDIR /app
+
+COPY --from=builder /opt/dldt/inference-engine/ /opt/dldt/inference-engine/
+COPY --from=builder /opt/cv /opt/cv
+COPY --from=builder /usr/local/lib/python3.7/site-packages /usr/local/lib/python3.7/site-packages
+COPY --from=builder /opt/dldt/inference-engine/bin/intel64/Release/lib/python_api/python3.7/openvino /usr/local/lib/python3.7/site-packages/openvino
+
+COPY --from=builder /opt/face-detection-retail-0004.bin .
+COPY --from=builder /opt/face-detection-retail-0004.xml .
+COPY --from=builder /opt/Lenna.png .
+
+
+RUN apt-get update &amp;&amp; apt-get install -y --no-install-recommends \
+    libcairo2-dev \
+    libpango1.0-dev \
+    libglib2.0-dev \
+    libswscale-dev \
+    libavcodec-dev \
+    libavformat-dev \
+    libpng-dev &amp;&amp; \
+    apt-get clean &amp;&amp; \
+    apt-get autoremove &amp;&amp; \
+    rm -rf /var/lib/apt/lists/*
+
+COPY model.py .
+
+CMD ["python", "model.py"]
+model.py:
+import time
+
+import cv2
+import numpy as np
+from openvino.inference_engine import IECore, IENetwork
+
+
+class FaceDetector:
+    def __init__(self, model, weights):
+        self.cpu_extension = (
+            "/opt/dldt/inference-engine/bin/intel64/Release/lib/libcpu_extension.so"
+        )
+        self.ie = ie = IECore()
+        self.ie.add_extension(self.cpu_extension, "CPU")
+
+        self.inner_net = IENetwork(model=model, weights=weights)
+        self.inner_net.batch_size = 1
+
+        self.input_blob = next(iter(self.inner_net.inputs))
+        self.out_blob = next(iter(self.inner_net.outputs))
+        self.n, self.c, self.h, self.w = self.inner_net.inputs[self.input_blob].shape
+
+        self.net = ie.load_network(network=self.inner_net, device_name="cpu")
+
+        self.threshold = 0.5
+
+    def findFaces(self, image):
+        h, w = image.shape[:-1]
+
+        batch = np.ndarray(shape=(self.n, self.c, self.h, self.w))
+        batch[0] = cv2.resize(image, (self.w, self.h)).transpose((2, 0, 1))
+
+        infer_res = self.net.infer(inputs={self.input_blob: batch})
+        infer_res = infer_res[self.out_blob]
+
+        scores, faces = [], []
+
+        for pred in infer_res[0][0]:
+            _, _, conf, x_min, y_min, x_max, y_max = pred
+
+            if conf &gt; self.threshold:
+                x_min = int(x_min * w)
+                y_min = int(y_min * h)
+                x_max = int(x_max * w)
+                y_max = int(y_max * h)
+
+                scores.append(conf)
+                faces.append((x_min, y_min, x_max, y_max,))
+
+        return scores, faces
+
+
+def main():
+    fd = FaceDetector(
+        "face-detection-retail-0004.xml", "face-detection-retail-0004.bin"
+    )
+
+    img_path = "Lenna.png"
+    img = cv2.imread(img_path)
+
+    while True:
+        t1 = time.process_time()
+        scores, faces = fd.findFaces(img)
+        time_ms = int((time.process_time() - t1) * 1000)
+        print(time_ms, scores)
+
+
+if __name__ == "__main__":
+    main()
+Output for G_SLICE=always-malloc G_DEBUG=gc-friendly  valgrind -v --tool=memcheck --leak-check=full --show-leak-kinds=all --num-callers=40 --log-file=valgrind.log $(which python) model.py:
+&lt;denchmark-code&gt;....
+
+==14088== LEAK SUMMARY:
+==14088==    definitely lost: 30 bytes in 1 blocks
+==14088==    indirectly lost: 0 bytes in 0 blocks
+==14088==      possibly lost: 144,923 bytes in 85 blocks
+==14088==    still reachable: 1,826,849 bytes in 1,726 blocks
+==14088==                       of which reachable via heuristic:
+==14088==                         stdstring          : 8,662 bytes in 135 blocks
+==14088==         suppressed: 0 bytes in 0 blocks
+...
+&lt;/denchmark-code&gt;
+
+Full: &lt;denchmark-link:https://github.com/opencv/dldt/files/4150342/valgrind.log&gt;valgrind.log&lt;/denchmark-link&gt;
+
+According to the Valgrind report, 30 bytes leak during one prediction. On my setup, the model can handle ~20 RPS (600 bytes leak per second) =&gt; ~1 Mb leak within 30 minutes. This is perfectly matched with the graph attached to the issue.
+	</description>
+	<comments>
+		<comment id='1' author='yutkin' date='2020-05-14T08:54:10Z'>
+		&lt;denchmark-link:https://github.com/yutkin&gt;@yutkin&lt;/denchmark-link&gt;
+ Thanks a lot for the report of this problem.
+&lt;denchmark-link:https://github.com/akuporos&gt;@akuporos&lt;/denchmark-link&gt;
+ Could you plan to investigate this issue?
+		</comment>
+		<comment id='2' author='yutkin' date='2020-05-14T09:00:34Z'>
+		Hi &lt;denchmark-link:https://github.com/yutkin&gt;@yutkin&lt;/denchmark-link&gt;
+,
+Can you, please, check if this memleak exists with master branch?
+Regards,
+Anastasia
+		</comment>
+		<comment id='3' author='yutkin' date='2020-07-20T13:54:52Z'>
+		It seems that the issues is not actual anymore as no response. Closing it. Feel free to reopen it or create a new one.
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,172 @@
+<bug id='27716' author='guillaumekln' open_date='2019-04-10T15:51:50Z' closed_time='2019-05-03T00:34:33Z'>
+	<summary>Distribution strategies and conditional parameters update fails with "Operation has been marked as not fetchable"</summary>
+	<description>
+System information
+
+Have I written custom code: Yes
+OS Platform and Distribution: Ubuntu 16.04
+TensorFlow installed from: binary
+TensorFlow version: 2.0.0a0
+Python version: 3.5.2
+
+Describe the current behavior
+When using conditional parameters update and a distribution strategy in graph mode, the first sess.run fails with the error:
+
+"Operation '*' has been marked as not fetchable."
+
+Describe the expected behavior
+Distribution strategies should support conditional parameters update.
+Code to reproduce the issue
+I tried to compile a small and representative snippet that is the base logic for gradient accumulation:
+import tensorflow as tf
+
+def train_op(accum_steps=None):
+    step = tf.Variable(initial_value=0, dtype=tf.int32, trainable=False)
+    optimizer = tf.optimizers.SGD(learning_rate=0.1)
+    variables = [tf.Variable(tf.zeros([4, 5], dtype=tf.float32))]
+    gradients = [tf.Variable(tf.ones([4, 5], dtype=tf.float32), trainable=False)]
+    if accum_steps is None:
+        return optimizer.apply_gradients(zip(gradients, variables))
+    else:
+        return tf.cond(
+            tf.equal((step + 1) % accum_steps, 0),
+            true_fn=lambda: optimizer.apply_gradients(zip(gradients, variables)),
+            false_fn=tf.no_op)
+
+devices = ["/gpu:2", "/gpu:3"]
+strategy = tf.distribute.MirroredStrategy(devices=devices)
+#strategy = tf.distribute.OneDeviceStrategy(device=devices[0])
+accum_count = 8
+
+with tf.Graph().as_default():
+    with strategy.scope():
+        train_op = strategy.extended.call_for_each_replica(train_op, args=(accum_count,))
+
+    config = tf.compat.v1.ConfigProto(allow_soft_placement=True)
+    with tf.compat.v1.Session(config=config) as sess:
+        sess.run(tf.compat.v1.global_variables_initializer())
+        _ = sess.run(train_op)
+The above code does not fail if OneDeviceStrategy is used or accum_count is set to None.
+Other info / logs
+&lt;denchmark-code&gt;Traceback (most recent call last):
+  File "cond_apply.py", line 27, in &lt;module&gt;
+    sess.run(tf.compat.v1.global_variables_initializer())
+  File "/usr/local/lib/python3.5/dist-packages/tensorflow/python/client/session.py", line 930, in run
+    run_metadata_ptr)
+  File "/usr/local/lib/python3.5/dist-packages/tensorflow/python/client/session.py", line 1138, in _run
+    self._graph, fetches, feed_dict_tensor, feed_handles=feed_handles)
+  File "/usr/local/lib/python3.5/dist-packages/tensorflow/python/client/session.py", line 480, in __init__
+    self._assert_fetchable(graph, fetch)
+  File "/usr/local/lib/python3.5/dist-packages/tensorflow/python/client/session.py", line 497, in _assert_fetchable
+    'Operation %r has been marked as not fetchable.' % op.name)
+ValueError: Operation 'init' has been marked as not fetchable.
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:hr&gt;&lt;/denchmark-h&gt;
+
+For an additional context, I'm porting a code from V1  and manual graph replication to V2  and distribution strategies. I'm struggling to port the gradient accumulation code that &lt;denchmark-link:https://github.com/OpenNMT/OpenNMT-tf/blob/v1.22.0/opennmt/utils/optim.py#L199-L261&gt;we have working in V1&lt;/denchmark-link&gt;
+.
+	</description>
+	<comments>
+		<comment id='1' author='guillaumekln' date='2019-04-16T15:56:07Z'>
+		So this is not straightforward. Here is the adapted code to run within a distribution strategy:
+import tensorflow as tf
+
+def train_op():
+    step = tf.Variable(
+        0,
+        dtype=tf.int32,
+        trainable=False,
+        aggregation=tf.VariableAggregation.ONLY_FIRST_REPLICA)
+    optimizer = tf.optimizers.SGD(learning_rate=1)
+    variables = [tf.Variable(tf.zeros([], dtype=tf.float32))]
+    gradients = [tf.ones_like(var) for var in variables]
+    with tf.init_scope():
+        train_op = tf.cond(
+            tf.equal((step + 1) % 4, 0),
+            true_fn=lambda: optimizer.apply_gradients(zip(gradients, variables)),
+            false_fn=tf.no_op)
+        with tf.control_dependencies([train_op]):
+            train_op = tf.group(train_op, step.assign_add(1))
+    return train_op, variables
+
+devices = ["/gpu:1", "/gpu:2"]
+strategy = tf.distribute.MirroredStrategy(devices=devices)
+#strategy = tf.distribute.OneDeviceStrategy(device=devices[-1])
+
+with tf.Graph().as_default():
+    with strategy.scope():
+        train_op, variables = strategy.extended.call_for_each_replica(train_op)
+
+    with tf.init_scope():
+        train_op = strategy.unwrap(train_op)
+        init_op = tf.compat.v1.global_variables_initializer()
+    config = tf.compat.v1.ConfigProto(allow_soft_placement=True)
+    with tf.compat.v1.Session(config=config) as sess:
+        sess.run(init_op)
+        for _ in range(10):
+            _, var = sess.run((train_op, variables[0]))
+            print(var)
+Notes:
+
+the variable initializer op has to be defined under tf.init_scope
+the conditional training op has to be defined under tf.init_scope
+the training op has to be unwrap before calling sess.run
+
+I'm interested in hearing some feedback from a TensorFlow member regarding the code above.
+I would also like to know if this approach is expected to be supported by tf.estimator. If not, this could make the transition to TF2.0 more painful.
+		</comment>
+		<comment id='2' author='guillaumekln' date='2019-04-26T05:43:39Z'>
+		The error in your original code is arising due to the fact that you have an apply_gradients call inside the tf.cond. apply_gradients when in a distribution strategy context would call a method called merge_call on the strategy object, which tries to execute some synchronization code, in this case it would be reducing the gradients across replicas, and updating the variables.
+Putting this code inside a merge_call is not very well supported. An alternative for this is to move the entire tf.cond inside a merge_call. Here is some code to illustrate this.
+If you currently have some something like:
+&lt;denchmark-code&gt;def f():
+  return optimizer.apply_gradients(a, ...)  # can execute merge_call
+
+def g():
+  return tf.no_op
+
+def h():  # executed once per replica in a replica context
+  return tf.cond(..., f, g)
+&lt;/denchmark-code&gt;
+
+then you would rewrite it to evaluate the condition once across all replicas:
+&lt;denchmark-code&gt;def f():  # as before
+  return optimizer.apply_gradients(a, ...)
+
+def g():  # as before
+  return tf.no_op
+
+# f1/g1 switch from cross-replica context to replica context and call f/g
+def f1():
+  return strategy.extended.call_for_each_replica(f)
+
+def g1():
+  return strategy.extended.call_for_each_replica(g)
+
+# gets evaluated once in a cross-replica context
+def h1():
+  return tf.cond(..., f1, g1)
+
+# called in a replica context once per replica, uses merge_call to call h1 once
+def h():
+  return tf.distribute.get_replica_context.merge_call(h1)
+&lt;/denchmark-code&gt;
+
+Thanks &lt;denchmark-link:https://github.com/josh11b&gt;@josh11b&lt;/denchmark-link&gt;
+ for this code snippet.
+Hope this helps.
+		</comment>
+		<comment id='3' author='guillaumekln' date='2019-05-03T00:34:33Z'>
+		Awesome explanation &lt;denchmark-link:https://github.com/guptapriya&gt;@guptapriya&lt;/denchmark-link&gt;
+.  Please re-open if you'd like more help.  We are looking internally on improving the error message.
+		</comment>
+		<comment id='4' author='guillaumekln' date='2019-05-03T00:34:34Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=27716&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=27716&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

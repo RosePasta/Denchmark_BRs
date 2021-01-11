@@ -1,0 +1,94 @@
+<bug id='5100' author='cnuernber' open_date='2015-07-30T22:39:38Z' closed_time='2015-08-02T16:58:32Z'>
+	<summary>Opencv sigsegv from java bindings</summary>
+	<description>
+We are running an app processing many, many images and I am seeing periodic crashes in opencv.
+Here is a representative stack trace:
+&lt;denchmark-code&gt;Java frames: (J=compiled Java code, j=interpreted, Vv=VM code)
+J 3492  org.opencv.core.Mat.nGetB(JIII[B)I (0 bytes) @ 0x00007fbd817e7622 [0x00007fbd817e75c0+0x62]
+J 3491 C1 org.opencv.core.Mat.get(II[B)I (133 bytes) @ 0x00007fbd817e6a14 [0x00007fbd817e6860+0x1b4]
+j  thinktopic.image.core$opencv_matrix_to_byte_pixels.invoke(Ljava/lang/Object;)Ljava/lang/Object;+182
+J 2958 C1 thinktopic.image.core$bounding_box_from_single_channel_cv_matrix.invoke(Ljava/lang/Object;)Ljava/lang/Object; (613 bytes) @ 0x00007fbd81702c94 [0x00007fbd817029e0+0x2b4]
+j  cn.ingester.functions$process_image_record.invoke(Ljava/lang/Object;)Ljava/lang/Object;+179
+j  clojure.core$pmap$fn__6740$fn__6741.invoke()Ljava/lang/Object;+21
+j  clojure.core$binding_conveyor_fn$fn__4442.invoke()Ljava/lang/Object;+14
+J 1504 C1 clojure.lang.AFn.call()Ljava/lang/Object; (5 bytes) @ 0x00007fbd8138e33c [0x00007fbd8138e300+0x3c]
+j  java.util.concurrent.FutureTask.run()V+42
+j  java.util.concurrent.ThreadPoolExecutor.runWorker(Ljava/util/concurrent/ThreadPoolExecutor$Worker;)V+95
+j  java.util.concurrent.ThreadPoolExecutor$Worker.run()V+5
+j  java.lang.Thread.run()V+11
+v  ~StubRoutines::call_stub
+&lt;/denchmark-code&gt;
+
+I believe that there is a problem with opencv30 and keeping reference counts to the objects because this crash is periodic so I believe it is a timing issue w/r/t the java gc.
+	</description>
+	<comments>
+		<comment id='1' author='cnuernber' date='2015-07-31T08:06:56Z'>
+		Can you, please, provide minimal example reproducing this issue? Do you use Mat.release to free allocated space during application work?
+		</comment>
+		<comment id='2' author='cnuernber' date='2015-07-31T15:14:17Z'>
+		If I could attach things to the bug I could give you a lot more information.  I don't agree that the priority is low.  I am trying to run through an overnight thing and I get a crash roughly every minute or two, so very very frequently.
+I never use free at any time during the processing flow; here is a high level outline:
+(let [{:keys [sku index url]} image-record
+          image (load-image-from-pipeline url)
+          ^Mat original-mat (think-image/image-to-opencv image)
+          ^Mat edges (think-image/opencv-mat-edge-detect original-mat :low-threshold 70 :ratio 3)
+          original-bounding-box (flatten (think-image/bounding-box-from-single-channel-cv-matrix edges))
+          ;;some heuristics to ensure the bounding box makes some sense.  If it doesn't then we use the image size.
+          bbox-width (think-image/bounding-box-width original-bounding-box)
+          bbox-height (think-image/bounding-box-height original-bounding-box)
+          image-width (.getWidth image)
+          image-height (.getHeight image)
+          original-bounding-box (if (or (&lt; bbox-width (* image-width 0.05))
+                                        (&lt; bbox-height (* image-height 0.05)))
+                                  [0 0 image-width image-height]
+                                  original-bounding-box)
+          large-img-data (think-image/create-nice-mat-and-bounding-box original-mat original-bounding-box)
+
+          medium-img-data (think-image/scale-opencv-mat (large-img-data 0) (large-img-data 1) 256)
+          small-img-data (think-image/scale-opencv-mat (medium-img-data 0) (medium-img-data 1) 128)
+          feature-img-data (think-image/square-matrix (large-img-data 0) (large-img-data 1) -1 256)
+
+          data-mask (think-image/opencv-matrix-grabcut (feature-img-data 0) (feature-img-data 1))
+          masked-feature-matrix (think-image/opencv-matrix-and-mask-to-masked-matrix (feature-img-data 0) data-mask)
+          [ccv color-sig] (think-image/get-matrix-ccv-and-color-signature masked-feature-matrix (feature-img-data 1))
+          [scaled-data-mask _] (think-image/scale-opencv-mat data-mask [0 0 256 256] 64)
+          feature-img-data [masked-feature-matrix (feature-img-data 1)]
+          shape-mask (think-image/mask-matrix-to-int-buffer scaled-data-mask)]
+		</comment>
+		<comment id='3' author='cnuernber' date='2015-07-31T15:18:19Z'>
+		Basically the only thing I am doing is using opencv in mostly trivial ways.  I use two algorithms; edge detect and grabcut and aside from that I am just scaling and mixing channels (to mix the grabcut results into the alpha channel).
+This bug is intermittent, sometimes I get through like 100 images, sometimes more but rare more than 1000.  I am certain there is a problem with the reference counting system opencv is using and the java gc can trigger this by running at very certain times or running in a separate thread or something along those lines.  I am going to back off and try the pre-built ubuntu opencv 2.4 bindings and then see what happens; it could be that the default cmake build options do something they should not but I really doubt it because how intermittent the error is.
+		</comment>
+		<comment id='4' author='cnuernber' date='2015-07-31T15:22:54Z'>
+		You should not rely on the GC in this case, because Java does not know about allocated memory for image (native memory). Each Mat takes just several bytes of memory from the GC's point of view. Try to explicitly call Mat.release for each image you do not need anymore.
+BTW, you can share files via github gists.
+		</comment>
+		<comment id='5' author='cnuernber' date='2015-07-31T15:54:59Z'>
+		Is there some mechanism that would cause a sigsegv if release wasn't being called?  It seems the error would be different.  Working on a more stand-alone repro right now.
+		</comment>
+		<comment id='6' author='cnuernber' date='2015-07-31T16:34:05Z'>
+		Release appears to greatly mitigate the problem.  Any insight as to why that may be?
+Thank you!!
+		</comment>
+		<comment id='7' author='cnuernber' date='2015-07-31T16:58:21Z'>
+		
+Is there some mechanism that would cause a sigsegv if release wasn't being called?
+
+It could happen when memory can not be allocated. As I wrote earlier, you still need to manage all native-allocated memory by yourself: along with Mat.release try to call &lt;denchmark-link:http://docs.opencv.org/java/3.0.0/org/opencv/core/Algorithm.html&gt;Algorithm.clear&lt;/denchmark-link&gt;
+ for all algorithm-based objects you use.
+		</comment>
+		<comment id='8' author='cnuernber' date='2015-07-31T17:02:05Z'>
+		I guess more specifically does opencv use some internal pooling mechanism or does it directly use new/malloc?  I have plenty of ram; I was nowhere close to the limit but the jvm may do something to cause new/malloc to fail earlier than they would otherwise (I was watching the ram usage in top).
+My point is that if opencv does use some pooling mechanism it would be better if it threw an exception or just had an error notification system rather than just silently failing; a sigsegv can be cause by a lot of possible things not just a null pointer somewhere.
+Is it possible we are missing error messages coming from opencv?  Or all errors exceptions or are errors reported in other ways?
+Going through the code now and very carefully now and releasing all matrix objects :).
+		</comment>
+		<comment id='9' author='cnuernber' date='2015-08-02T16:58:32Z'>
+		The fix is solid, I ran the process for literally a day and didn't see the same error again.
+I did, however, run into an openjdk bug:
+&lt;denchmark-link:https://bugs.openjdk.java.net/browse/JDK-8059010&gt;https://bugs.openjdk.java.net/browse/JDK-8059010&lt;/denchmark-link&gt;
+
+At this point closing issue; opencv is not at fault.
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,125 @@
+<bug id='3454' author='stephanie-wang' open_date='2018-12-02T03:41:07Z' closed_time='2020-10-12T03:35:26Z'>
+	<summary>Prevent duplicate actor creation</summary>
+	<description>
+&lt;denchmark-h:h3&gt;Describe the problem&lt;/denchmark-h&gt;
+
+If an actor fails due to a node failure, then another node in the cluster will resubmit the actor creation task to recover. However, if reconstruction isn't suppressed properly, this could potentially lead to multiple creations of the same actor by different nodes. Reconstruction may not be suppressed properly in two cases that I can think of: &lt;denchmark-link:https://github.com/ray-project/ray/issues/3214&gt;#3214&lt;/denchmark-link&gt;
+ and/or delayed actor creation notifications to the actor table in the GCS.
+Right now, a duplicate actor creation is a fatal error that will crash the backend, but in the future, we should handle the error gracefully.
+&lt;denchmark-h:h3&gt;Source code / logs&lt;/denchmark-h&gt;
+
+A test with many nodes, many actor handles, and many actors that are getting terminated and created frequently is likely to produce the error. The following script run on 50 nodes with a failure every few minutes will induce a raylet crash within 30 minutes.
+&lt;denchmark-code&gt;#!/usr/bin/env python
+
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
+import logging
+import numpy as np
+import sys
+import time
+
+import ray
+
+logger = logging.getLogger(__name__)
+
+ray.init(redis_address="localhost:6379")
+
+
+@ray.remote
+class Child(object):
+    def __init__(self, death_probability):
+        self.death_probability = death_probability
+
+    def ping(self):
+        # Exit process with some probability.
+        exit_chance = np.random.rand()
+        if exit_chance &gt; self.death_probability:
+            sys.exit(-1)
+
+
+@ray.remote
+class Parent(object):
+    def __init__(self, num_children, death_probability):
+        self.death_probability = death_probability
+        self.children = [
+            Child.remote(death_probability) for _ in range(num_children)
+        ]
+
+    def ping(self, num_pings):
+        children_outputs = []
+        for _ in range(num_pings):
+            children_outputs += [
+                child.ping.remote() for child in self.children
+            ]
+        try:
+            ray.get(children_outputs)
+        except Exception:
+            # Replace the children if one of them died.
+            self.__init__(len(self.children), self.death_probability)
+
+    def kill(self):
+        # Clean up children.
+        ray.get([child.__ray_terminate__.remote() for child in self.children])
+
+
+@ray.remote
+class Fork(object):
+    def __init__(self, actor):
+        self.actor = actor
+
+    def ping(self, num_pings):
+        ray.get(self.actor.ping.remote(num_pings))
+
+num_parents = 100
+num_children = 10
+num_forks = 4
+death_probability = 0.99
+
+parents = [Parent.remote(num_children, death_probability) for _ in range(num_parents)]
+all_forks = [[Fork.remote(parent) for parent in parents] for _ in range(num_forks)]
+
+for i in range(100):
+    start_time = time.time()
+    outs = [fork.ping.remote(10) for forks in all_forks for fork in forks]
+    # Wait a while for all the tasks to complete. This should trigger
+    # reconstruction for any actor creation tasks that were forwarded
+    # to nodes that then failed.
+    ready, _ = ray.wait(
+        outs,
+        num_returns=len(outs),
+        timeout=120 * 1000)
+    assert len(ready) == len(outs)
+
+    for j, out in enumerate(outs):
+        try:
+            print("getting parent", j)
+            ray.get(out)
+        except:
+            parent = Parent.remote(num_children, death_probability)
+            parents[j % len(parents)] = parent
+            for forks in all_forks:
+                forks[j % len(parents)] = Fork.remote(parent)
+            print("Parent", j % len(parents), "restarted")
+
+    logger.info("Finished trial {} in {}s".format(i, time.time() - start_time))
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='stephanie-wang' date='2018-12-02T08:37:22Z'>
+		I was under the impression that only the raylet that succeeds in AppendAt the actor table can actually recreate the actor, if that's the case there shouldn't be duplicate creations since there should be only one that can succeed?
+		</comment>
+		<comment id='2' author='stephanie-wang' date='2018-12-03T18:58:52Z'>
+		That is true, but right now it's a fatal error if the second AppendAt doesn't succeed. The todo is to reduce that error to a warning and make sure that we clean up any state for the failed actor creation.
+		</comment>
+		<comment id='3' author='stephanie-wang' date='2018-12-05T07:34:16Z'>
+		I see, that makes sense. thanks &lt;denchmark-link:https://github.com/stephanie-wang&gt;@stephanie-wang&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='4' author='stephanie-wang' date='2020-10-12T03:35:26Z'>
+		I think this should be fixed by GCS actor management! Please reopen if not!
+		</comment>
+	</comments>
+</bug>

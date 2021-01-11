@@ -1,0 +1,297 @@
+<bug id='38617' author='lgeiger' open_date='2020-04-16T23:29:23Z' closed_time='2020-04-30T18:27:29Z'>
+	<summary>[2.2rc3] Distibuted training with Keras and ThreadPoolDataset runs out of memory</summary>
+	<description>
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): Yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Ubuntu 18.04
+TensorFlow installed from (source or binary): binary
+TensorFlow version (use command below): 2.2.0rc3 and tf-nightly
+Python version: 3.7
+CUDA/cuDNN version: 10.1 / 7.6.5.32
+GPU model and memory: 4 x NVIDIA V100 on GCP
+
+Describe the current behavior
+When running the code below with cached training and validations datasets in a multi-GPU environment (I am using a GCP VM with 312GB of memory and 4 NVIDIA V100s) memory increases during each validation run until the VM runs out of memory. This behaviour can be observed on 2.2.0-rc3 and on the latest nightly.
+It looks like the validation dataset is not properly cached since I can still see network access during validation and the memory usage drops below the theoretical cached memory requirements after validation has finished and then increases linearly during the next validation round to a point larger than the memory usage in the previous epoch.
+In the example below I intentionally use an very large validation set to make this memory increase very obvious and make training crash within the first 5 epochs. This behaviour can also be observed with other datasets, but the memory increase will be less noticible on smaller datsets.
+In which cases is the memory usage still stable?
+To narrow down the possible causes for this I found two cases where this issue doesn't exist:
+
+
+When running on a single GPU memory usage is stable.
+
+
+Tensorflow Datasets uses a _PrivateThreadPoolDataset by setting the experimental_threading.private_threadpool_size=16 as a default option. When disabling this option the memory usage is stable again. Unfortunately this is not a valid workaround in userland since the dataset option cannot be overwritten with experimental_threading.private_threadpool_size=None as it expects an integer.
+
+
+&lt;denchmark-link:https://github.com/yhliang2018&gt;@yhliang2018&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/tomerk&gt;@tomerk&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/byronyi&gt;@byronyi&lt;/denchmark-link&gt;
+ This seems to be a complicated interaction between ,  and , do you have an idea what could cause this behaviour? Please let me know what additional information I could provide.
+I've ran into similar issues with  on TF 2.0.0 in the past though never investigated the root cause in detail, so this might not be an entirely new regression.
+Describe the expected behavior
+Memory usage should be stable after the first epoch.
+Standalone code to reproduce the issue
+import tensorflow as tf
+import tensorflow_datasets as tfds
+
+
+batch_size = 1024
+
+dataset = tfds.load(
+    "imagenet2012:5.0.0",
+    decoders={"image": tfds.decode.SkipDecoding()},
+    split="train",
+    data_dir="gs://my-cloud-bucket",
+)
+
+val_dataset = tfds.load(
+    "imagenet2012:5.0.0",
+    decoders={"image": tfds.decode.SkipDecoding()},
+    split="validation",
+    data_dir="gs://my-cloud-bucket",
+)
+
+
+def _decode_and_center_crop(image_bytes):
+    """Crops to center of image with padding then scales image_size."""
+    shape = tf.image.extract_jpeg_shape(image_bytes)
+    image_height = shape[0]
+    image_width = shape[1]
+    image_size = 224
+
+    padded_center_crop_size = tf.cast(
+        (
+            (image_size / (image_size + 32))
+            * tf.cast(tf.minimum(image_height, image_width), tf.float32)
+        ),
+        tf.int32,
+    )
+
+    offset_height = ((image_height - padded_center_crop_size) + 1) // 2
+    offset_width = ((image_width - padded_center_crop_size) + 1) // 2
+    crop_window = tf.stack(
+        [offset_height, offset_width, padded_center_crop_size, padded_center_crop_size]
+    )
+    image = tf.image.decode_and_crop_jpeg(image_bytes, crop_window, channels=3)
+    return tf.image.resize(image, [image_size, image_size], method="bicubic")
+
+
+def preprocessing(data):
+    return tf.cast(_decode_and_center_crop(data["image"]), tf.float32), data["label"]
+
+dataset = (
+    dataset.cache()
+    .map(preprocessing, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+    .batch(batch_size)
+    .prefetch(1)
+)
+
+val_dataset = (
+    val_dataset.cache()
+    .map(preprocessing, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+    .batch(batch_size)
+    .prefetch(1)
+)
+
+with tf.distribute.MirroredStrategy().scope():
+    model = tf.keras.models.Sequential(
+        [
+            tf.keras.layers.GlobalMaxPool2D(input_shape=(224, 224, 3)),
+            tf.keras.layers.Dense(1000, activation="softmax",),
+        ]
+    )
+
+    model.compile(
+        optimizer="adam",
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy", "sparse_top_k_categorical_accuracy"],
+    )
+
+model.fit(
+    val_dataset, epochs=5, validation_data=dataset,
+)
+Other info / logs
+To monitor memory usage over time tools like &lt;denchmark-link:https://github.com/cjbassi/ytop/&gt;ytop&lt;/denchmark-link&gt;
+ can be used.
+	</description>
+	<comments>
+		<comment id='1' author='lgeiger' date='2020-04-17T01:24:54Z'>
+		Yes, I think those arguments are obsolete and should be removed. Thank you for your PR
+		</comment>
+		<comment id='2' author='lgeiger' date='2020-04-17T04:54:13Z'>
+		&lt;denchmark-link:https://github.com/lgeiger&gt;@lgeiger&lt;/denchmark-link&gt;
+
+as there is a pr monitoring the issue, please let us know if we can move this to closed status
+		</comment>
+		<comment id='3' author='lgeiger' date='2020-04-17T08:56:35Z'>
+		
+as there is a pr monitoring the issue, please let us know if we can move this to closed status
+
+&lt;denchmark-link:https://github.com/Saduf2019&gt;@Saduf2019&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/Conchylicultor&gt;@Conchylicultor&lt;/denchmark-link&gt;
+ is refering to the PR on the &lt;denchmark-link:https://github.com/tensorflow/datasets/pull/1893&gt;TensorFlow Datasets repo&lt;/denchmark-link&gt;
+. This doesn't solve the underlying issue in TensorFlow though, so this issue is not resolved.
+		</comment>
+		<comment id='4' author='lgeiger' date='2020-04-17T19:01:02Z'>
+		&lt;denchmark-link:https://github.com/lgeiger&gt;@lgeiger&lt;/denchmark-link&gt;
+ you mentioned with 1 GPU memory was stable. Was that without using any distribution strategy? or with MirroredStrategy + 1 GPU? Also, what batch size was used for the 1 GPU case?
+Also, does the issue go away if there is no validation dataset at all?
+		</comment>
+		<comment id='5' author='lgeiger' date='2020-04-17T19:08:52Z'>
+		
+you mentioned with 1 GPU memory was stable. Was that without using any distribution strategy? or with MirroredStrategy + 1 GPU?
+
+This was without using any distribution strategy.
+
+Also, what batch size was used for the 1 GPU case?
+
+Both MirroredStrategy and single GPU used batch size 1024.
+
+Also, does the issue go away if there is no validation dataset at all?
+
+If I recall correctly this only happens with a validation set, but I will explicitely test this later today again just to make sure.
+		</comment>
+		<comment id='6' author='lgeiger' date='2020-04-17T20:22:04Z'>
+		
+Also, does the issue go away if there is no validation dataset at all?
+
+&lt;denchmark-link:https://github.com/guptapriya&gt;@guptapriya&lt;/denchmark-link&gt;
+ I just double checked and memory usage is completely flat when there is no validation dataset.
+		</comment>
+		<comment id='7' author='lgeiger' date='2020-04-17T21:20:50Z'>
+		&lt;denchmark-link:https://github.com/goldiegadde&gt;@goldiegadde&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/guptapriya&gt;@guptapriya&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/ymodak&gt;@ymodak&lt;/denchmark-link&gt;
+ After writing down this issue yesterday I discovered another related broken behaviour in the latest RC. I wrote down my findings in &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/38655&gt;#38655&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='8' author='lgeiger' date='2020-04-17T21:24:41Z'>
+		Thanks a lot for filing this issue &lt;denchmark-link:https://github.com/lgeiger&gt;@lgeiger&lt;/denchmark-link&gt;
+. Your analysis has helped us narrow down on a possible root cause which we will investigate further and fix. For now this does look like a regression in 2.2rc3.
+We still don't understand why removing experimental_threading.private_threadpool_size helps though.
+		</comment>
+		<comment id='9' author='lgeiger' date='2020-04-17T21:46:47Z'>
+		&lt;denchmark-link:https://github.com/lgeiger&gt;@lgeiger&lt;/denchmark-link&gt;
+ to help us confirm that this is a regression, would you mind running your check against TF 2.1? both for the OOM issue, and the network usage.
+		</comment>
+		<comment id='10' author='lgeiger' date='2020-04-18T14:10:31Z'>
+		
+@lgeiger to help us confirm that this is a regression, would you mind running your check against TF 2.1? both for the OOM issue, and the network usage.
+
+&lt;denchmark-link:https://github.com/guptapriya&gt;@guptapriya&lt;/denchmark-link&gt;
+ This is a regression introduced between 2.1 and 2.2. I re-ran the checks with TF 2.1 and both issues are not present there (i.e. memory a network usage are completely stable).
+Note that with TF 2.1 I am running into &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/36126&gt;#36126&lt;/denchmark-link&gt;
+ instead so I am seeing a lot of unnecessary error messages each epoch, but I don't think this is related.
+		</comment>
+		<comment id='11' author='lgeiger' date='2020-04-18T19:55:51Z'>
+		Thanks &lt;denchmark-link:https://github.com/lgeiger&gt;@lgeiger&lt;/denchmark-link&gt;
+ for confirming, appreciate it! We know the root cause of the memory issue, and have a fix in the works. I am surprised the network usage is also stable though, because we thought the root cause for the network issue is something else.. maybe there is some interaction still between the 2 issues that we do not understand.
+		</comment>
+		<comment id='12' author='lgeiger' date='2020-04-18T22:27:35Z'>
+		&lt;denchmark-link:https://github.com/guptapriya&gt;@guptapriya&lt;/denchmark-link&gt;
+ Thanks for investigating! In my journey of upgrading from 2.0 to 2.2 I discovered my hopefully last GPU memory related problem. I wrote down the findings in &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/38675&gt;#38675&lt;/denchmark-link&gt;
+.
+		</comment>
+		<comment id='13' author='lgeiger' date='2020-04-19T07:07:17Z'>
+		Thanks &lt;denchmark-link:https://github.com/lgeiger&gt;@lgeiger&lt;/denchmark-link&gt;
+, I ll ask some folks in XLA to take a look at that one.
+		</comment>
+		<comment id='14' author='lgeiger' date='2020-04-21T21:56:24Z'>
+		I just retested this with the latest nightly and it seems that this has been fixed by &lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/7ebbab819e736319ec35b48e31f4d62fbad6626b&gt;7ebbab8&lt;/denchmark-link&gt;
+ as well. I'm still not sure what the interaction with the thread pool dataset is though.
+		</comment>
+		<comment id='15' author='lgeiger' date='2020-04-23T17:18:37Z'>
+		Hm, are you saying that after &lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/7ebbab819e736319ec35b48e31f4d62fbad6626b&gt;7ebbab8&lt;/denchmark-link&gt;
+, there is no increase in memory usage?
+That seems a bit surprising because my understanding was that the fix for the memory leak and caching issues were actually different.. (and we still haven't submitted the fix for memory leak, though it is close to be submitted).
+Is memory usage completely stable after this change, or does it still increase a little bit?
+		</comment>
+		<comment id='16' author='lgeiger' date='2020-04-23T17:23:10Z'>
+		
+Is memory usage completely stable after this change, or does it still increase a little bit?
+
+I can retest this more carefully tomorrow, but at least the memory increase seemed not to be as catastrophic. But I will double check, since I only briefly tested this.
+		</comment>
+		<comment id='17' author='lgeiger' date='2020-04-28T14:34:03Z'>
+		&lt;denchmark-link:https://github.com/lgeiger&gt;@lgeiger&lt;/denchmark-link&gt;
+ I got memory error on second epoch when evaluate val set. Then, I see on the memory usage, at the begining it only takes 35%, but it's going up time by time until I got OOM. Is it same problem with you?
+I use Multi Workers Mirrored Strategy btw
+		</comment>
+		<comment id='18' author='lgeiger' date='2020-04-28T14:35:47Z'>
+		&lt;denchmark-link:https://github.com/alimhanif&gt;@alimhanif&lt;/denchmark-link&gt;
+ are you using the latest nightly or 2.2.0rc3?
+		</comment>
+		<comment id='19' author='lgeiger' date='2020-04-28T14:38:14Z'>
+		yes, i'm using that version
+		</comment>
+		<comment id='20' author='lgeiger' date='2020-04-28T14:40:24Z'>
+		
+yes, i'm using that version
+
+If you are using tensorflow==2.2.0rc3, could you give the latest version of tf-nightly a try and see if the issue is still there?
+		</comment>
+		<comment id='21' author='lgeiger' date='2020-04-28T14:48:53Z'>
+		The latest version of TF Nightly is not able to use Tensorboard Callback. Will fix it then start the training :)
+TF Nightly version: 2.2.0.dev20200428
+		</comment>
+		<comment id='22' author='lgeiger' date='2020-04-28T18:39:52Z'>
+		&lt;denchmark-link:https://github.com/lgeiger&gt;@lgeiger&lt;/denchmark-link&gt;
+ We've checked in the &lt;denchmark-link:dac6d6ae7c381fb93438d8553b2596bfd4828c49&gt;fix&lt;/denchmark-link&gt;
+ for the memory leak regression. I know you mentioned that the issue was not there post the cache fix. Let us know if you are still running into issues. Thanks!
+		</comment>
+		<comment id='23' author='lgeiger' date='2020-04-28T21:00:30Z'>
+		&lt;denchmark-link:https://github.com/lgeiger&gt;@lgeiger&lt;/denchmark-link&gt;
+ after training for 5 hrs, TF Nightly version:  shows the flat memory utilization.
+But for sure, I have another error on this version (cant use Tensorboard callback). Will make another issue
+		</comment>
+		<comment id='24' author='lgeiger' date='2020-04-28T21:30:40Z'>
+		&lt;denchmark-link:https://github.com/anj-s&gt;@anj-s&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/guptapriya&gt;@guptapriya&lt;/denchmark-link&gt;
+ Thank you very much for the fix. Reliably reproducing and tracking down this issue was rather painful, so I'm very happy that it is fixed now. I double checked with todays  and the memory usage is perfectly stable for many epochs 
+On tf-nightly I now get the following warning, but I am not sure if this is related to the fix:
+&lt;denchmark-code&gt;tensorflow/core/kernels/data/captured_function.cc:458]
+Disabling multi-device execution for a function that uses the experimental_ints_on_device attribute.
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='25' author='lgeiger' date='2020-04-28T21:33:06Z'>
+		can we do a cherry picking this 2.2.0.dev20200428 version to the 2.2.0rc3?
+I need to train my model with Tensorboard, btw
+TF 2.2 RC 3 is almost perfect, it's only have memory leak problem in my experiences
+I think latest TF Nighly that I use is not able to read on gcs bucket (especially for Tensorboard CallBack)
+		</comment>
+		<comment id='26' author='lgeiger' date='2020-04-28T21:36:02Z'>
+		
+can we do a cherry picking this 2.2.0.dev20200428 version to the 2.2.0rc3?
+
+&lt;denchmark-link:https://github.com/alimhanif&gt;@alimhanif&lt;/denchmark-link&gt;
+ This is in progress and will probably be included in the stable release of 2.2.0. See &lt;denchmark-link:https://github.com/tensorflow/tensorflow/pull/38996&gt;#38996&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='27' author='lgeiger' date='2020-04-29T01:26:34Z'>
+		They close it and move to existing PR
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/pull/39002&gt;#39002&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='28' author='lgeiger' date='2020-04-29T01:30:03Z'>
+		&lt;denchmark-link:https://github.com/lgeiger&gt;@lgeiger&lt;/denchmark-link&gt;
+ and &lt;denchmark-link:https://github.com/alimhanif&gt;@alimhanif&lt;/denchmark-link&gt;
+ thanks for verifying that the issue is fixed with tf-nightly
+		</comment>
+		<comment id='29' author='lgeiger' date='2020-04-30T18:27:29Z'>
+		Closing this bug since the issue has been fixed. Thank you for reporting this!
+		</comment>
+		<comment id='30' author='lgeiger' date='2020-04-30T18:27:31Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/38617&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/38617&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='31' author='lgeiger' date='2020-05-01T18:35:07Z'>
+		Thanks, I can confirm that this doesn't show up in rc4 anymore
+		</comment>
+	</comments>
+</bug>

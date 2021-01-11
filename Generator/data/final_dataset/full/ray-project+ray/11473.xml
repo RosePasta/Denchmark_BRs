@@ -1,0 +1,191 @@
+<bug_data>
+<bug id='11473' author='mvindiola1' open_date='2020-10-19T19:16:29Z' closed_time='2020-10-28T21:23:07Z'>
+ 	<summary>[RLLIB] remote_worker environments not being closed</summary>
+ 	<description>
+ &lt;denchmark-h:h3&gt;What is the problem?&lt;/denchmark-h&gt;
+ 
+ Ray version 1.0.0
+ Python 3.7.7
+ Tensorflow 2.2
+ I have wrapped a custom environment in an rllib MultiAgentEnv. This environment requires that I post an http request when the environment is closed in order to shut down remote resources. If this request takes too long the remote resources are never freed.
+ I have attached a sample script adapted from ray/rllib/examples/centralized_critic_2.py.
+ I also adapted TwoStepGame to add a close method and introduce a 5 second sleep to simulate a slow closing environment. In this example there are 2 workers and 4 envs_per_worker
+ I have attached two example: 1. Where the sleep is 0 and all of the environments are closed correctly and 2. Where the sleep is 5 seconds and only the environments in the local_worker are closed and none of the remote_worker envs are closed.
+ The source of the problem comes from here:
+ 
+ 
+ 
+ ray/rllib/evaluation/worker_set.py
+ 
+ 
+         Lines 145 to 150
+       in
+       acbd12e
+ 
+ 
+ 
+ 
+ 
+ 
+  def stop(self) -&gt; None: 
+ 
+ 
+ 
+  """Stop all rollout workers.""" 
+ 
+ 
+ 
+  self.local_worker().stop() 
+ 
+ 
+ 
+  for w in self.remote_workers(): 
+ 
+ 
+ 
+  w.stop.remote() 
+ 
+ 
+ 
+  w.__ray_terminate__.remote() 
+ 
+ 
+ 
+ 
+ 
+ I have fixed this locally like this:
+     def stop(self) -&gt; None:
+         """Stop all rollout workers."""
+         self.local_worker().stop()
+         fhandles = [w.stop.remote() for w in self.remote_workers()]
+         ray.get(fhandles)
+         for w in self.remote_workers():
+             w.__ray_terminate__.remote()
+ In this example with time.sleep(0) you will see that all the envs are closed and all of the counter decrement calls complete.
+ &lt;denchmark-link:https://github.com/ray-project/ray/files/5404171/remote_worker_env_close_sleep0.txt&gt;remote_worker_env_close_sleep0.txt&lt;/denchmark-link&gt;
+ 
+ In this example with time.sleep(5) you will see that only the first 4 envs are closed (on the local_worker) and after tune has finished there are 8 calls to counter.decrement that do not occur.
+ &lt;denchmark-link:https://github.com/ray-project/ray/files/5404172/remote_worker_env_close_sleep20.txt&gt;remote_worker_env_close_sleep20.txt&lt;/denchmark-link&gt;
+ 
+ &lt;denchmark-h:h3&gt;Reproduction (REQUIRED)&lt;/denchmark-h&gt;
+ 
+ &lt;denchmark-code&gt;from gym.spaces import Dict, Discrete
+ import argparse
+ import ray
+ import time
+ 
+ from ray import tune
+ from ray.rllib.examples.models.centralized_critic_models import YetAnotherCentralizedCriticModel
+ from ray.rllib.examples.env.two_step_game import TwoStepGame
+ from ray.rllib.examples.centralized_critic_2 import FillInActions,central_critic_observer
+ from ray.rllib.models import ModelCatalog
+ 
+ 
+ parser = argparse.ArgumentParser()
+ parser.add_argument("--torch", action="store_true")
+ parser.add_argument("--as-test", action="store_true")
+ parser.add_argument("--stop-iters", type=int, default=1)
+ parser.add_argument("--stop-timesteps", type=int, default=1)
+ parser.add_argument("--stop-reward", type=float, default=7.99)
+ 
+ 
+ if __name__ == "__main__":
+     args = parser.parse_args()
+ 
+     ray.init()
+ 
+     @ray.remote
+     class Counter(object):
+         def __init__(self):
+             self.value = 0
+ 
+         def increment(self):
+             self.value += 1
+             return self.value
+ 
+         def decrement(self):
+             self.value -= 1
+             return self.value
+ 
+         def get_counter(self):
+             return self.value
+ 
+     counter = Counter.remote()
+ 
+     class TwoStepGameSlow(TwoStepGame):
+ 
+         def __init__(self, env_config):
+             num = ray.get(counter.increment.remote())
+             print("Creating Game: ", num)
+             return super().__init__(env_config)
+ 
+         def close(self):
+             num = ray.get(counter.decrement.remote())
+             print("Closing Game, Remaining: ", num)
+             time.sleep(5)
+ 
+     ModelCatalog.register_custom_model(
+         "cc_model",  YetAnotherCentralizedCriticModel)
+ 
+     action_space = Discrete(2)
+     observer_space = Dict({
+         "own_obs": Discrete(6),
+         # These two fields are filled in by the CentralCriticObserver, and are
+         # not used for inference, only for training.
+         "opponent_obs": Discrete(6),
+         "opponent_action": Discrete(2),
+     })
+ 
+     config = {
+         "env": TwoStepGameSlow,
+         "batch_mode": "complete_episodes",
+         "callbacks": FillInActions,
+         "num_workers": 2,
+         "num_envs_per_worker": 4,
+         "multiagent": {
+             "policies": {
+                 "pol1": (None, observer_space, action_space, {}),
+                 "pol2": (None, observer_space, action_space, {}),
+             },
+             "policy_mapping_fn": lambda x: "pol1" if x == 0 else "pol2",
+             "observation_fn": central_critic_observer,
+         },
+         "model": {
+             "custom_model": "cc_model",
+         },
+     }
+ 
+     stop = {
+         "training_iteration": args.stop_iters,
+     }
+ 
+     results = tune.run("PPO", config=config, stop=stop, verbose=0)
+     print("TUNE DONE")
+     print("Unclosed Games: ", ray.get(counter.get_counter.remote()))
+     ray.shutdown()
+ &lt;/denchmark-code&gt;
+ 
+ 
+  I have verified my script runs in a clean environment and reproduces the issue.
+  I have verified the issue also occurs with the latest wheels.
+ 
+ 	</description>
+ 	<comments>
+ 	</comments>
+ </bug>
+<commit id='9e68b77796c1478973f5236adfc09f3399721659' author='mvindiola1' date='2020-10-28 14:23:06-07:00'>
+ 	<dmm_unit complexity='1.0' interfacing='1.0' size='1.0'></dmm_unit>
+ 	<modification change_type='MODIFY' old_name='rllib\evaluation\worker_set.py' new_name='rllib\evaluation\worker_set.py'>
+ 		<file_info nloc='297' complexity='26' token_count='1839'></file_info>
+ 		<method name='stop' parameters='self'>
+ 				<method_info nloc='11' complexity='5' token_count='71' nesting_level='1' start_line='145' end_line='155'></method_info>
+ 			<added_lines>147,148,149,150,151,152,153,154,155</added_lines>
+ 			<deleted_lines>147,148,149,150</deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines></added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ </commit>
+</bug_data>

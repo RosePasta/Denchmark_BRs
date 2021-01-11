@@ -1,0 +1,308 @@
+<bug id='10998' author='cheyang' open_date='2020-02-24T16:37:56Z' closed_time='2020-04-24T18:15:09Z'>
+	<summary>Alluxio Fuse reads zero data in heavy load</summary>
+	<description>
+Alluxio Version:
+2.1.1
+Describe the bug
+利用Alluxio Fuse在高负载下运行模型训练，会产生两个问题：
+1.延时过长，read和release会出现1到5秒时间消耗
+2.会出现读到0数据的情况
+&lt;denchmark-code&gt; (0) Data loss: corrupted record at 0
+	 [[{{node MultiDeviceIteratorGetNextFromShard}}]]
+	 [[RemoteCall]]
+	 [[input_processing/IteratorGetNext]]
+	 [[cluster_5_1/merge_oidx_1/_951]]
+  (1) Data loss: corrupted record at 0
+	 [[{{node MultiDeviceIteratorGetNextFromShard}}]]
+	 [[RemoteCall]]
+	 [[input_processing/IteratorGetNext]]
+0 successful operations.
+0 derived errors ignored.
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.6/site-packages/tensorflow/python/client/session.py", line 1356, in _do_call
+    return fn(*args)
+  File "/usr/local/lib/python3.6/site-packages/tensorflow/python/client/session.py", line 1341, in _run_fn
+    options, feed_dict, fetch_list, target_list, run_metadata)
+  File "/usr/local/lib/python3.6/site-packages/tensorflow/python/client/session.py", line 1429, in _call_tf_sessionrun
+    run_metadata)
+tensorflow.python.framework.errors_impl.DataLossError: 2 root error(s) found.
+  (0) Data loss: corrupted record at 0
+	 [[{{node MultiDeviceIteratorGetNextFromShard}}]]
+	 [[RemoteCall]]
+	 [[input_processing/IteratorGetNext]]
+	 [[cluster_5_1/merge_oidx_1/_951]]
+  (1) Data loss: corrupted record at 0
+	 [[{{node MultiDeviceIteratorGetNextFromShard}}]]
+	 [[RemoteCall]]
+	 [[input_processing/IteratorGetNext]]
+&lt;/denchmark-code&gt;
+
+为了复现这个问题，并且提供更多的信息，我们分别提供
+1.通过strace查看系统调用
+2.在alluxio代码上输出更多的debug信息: &lt;denchmark-link:https://github.com/cheyang/alluxio/tree/features/branch-2.1-investigation-0222&gt;https://github.com/cheyang/alluxio/tree/features/branch-2.1-investigation-0222&lt;/denchmark-link&gt;
+
+文件/data/imagenet/train/train-00007-of-01024，执行pread64的时候，读出的数据是\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0， 同时耗时为1.332411秒。
+&lt;denchmark-code&gt;strace -Tf -p 15031 -e trace=open,close,read 
+[pid 21276] open("/data/imagenet/train/train-00007-of-01024", O_RDONLY &lt;unfinished ...&gt;
+[pid 21276] &lt;... open resumed&gt; )        = 50 &lt;0.012394&gt;
+[pid 21276] mprotect(0x7fdbe8027000, 139264, PROT_READ|PROT_WRITE &lt;unfinished ...&gt;
+[pid 21276] &lt;... mprotect resumed&gt; )    = 0 &lt;0.000164&gt;
+[pid 21276] pread64(50,  &lt;unfinished ...&gt;
+[pid 21276] &lt;... pread64 resumed&gt; "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 262144, 0) = 262144 &lt;1.332411&gt;
+[pid 21276] close(50 &lt;unfinished ...&gt;
+[pid 21276] &lt;... close resumed&gt; )       = 0 &lt;0.001721&gt;
+[pid 21276] open("/data/imagenet/train/train-00720-of-01024", O_RDONLY &lt;unfinished ...&gt;
+[pid 21276] &lt;... open resumed&gt; )        = 50 &lt;0.002152&gt;
+[pid 21276] pread64(50,  &lt;unfinished ...&gt;
+[pid 21276] &lt;... pread64 resumed&gt; "\376\307\1\0\0\0\0\0\3628\260\374\n\372\217\7\n\26\n\fimage/height"..., 262144, 0) = 262144 &lt;0.282423&gt;
+[pid 21276] mprotect(0x7fdbe8049000, 118784, PROT_READ|PROT_WRITE) = 0 &lt;0.000036&gt;
+[pid 21276] mprotect(0x7fdbe8066000, 28672, PROT_READ|PROT_WRITE) = 0 &lt;0.000029&gt;
+[pid 21276] mprotect(0x7fdbe806d000, 86016, PROT_READ|PROT_WRITE) = 0 &lt;0.000026&gt;
+[pid 21276] madvise(0x7fdc14ffa000, 8368128, MADV_DONTNEED &lt;unfinished ...&gt;
+[pid 21276] &lt;... madvise resumed&gt; )     = 0 &lt;0.000054&gt;
+[pid 21276] exit(0)                     = ?
+[pid 21276] +++ exited with 0 +++
+&lt;/denchmark-code&gt;
+
+完整strace日志：
+&lt;denchmark-link:https://github.com/Alluxio/alluxio/files/4245687/8578.log&gt;8578.log&lt;/denchmark-link&gt;
+
+而在alluxio-fuse的日志,可以看到该文件的读取时间为1.3秒,但是读到的数据为空
+&lt;denchmark-code&gt;grep train-00007-of-01024 alluxio-fuse-ppwp9-alluxio-fuse.log
+2020-02-24 14:44:25,078 INFO  AlluxioFuseFileSystem - read(/train/train-00007-of-01024_20, 129544, 0) takes 1323 ms
+2020-02-24 14:44:26,726 INFO  AlluxioFuseFileSystem - release(/train/train-00007-of-01024_20) takes 1633 ms
+&lt;/denchmark-code&gt;
+
+The full alluxio log:
+&lt;denchmark-link:https://github.com/Alluxio/alluxio/files/4245683/diagnose_alluxio_1582555501.tar.gz&gt;diagnose_alluxio_1582555501.tar.gz&lt;/denchmark-link&gt;
+
+同时为了确保不是train-00007-of-01024文件的问题，我还尝试把文件放到ssd上进行访问,可以看到同样的文件, pread64能够读出数据
+&lt;denchmark-code&gt;[pid 35573] open("/data/imagenet/train/train-00007-of-01024", O_RDONLY &lt;unfinished ...&gt;
+[pid 35573] &lt;... open resumed&gt; )        = 40 &lt;0.000039&gt;
+[pid 35573] pread64(40,  &lt;unfinished ...&gt;
+[pid 35573] &lt;... pread64 resumed&gt; "\2\f\1\0\0\0\0\0002 A\331\n\376\227\4\n\26\n\fimage/height"..., 262144, 0) = 262144 &lt;0.000116&gt;
+[pid 35573] pread64(40,  &lt;unfinished ...&gt;
+[pid 35573] &lt;... pread64 resumed&gt; "\205*/\0016{\306\253M\1\34\f\201\23\37v\307\36\355jSH*\277\322,\336t\332\371\266W"..., 262144, 262144) = 262144 &lt;0.000102&gt;
+[pid 35573] pread64(40,  &lt;unfinished ...&gt;
+[pid 35573] &lt;... pread64 resumed&gt; "\242\364\326\263\324K|\237Ei\32\243h\264\333\36Yk^\205\326j\260\315\227X\337\4\222@P\10"..., 262144, 524288) = 262144 &lt;0.000088&gt;
+[pid 35573] pread64(40,  &lt;unfinished ...&gt;
+[pid 35573] &lt;... pread64 resumed&gt; "\226\351uI1\203\247\311\";\2446\254\367\n\31\306\16O?N\226\245\251\1\222X\303%\1E\307"..., 262144, 786432) = 262144 &lt;0.000075&gt;
+[pid 35573] pread64(40,  &lt;unfinished ...&gt;
+&lt;/denchmark-code&gt;
+
+To Reproduce
+Steps to reproduce the behavior (as minimally and precisely as possible)
+Expected behavior
+A clear and concise description of what you expected to happen.
+Urgency
+Describe the impact and urgency of the bug.
+Additional context
+Add any other context about the problem here.
+	</description>
+	<comments>
+		<comment id='1' author='cheyang' date='2020-03-09T10:12:09Z'>
+		利用包含详细诊断信息的代码重现该问题: &lt;denchmark-link:https://github.com/cheyang/alluxio/tree/branch-2.2-for-AI-0309&gt;https://github.com/cheyang/alluxio/tree/branch-2.2-for-AI-0309&lt;/denchmark-link&gt;
+
+1.部署了四个alluxio-worker和fuse
+&lt;denchmark-code&gt;kubectl get po -owide |grep alluxio|grep Running
+alluxio-fuse-42ztb                                 1/1     Running     0          30m   192.168.1.15   cn-shanghai.192.168.1.15   &lt;none&gt;           &lt;none&gt;
+alluxio-fuse-5gsvm                                 1/1     Running     0          31m   192.168.1.11   cn-shanghai.192.168.1.11   &lt;none&gt;           &lt;none&gt;
+alluxio-fuse-85qzz                                 1/1     Running     0          29m   192.168.1.17   cn-shanghai.192.168.1.17   &lt;none&gt;           &lt;none&gt;
+alluxio-fuse-bh7gs                                 1/1     Running     0          29m   192.168.1.16   cn-shanghai.192.168.1.16   &lt;none&gt;           &lt;none&gt;
+alluxio-master-0                                   2/2     Running     0          31m   192.168.1.11   cn-shanghai.192.168.1.11   &lt;none&gt;           &lt;none&gt;
+alluxio-worker-47npw                               2/2     Running     0          31m   192.168.1.11   cn-shanghai.192.168.1.11   &lt;none&gt;           &lt;none&gt;
+alluxio-worker-8r5wj                               2/2     Running     0          29m   192.168.1.16   cn-shanghai.192.168.1.16   &lt;none&gt;           &lt;none&gt;
+alluxio-worker-tbdgb                               2/2     Running     0          30m   192.168.1.15   cn-shanghai.192.168.1.15   &lt;none&gt;           &lt;none&gt;
+alluxio-worker-xgwxk                               2/2     Running     0          29m   192.168.1.17   cn-shanghai.192.168.1.17   &lt;none&gt;           &lt;none&gt;
+&lt;/denchmark-code&gt;
+
+在做了更详细的诊断后，现在可以在fuse侧重现all bytes zero, 该错误出现了35次
+&lt;denchmark-code&gt;alluxio-fuse-85qzz-alluxio-fuse.log:2020-03-09 09:28:58,473 ERROR AlluxioFuseFileSystem - read(file=/train/train-00525-of-01024,offset=72088088,size=1512): all bytes zero
+alluxio-fuse-85qzz-alluxio-fuse.log:2020-03-09 09:28:58,579 ERROR AlluxioFuseFileSystem - read(file=/train/train-00916-of-01024,offset=68418056,size=1528): all bytes zero
+alluxio-fuse-85qzz-alluxio-fuse.log:2020-03-09 09:28:59,418 ERROR AlluxioFuseFileSystem - read(file=/train/train-00207-of-01024,offset=74185448,size=1304): all bytes zero
+alluxio-fuse-85qzz-alluxio-fuse.log:2020-03-09 09:29:00,683 ERROR AlluxioFuseFileSystem - read(file=/train/train-00683-of-01024,offset=90962680,size=1288): all bytes zero
+alluxio-fuse-bh7gs-alluxio-fuse.log:2020-03-09 09:28:51,403 ERROR AlluxioFuseFileSystem - read(file=/train/train-00075-of-01024,offset=15727176,size=1464): all bytes zero
+alluxio-fuse-bh7gs-alluxio-fuse.log:2020-03-09 09:28:52,681 ERROR AlluxioFuseFileSystem - read(file=/train/train-00136-of-01024,offset=6814280,size=1464): all bytes zero
+alluxio-fuse-bh7gs-alluxio-fuse.log:2020-03-09 09:28:53,809 ERROR AlluxioFuseFileSystem - read(file=/train/train-00838-of-01024,offset=26735720,size=2968): all bytes zero
+alluxio-fuse-bh7gs-alluxio-fuse.log:2020-03-09 09:28:54,685 ERROR AlluxioFuseFileSystem - read(file=/train/train-00342-of-01024,offset=19397192,size=1464): all bytes zero
+alluxio-fuse-bh7gs-alluxio-fuse.log:2020-03-09 09:28:55,892 ERROR AlluxioFuseFileSystem - read(file=/train/train-00164-of-01024,offset=46136056,size=1288): all bytes zero
+alluxio-fuse-bh7gs-alluxio-fuse.log:2020-03-09 09:28:57,135 ERROR AlluxioFuseFileSystem - read(file=/train/train-00626-of-01024,offset=49543752,size=1464): all bytes zero
+alluxio-fuse-bh7gs-alluxio-fuse.log:2020-03-09 09:28:57,319 ERROR AlluxioFuseFileSystem - read(file=/train/train-00963-of-01024,offset=31717992,size=1432): all bytes zero
+alluxio-fuse-bh7gs-alluxio-fuse.log:2020-03-09 09:28:59,899 ERROR AlluxioFuseFileSystem - read(file=/train/train-00583-of-01024,offset=52428344,size=456): all bytes zero
+alluxio-fuse-bh7gs-alluxio-fuse.log:2020-03-09 09:29:00,341 ERROR AlluxioFuseFileSystem - read(file=/train/train-00309-of-01024,offset=56098360,size=456): all bytes zero
+alluxio-fuse-bh7gs-alluxio-fuse.log:2020-03-09 09:29:01,156 ERROR AlluxioFuseFileSystem - read(file=/train/train-00353-of-01024,offset=92797512,size=1464): all bytes zero
+&lt;/denchmark-code&gt;
+
+以/train/train-00075-of-01024为例子，该文件只出现了一次
+&lt;denchmark-code&gt;grep train-00075-of-01024 alluxio-*
+alluxio-fuse-bh7gs-alluxio-fuse.log:2020-03-09 09:28:51,403 ERROR AlluxioFuseFileSystem - read(file=/train/train-00075-of-01024,offset=15727176,size=1464): all bytes zero
+alluxio-master-0-alluxio-job-master.log:2020-03-09 09:25:00,936 INFO  PlanCoordinator - Starting job Id=1583745718966 Config=LoadConfig{FilePath=/train/train-00075-of-01024, Replication=1}
+&lt;/denchmark-code&gt;
+
+从上下文看，出现了其他超过1s的操作，但是读取该文件没有超时的日志。
+&lt;denchmark-code&gt;2020-03-09 09:28:50,439 WARN  AlluxioFuseFileSystem - read(path=/train/train-00922-of-01024,buf=jnr.ffi.provider.jffi.DirectMemoryIO[address=0x7f4f280008c0],size=129768,offset=0) returned 129768 in 2253 ms (&gt;=1000ms)
+2020-03-09 09:28:50,452 WARN  AlluxioFuseFileSystem - read(path=/train/train-00721-of-01024,buf=jnr.ffi.provider.jffi.DirectMemoryIO[address=0x7f4fa004bc50],size=129544,offset=0) returned 129544 in 2266 ms (&gt;=1000ms)
+2020-03-09 09:28:50,453 WARN  AlluxioFuseFileSystem - read(path=/train/train-00460-of-01024,buf=jnr.ffi.provider.jffi.DirectMemoryIO[address=0x7f4cf4021c70],size=130616,offset=0) returned 130616 in 2336 ms (&gt;=1000ms)
+2020-03-09 09:28:50,460 WARN  AlluxioFuseFileSystem - read(path=/train/train-00711-of-01024,buf=jnr.ffi.provider.jffi.DirectMemoryIO[address=0x7f4d38021c70],size=129544,offset=0) returned 129544 in 2343 ms (&gt;=1000ms)
+2020-03-09 09:28:50,484 WARN  AlluxioFuseFileSystem - read(path=/train/train-00619-of-01024,buf=jnr.ffi.provider.jffi.DirectMemoryIO[address=0x7f4ecc0008c0],size=130664,offset=0) returned 130664 in 2365 ms (&gt;=1000ms)
+2020-03-09 09:28:50,640 WARN  AlluxioFuseFileSystem - read(path=/train/train-00826-of-01024,buf=jnr.ffi.provider.jffi.DirectMemoryIO[address=0x7f4e5c021b10],size=129544,offset=0) returned 129544 in 2454 ms (&gt;=1000ms)
+2020-03-09 09:28:50,719 WARN  AlluxioFuseFileSystem - read(path=/train/train-00491-of-01024,buf=jnr.ffi.provider.jffi.DirectMemoryIO[address=0x7f4f98023be0],size=129624,offset=0) returned 129624 in 2537 ms (&gt;=1000ms)
+2020-03-09 09:28:51,320 WARN  AlluxioFuseFileSystem - read(path=/train/train-00910-of-01024,buf=jnr.ffi.provider.jffi.DirectMemoryIO[address=0x7f4d78021b10],size=130120,offset=0) returned 130120 in 3134 ms (&gt;=1000ms)
+2020-03-09 09:28:51,403 ERROR AlluxioFuseFileSystem - read(file=/train/train-00075-of-01024,offset=15727176,size=1464): all bytes zero
+2020-03-09 09:28:52,681 ERROR AlluxioFuseFileSystem - read(file=/train/train-00136-of-01024,offset=6814280,size=1464): all bytes zero
+2020-03-09 09:28:53,344 WARN  AlluxioFuseFileSystem - release(path=/train/train-00074-of-01024) returned 0 in 5339 ms (&gt;=1000ms)
+2020-03-09 09:28:53,809 ERROR AlluxioFuseFileSystem - read(file=/train/train-00838-of-01024,offset=26735720,size=2968): all bytes zero
+2020-03-09 09:28:54,325 WARN  AlluxioFuseFileSystem - read(path=/train/train-00626-of-01024,buf=jnr.ffi.provider.jffi.DirectMemoryIO[address=0x7f4f200008c0],size=129608,offset=33554432) returned 129608 in 1109 ms (&gt;=1000ms)
+&lt;/denchmark-code&gt;
+
+确认该文件的完整性, 直接从alluixo fuse的目录拷贝可以成功，并且和原始文件比较md5值一致
+&lt;denchmark-code&gt;# time cp /alluxio-fuse/train/train-00164-of-01024 /tmp/
+
+real	0m0.366s
+user	0m0.003s
+sys	0m0.135s
+# echo $?
+0
+# cd /mnt/
+alluxio-fuse/ essd/         mem/          ram/          ramfs/        test/
+# cd /mnt/essd/train/
+# md5sum train-00164-of-01024
+48d85edf889ff3159f85252f7bb7c303  train-00164-of-01024
+# md5sum /tmp/train-00164-of-01024
+48d85edf889ff3159f85252f7bb7c303  /tmp/train-00164-of-01024
+&lt;/denchmark-code&gt;
+
+完整日志：
+&lt;denchmark-link:https://github.com/Alluxio/alluxio/files/4306080/diagnose_alluxio_1583746156.tar.gz&gt;diagnose_alluxio_1583746156.tar.gz&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='2' author='cheyang' date='2020-03-14T14:22:01Z'>
+		利用包含blockstream和filestream日志的代码，运行4机8卡的模型训练，可以复现读到0的错误。从日志中分析发现，读该block只有一次读出全为0的结果.
+
+首先查询在fuse侧重现all bytes zero, 该错误出现了6次
+
+&lt;denchmark-code&gt;# grep 'all bytes zero' alluxio-*.log
+alluxio-fuse-c9qx2-alluxio-fuse.log:2020-03-14 12:20:12,531 ERROR AlluxioFuseFileSystem - read(file=/train/train-00847-of-01024,offset=103022136,size=456): all bytes zero
+alluxio-fuse-c9qx2-alluxio-fuse.log:2020-03-14 12:20:39,752 ERROR AlluxioFuseFileSystem - read(file=/train/train-00586-of-01024,offset=144964184,size=1448): all bytes zero
+alluxio-fuse-hrvzs-alluxio-fuse.log:2020-03-14 12:20:15,441 ERROR AlluxioFuseFileSystem - read(file=/train/train-00048-of-01024,offset=121632152,size=2664): all bytes zero
+alluxio-fuse-hrvzs-alluxio-fuse.log:2020-03-14 12:20:41,876 ERROR AlluxioFuseFileSystem - read(file=/train/train-00489-of-01024,offset=13631032,size=456): all bytes zero
+alluxio-fuse-qp4b4-alluxio-fuse.log:2020-03-14 12:20:40,514 ERROR AlluxioFuseFileSystem - read(file=/train/train-00271-of-01024,offset=1310264,size=456): all bytes zero
+alluxio-fuse-qp4b4-alluxio-fuse.log:2020-03-14 12:20:41,806 ERROR AlluxioFuseFileSystem - read(file=/train/train-00487-of-01024,offset=10484232,size=1528): all bytes zero
+[root@iZuf60ig21389wrykbcmrzZ pods]# grep 'all bytes zero' alluxio-*.log  | wc -l
+6
+&lt;/denchmark-code&gt;
+
+以/train/train-00847-of-01024为例子，分析该文件的读失败的操作。该操作对应的block id为16374562819。以下为从开始读到读失败之间的日志
+&lt;denchmark-code&gt;2020-03-14 12:20:12,525 DEBUG AlluxioFileInStream - Enter: read(file=/train/train-00847-of-01024,off=0,len=456)
+2020-03-14 12:20:12,530 DEBUG BlockInStream - Enter: read(id=16374562819,off=0,len=456)
+2020-03-14 12:20:12,525 DEBUG BlockInStream - Exit (129624): read(id=5117050883,off=0,len=129624)
+2020-03-14 12:20:12,530 DEBUG AlluxioFileInStream - Exit (129624): read(file=/train/train-00176-of-01024,off=0,len=129624)
+2020-03-14 12:20:12,525 DEBUG AlluxioFileInStream - Enter: seek(file=/train/train-00429-of-01024,pos=100925440)
+2020-03-14 12:20:12,530 DEBUG AlluxioFileInStream - Exit (OK): seek(file=/train/train-00429-of-01024,pos=100925440)
+2020-03-14 12:20:12,530 DEBUG AlluxioFileInStream - Enter: seek(file=/train/train-00176-of-01024,pos=103152216)
+2020-03-14 12:20:12,530 DEBUG AlluxioFileInStream - Exit (OK): seek(file=/train/train-00176-of-01024,pos=103152216)
+2020-03-14 12:20:12,525 DEBUG AlluxioFileInStream - Enter: seek(file=/train/train-00046-of-01024,pos=97647128)
+2020-03-14 12:20:12,530 DEBUG AlluxioFileInStream - Exit (OK): seek(file=/train/train-00046-of-01024,pos=97647128)
+2020-03-14 12:20:12,525 DEBUG AlluxioFileInStream - Exit (128104): read(file=/train/train-00879-of-01024,off=0,len=128104)
+2020-03-14 12:20:12,525 DEBUG AlluxioFileInStream - Enter: read(file=/train/train-00314-of-01024,off=0,len=131072)
+2020-03-14 12:20:12,530 DEBUG BlockInStream - Enter: read(id=7432306691,off=0,len=131072)
+2020-03-14 12:20:12,525 DEBUG AlluxioFileInStream - Enter: read(file=/train/train-00279-of-01024,off=0,len=1464)
+2020-03-14 12:20:12,530 DEBUG AlluxioFileInStream - Enter: read(file=/train/train-00046-of-01024,off=0,len=131072)
+2020-03-14 12:20:12,530 DEBUG BlockInStream - Exit (131072): read(id=7432306691,off=0,len=131072)
+2020-03-14 12:20:12,530 DEBUG AlluxioFileInStream - Exit (131072): read(file=/train/train-00314-of-01024,off=0,len=131072)
+2020-03-14 12:20:12,525 DEBUG BlockInStream - Exit (456): read(id=4177526787,off=0,len=456)
+2020-03-14 12:20:12,530 DEBUG AlluxioFileInStream - Exit (456): read(file=/train/train-00120-of-01024,off=0,len=456)
+2020-03-14 12:20:12,525 DEBUG AlluxioFileInStream - Enter: read(file=/train/train-00684-of-01024,off=0,len=131072)
+2020-03-14 12:20:12,530 DEBUG BlockInStream - Enter: read(id=13639876610,off=0,len=131072)
+2020-03-14 12:20:12,525 DEBUG AlluxioFileInStream - Enter: read(file=/train/train-00368-of-01024,off=0,len=131072)
+2020-03-14 12:20:12,530 DEBUG BlockInStream - Enter: read(id=8338276355,off=0,len=131072)
+2020-03-14 12:20:12,525 DEBUG AlluxioFileInStream - Enter: seek(file=/train/train-00656-of-01024,pos=98957912)
+2020-03-14 12:20:12,530 DEBUG AlluxioFileInStream - Exit (OK): seek(file=/train/train-00656-of-01024,pos=98957912)
+2020-03-14 12:20:12,525 DEBUG AlluxioFileInStream - Exit (129640): read(file=/train/train-01009-of-01024,off=0,len=129640)
+2020-03-14 12:20:12,525 DEBUG AlluxioFileInStream - Exit (131072): read(file=/train/train-00306-of-01024,off=0,len=131072)
+2020-03-14 12:20:12,530 DEBUG BlockInStream - Exit (131072): read(id=8338276355,off=0,len=131072)
+2020-03-14 12:20:12,531 DEBUG AlluxioFileInStream - Exit (131072): read(file=/train/train-00368-of-01024,off=0,len=131072)
+2020-03-14 12:20:12,530 DEBUG BlockInStream - Exit (131072): read(id=13639876610,off=0,len=131072)
+2020-03-14 12:20:12,531 DEBUG AlluxioFileInStream - Exit (131072): read(file=/train/train-00684-of-01024,off=0,len=131072)
+2020-03-14 12:20:12,531 DEBUG AlluxioFileInStream - Enter: seek(file=/train/train-00120-of-01024,pos=107216896)
+2020-03-14 12:20:12,531 DEBUG AlluxioFileInStream - Exit (OK): seek(file=/train/train-00120-of-01024,pos=107216896)
+2020-03-14 12:20:12,531 DEBUG AlluxioFileInStream - Enter: seek(file=/train/train-00306-of-01024,pos=99875720)
+2020-03-14 12:20:12,531 DEBUG AlluxioFileInStream - Enter: seek(file=/train/train-01009-of-01024,pos=101317224)
+2020-03-14 12:20:12,531 DEBUG AlluxioFileInStream - Exit (OK): seek(file=/train/train-01009-of-01024,pos=101317224)
+2020-03-14 12:20:12,530 DEBUG AlluxioFileInStream - Enter: seek(file=/train/train-00314-of-01024,pos=107213928)
+2020-03-14 12:20:12,531 DEBUG AlluxioFileInStream - Exit (OK): seek(file=/train/train-00314-of-01024,pos=107213928)
+2020-03-14 12:20:12,531 DEBUG AlluxioFileInStream - Enter: read(file=/train/train-00314-of-01024,off=0,len=2968)
+2020-03-14 12:20:12,531 DEBUG BlockInStream - Enter: read(id=7432306691,off=0,len=2968)
+2020-03-14 12:20:12,531 DEBUG BlockInStream - Exit (2968): read(id=7432306691,off=0,len=2968)
+2020-03-14 12:20:12,531 DEBUG AlluxioFileInStream - Enter: seek(file=/train/train-00684-of-01024,pos=97779256)
+2020-03-14 12:20:12,531 DEBUG AlluxioFileInStream - Exit (OK): seek(file=/train/train-00684-of-01024,pos=97779256)
+2020-03-14 12:20:12,531 DEBUG AlluxioFileInStream - Enter: read(file=/train/train-00684-of-01024,off=0,len=456)
+2020-03-14 12:20:12,531 DEBUG BlockInStream - Enter: read(id=13639876610,off=0,len=456)
+2020-03-14 12:20:12,531 DEBUG BlockInStream - Exit (456): read(id=13639876610,off=0,len=456)
+2020-03-14 12:20:12,531 DEBUG AlluxioFileInStream - Exit (456): read(file=/train/train-00684-of-01024,off=0,len=456)
+2020-03-14 12:20:12,530 DEBUG AlluxioFileInStream - Enter: seek(file=/train/train-00879-of-01024,pos=104985704)
+2020-03-14 12:20:12,531 DEBUG AlluxioFileInStream - Exit (OK): seek(file=/train/train-00879-of-01024,pos=104985704)
+2020-03-14 12:20:12,530 DEBUG BlockInStream - Enter: read(id=2936012802,off=0,len=131072)
+2020-03-14 12:20:12,530 DEBUG BlockInStream - Enter: read(id=6845104130,off=0,len=1464)
+2020-03-14 12:20:12,531 DEBUG BlockInStream - Exit (1464): read(id=6845104130,off=0,len=1464)
+2020-03-14 12:20:12,531 DEBUG AlluxioFileInStream - Exit (1464): read(file=/train/train-00279-of-01024,off=0,len=1464)
+2020-03-14 12:20:12,530 DEBUG AlluxioFileInStream - Enter: read(file=/train/train-00176-of-01024,off=0,len=131072)
+2020-03-14 12:20:12,531 DEBUG BlockInStream - Enter: read(id=5117050883,off=0,len=131072)
+2020-03-14 12:20:12,530 DEBUG AlluxioFileInStream - Enter: read(file=/train/train-00429-of-01024,off=0,len=128168)
+2020-03-14 12:20:12,531 DEBUG BlockInStream - Exit (131072): read(id=5117050883,off=0,len=131072)
+2020-03-14 12:20:12,531 DEBUG AlluxioFileInStream - Exit (131072): read(file=/train/train-00176-of-01024,off=0,len=131072)
+2020-03-14 12:20:12,530 DEBUG BlockInStream - Exit (456): read(id=16374562819,off=0,len=456)
+2020-03-14 12:20:12,531 DEBUG AlluxioFileInStream - Exit (456): read(file=/train/train-00847-of-01024,off=0,len=456)
+2020-03-14 12:20:12,531 ERROR AlluxioFuseFileSystem - read(file=/train/train-00847-of-01024,offset=103022136,size=456): all bytes zero
+&lt;/denchmark-code&gt;
+
+
+问题： read(file=/train/train-00847-of-01024,off=0,len=456)中的off代表block中的offset吗？
+
+查看该block信息，确认其属于/train/train-00847-of-01024
+&lt;denchmark-code&gt;alluxio fsadmin getBlockInfo 16374562819
+BlockInfo{id=16374562819, length=33554432, locations=[BlockLocation{workerId=5850298923623219272, address=WorkerNetAddress{host=192.168.1.17, rpcPort=29999, dataPort=29999, webPort=30000, domainSocketPath=, tieredIdentity=TieredIdentity(node=192.168.1.17, rack=null)}, tierAlias=MEM, mediumType=MEM}]}
+This block belongs to file {id=16391340031, path=/train/train-00847-of-01024}
+&lt;/denchmark-code&gt;
+
+从fuse的日志中看到进入相关的file和block的次数很多
+&lt;denchmark-code&gt;# grep file=/train/train-00847-of-01024,off=0,len=456 alluxio-fuse-c9qx2-alluxio-fuse.log | grep Enter | wc -l
+159
+# grep file=/train/train-00847-of-01024,off=0,len=456 alluxio-fuse-c9qx2-alluxio-fuse.log | grep Exit | wc -l
+159
+grep 'Enter: read(id=16374562819,off=0,len=456)' alluxio-fuse-c9qx2-alluxio-fuse.log | wc -l
+121
+grep 'Exit (456): read(id=16374562819,off=0,len=456)' alluxio-fuse-c9qx2-alluxio-fuse.log | wc -l
+121
+&lt;/denchmark-code&gt;
+
+但是出现读到数据全为0的次数为1
+&lt;denchmark-code&gt;grep file=/train/train-00847-of-01024,off=0,len=456 alluxio-fuse-c9qx2-alluxio-fuse.log -C20 | grep ERROR
+2020-03-14 12:20:12,531 ERROR AlluxioFuseFileSystem - read(file=/train/train-00847-of-01024,offset=103022136,size=456): all bytes zero
+&lt;/denchmark-code&gt;
+
+从fuse日志中获取所有和/train/train-00847-of-01024中读取off=0,len=456的上下文日志。读这个文件成功率并不低。
+&lt;denchmark-code&gt;grep file=/train/train-00847-of-01024,off=0,len=456 alluxio-fuse-c9qx2-alluxio-fuse.log -C20 &gt; /tmp/train-00847-of-01024.log
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-link:https://github.com/Alluxio/alluxio/files/4332881/train-00847-of-01024.log&gt;train-00847-of-01024.log&lt;/denchmark-link&gt;
+
+完整日志：
+&lt;denchmark-link:https://github.com/Alluxio/alluxio/files/4332885/diagnose_alluxio_1584188461.tar.gz&gt;diagnose_alluxio_1584188461.tar.gz&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='3' author='cheyang' date='2020-04-24T18:15:09Z'>
+		to close this issue, I and &lt;denchmark-link:https://github.com/cheyang&gt;@cheyang&lt;/denchmark-link&gt;
+ debugged through and identified the root cause is outside the code of Alluxio-FUSE integration, likely in JNR-FUSE. What we see is with read-only workloads with high concurrency, the first 8+4 bytes (metadata in a TFRecord) is read correctly from Alluxio:
+&lt;denchmark-code&gt;alluxio-fuse-wl52s-alluxio-fuse.log:2020-03-25 00:35:20,359 WARN  AlluxioFuseFileSystem - read(file=/train/train-00966-of-01024,offset=0,size=128952): first 8 bytes = 0x20 0x3b 0x 3 0x 0 0x 0 0x 0 0x 0 0x 0, next 4 bytes = 0x51 0xb0 0x36 0x7e
+&lt;/denchmark-code&gt;
+
+However, it is incorrectly received on Tensorflow with all zeros:
+&lt;denchmark-code&gt;Data loss: corrupted record at file:/data/imagenet/train/train-00966-of-01024 offset: 0, n: 8, expected crc: 2324967102, actual crc: 2351477386, first 8 bytes = 0x0 0x0 0x0 0x0 0x0 0x0 0x0 0x0 , next 4 bytes = 0x0 0x0 0x0 0x0
+&lt;/denchmark-code&gt;
+
+Currently the hypothesis is JNR-FUSE which Alluxio-FUSE depending on is likely to cause this issue.  Close this issue as there is nothing to fix in Alluxio.
+We are investigating a replacement of JNR-FUSE.
+		</comment>
+	</comments>
+</bug>

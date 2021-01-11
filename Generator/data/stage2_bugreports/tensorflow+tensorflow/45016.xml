@@ -1,0 +1,175 @@
+<bug id='45016' author='shardiman' open_date='2020-11-19T17:49:07Z' closed_time='2020-12-07T10:29:57Z'>
+	<summary>Memory leak with tf.GradientTape, tf.while_loop and tf.function</summary>
+	<description>
+System information
+
+
+I have a minimal working example of some custom code which highlights the bug. My code is just a very trimmed down scematic of a larger code I have written, that functions perfectly, it just has a memory leak that requires restarting the process regularly.
+
+
+The platform is Linux. Python version 3.8
+3.6.8 (default, Nov  3 2020, 19:58:28)
+[GCC 7.2.1 20170829 (Red Hat 7.2.1-1)]
+
+
+I did not install TensorFlow on this system, so I'm unsure of the details.
+
+
+Tensorflow version is 2.3.0
+
+
+I'm not using GPU, I typically get this kind of message reported to my python session when running TensorFlow
+This TensorFlow binary is optimized with oneAPI Deep Neural Network Library (oneDNN)to use the following CPU instructions in performance-critical operations:  AVX512F
+To enable them in other operations, rebuild TensorFlow with the appropriate compiler flags.
+
+
+I have written a short piece of code that performs a basic regression.
+I'm forming a prediction y_hat using an input of dimension = 100 and 100 trainable variables stored in "w".
+I have two ways of forming the prediction vector with which I calculate my loss (MSE).
+
+
+One method is the standard way that you would expect any sane person to do it: exploit vector arithmitic. If I evaluate the gradient of the loss calculated this way, and iterate, I see no growth in the memory footprint of my process over time.
+
+
+If however, I use a tf.while_loop and build the MSE loss by summing increments then each time I evaluate a gradient, the memory footprint of my process grows and I don't know how to clear it.
+
+
+Finally, note that if you remove the @tf.function decorator then the memory leak vanishes. Suggesting the problem arises somehow through autograph applied to loops.
+Note: I have tried reformulating my code as both an (autographed) for loop as well as tf.scan, and I see the same memory growth in all cases.
+Although in the example I have shown, there is no need for the loop, and I can easily avoid this memory leak by not using it. I can also avoid the memory leak by not using tf.function and running my code in eager mode. In reality my original code is significantly more complex and I do many operations inside the loop and depend on TensorArrays to do further operations on the output. Furthermore, performance is critical, so running in eager mode is not an option.
+&lt;denchmark-code&gt;import tensorflow as tf
+import os
+import psutil
+
+# simulate a basic loop
+def get_loss(w, x, y, use_loop=True):
+
+    # infer the length of our loop form the size of our inputs
+    T = tf.shape(y)[0]
+
+    # creating the vector of predictions is unnecessarily complicated
+    # when using the tensor array, but this is just a minimal use case
+    # that exposes exposes the memory leak
+    if use_loop:
+
+        # what we do at each iteration of the loop
+        def body(t, loss):
+
+            # get the prediction
+            y_hat = tf.reduce_sum(x[t] * w, axis=-1)
+
+            # into the next
+            return t+1, loss + tf.square(y[t,0] - y_hat)
+
+        # run the while loop
+        t, loss = tf.while_loop(lambda t, *args: t &lt; T,
+                                 body,
+                                 [tf.constant(0), tf.constant(0.)],
+                                 name='main_loop')
+
+        # unstack the tensor array to get the vector of predictions
+        loss /= tf.cast(T, tf.float32)
+
+        # return the loss
+        return loss
+
+    else:
+
+        # other wise just broadcast
+        y_hat_vector = tf.reduce_sum(x * w, axis=1, keepdims=True)
+
+        # minimize some loss
+        return tf.reduce_mean(tf.square(y - y_hat_vector))
+
+# get the gradient
+@tf.function
+def get_gradient(w, x, y, use_loop):
+
+    with tf.GradientTape() as g:
+        loss = get_loss(w, x, y, use_loop)
+    return g.gradient(loss, w)
+
+# function to get memory usage
+def get_memory_usage():
+    pid = os.getpid()
+    py = psutil.Process(pid)
+    return py.memory_info()[0]/2.**30  # memory use in GB...I think
+
+# now run the training loop
+w = tf.Variable(tf.random.normal((100,)))
+x = tf.constant(tf.random.normal((1024, 100)))
+y = tf.constant(tf.random.normal((1024, 1)))
+
+# simulate a training loop
+# don't actually apply the gradients, just calculate them on the same data
+# over and over again
+# this loop produces no memory leak
+for i in range(20):
+
+    # each iteration we calculate the gradient of our loss
+    grad = get_gradient(w, x, y, use_loop=False)
+    tf.print('avg. grad:', tf.reduce_mean(grad),
+             '\tmem usage:', get_memory_usage())
+
+# but if we use the while loop
+# the memory footprint of this process just grows and grows and goes
+# until eventually a training loop would be killed by the operating system
+for i in range(20):
+	# each iteration we calculate the gradient of our loss
+	grad = get_gradient(w, x, y, use_loop=True)
+	tf.print('avg. grad:', tf.reduce_mean(grad),
+		  '\tmem usage:', get_memory_usage())
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='shardiman' date='2020-11-20T15:17:00Z'>
+		Ok, problem seems to be resolved now by putting the training loop itself in a tf.function
+		</comment>
+		<comment id='2' author='shardiman' date='2020-11-20T15:17:02Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/45016&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/45016&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='3' author='shardiman' date='2020-11-20T16:45:00Z'>
+		Actually no, it's not fixed. Putting the training loop into a @tf.function just gave the false impression that the memory was not increasing, by evaluating get_memory_usage() once at the initial autograph tracing.
+In fact the problem is unrelated to TensorArray, I have reduced the complexity of my minimal example again by removing the TensorArray
+		</comment>
+		<comment id='4' author='shardiman' date='2020-11-23T11:25:54Z'>
+		&lt;denchmark-link:https://github.com/shardiman&gt;@shardiman&lt;/denchmark-link&gt;
+
+Can you please share a colab gist with the error reported, and try on later version of tf.
+		</comment>
+		<comment id='5' author='shardiman' date='2020-11-23T11:29:23Z'>
+		
+@shardiman
+Can you please share a colab gist with the error reported, and try on later version of tf.
+
+Thanks for the reply!
+Give me some time and I will do this for you. Thanks
+		</comment>
+		<comment id='6' author='shardiman' date='2020-12-01T00:43:32Z'>
+		I don't know if this would help, but I have been through a tough time trying to solve the memory leaking issue the last few days. Now I solved my issue, and want to share my solution here even though it may not fit your problem description. Just want people with similar experience to see this.
+The solution first: Tensorflow docker image from Nvidia NGC saved my life.
+I recently got a 30 series GPU and in order to make it work, I upgraded my Cuda to 11.1, cudnn to 8.0.5, python to 3.8, and TensorFlow to 2.4+ (tried both nightly and 2.4, currently 2.3 doesn't support 30 series). All of a sudden, my previously working model started to leak memory. Even when I'm using my non-30 series GPU.
+The release notes of Tensorflow 2.4+ says operations that are previously susceptible to memory leaking may become more likely to do so (ok... then what are the susceptible operations?). I tried every possible solution found on the internet, including replacing all the tf. based tensor operations in graph building (because they may generate new graphs each iteration), forcing garbage collector after each epoch, modified and even stopped using image-data-generator (one of the most frequent search results of memory leakage), and switched between Windows and Linux. None of them worked. I was using a perfectly normal U-Net structure for image segmentation, there is no reason I should do more hacking to stop the leakage.
+Then I realized Nvidia NGC recently released a docker image that brings Tensorflow 2.3 and Cuda 11.1 together, I never used docker before but I immediately tried it. It works like a charm, everything backs to normal.
+I guess there are some compatibility issues between Tensorflow 2.4+ and the new Cuda toolkits that caused the problem. Anybody who recently upgraded their hardware or software should definitely try this.
+		</comment>
+		<comment id='7' author='shardiman' date='2020-12-07T10:29:57Z'>
+		Ok thanks for the suggestions and taking the time to look at my issue,
+After running my code on Colab, I can confirm that the bug no longer seems to persist on this colab environment.
+I guess the problem must be specific to my hardware/architecture/installation. Unfortunately I don't really have control over this environment, so I'll have to contact and my system administrators and work with them!
+Thanks for your advice mrwildddogg!
+		</comment>
+		<comment id='8' author='shardiman' date='2020-12-07T10:29:58Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/45016&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/45016&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

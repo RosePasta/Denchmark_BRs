@@ -1,0 +1,156 @@
+<bug id='382' author='jaschau' open_date='2019-10-10T12:47:07Z' closed_time='2019-10-16T09:03:56Z'>
+	<summary>SimpleFeedForwardEstimator with multivariate time series produces SampleForecast with incorrect sample shape and prediction_length</summary>
+	<description>
+&lt;denchmark-h:h2&gt;Description&lt;/denchmark-h&gt;
+
+When training a SimpleFeedForwardEstimator on a multivariate time series, the training runs through successfully. However, the samples produced by the estimator seem to have incorrect shape: the SampleForecast.samples shape seems to be of shape (n_samples, n_dims, prediction_length) while they should probably be of shape (n_samples, prediction_length, n_dims). At least, this is what the DeepAREstimator produces.
+&lt;denchmark-h:h2&gt;To Reproduce&lt;/denchmark-h&gt;
+
+&lt;denchmark-code&gt;import pandas as pd
+import numpy as np
+
+
+from gluonts.dataset.common import ListDataset
+from gluonts.model.simple_feedforward import SimpleFeedForwardEstimator
+from gluonts.model.deepar import DeepAREstimator
+from gluonts.trainer import Trainer
+
+from gluonts.distribution.multivariate_gaussian import MultivariateGaussianOutput
+
+from gluonts.evaluation.backtest import make_evaluation_predictions
+
+
+        
+# Generate data 
+
+N = 20  # number of time series
+T = 1000  # number of timesteps
+dim = 2 # dimension of the observations
+prediction_length = 25
+freq = '1H'
+
+custom_datasetx = np.random.normal(size=(N, dim, T))
+custom_datasetx[:,1,:] = 5*custom_datasetx[:,1,:]
+start = pd.Timestamp("01-01-2019", freq=freq)
+
+train_ds = ListDataset(
+    [
+        {'target': x, 'start': start}
+        for x in custom_datasetx[:, :, :-prediction_length]
+    ],
+    freq=freq,
+    one_dim_target=False,
+)
+
+
+
+test_ds = ListDataset(
+    [
+        {'target': x, 'start': start}
+        for x in custom_datasetx[:, :, :]
+    ],
+    freq=freq,
+    one_dim_target=False,
+)
+
+
+# Trainer parameters
+epochs = 10
+learning_rate = 1E-3
+batch_size = 5
+num_batches_per_epoch = 100
+
+# exchange this with DeepAREstimator to see the difference in behavior
+estimator = SimpleFeedForwardEstimator(
+    prediction_length=prediction_length,
+    context_length=prediction_length,
+    freq=freq,
+    trainer=Trainer(
+        ctx="cpu",
+        epochs=epochs,
+        learning_rate=learning_rate,
+        hybridize=True,
+        batch_size=batch_size,
+        num_batches_per_epoch=num_batches_per_epoch,
+    ),
+    distr_output=MultivariateGaussianOutput(dim=dim)
+)
+
+predictor = estimator.train(train_ds)
+
+
+forecast_it, ts_it = make_evaluation_predictions(
+    dataset=test_ds,  # test dataset
+    predictor=predictor,  # predictor
+    num_eval_samples=100,  # number of sample paths we want for evaluation
+)
+
+
+forecasts = list(forecast_it)
+tss = list(ts_it)
+
+print('samples_shape: ', forecasts[0].samples.shape)
+print('prediction_length: ', forecasts[0].prediction_length)
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h2&gt;Error Message&lt;/denchmark-h&gt;
+
+No error message, but the code obviously doesn't do what it should.
+Expected output:
+&lt;denchmark-code&gt;samples_shape: (100, 2, 25)
+prediction_length: 25
+&lt;/denchmark-code&gt;
+
+Actual output:
+&lt;denchmark-code&gt;samples_shape: (100, 25, 2)
+prediction_length: 2
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h2&gt;Environment&lt;/denchmark-h&gt;
+
+
+Operating system: Ubuntu LTS 18
+Python version: Python 3.6.8
+GluonTS version: 0.3.3
+
+	</description>
+	<comments>
+		<comment id='1' author='jaschau' date='2019-10-11T18:48:22Z'>
+		Related to &lt;denchmark-link:https://github.com/awslabs/gluon-ts/pull/366&gt;#366&lt;/denchmark-link&gt;
+ and discussion therein
+		</comment>
+		<comment id='2' author='jaschau' date='2019-10-12T13:33:27Z'>
+		Also related: &lt;denchmark-link:https://github.com/awslabs/gluon-ts/pull/330&gt;#330&lt;/denchmark-link&gt;
+, in which the samples layout of DeepAR was aligned to that of SimpleFeedForward. Note that this change is on the master branch only, and not included in any release yet.
+What the best output layout is is currently under discussion, but I believe that the changes proposed in &lt;denchmark-link:https://github.com/awslabs/gluon-ts/pull/330&gt;#330&lt;/denchmark-link&gt;
+ (and completed in &lt;denchmark-link:https://github.com/awslabs/gluon-ts/pull/366&gt;#366&lt;/denchmark-link&gt;
+, still open at the time of writing) are the right way to go. The reason is consistency between forecast types: swapping the “dimension” axis with the “time” axis is only doable only if draw samples — however, the recently introduced DistributionForecast class allows producing forecasts directly in parametric form, in which case the “dimension” axis is the last one (see MultivariateGaussian for example).
+		</comment>
+		<comment id='3' author='jaschau' date='2019-10-16T08:45:25Z'>
+		Thanks &lt;denchmark-link:https://github.com/lostella&gt;@lostella&lt;/denchmark-link&gt;
+ for the information and the quick response. I was indeed unaware of the pending changes in &lt;denchmark-link:https://github.com/awslabs/gluon-ts/pull/366&gt;#366&lt;/denchmark-link&gt;
+. It's great that you are already working on fixing this behaviour :). In the meantime, I have tried the following workaround:
+&lt;denchmark-code&gt;def fix_forecast(forecast: SampleForecast):
+    # convert from (n_samples, prediction_length, n_dims) to (n_samples, n_dims, prediction_length)
+    n_samples, prediction_length, n_dims = forecast.samples.shape
+    #fixed_samples = forecast.samples.reshape((n_samples, n_dims, prediction_length))
+    fixed_samples = np.swapaxes(forecast.samples, 1, 2)
+    fixed_forecast = SampleForecast(fixed_samples, forecast.start_date, forecast.freq)
+    return fixed_forecast
+&lt;/denchmark-code&gt;
+
+I am unsure, though, if this is a viable workaround and if I should use swapaxis or reshape.
+Could you give me a hint what would be the appropriate strategy?
+		</comment>
+		<comment id='4' author='jaschau' date='2019-10-16T09:03:56Z'>
+		&lt;denchmark-link:https://github.com/jaschau&gt;@jaschau&lt;/denchmark-link&gt;
+ Your workaround looks OK.
+However, on the  branch now both  and  produce sample-based forecasts with layout . PR &lt;denchmark-link:https://github.com/awslabs/gluon-ts/pull/366&gt;#366&lt;/denchmark-link&gt;
+ has been merged so now you can also use  to slice a single forecast dimension to e.g. plot it.
+You should be fine with using the master branch until these changes are included in the next release. Feel free to further comment if you have questions!
+		</comment>
+		<comment id='5' author='jaschau' date='2019-10-16T09:06:03Z'>
+		Great, thanks a lot for the feedback and your efforts :).
+		</comment>
+	</comments>
+</bug>

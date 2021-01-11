@@ -1,0 +1,236 @@
+<bug id='12157' author='Sycor4x' open_date='2017-08-09T20:29:07Z' closed_time='2018-01-30T00:08:03Z'>
+	<summary>Bug - Restoring a graph created by tensorflow.python.tools.optimize_for_inference has errors with RNN models</summary>
+	<description>
+&lt;denchmark-h:h3&gt;System information&lt;/denchmark-h&gt;
+
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): yes, below
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Linux Ubuntu 16.04.1
+TensorFlow installed from (source or binary): binary
+TensorFlow version (use command below): tensorflow-gpu (1.1.0)
+Python version: 2.7.12
+Bazel version (if compiling from source): NA
+CUDA/cuDNN version:
+/usr/local/cuda-8.0/doc/man/man7/libcudart.so.7
+/usr/local/cuda-8.0/doc/man/man7/libcudart.7
+/usr/local/cuda-8.0/targets/x86_64-linux/lib/libcudart_static.a
+/usr/local/cuda-8.0/targets/x86_64-linux/lib/libcudart.so.8.0.61
+GPU model and memory: Tesla K80 24GB
+Exact command to reproduce: see below
+
+&lt;denchmark-h:h3&gt;Describe the problem&lt;/denchmark-h&gt;
+
+I believe I've found a bug. The freeze and optimize scripts appear to have bugs related to the proper function of RNNs. Creating a simple RNN, running the freeze script and the optimize script, and then attempting to restore and use the optimized graph creates a puzzling series of errors.
+
+
+After running freeze and optimize, the placeholder for sequence lengths has datatype float32, instead of tf.int32, even though the placeholder specifies that it is tf.int32. This breaks evaluating an instance of GRUCell, which expects length to be of type tf.int32.
+
+
+If I add a tf.to_int32() to coerce the sequence length placeholder to type tf.int32, then we obtain a different error, which appears to pertain to the internal operation of the tf.nn.dynamic_rnn() function.
+
+
+&lt;denchmark-h:h3&gt;Source code / logs&lt;/denchmark-h&gt;
+
+The code is divided into 2 user-created scripts (and 2 TF-provided scripts are employed along the way). The first of my scripts defines a model and saves it, and is called "optimize_graph_minimal.py". Then the freeze and optimize scripts are run. The second of my scripts attempts to restore the model to a new Python session, and this appears to be buggy.
+&lt;denchmark-h:h4&gt;This is the code I used to create and save the graph.&lt;/denchmark-h&gt;
+
+&lt;denchmark-code&gt;import numpy as np
+import tensorflow as tf
+import tensorflow.contrib.rnn as rnn
+
+class tf_rnn_model(object):
+    def __init__(self, seq_length=10, num_units=2):
+        self.seq_length = seq_length
+        self.num_units = num_units
+        self.graph_context = tf.Graph()
+        self.graph_specification()
+
+    def graph_specification(self):
+        with self.graph_context.as_default():
+            self.X = tf.placeholder(dtype=tf.float32, shape=[None, self.seq_length, 2], name="X")
+            self.X_length = tf.placeholder(dtype=tf.int32, shape=[None], name="X_length")
+
+            cell = rnn.GRUCell(self.num_units)
+            Y, rnn_state = tf.nn.dynamic_rnn(cell=cell,
+                                             inputs=self.X,
+                                             sequence_length=self.X_length,
+                                             dtype=tf.float32,
+                                             swap_memory=False)
+
+            self.Y = tf.identity(Y, name="Y")
+            self.saver = tf.train.Saver()
+
+        return None
+
+    def restore_optimized_graph(self, graph_def_optimized):
+        with tf.gfile.GFile(graph_def_optimized, 'rb') as f:
+            graph_def_optimized = tf.GraphDef()
+            graph_def_optimized.ParseFromString(f.read())
+
+        self.Y, = tf.import_graph_def(graph_def_optimized, return_elements=["Y:0"])
+        self.X = self.graph_context.get_tensor_by_name("import/X:0")
+        self.X_length = self.graph_context.get_tensor_by_name("import/X_length:0")
+        tf.global_variables_initializer().run()
+
+        return None
+
+model = tf_rnn_model()
+with tf.Session(graph=model.graph_context) as sess:
+    sess.run(tf.global_variables_initializer())
+    inputs = np.arange(20).reshape([1, 10, 2])
+    out = sess.run(fetches=[model.Y], feed_dict={model.X: inputs, model.X_length: [10]})
+    print(out)
+
+    tf.train.write_graph(sess.graph_def, ".", "toy_graph.pb")
+    model.saver.save(sess, save_path="toy_saved")
+
+    print("These are some helpful things to know for the script.")
+    print("saver.as_saver_def()= %s" % model.saver.as_saver_def())
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h2&gt;Freeze and optimize scripts are executed here.&lt;/denchmark-h&gt;
+
+&lt;denchmark-code&gt;python -m tensorflow.python.tools.freeze_graph \
+--input_graph toy_graph.pb \
+--input_checkpoint toy_saved \
+--output_graph graph_frozen.pb \
+--output_node_names=Y \
+--filename_tensor_name=save/Const:0 \
+--restore_op_name=save/restore_all
+
+python -m tensorflow.python.tools.optimize_for_inference \
+--input graph_frozen.pb \
+--output graph_optimized.pb \
+--input_names=X,X_length \
+--output_names=Y
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h4&gt;Attempt to restore and run using this script in a new Python session.&lt;/denchmark-h&gt;
+
+&lt;denchmark-code&gt;# This line just imports the model class from the previous Python script because this is a new Python session.
+from optimize_graph_minimal import tf_rnn_model
+import numpy as np
+import tensorflow as tf
+
+model = tf_rnn_model()
+
+with tf.Session(graph=model.graph_context) as sess:
+    model.restore_optimized_graph("graph_optimized.pb")
+    inputs = np.arange(20).reshape([1, 10, 2])
+    out = sess.run(fetches=[model.Y], feed_dict={model.X: inputs, model.X_length: [10]})
+    print(out)
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h4&gt;The following errors are produced.&lt;/denchmark-h&gt;
+
+
+Without explicitly coercing the sequence length placeholder using tf.to_int32(), we get an error indicating that the sequence length tensor is of type float32 but must be type int32.
+
+&lt;denchmark-code&gt;Traceback (most recent call last):
+  File "tf_minimal/optimize_restore_graph.py", line 14, in &lt;module&gt;
+    model.restore_optimized_graph("graph_optimized.pb")
+  File "optimize_graph_minimal.py", line 44, in restore_optimized_graph
+    self.Y = tf.import_graph_def(graph_def_optimized, return_elements=["Y:0"])
+  File "python2.7/site-packages/tensorflow/python/framework/importer.py", line 388, in import_graph_def
+    node, 'Input tensor %r %s' % (input_name, te)))
+ValueError: graph_def is invalid at node u'rnn/Shape_1': Input tensor 'X_length:0' Cannot convert a tensor of type float32 to an input of type int32.
+&lt;/denchmark-code&gt;
+
+
+If we change the graph specification to use an explicit coercion to int32 type
+self.X_length = tf.to_int32(tf.placeholder(dtype=tf.int32, shape=[None], name="X_length"))
+then we get this error instead.
+
+&lt;denchmark-code&gt;2017-08-09 19:19:10.910686: I tensorflow/core/common_runtime/gpu/gpu_device.cc:977] Creating TensorFlow device (/gpu:0) -&gt; (device: 0, name: Tesla K80, pci bus id: 0000:00:1e.0)
+Traceback (most recent call last):
+  File "optimize_restore_graph.py", line 14, in &lt;module&gt;
+    model.restore_optimized_graph("graph_optimized.pb")
+  File "optimize_graph_minimal.py", line 44, in restore_optimized_graph
+    self.Y = tf.import_graph_def(graph_def_optimized, return_elements=["Y:0"])
+  File "python2.7/site-packages/tensorflow/python/framework/importer.py", line 362, in import_graph_def
+    % (input_name,)))
+ValueError: graph_def is invalid at node u'rnn/while/gru_cell/gates/gates/concat/axis': More inputs specified ('rnn/while/Switch:1') than the op expects..
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='Sycor4x' date='2017-11-01T05:39:41Z'>
+		We have the same error.
+ValueError: graph_def is invalid at node u'rnn_model_20/bidirectional_rnn/fw/fw/while/fw/basic_lstm_cell/basic_lstm_cell/concat/axis':
+More inputs specified ('rnn_model_20/bidirectional_rnn/fw/fw/while/Switch:1') than the op expects..
+Have you fixed it up?
+		</comment>
+		<comment id='2' author='Sycor4x' date='2017-11-07T01:47:46Z'>
+		&lt;denchmark-link:https://github.com/Sycor4x&gt;@Sycor4x&lt;/denchmark-link&gt;
+, has anything changed since you filed this issue?
+&lt;denchmark-link:https://github.com/abrbrazj&gt;@abrbrazj&lt;/denchmark-link&gt;
+, can you provide additional information, as per &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/new&gt;the Github new issue template&lt;/denchmark-link&gt;
+?
+		</comment>
+		<comment id='3' author='Sycor4x' date='2017-11-07T02:33:35Z'>
+		@angersson
+The System Information is the same as Sycor4x.
+I want to move my model to the app on iPad, so I frozen and optimize my graph. But when I used the optimized model on C++ API of TnesorFlow, this issue occurred. I used bidirectional_dynamic_rnn in my graph, and this issue happened in the whileloop in dynamic_rnn.  And then I changed bidirectional_dynamic_rnn to static_bidirectional_rnn， it disappeared.  If I used the graph_frozen.pb, there is also no problem. So it might be a bug in dynamic_rnn and optimize_for_inference.
+		</comment>
+		<comment id='4' author='Sycor4x' date='2017-11-07T21:02:32Z'>
+		I was able to recreate &lt;denchmark-link:https://github.com/Sycor4x&gt;@Sycor4x&lt;/denchmark-link&gt;
+'s errors with the latest docker image (TF 1.4) from gcr.io/tensorflow/tensorflow, after changing  to . The first script had to be saved as .
+&lt;denchmark-link:https://github.com/ebrevdo&gt;@ebrevdo&lt;/denchmark-link&gt;
+, can you take a look at this?
+		</comment>
+		<comment id='5' author='Sycor4x' date='2017-12-20T01:15:07Z'>
+		It has been 14 days with no activity and the awaiting tensorflower label was assigned. Please update the label and/or status accordingly.
+		</comment>
+		<comment id='6' author='Sycor4x' date='2017-12-31T10:16:00Z'>
+		@angersson I have also confirmed this on Tensorflow 1.4.
+The Error:
+&lt;denchmark-code&gt;ValueError: graph_def is invalid at node 'model/inference/Shape': Input tensor 'inputs:0' Cannot convert a tensor of type float32 to an input of type int32.
+&lt;/denchmark-code&gt;
+
+A non optimised only frozen graph works fine. Again with a RNN.
+		</comment>
+		<comment id='7' author='Sycor4x' date='2017-12-31T23:16:31Z'>
+		&lt;denchmark-link:https://github.com/petewarden&gt;@petewarden&lt;/denchmark-link&gt;
+ can you tal at this?  I don't have any experience with optimize_for_inference, but happy to consult on the RNN side.
+		</comment>
+		<comment id='8' author='Sycor4x' date='2017-12-31T23:17:23Z'>
+		(can does optimize_for_inference handle while_loop?)
+		</comment>
+		<comment id='9' author='Sycor4x' date='2018-01-15T18:59:48Z'>
+		Nagging Assignee: It has been 14 days with no activity and this issue has an assignee. Please update the label and/or status accordingly.
+		</comment>
+		<comment id='10' author='Sycor4x' date='2018-01-15T19:40:42Z'>
+		I would be interested on how to perform optimize_for_inference.py on the ssd_mobilenet.
+I was using it like:
+&lt;denchmark-code&gt;python -m tensorflow.python.tools.optimize_for_inference \
+    --input /path/to/frozen_inference_graph.pb \
+    --output /path/to/optimized_inference_graph.pb \
+    --input_names=image_tensor \
+    --output_names=detection_boxes,detection_scores,num_detections,detection_classes
+&lt;/denchmark-code&gt;
+
+but got following error:
+&lt;denchmark-code&gt;ValueError: graph_def is invalid at node u'ToFloat': Input tensor
+'image_tensor:0' Cannot convert a tensor of type float32 to an input of type uint8.
+&lt;/denchmark-code&gt;
+
+So obviously i did something wrong with In- and/or Output.
+Would be nice if someone could correct this.
+		</comment>
+		<comment id='11' author='Sycor4x' date='2018-01-23T23:18:32Z'>
+		A member of the TensorFlow organization has replied after the stat:awaiting tensorflower label was applied.
+		</comment>
+		<comment id='12' author='Sycor4x' date='2018-01-30T00:08:02Z'>
+		I'm not sure what's going wrong here, but we do now recommend using the more up to date Graph Transform Tool instead of the optimize_for_inference script:
+&lt;denchmark-link:https://www.tensorflow.org/mobile/prepare_models&gt;https://www.tensorflow.org/mobile/prepare_models&lt;/denchmark-link&gt;
+
+Since I don't believe the same errors apply there, closing this issue.
+		</comment>
+		<comment id='13' author='Sycor4x' date='2018-02-08T09:29:58Z'>
+		I have the same error...
+All my input_names will be changed to DT_FLOAT(type).
+I fixed it manual !
+by the way, optimize_for_inference still not works well, I used strip_unused instead.
+		</comment>
+	</comments>
+</bug>

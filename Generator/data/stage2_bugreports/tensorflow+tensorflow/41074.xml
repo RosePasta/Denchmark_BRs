@@ -1,0 +1,601 @@
+<bug id='41074' author='Santosh-Gupta' open_date='2020-07-04T05:42:28Z' closed_time='2020-07-20T19:23:55Z'>
+	<summary>All operations are tensorflow operations, or wrapped with @tf.function, but still getting "NotImplementedError: TPUStrategy.run(fn, ...) does not support pure eager execution. please make sure the function passed into strategy.run is a tf.function..."</summary>
+	<description>
+System information
+
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): Custom code
+
+
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Google Colab, python 3 default.
+
+
+TensorFlow installed from (source or binary): Google Colab, python 3 default.
+
+
+TensorFlow version (use command below):  tensorflow:2.2.0
+
+
+Python version: 3.6.9
+
+
+GPU model and memory: Using colab TPU
+
+
+Describe the current behavior
+Even though I wrapped all my functions, and am only using Tensorflow functions, I get this error
+
+NotImplementedError: TPUStrategy.run(fn, ...) does not support pure eager execution. please make sure the function passed into strategy.run is a tf.function or strategy.run is called inside a tf.function if eager behavior is enabled.
+
+Describe the expected behavior
+Model should train on TPU without
+Standalone code to reproduce the issue
+Here is a colab notebook that reproduces the error.
+&lt;denchmark-link:https://colab.research.google.com/drive/11Yo1mdnKA3DqZCr_UpZI4umY8tpBpDzS?usp=sharing&gt;https://colab.research.google.com/drive/11Yo1mdnKA3DqZCr_UpZI4umY8tpBpDzS?usp=sharing&lt;/denchmark-link&gt;
+
+The code also needs a datafile on GCP, since it is training on a TPU. Here's a link to the sample data file.
+&lt;denchmark-link:https://drive.google.com/file/d/106gSmcClyshu98SDQ9VsUVOhd-LYamVq/view?usp=sharing&gt;https://drive.google.com/file/d/106gSmcClyshu98SDQ9VsUVOhd-LYamVq/view?usp=sharing&lt;/denchmark-link&gt;
+
+&lt;denchmark-code&gt;%tensorflow_version 2.x
+!pip install transformers --q
+
+!gcloud auth login
+
+'''NEED TO RUN THIS CELL TWICE TO AVOID ERROR'''
+
+from google.colab import auth
+auth.authenticate_user()
+
+project_id = 'machinelearning-264918'
+!gcloud config set project {project_id}
+
+!pip install tfa-nightly
+import tensorflow_addons as tfa
+
+from transformers import TFBertModel, AutoModel, TFRobertaModel
+import tensorflow as tf
+
+from tensorflow import keras
+from tensorflow.keras import layers
+from tensorflow.keras.layers import (Dense,
+                                     Dropout)
+import tensorflow_addons as tfa
+import numpy as np
+import os
+from copy import deepcopy 
+from time import time
+
+logger = tf.get_logger()
+logger.info(tf.__version__)
+
+autotune = tf.data.experimental.AUTOTUNE
+
+try:
+    tpu = tf.distribute.cluster_resolver.TPUClusterResolver()
+    tf.config.experimental_connect_to_cluster(tpu)
+    tf.tpu.experimental.initialize_tpu_system(tpu)
+    strategy = tf.distribute.experimental.TPUStrategy(tpu)
+    print('strategy.num_replicas_in_sync', strategy.num_replicas_in_sync)
+    logger.info('Running with TPUStrategy on TPU {} with {} cores '
+                .format(tpu.cluster_spec().as_dict()['worker'],
+                        strategy.num_replicas_in_sync))
+    batch_size = 16 * strategy.num_replicas_in_sync
+except Exception:
+    # raise ValueError
+    strategy = tf.distribute.OneDeviceStrategy(device='/gpu:0')
+    logger.warning('Failed initializing TPU! Running on GPU')
+    batch_size = 16
+
+class Dora_A(tf.keras.Model):
+    def __init__(self, **kwargs):
+        super(Dora_A, self).__init__(**kwargs)
+        self.bioRoberta = TFRobertaModel.from_pretrained('allenai/biomed_roberta_base', from_pt=True)
+
+    def call(self, inputIds):
+        queryInputs, passageInputs = inputIds
+
+        Q_outputs = self.bioRoberta(queryInputs)[0]
+        P_outputs = self.bioRoberta(passageInputs)[0]
+
+        dotProductMatrix = tf.linalg.matmul(Q_outputs, P_outputs, transpose_b=True, name='mm')
+
+        return dotProductMatrix
+
+@tf.function
+def loss_fn(_, probs):
+    '''
+        1. Every sample is its own positive, and  the rest of the
+            elements in the batch are its negative.
+        2. Each TPU core gets 1/8 * global_batch_size elements, hence
+            compute shape dynamically.
+        3. Dataset produces dummy labels to make sure the loss_fn matches
+            the loss signature of keras, actual labels are computed inside this
+            function.
+        4. Inputs are logits, for better numerical stability.
+    '''
+    bs = tf.shape(probs)[0]
+    labels = tf.eye(bs, bs)
+    return tf.losses.categorical_crossentropy(labels,
+                                              probs,
+                                              from_logits=True)
+
+CLS_inputID = tf.constant([0])
+SEP_inputID = tf.constant([2])
+
+@tf.function
+def _parse_example(example_proto):
+    features = {
+        'bioRoberta_SentenceIndex': tf.io.VarLenFeature( dtype=tf.int64),
+        'BioRoberta_IDs': tf.io.VarLenFeature( dtype=tf.int64),
+    }
+
+    parsed_example_dict = tf.io.parse_single_example(example_proto, features)
+    bertIds = parsed_example_dict['BioRoberta_IDs']
+    bertIds = tf.sparse.to_dense(bertIds)
+    bertIds = tf.cast(bertIds, dtype=tf.int32)
+
+    queryPiece = tf.slice(bertIds, [0], [510])
+    restPassagePiece = tf.slice(bertIds, [0], [510])
+    # add special tokens for proper input into the model 
+    queryBertInput = tf.concat( [CLS_inputID, queryPiece, SEP_inputID], axis=0)
+    paragraphBertInput = tf.concat( [CLS_inputID, restPassagePiece, SEP_inputID], axis=0)
+
+    return queryBertInput, paragraphBertInput
+
+config_name = 'model_a'
+base_dir = 'gs://a-dora-semantic-scholar'
+model_dir = os.path.join(base_dir, config_name)
+tensorboard_dir = os.path.join(model_dir, 'logs_' + str(time()))
+tfrecords_pattern_train = os.path.join(base_dir, 'VersionA_00022*')
+tfrecords_pattern_val = os.path.join(base_dir, 'VersionA_00022*')
+
+
+if 'COLAB_TPU_ADDR' in os.environ:
+    print('Setting tf.data objects')
+    with strategy.scope():
+        filenames = tf.io.gfile.glob(tfrecords_pattern_train)
+        train_dataset = tf.data.TFRecordDataset(filenames, num_parallel_reads=autotune)
+        train_dataset = train_dataset.map(
+                                        _parse_example, num_parallel_calls=autotune)
+        train_dataset = train_dataset.shuffle(130_000, seed=1000, reshuffle_each_iteration=True)
+        train_dataset = train_dataset.padded_batch(batch_size, padding_values=(1, 1))
+        train_dataset = train_dataset.prefetch(autotune)
+        train_dataset = train_dataset.apply(tf.data.experimental.ignore_errors())
+
+with strategy.scope():
+    model = Dora_A(dynamic=True)
+    model.layers[0].trainable = False
+    model.compile(loss=loss_fn,
+                    optimizer=tfa.optimizers.AdamW(weight_decay=1e-5, 
+                                                   learning_rate=1e-5, 
+                                                   epsilon=1e-06))
+
+model.fit(train_dataset)
+&lt;/denchmark-code&gt;
+
+Other Attempts to fix
+I decorated the call function, so that my model class looked like this
+&lt;denchmark-code&gt;class Dora_A(tf.keras.Model):
+    def __init__(self, **kwargs):
+        super(Dora_A, self).__init__(**kwargs)
+        self.bioRoberta = TFRobertaModel.from_pretrained('allenai/biomed_roberta_base', from_pt=True)
+
+    @tf.function
+    def call(self, inputIds):
+        queryInputs, passageInputs = inputIds
+
+        Q_outputs = self.bioRoberta(queryInputs)[0]
+        P_outputs = self.bioRoberta(passageInputs)[0]
+
+        dotProductMatrix = tf.linalg.matmul(Q_outputs, P_outputs, transpose_b=True, name='mm')
+
+        return dotProductMatrix
+&lt;/denchmark-code&gt;
+
+But I got the same error message.
+I also tried decorating my tf.data parse function
+I tried disabling eager execution, but got an error when trying to compile the model.
+It seems that when eager mode is disabled, I can not use distributed strategies for a subclassed model. The error message is 
+
+ ValueError: We currently do not support distribution strategy with a Sequential model that is created without input_shape/input_dim set in its first layer or a subclassed model.
+This happens during model.compile. 
+
+Here is a link to a different colab notebook I tried for this
+&lt;denchmark-link:https://colab.research.google.com/drive/1OhFgxbFoAEsLCDqpwBbe3P8owdJHMcUZ?usp=sharing&gt;https://colab.research.google.com/drive/1OhFgxbFoAEsLCDqpwBbe3P8owdJHMcUZ?usp=sharing&lt;/denchmark-link&gt;
+
+Here is a related question &lt;denchmark-link:https://stackoverflow.com/questions/60444486/use-tf-distribute-strategies-with-tf-keras-model-subclassing&gt;https://stackoverflow.com/questions/60444486/use-tf-distribute-strategies-with-tf-keras-model-subclassing&lt;/denchmark-link&gt;
+
+It's been suggested either to use the sequential or functional API, but it seems that I can only use model subclassing. I am unable to use Sequential in the non-minimalized version of my architecture because it has two pipelines. And the functional api has its own issues, which I describe it in this github issue ( &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/40638#event-3468314954&gt;#40638 (comment)&lt;/denchmark-link&gt;
+ ) but the summary is somehow the functional api seems to be deleting model weights and whole layers for my architecture.
+Other info / logs
+&lt;denchmark-code&gt;---------------------------------------------------------------------------
+NotImplementedError                       Traceback (most recent call last)
+&lt;ipython-input-12-50bee5f74f82&gt; in &lt;module&gt;()
+----&gt; 1 model.fit(train_dataset)
+
+4 frames
+/usr/local/lib/python3.6/dist-packages/tensorflow/python/keras/engine/training.py in _method_wrapper(self, *args, **kwargs)
+     64   def _method_wrapper(self, *args, **kwargs):
+     65     if not self._in_multi_worker_mode():  # pylint: disable=protected-access
+---&gt; 66       return method(self, *args, **kwargs)
+     67 
+     68     # Running inside `run_distribute_coordinator` already.
+
+/usr/local/lib/python3.6/dist-packages/tensorflow/python/keras/engine/training.py in fit(self, x, y, batch_size, epochs, verbose, callbacks, validation_split, validation_data, shuffle, class_weight, sample_weight, initial_epoch, steps_per_epoch, validation_steps, validation_batch_size, validation_freq, max_queue_size, workers, use_multiprocessing)
+    846                 batch_size=batch_size):
+    847               callbacks.on_train_batch_begin(step)
+--&gt; 848               tmp_logs = train_function(iterator)
+    849               # Catch OutOfRangeError for Datasets of unknown size.
+    850               # This blocks until the batch has finished executing.
+
+/usr/local/lib/python3.6/dist-packages/tensorflow/python/keras/engine/training.py in train_function(iterator)
+    570       data = next(iterator)
+    571       outputs = self.distribute_strategy.run(
+--&gt; 572           self.train_step, args=(data,))
+    573       outputs = reduce_per_replica(
+    574           outputs, self.distribute_strategy, reduction='first')
+
+/usr/local/lib/python3.6/dist-packages/tensorflow/python/distribute/tpu_strategy.py in run(self, fn, args, kwargs, options)
+    166   def run(self, fn, args=(), kwargs=None, options=None):
+    167     """See base class."""
+--&gt; 168     validate_run_function(fn)
+    169 
+    170     # Note: the target function is converted to graph even when in Eager mode,
+
+/usr/local/lib/python3.6/dist-packages/tensorflow/python/distribute/tpu_strategy.py in validate_run_function(fn)
+    104       and not (callable(fn) and isinstance(fn.__call__, def_function.Function)):
+    105     raise NotImplementedError(
+--&gt; 106         "TPUStrategy.run(fn, ...) does not support pure eager "
+    107         "execution. please make sure the function passed into "
+    108         "`strategy.run` is a `tf.function` or "
+
+NotImplementedError: TPUStrategy.run(fn, ...) does not support pure eager execution. please make sure the function passed into `strategy.run` is a `tf.function` or `strategy.run` is called inside a `tf.function` if eager behavior is enabled.
+&lt;/denchmark-code&gt;
+
+StackOverflow Question
+I also put a stack overflow question for this issue, in case I may have overlooked something, but it's been up for a few days, with a bounty, and no further insights.
+&lt;denchmark-link:https://stackoverflow.com/questions/62650379/error-when-running-on-tpu-notimplementederror-tpustrategy-runfn-does-n&gt;https://stackoverflow.com/questions/62650379/error-when-running-on-tpu-notimplementederror-tpustrategy-runfn-does-n&lt;/denchmark-link&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='Santosh-Gupta' date='2020-07-06T10:44:36Z'>
+		&lt;denchmark-link:https://github.com/Santosh-Gupta&gt;@Santosh-Gupta&lt;/denchmark-link&gt;
+,
+The Colab gist you have provided does not throw an error, but the  cell runs indefinitely. Please find the gist of it &lt;denchmark-link:https://colab.research.google.com/gist/amahendrakar/f0e1c450b2c5fddaa9a87aec570fec8d/41074.ipynb&gt;here&lt;/denchmark-link&gt;
+.
+Could you please provide a reproducible code snippet? Thanks!
+		</comment>
+		<comment id='2' author='Santosh-Gupta' date='2020-07-06T21:19:56Z'>
+		
+@Santosh-Gupta,
+The Colab gist you have provided does not throw an error, but the model.fit cell runs indefinitely. Please find the gist of it here.
+Could you please provide a reproducible code snippet? Thanks!
+
+I ran the gist provided in your reply and got the same result; I got a hanging cell but not an error. I think this is due to your gist copying the data into the colab disk, and feeding that data to the model, rather than getting the model data through GCP.
+Here is a gist that gets the data through GCP, which reproduces "NotImplementedError: TPUStrategy.run(fn, ...) does not support pure eager execution"
+&lt;denchmark-link:https://colab.research.google.com/gist/Santosh-Gupta/6241611b60c22bad60d4309d2adee5c2/doraa_v3_minimal_tpu_gcpcloud_6-30.ipynb&gt;https://colab.research.google.com/gist/Santosh-Gupta/6241611b60c22bad60d4309d2adee5c2/doraa_v3_minimal_tpu_gcpcloud_6-30.ipynb&lt;/denchmark-link&gt;
+
+Getting training to work by either getting it directly through GCP, or from the colab enviroment would work for me, since I can just download the data from GCP into colab.
+		</comment>
+		<comment id='3' author='Santosh-Gupta' date='2020-07-08T12:39:03Z'>
+		For the issue with the cell hanging when the data was being read from the colab enviroment, I am wondering if this is due to TPUs only being able to read data from GCP. This is the impression I got from this documentation
+&lt;denchmark-link:https://cloud.google.com/tpu/docs/troubleshooting#cannot_use_local_filesystem&gt;https://cloud.google.com/tpu/docs/troubleshooting#cannot_use_local_filesystem&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='4' author='Santosh-Gupta' date='2020-07-10T05:55:35Z'>
+		Another thing I looked into is if there was a tensorflow function that was not yet supported on TPUs, there is a non-exhaustive list here
+&lt;denchmark-link:https://cloud.google.com/tpu/docs/tensorflow-ops&gt;https://cloud.google.com/tpu/docs/tensorflow-ops&lt;/denchmark-link&gt;
+
+None of the operations in my examples seem to include operations that are not supported. Also, it seems that if there was an unsupported tensorflow operation, it would give a different error message, something like
+
+RuntimeError: Compilation failed: Compilation failure: Detected unsupported operations when trying to compile graph
+
+So it looks like the issue is due to something else.
+		</comment>
+		<comment id='5' author='Santosh-Gupta' date='2020-07-13T03:17:13Z'>
+		I've been training a different architecture that is working on TPU, and this architecture has a lot of similarities to the minimal example posted earlier.
+This is a notebook of the working architecture (it is not minimal, I figured it doesn't need to be since it is working, but if having a minimal version would help isolate the issue, I would be more than happy to create one).
+&lt;denchmark-link:https://colab.research.google.com/gist/Santosh-Gupta/269329b682d0e94f2858d69722602674/bdorab_tpu_7-9-10_working.ipynb&gt;https://colab.research.google.com/gist/Santosh-Gupta/269329b682d0e94f2858d69722602674/bdorab_tpu_7-9-10_working.ipynb&lt;/denchmark-link&gt;
+
+For convenience, here is the original minimal (non working) architecture which is the focus of this github issue.
+&lt;denchmark-link:https://colab.research.google.com/gist/Santosh-Gupta/6241611b60c22bad60d4309d2adee5c2/doraa_v3_minimal_tpu_gcpcloud_6-30.ipynb&gt;https://colab.research.google.com/gist/Santosh-Gupta/6241611b60c22bad60d4309d2adee5c2/doraa_v3_minimal_tpu_gcpcloud_6-30.ipynb&lt;/denchmark-link&gt;
+
+Here what the non-working example contains which is not in the working example:
+-The non-working architecture returns a result from tf.linalg.matmul, the lines of code are below
+&lt;denchmark-code&gt;        dotProductMatrix = tf.linalg.matmul(Q_outputs, P_outputs, transpose_b=True, name='mm')
+
+        return dotProductMatrix
+&lt;/denchmark-code&gt;
+
+-The non non-working architecture loss function is performed on this matrix (the training is set up so that the diagonals are the true values, everything else is false
+&lt;denchmark-code&gt;@tf.function
+def loss_fn(_, probs):
+    '''
+        1. Every sample is its own positive, and  the rest of the
+            elements in the batch are its negative.
+        2. Each TPU core gets 1/8 * global_batch_size elements, hence
+            compute shape dynamically.
+        3. Dataset produces dummy labels to make sure the loss_fn matches
+            the loss signature of keras, actual labels are computed inside this
+            function.
+        4. Inputs are logits, for better numerical stability.
+    '''
+    bs = tf.shape(probs)[0]
+    labels = tf.eye(bs, bs)
+    return tf.losses.categorical_crossentropy(labels,
+                                              probs,
+                                              from_logits=True)
+&lt;/denchmark-code&gt;
+
+Where as the working architecture just uses loss_fn = tf.keras.losses.CategoricalCrossentropy(from_logits=True) on two outputs from its last classifier output.
+-The working architecture is using the Keras Functional API to create the keras model, where as the non-working architecture is created using model subclassing. Using the functional API is not a workaround for the (non-working) architecture, because it seems to be be erasing whole weights/layers from the model (described in this issue &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/40638#event-3468314954&gt;#40638 (comment)&lt;/denchmark-link&gt;
+ )
+-There are a few minor differences in how the tf.data objects are handled, for clarity of isolation, I made another notebook where they are handled pretty much the same
+&lt;denchmark-link:https://colab.research.google.com/gist/Santosh-Gupta/170e7a7f49074c1e03d2cfe37d8a7188/doraa_v3_minimal_tpu_gcpcloud_newfile_matmul7-12.ipynb&gt;https://colab.research.google.com/gist/Santosh-Gupta/170e7a7f49074c1e03d2cfe37d8a7188/doraa_v3_minimal_tpu_gcpcloud_newfile_matmul7-12.ipynb&lt;/denchmark-link&gt;
+
+In the notebook above, I also changed tf.linalg.matmul to tf.matmul because I noticed the latter was included in the official list of supported TPU operations [ https://cloud.google.com/tpu/docs/tensorflow-ops ]
+So, my guesses would be that the issue could be combination of tf.matmul and model subclassing. I don't think either alone could be an issue, the tf.matmul is an officially supported TPU operation, and the Transformers library has been using keras model subclassing to develop the tensorflow version of their models, and they have options to do TPU training in their trainers.
+Another guess is the loss function; maybe the way its wrapped with tf.function, but I have used this type of loss function in the past for TPU training in a different architecture ( &lt;denchmark-link:https://github.com/Santosh-Gupta/NaturalLanguageRecommendations/blob/master/src/model.py#L83&gt;https://github.com/Santosh-Gupta/NaturalLanguageRecommendations/blob/master/src/model.py#L83&lt;/denchmark-link&gt;
+ ) and it was working just fine.
+Another guess is that it is the way I set up the architecture; maybe using a whole Bert architecture as a single layer
+&lt;denchmark-code&gt;class Dora_A(tf.keras.Model):
+    def __init__(self, **kwargs):
+        super(Dora_A, self).__init__(**kwargs)
+        self.bioRoberta = TFRobertaModel.from_pretrained('allenai/biomed_roberta_base', from_pt=True)
+
+    @tf.function
+    def call(self, inputIds):
+        queryInputs, passageInputs = inputIds
+
+        Q_outputs = self.bioRoberta(queryInputs)[0]
+        P_outputs = self.bioRoberta(passageInputs)[0]
+
+        dotProductMatrix = tf.matmul(Q_outputs, P_outputs, transpose_b=True, name='mm')
+
+        return dotProductMatrix
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='6' author='Santosh-Gupta' date='2020-07-15T23:26:23Z'>
+		Hi &lt;denchmark-link:https://github.com/Santosh-Gupta&gt;@Santosh-Gupta&lt;/denchmark-link&gt;
+, thank you for providing detailed information to help debug this issue. Based on the error message, it seems to be failing the &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/v2.2.0/tensorflow/python/distribute/tpu_strategy.py#L88&gt;validate_run_function(fn)&lt;/denchmark-link&gt;
+. I am not sure why but the train fn passed to strategy.run is not one of the following, hence the error:
+&lt;denchmark-code&gt;# We allow three types of functions/objects passed into TPUStrategy
+# run in eager mode:
+#   1. a user annotated tf.function
+#   2. a ConcreteFunction, this is mostly what you get from loading a saved
+#      model.
+#   3. a callable object and the `__call__` method itself is a tf.function.
+#
+# Otherwise we return an error, because we don't support eagerly running
+# run in TPUStrategy.
+&lt;/denchmark-code&gt;
+
+A few questions:
+-Can you confirm this model trains without using TPUs?
+-Keeping everything else the same In the non-working example, if you use a standard loss function (instead of custom) do you still get the error?
+		</comment>
+		<comment id='7' author='Santosh-Gupta' date='2020-07-16T08:52:55Z'>
+		Hi nikitamaia,
+I have to apologize, the last two notebooks didn't work on GPU. I was attempting to get the notebooks to work on TPU by following the error messages, and I didn't realize I completely bugged them in the process.
+The non-standard loss function wasn't an issue at all.
+Here is a colab gist that works on GPU but not TPU
+&lt;denchmark-link:https://colab.research.google.com/gist/Santosh-Gupta/d14f8b76a22582992c7fc4cebc65622d/a_doraa_minimal_notworkingtpu_workinggpu2.ipynb&gt;https://colab.research.google.com/gist/Santosh-Gupta/d14f8b76a22582992c7fc4cebc65622d/a_doraa_minimal_notworkingtpu_workinggpu2.ipynb&lt;/denchmark-link&gt;
+
+I was able to isolate the issue to the deep copying of layers in the model init
+&lt;denchmark-code&gt;        self.Q_Tlayer0 = deepcopy(self.bioRoberta.layers[0].encoder.layer[8])
+        self.P_Tlayer0 = deepcopy(self.bioRoberta.layers[0].encoder.layer[8])
+&lt;/denchmark-code&gt;
+
+These layers are the cause of this error "    AttributeError: Tensor.name is meaningless when eager execution is enabled."
+Here is the full error message
+&lt;denchmark-code&gt;---------------------------------------------------------------------------
+AttributeError                            Traceback (most recent call last)
+&lt;ipython-input-11-4a1cb08fd12a&gt; in &lt;module&gt;()
+     16 
+     17 model.fit(train_dataset,
+---&gt; 18             epochs=epochs)
+     19 
+
+10 frames
+/usr/local/lib/python3.6/dist-packages/tensorflow/python/keras/engine/training.py in _method_wrapper(self, *args, **kwargs)
+     64   def _method_wrapper(self, *args, **kwargs):
+     65     if not self._in_multi_worker_mode():  # pylint: disable=protected-access
+---&gt; 66       return method(self, *args, **kwargs)
+     67 
+     68     # Running inside `run_distribute_coordinator` already.
+
+/usr/local/lib/python3.6/dist-packages/tensorflow/python/keras/engine/training.py in fit(self, x, y, batch_size, epochs, verbose, callbacks, validation_split, validation_data, shuffle, class_weight, sample_weight, initial_epoch, steps_per_epoch, validation_steps, validation_batch_size, validation_freq, max_queue_size, workers, use_multiprocessing)
+    846                 batch_size=batch_size):
+    847               callbacks.on_train_batch_begin(step)
+--&gt; 848               tmp_logs = train_function(iterator)
+    849               # Catch OutOfRangeError for Datasets of unknown size.
+    850               # This blocks until the batch has finished executing.
+
+/usr/local/lib/python3.6/dist-packages/tensorflow/python/eager/def_function.py in __call__(self, *args, **kwds)
+    578         xla_context.Exit()
+    579     else:
+--&gt; 580       result = self._call(*args, **kwds)
+    581 
+    582     if tracing_count == self._get_tracing_count():
+
+/usr/local/lib/python3.6/dist-packages/tensorflow/python/eager/def_function.py in _call(self, *args, **kwds)
+    625       # This is the first call of __call__, so we have to initialize.
+    626       initializers = []
+--&gt; 627       self._initialize(args, kwds, add_initializers_to=initializers)
+    628     finally:
+    629       # At this point we know that the initialization is complete (or less
+
+/usr/local/lib/python3.6/dist-packages/tensorflow/python/eager/def_function.py in _initialize(self, args, kwds, add_initializers_to)
+    504     self._concrete_stateful_fn = (
+    505         self._stateful_fn._get_concrete_function_internal_garbage_collected(  # pylint: disable=protected-access
+--&gt; 506             *args, **kwds))
+    507 
+    508     def invalid_creator_scope(*unused_args, **unused_kwds):
+
+/usr/local/lib/python3.6/dist-packages/tensorflow/python/eager/function.py in _get_concrete_function_internal_garbage_collected(self, *args, **kwargs)
+   2444       args, kwargs = None, None
+   2445     with self._lock:
+-&gt; 2446       graph_function, _, _ = self._maybe_define_function(args, kwargs)
+   2447     return graph_function
+   2448 
+
+/usr/local/lib/python3.6/dist-packages/tensorflow/python/eager/function.py in _maybe_define_function(self, args, kwargs)
+   2775 
+   2776       self._function_cache.missed.add(call_context_key)
+-&gt; 2777       graph_function = self._create_graph_function(args, kwargs)
+   2778       self._function_cache.primary[cache_key] = graph_function
+   2779       return graph_function, args, kwargs
+
+/usr/local/lib/python3.6/dist-packages/tensorflow/python/eager/function.py in _create_graph_function(self, args, kwargs, override_flat_arg_shapes)
+   2665             arg_names=arg_names,
+   2666             override_flat_arg_shapes=override_flat_arg_shapes,
+-&gt; 2667             capture_by_value=self._capture_by_value),
+   2668         self._function_attributes,
+   2669         # Tell the ConcreteFunction to clean up its graph once it goes out of
+
+/usr/local/lib/python3.6/dist-packages/tensorflow/python/framework/func_graph.py in func_graph_from_py_func(name, python_func, args, kwargs, signature, func_graph, autograph, autograph_options, add_control_dependencies, arg_names, op_return_value, collections, capture_by_value, override_flat_arg_shapes)
+    979         _, original_func = tf_decorator.unwrap(python_func)
+    980 
+--&gt; 981       func_outputs = python_func(*func_args, **func_kwargs)
+    982 
+    983       # invariant: `func_outputs` contains only Tensors, CompositeTensors,
+
+/usr/local/lib/python3.6/dist-packages/tensorflow/python/eager/def_function.py in wrapped_fn(*args, **kwds)
+    439         # __wrapped__ allows AutoGraph to swap in a converted function. We give
+    440         # the function a weak reference to itself to avoid a reference cycle.
+--&gt; 441         return weak_wrapped_fn().__wrapped__(*args, **kwds)
+    442     weak_wrapped_fn = weakref.ref(wrapped_fn)
+    443 
+
+/usr/local/lib/python3.6/dist-packages/tensorflow/python/framework/func_graph.py in wrapper(*args, **kwargs)
+    966           except Exception as e:  # pylint:disable=broad-except
+    967             if hasattr(e, "ag_error_metadata"):
+--&gt; 968               raise e.ag_error_metadata.to_exception(e)
+    969             else:
+    970               raise
+
+AttributeError: in user code:
+
+    /usr/local/lib/python3.6/dist-packages/tensorflow/python/keras/engine/training.py:571 train_function  *
+        outputs = self.distribute_strategy.run(
+    &lt;ipython-input-5-3ada42a824f0&gt;:19 train_step  *
+        self.optimizer.apply_gradients(zip(gradients, trainable_vars))
+    /usr/local/lib/python3.6/dist-packages/tensorflow_addons/optimizers/weight_decay_optimizers.py:149 apply_gradients  *
+        return super().apply_gradients(grads_and_vars, name=name)
+    /usr/local/lib/python3.6/dist-packages/tensorflow/python/keras/optimizer_v2/optimizer_v2.py:472 apply_gradients  **
+        grads_and_vars = _filter_grads(grads_and_vars)
+    /usr/local/lib/python3.6/dist-packages/tensorflow/python/keras/optimizer_v2/optimizer_v2.py:1219 _filter_grads
+        ([v.name for _, v in grads_and_vars],))
+    /usr/local/lib/python3.6/dist-packages/tensorflow/python/keras/optimizer_v2/optimizer_v2.py:1219 &lt;listcomp&gt;
+        ([v.name for _, v in grads_and_vars],))
+    /usr/local/lib/python3.6/dist-packages/tensorflow/python/framework/ops.py:1123 name
+        "Tensor.name is meaningless when eager execution is enabled.")
+
+    AttributeError: Tensor.name is meaningless when eager execution is enabled.
+&lt;/denchmark-code&gt;
+
+I am curious how this error message could be interpreted to better pinpoint the issue. I am also curious why the deep copying works for GPU, but not TPU.
+I found a workaround is to instantiate these layers directly, feed the model a sample datapoint to instantiate the layers, and then set the weights directly with the desired layer. Here is a colab gist for this workaround
+&lt;denchmark-link:https://colab.research.google.com/gist/Santosh-Gupta/bcfa4c3e358df3dae47b4711364883ba/a_doraa_minimal_tpu_furtherworkaround_set.ipynb&gt;https://colab.research.google.com/gist/Santosh-Gupta/bcfa4c3e358df3dae47b4711364883ba/a_doraa_minimal_tpu_furtherworkaround_set.ipynb&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='8' author='Santosh-Gupta' date='2020-07-16T23:48:02Z'>
+		I think I'm a little confused now. Is the error message you're facing the NotImplementedError mentioned in the title of the issue? Or the AttributeError you've just shared?
+		</comment>
+		<comment id='9' author='Santosh-Gupta' date='2020-07-18T06:32:25Z'>
+		
+I think I'm a little confused now. Is the error message you're facing the NotImplementedError mentioned in the title of the issue? Or the AttributeError you've just shared?
+
+Ahh, sorry, I got a little ahead in solving my architecture. This issue is for a minimal example I was stuck at before I solved it.
+Here's a Colab gist that works on GPU, but fails in TPU, and gives this error.
+
+NotImplementedError: TPUStrategy.run(fn, ...) does not support pure eager execution. please make sure the function passed into strategy.run is a tf.function or strategy.run is called inside a tf.function if eager behavior is enabled.
+
+&lt;denchmark-link:https://colab.research.google.com/gist/Santosh-Gupta/ad16030a7f4ed73045f53b71138da456/doraa_github_workinggpu_failingtpu.ipynb&gt;https://colab.research.google.com/gist/Santosh-Gupta/ad16030a7f4ed73045f53b71138da456/doraa_github_workinggpu_failingtpu.ipynb&lt;/denchmark-link&gt;
+
+And the following is a colab notebook which is similar to that notebook, but is non-minimal, and is fully working
+&lt;denchmark-link:https://colab.research.google.com/drive/1y1GuE1vr4tgUOFKeVeQEouP-33a3elqp?usp=sharing&gt;https://colab.research.google.com/drive/1y1GuE1vr4tgUOFKeVeQEouP-33a3elqp?usp=sharing&lt;/denchmark-link&gt;
+
+
+-Keeping everything else the same In the non-working example, if you use a standard loss function (instead of custom) do you still get the error?
+
+For this I had to change the custom function since the data does not contain labels; in each batch, all the other samples act as negative samples from each other. With a standard loss function, I get the same error. Here is a colab gist for this notebook.
+&lt;denchmark-link:https://colab.research.google.com/gist/Santosh-Gupta/0479b6c8a97cef90289ec68924de4fdf/doraa_github_workinggpu_failingtpu_standardloss.ipynb&gt;https://colab.research.google.com/gist/Santosh-Gupta/0479b6c8a97cef90289ec68924de4fdf/doraa_github_workinggpu_failingtpu_standardloss.ipynb&lt;/denchmark-link&gt;
+
+Looking at the working and non-working notebooks, I noticed that one of the differences is that in the working notebooking, the model instantiation does not have dynamic=True. So I tried to run it without dynamic=True. I then got an UnimplementedError. Here is the full error message.
+&lt;denchmark-code&gt;---------------------------------------------------------------------------
+UnimplementedError                        Traceback (most recent call last)
+&lt;ipython-input-36-50bee5f74f82&gt; in &lt;module&gt;()
+----&gt; 1 model.fit(train_dataset)
+
+3 frames
+/usr/local/lib/python3.6/dist-packages/tensorflow/python/keras/engine/training.py in _method_wrapper(self, *args, **kwargs)
+     64   def _method_wrapper(self, *args, **kwargs):
+     65     if not self._in_multi_worker_mode():  # pylint: disable=protected-access
+---&gt; 66       return method(self, *args, **kwargs)
+     67 
+     68     # Running inside `run_distribute_coordinator` already.
+
+/usr/local/lib/python3.6/dist-packages/tensorflow/python/keras/engine/training.py in fit(self, x, y, batch_size, epochs, verbose, callbacks, validation_split, validation_data, shuffle, class_weight, sample_weight, initial_epoch, steps_per_epoch, validation_steps, validation_batch_size, validation_freq, max_queue_size, workers, use_multiprocessing)
+    851               # TODO(b/150292341): Allow multiple async steps here.
+    852               if not data_handler.inferred_steps:
+--&gt; 853                 context.async_wait()
+    854               logs = tmp_logs  # No error, now safe to assign to logs.
+    855               callbacks.on_train_batch_end(step, logs)
+
+/usr/local/lib/python3.6/dist-packages/tensorflow/python/eager/context.py in async_wait()
+   2201   an error state.
+   2202   """
+-&gt; 2203   context().sync_executors()
+   2204 
+   2205 
+
+/usr/local/lib/python3.6/dist-packages/tensorflow/python/eager/context.py in sync_executors(self)
+    636     """
+    637     if self._context_handle:
+--&gt; 638       pywrap_tfe.TFE_ContextSyncExecutors(self._context_handle)
+    639     else:
+    640       raise ValueError("Context is not initialized.")
+
+UnimplementedError: {{function_node __inference_train_function_145300}} Compilation failure: Dynamic shape is not supported for non trivial window: size=1x136 pad=0_0x135_0
+	 [[{{node tf_roberta_model_3/roberta/embeddings/Cumsum}}]]
+	TPU compilation failed
+	 [[tpu_compile_succeeded_assert/_8332457752893656119/_5]]
+&lt;/denchmark-code&gt;
+
+Here is a copy of the colab gist for this notebook.
+&lt;denchmark-link:https://colab.research.google.com/gist/Santosh-Gupta/720b677c769a060c97aca2a4becbeebd/doraa_github_workinggpu_failingtpu_nodynamic.ipynb&gt;https://colab.research.google.com/gist/Santosh-Gupta/720b677c769a060c97aca2a4becbeebd/doraa_github_workinggpu_failingtpu_nodynamic.ipynb&lt;/denchmark-link&gt;
+
+I remember that I saw on StackOverflow for this error, I should use dynamic=True, so that's why I originally put it in. But obviously it's not necessary since I didn't put it in the working notebook.
+Another difference I noticed between the working and non-working notebooks is that I set a  padded_shapes=(512, 512) when doing a batched pad with tf.data, so I tried that.
+And the model started training!
+Here is a colab gist for this
+&lt;denchmark-link:https://colab.research.google.com/gist/Santosh-Gupta/2faaebef587fcc8831e9627a2d944937/doraa_github_workinggpu_failingtpu_paddedshapes_working.ipynb&gt;https://colab.research.google.com/gist/Santosh-Gupta/2faaebef587fcc8831e9627a2d944937/doraa_github_workinggpu_failingtpu_paddedshapes_working.ipynb&lt;/denchmark-link&gt;
+
+So it looks like there's two areas where TPUs throws an error, that does not occur with GPUs:
+
+
+Dynamic batch shapes do not work with TPUs (cause of original error of this issue)
+
+
+Deepcopying a layer to be used downstream in the architecture results in     AttributeError: Tensor.name is meaningless when eager execution is enabled.
+
+
+		</comment>
+		<comment id='10' author='Santosh-Gupta' date='2020-07-20T18:35:58Z'>
+		Thanks for the summary!
+Setting dynamic=True runs the layer eagerly, which probably explains the original error message.
+To your first point, dynamic shapes were not supported with TPUs in 1.x, which required specifying static per-replica and global batch sizes (eg previously you needed to set drop_remainder=True in the input dataset), but there is increased support since 2.1 where even if the last partial batch is not even across replicas or some replicas have no data, the training job will run and complete as expected. That being said, not all dynamic shapes use cases are supported with TPUs.
+As for the deepcopying, I'm not sure why that's happening. If you think this is a bug then please feel free to file a separate issue just for that + minimal example and we can definitely take a look.
+But overall it sounds like you were able to find the correct workaround to get your model to train?
+		</comment>
+		<comment id='11' author='Santosh-Gupta' date='2020-07-20T19:23:57Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/41074&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/41074&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

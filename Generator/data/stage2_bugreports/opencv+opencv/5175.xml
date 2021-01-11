@@ -1,0 +1,76 @@
+<bug id='5175' author='frasercrmck' open_date='2015-08-12T13:34:50Z' closed_time='2016-03-15T12:51:40Z'>
+	<summary>Possible race conditions in OpenCL Canny</summary>
+	<description>
+This isn't a definite bug; it's more of a discussion.
+I'm seeing hangs in canny's stage 2 hysteresis on an OpenCL implementation. From my reading of the code, there are a couple of potential problems. They all stem from the use of the local variable l_counter.
+The first is that the OpenCL atomic functions are defined to work on pointers to volatile variables. Should l_counter therefore be declared volatile?
+I can also imagine problems in the following loop:
+&lt;denchmark-code&gt;while(l_counter != 0)
+{
+    int mod = l_counter % LOCAL_TOTAL;
+    int pix_per_thr = l_counter / LOCAL_TOTAL + ((lid &lt; mod) ? 1 : 0);
+
+    for (int i = 0; i &lt; pix_per_thr; ++i)
+    {
+        int index = atomic_dec(&amp;l_counter) - 1;
+        if (index &lt; 0)
+           continue;
+        ushort2 pos = l_stack[ index ];
+
+        #pragma unroll
+        for (int j = 0; j &lt; 8; ++j)
+        {
+            ushort posx = pos.x + move_dir[0][j];
+            ushort posy = pos.y + move_dir[1][j];
+            if (posx &lt; 0 || posy &lt; 0 || posx &gt;= cols || posy &gt;= rows)
+                continue;
+            __global uchar *addr = map_ptr + mad24(posy, map_step, posx * (int)sizeof(int));
+            int type = loadpix(addr);
+            if (type == 0)
+            {
+                p_stack[p_counter++] = (ushort2)(posx, posy);
+                storepix(2, addr);
+            }
+        }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (l_counter &lt; 0)
+        l_counter = 0;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    while (p_counter &gt; 0)
+    {
+        l_stack[ atomic_inc(&amp;l_counter) ] = p_stack[--p_counter];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+}
+&lt;/denchmark-code&gt;
+
+There could be race conditions in the reading and writing of l_counter at the beginning of that loop when setting mod and pix_per_thr, leading some work-items to do either too much or too little work. This might not be a problem, though, if the algorithm can balance itself out correctly.
+To my mind, it should also be possible here that a group work-items could enter the while loop ahead of the rest of the work-items in the same work-group. The first group of work-items could then proceed to decrement l_counter to 0, such that the rest of the work-items don't enter the loop at all. This would result in a divergent barrier at the end of the while loop which, depending on the implementation, could hang forever.
+I'd appreciate any feedback on my analysis of this kernel.
+	</description>
+	<comments>
+		<comment id='1' author='frasercrmck' date='2015-08-12T13:50:16Z'>
+		BTW, some Canny data races have been fixed in May 2015:
+&lt;denchmark-link:https://github.com/Itseez/opencv/commits/master/modules/imgproc/src/opencl/canny.cl&gt;https://github.com/Itseez/opencv/commits/master/modules/imgproc/src/opencl/canny.cl&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='2' author='frasercrmck' date='2015-08-12T16:12:15Z'>
+		The code I pasted above includes those changes but I don't think they fix the problems I'm seeing.
+		</comment>
+		<comment id='3' author='frasercrmck' date='2015-12-17T08:12:19Z'>
+		&lt;denchmark-link:https://github.com/frasercrmck&gt;@frasercrmck&lt;/denchmark-link&gt;
+
+We may not worry about whether we should use volatile l_counter, because the atomic_xxx() builtin function takes l_counter's pointer as argument, thus the compiler knows that the value of l_counter may change after that call and will generate correct load instructions.
+If we use volatile， then the following two lines of code will generate unnecessary load instructions:
+int mod = l_counter % LOCAL_TOTAL;
+int pix_per_thr = l_counter / LOCAL_TOTAL + ((lid &lt; mod) ? 1 : 0);
+I agree the rest part of your analysis, and my previous fix doesn't fix all the race conditions, We should put a barrier() before  the following for loop.
+for (int i = 0; i &lt; pix_per_thr; ++i)
+{
+int index = atomic_dec(&amp;l_counter) - 1;
+Thanks for your valuable feedback.
+		</comment>
+	</comments>
+</bug>

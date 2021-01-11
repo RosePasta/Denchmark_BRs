@@ -1,0 +1,181 @@
+<bug id='8118' author='yskim5892' open_date='2020-04-21T08:29:08Z' closed_time='2020-11-27T00:00:31Z'>
+	<summary>[RLlib] PrioritizedReplayBuffer raises "IndexError: list index out of range" when used together with MultiAgentEnv</summary>
+	<description>
+&lt;denchmark-h:h3&gt;What is the problem?&lt;/denchmark-h&gt;
+
+Ray version and other system information (Python version, TensorFlow version, OS):
+
+Python 3.7.5
+Ray : from commit d66d126
+OS : Linux (Ubuntu 18.04)
+
+I've made a custom environment which implements MultiAgentEnv, and tried to train on it with DDPG agents, but the error below happened.
+&lt;denchmark-h:h3&gt;Reproduction (REQUIRED)&lt;/denchmark-h&gt;
+
+Please provide a script that can be run to reproduce the issue. The script should have no external library dependencies (i.e., use fake or mock data / environments):
+&lt;denchmark-code&gt;from ray import tune
+from ray.tune import function
+from ray.rllib.env import MultiAgentEnv
+import numpy as np
+import gym
+
+class HIRO_env_wrapper(MultiAgentEnv):
+    def __init__(self, config):
+        try:
+            self.env = config['flat_env']
+            self.observation_space = self.env.observation_space
+            self.action_space = self.env.action_space
+        except AttributeError:
+            self.env = gym.make(config['flat_env'])
+            self.observation_space = self.env.observation_space
+            self.action_space = self.env.action_space
+        self.config = config
+
+    def reset(self):
+        self.state = self.env.reset()
+        self.goal = self.state
+        self.l_steps = 0
+
+        return {'h': self.state, 'l': np.concatenate((self.state, self.goal))}
+
+    def step(self, action_dict):
+        obs, rew, done, info = {}, {}, {'__all__' : False}, {'l' : {}}
+
+        if 'h' in action_dict:
+            action = action_dict['h']
+            self.goal = action
+            self.h_reward = 0
+            self.l_reward = 0
+            self.l_steps = 0
+
+        if 'l' in action_dict:
+            action = action_dict['l']
+            self.l_steps += 1
+            next_state, ext_reward, f_done, _ = self.env.step(action)
+
+            self.h_reward += ext_reward
+            self.goal = self.state + self.goal - next_state
+            self.l_reward = -(np.dot(self.goal, self.goal)) ** 0.5
+
+            self.state = next_state
+
+            if f_done:
+                done = {'l' : True, 'h' : True, '__all__': True}
+                obs['h'] = self.state
+                rew['h'] = self.h_reward
+                info['h'] = {}
+
+            elif self.l_steps &gt;= self.config['max_sub_policy_steps']:
+                done = {'l' : True, 'h' : False, '__all__': False}
+                obs['h'] = self.state
+                rew['h'] = self.h_reward
+                info['h'] = {}
+
+        obs['l'] = np.concatenate((self.state, self.goal))
+        rew['l'] = self.l_reward
+        return obs, rew, done, info
+
+from ray.rllib.agents.ddpg.ddpg import DDPGTrainer, DEFAULT_CONFIG
+trainer = DDPGTrainer
+config = DEFAULT_CONFIG
+
+config['env_config'] = {'flat_env': 'BipedalWalker-v2', 'max_sub_policy_steps' : 10}
+env = HIRO_env_wrapper(config['env_config'])
+config['env'] = HIRO_env_wrapper
+obs_space = env.observation_space
+action_space = env.action_space
+
+def policy_mapping(agent_id):
+    return agent_id
+l_obs_space = gym.spaces.Box(low=obs_space.low[0], high=obs_space.high[0], shape=(obs_space.shape[0]*2,))
+
+config['multiagent'] = {
+    'policies': {
+        'h': (None, obs_space, obs_space, {}),
+        'l': (None, l_obs_space, action_space, {}),
+    },
+    'policies_to_train': ['h', 'l'],
+    'policy_mapping_fn': policy_mapping,
+}
+ray.init(num_cpus=18, num_gpus=3)
+config['num_gpus'] = 3
+config['lr'] = tune.sample_from(lambda spec : np.random.choice(np.array([1e-5, 3e-5, 1e-4, 3e-4, 1e-3], dtype=np.float32)))
+tune.run(trainer, config=config)
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h3&gt;Output&lt;/denchmark-h&gt;
+
+&lt;denchmark-code&gt;(pid=33988) /home/silver/anaconda3/envs/torch/lib/python3.7/site-packages/ray/rllib/optimizers/segment_tree.py:185: RuntimeWarning: invalid value en[24/6985]
+ in double_scalars
+(pid=33988)   prefixsum -= self.value[update_idx]
+(pid=33988) /home/silver/anaconda3/envs/torch/lib/python3.7/site-packages/ray/rllib/optimizers/replay_buffer.py:183: RuntimeWarning: divide by zero encounter
+ed in double_scalars
+(pid=33988)   max_weight = (p_min * len(self._storage))**(-beta)
+(pid=33988) /home/silver/anaconda3/envs/torch/lib/python3.7/site-packages/ray/rllib/optimizers/replay_buffer.py:187: RuntimeWarning: divide by zero encounter
+ed in double_scalars
+(pid=33988)   weight = (p_sample * len(self._storage))**(-beta)
+(pid=33988) /home/silver/anaconda3/envs/torch/lib/python3.7/site-packages/ray/rllib/optimizers/replay_buffer.py:188: RuntimeWarning: invalid value encountere
+d in double_scalars
+(pid=33988)   weights.append(weight / max_weight)
+2020-04-21 17:24:17,777 ERROR trial_runner.py:521 -- Trial DDPG_HIRO_env_wrapper_00000: Error processing event.
+Traceback (most recent call last):
+  File "/home/silver/anaconda3/envs/torch/lib/python3.7/site-packages/ray/tune/trial_runner.py", line 467, in _process_trial
+    result = self.trial_executor.fetch_result(trial)
+  File "/home/silver/anaconda3/envs/torch/lib/python3.7/site-packages/ray/tune/ray_trial_executor.py", line 431, in fetch_result
+    result = ray.get(trial_future[0], DEFAULT_GET_TIMEOUT)
+  File "/home/silver/anaconda3/envs/torch/lib/python3.7/site-packages/ray/worker.py", line 1504, in get
+    raise value.as_instanceof_cause()
+ray.exceptions.RayTaskError(IndexError): ray::DDPG.train() (pid=33988, ip=147.46.219.155)
+  File "python/ray/_raylet.pyx", line 459, in ray._raylet.execute_task
+  File "python/ray/_raylet.pyx", line 414, in ray._raylet.execute_task.function_executor
+  File "/home/silver/anaconda3/envs/torch/lib/python3.7/site-packages/ray/rllib/agents/trainer.py", line 498, in train
+    raise e
+  File "/home/silver/anaconda3/envs/torch/lib/python3.7/site-packages/ray/rllib/agents/trainer.py", line 484, in train
+    result = Trainable.train(self)
+  File "/home/silver/anaconda3/envs/torch/lib/python3.7/site-packages/ray/tune/trainable.py", line 261, in train
+    result = self._train()
+  File "/home/silver/anaconda3/envs/torch/lib/python3.7/site-packages/ray/rllib/agents/trainer_template.py", line 151, in _train
+    fetches = self.optimizer.step()
+  File "/home/silver/anaconda3/envs/torch/lib/python3.7/site-packages/ray/rllib/optimizers/sync_replay_optimizer.py", line 146, in step
+    self._optimize()
+  File "/home/silver/anaconda3/envs/torch/lib/python3.7/site-packages/ray/rllib/optimizers/sync_replay_optimizer.py", line 172, in _optimize
+    samples = self._replay()
+  File "/home/silver/anaconda3/envs/torch/lib/python3.7/site-packages/ray/rllib/optimizers/sync_replay_optimizer.py", line 217, in _replay
+    self.num_steps_trained))
+  File "/home/silver/anaconda3/envs/torch/lib/python3.7/site-packages/ray/rllib/optimizers/replay_buffer.py", line 190, in sample_with_idxes
+    encoded_sample = self._encode_sample(idxes)
+  File "/home/silver/anaconda3/envs/torch/lib/python3.7/site-packages/ray/rllib/optimizers/replay_buffer.py", line 56, in _encode_sample
+    data = self._storage[i]
+IndexError: list index out of range
+
+&lt;/denchmark-code&gt;
+
+If we cannot run your script, we cannot fix your issue.
+
+[* ] I have verified my script runs in a clean environment and reproduces the issue.
+[* ] I have verified the issue also occurs with the latest wheels.
+
+	</description>
+	<comments>
+		<comment id='1' author='yskim5892' date='2020-11-12T23:45:42Z'>
+		Hi, I'm a bot from the Ray team :)
+To help human contributors to focus on more relevant issues, I will automatically add the stale label to issues that have had no activity for more than 4 months.
+If there is no further activity in the 14 days, the issue will be closed!
+
+If you'd like to keep the issue open, just leave any comment, and the stale label will be removed!
+If you'd like to get more attention to the issue, please tag one of Ray's contributors.
+
+You can always ask for help on our &lt;denchmark-link:https://discuss.ray.io/&gt;discussion forum&lt;/denchmark-link&gt;
+ or &lt;denchmark-link:https://github.com/ray-project/ray#getting-involved&gt;Ray's public slack channel&lt;/denchmark-link&gt;
+.
+		</comment>
+		<comment id='2' author='yskim5892' date='2020-11-27T00:00:26Z'>
+		Hi again! The issue will be closed because there has been no more activity in the 14 days since the last message.
+Please feel free to reopen or open a new issue if you'd still like it to be addressed.
+Again, you can always ask for help on our &lt;denchmark-link:https://discuss.ray.io&gt;discussion forum&lt;/denchmark-link&gt;
+ or &lt;denchmark-link:https://github.com/ray-project/ray#getting-involved&gt;Ray's public slack channel&lt;/denchmark-link&gt;
+.
+Thanks again for opening the issue!
+		</comment>
+	</comments>
+</bug>

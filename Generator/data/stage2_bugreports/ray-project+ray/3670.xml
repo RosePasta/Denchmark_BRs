@@ -1,0 +1,123 @@
+<bug id='3670' author='robertnishihara' open_date='2019-01-01T00:05:28Z' closed_time='2020-03-05T23:21:31Z'>
+	<summary>Calling ray.init() with too much object store memory causes object store to crash on Linux.</summary>
+	<description>
+&lt;denchmark-h:h3&gt;System information&lt;/denchmark-h&gt;
+
+
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Ubuntu
+Ray installed from (source or binary): source
+Ray version: 0.6.1
+Python version: 3.6.3
+
+Starting the object store with 50GB on an m5.4xlarge instance
+&lt;denchmark-code&gt;In [1]: import ray
+ray
+In [2]: ray.init(object_store_memory_mb=50*1000)
+WARNING: Not updating worker name since `setproctitle` is not installed. Install this with `pip install setproctitle` (or ray[debug]) to enable monitoring of worker processes.
+Process STDOUT and STDERR is being redirected to /tmp/ray/session_2018-12-31_23-58-25_28453/logs.
+Waiting for redis server at 127.0.0.1:14322 to respond...
+Waiting for redis server at 127.0.0.1:24609 to respond...
+WARNING: The object store is using /tmp instead of /dev/shm because /dev/shm has only 33008.238592MB available. This may slow down performance! You may be able to free up space by deleting files in /dev/shm or terminating any running plasma_store_server processes. If you are inside a Docker container, you may need to pass an argument with the flag '--shm-size' to 'docker run'.
+Starting the Plasma object store with 50.0GB memory using /tmp.
+E1231 23:58:25.641736 28607 io.cc:167] Connection to IPC socket failed for pathname /tmp/ray/session_2018-12-31_23-58-25_28453/sockets/plasma_store, retrying 50 more times
+&lt;/denchmark-code&gt;
+
+doesn't immediately fail because we think that the machine has 66GB memory
+&lt;denchmark-code&gt;In [3]: ray.utils.get_system_memory_bytes() // 10**9
+Out[3]: 66
+&lt;/denchmark-code&gt;
+
+However, the plasma store fails to start because the way we check memory in Arrow appears to think we only have 42GB. Note that I'm passing in -d /tmp.
+&lt;denchmark-code&gt;~$ ray/build/external/arrow-install/bin/plasma_store_server -s /tmp/store -m 50000000000 -d /tmp
+I0101 00:02:24.788489 28722 store.cc:994] Allowing the Plasma store to use up to 50GB of memory.
+I0101 00:02:24.788723 28722 store.cc:1024] Starting object store with directory /tmp and huge page support disabled
+F0101 00:02:24.788743 28722 store.cc:1039] System memory request exceeds memory available in /tmp. The request is for 50000000000 bytes, and the amount available is 42490683392 bytes. You may be able to free up space by deleting files in /dev/shm. If you are inside a Docker container, you may need to pass an argument with the flag '--shm-size' to 'docker run'.
+*** Check failure stack trace: ***
+    @           0x44212c  google::LogMessage::Fail()
+    @           0x442070  google::LogMessage::SendToLog()
+    @           0x4419b2  google::LogMessage::Flush()
+    @           0x4417ad  google::LogMessage::~LogMessage()
+    @           0x43e5e0  arrow::util::ArrowLog::~ArrowLog()
+    @           0x415b04  main
+    @     0x7f5039fa4830  __libc_start_main
+    @           0x415f09  _start
+    @              (nil)  (unknown)
+Aborted (core dumped)
+&lt;/denchmark-code&gt;
+
+The relevant code for checking memory in the plasma store is &lt;denchmark-link:https://github.com/apache/arrow/blob/71ccba9b217a7af922d8a69be21ed4db205af741/cpp/src/plasma/store.cc#L1028-L1037&gt;https://github.com/apache/arrow/blob/71ccba9b217a7af922d8a69be21ed4db205af741/cpp/src/plasma/store.cc#L1028-L1037&lt;/denchmark-link&gt;
+. The issue may be that we're checking shared memory size instead of regular memory.
+Note that the actual failure raised by ray.init is
+&lt;denchmark-code&gt;E1231 23:58:30.547828 28607 io.cc:167] Connection to IPC socket failed for pathname /tmp/ray/session_2018-12-31_23-58-25_28453/sockets/plasma_store, retrying 1 more times
+E1231 23:58:30.549942 28453 io.cc:167] Connection to IPC socket failed for pathname /tmp/ray/session_2018-12-31_23-58-25_28453/sockets/plasma_store, retrying 1 more times
+F1231 23:58:30.647966 28607 object_store_notification_manager.cc:22]  Check failed: _s.ok() Bad status: IOError: Could not connect to socket /tmp/ray/session_2018-12-31_23-58-25_28453/sockets/plasma_store
+*** Check failure stack trace: ***
+    @           0x5d7cd0  google::LogMessage::Fail()
+    @           0x5d7c14  google::LogMessage::SendToLog()
+    @           0x5d7556  google::LogMessage::Flush()
+    @           0x5d7351  google::LogMessage::~LogMessage()
+    @           0x5c5c50  arrow::util::ArrowLog::~ArrowLog()
+    @           0x5770e7  ray::ObjectStoreNotificationManager::ObjectStoreNotificationManager()
+    @           0x526cfa  ray::ObjectManager::ObjectManager()
+    @           0x4c0e67  ray::raylet::Raylet::Raylet()
+    @           0x4ae3c9  main
+    @     0x7fc2edc6d830  __libc_start_main
+    @           0x4b3d19  _start
+    @              (nil)  (unknown)
+---------------------------------------------------------------------------
+ArrowIOError                              Traceback (most recent call last)
+&lt;ipython-input-2-f09714301df8&gt; in &lt;module&gt;()
+----&gt; 1 ray.init(object_store_memory_mb=50*1000)
+
+~/ray/python/ray/worker.py in init(redis_address, num_cpus, num_gpus, resources, object_store_memory, object_store_memory_mb, redis_max_memory, redis_max_memory_mb, collect_profiling_data, node_ip_address, object_id_seed, num_workers, local_mode, driver_mode, redirect_worker_output, redirect_output, ignore_reinit_error, num_redis_shards, redis_max_clients, redis_password, plasma_directory, huge_pages, include_webui, driver_id, configure_logging, logging_level, logging_format, plasma_store_socket_name, raylet_socket_name, temp_dir, _internal_config, use_raylet)
+   1619         _internal_config=_internal_config,
+   1620     )
+-&gt; 1621     ret = _init(ray_params, driver_id=driver_id)
+   1622     for hook in _post_init_hooks:
+   1623         hook()
+
+~/ray/python/ray/worker.py in _init(ray_params, driver_id)
+   1428         mode=ray_params.driver_mode,
+   1429         worker=global_worker,
+-&gt; 1430         driver_id=driver_id)
+   1431     return ray_params.address_info
+   1432 
+
+~/ray/python/ray/worker.py in connect(ray_params, info, mode, worker, driver_id)
+   1975     # Create an object store client.
+   1976     worker.plasma_client = thread_safe_client(
+-&gt; 1977         plasma.connect(info["store_socket_name"]))
+   1978 
+   1979     raylet_socket = info["raylet_socket_name"]
+
+~/ray/python/ray/pyarrow_files/pyarrow/_plasma.pyx in pyarrow._plasma.connect()
+
+~/ray/python/ray/pyarrow_files/pyarrow/error.pxi in pyarrow.lib.check_status()
+
+ArrowIOError: Could not connect to socket /tmp/ray/session_2018-12-31_23-58-25_28453/sockets/plasma_store
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='robertnishihara' date='2019-01-11T20:55:44Z'>
+		I'm getting this as well. Ray starts and mentions it's using /tmp. Driver then cannot find the ray process when calling ray.init().
+		</comment>
+		<comment id='2' author='robertnishihara' date='2019-03-07T20:49:09Z'>
+		See &lt;denchmark-link:https://github.com/modin-project/modin/issues/468&gt;modin-project/modin#468&lt;/denchmark-link&gt;
+ for a concrete instantiation of this problem.
+		</comment>
+		<comment id='3' author='robertnishihara' date='2019-03-07T21:16:19Z'>
+		I'm contemplating to remove this check from plasma altogether. This could bring back the dreaded "BUS ERROR" problem, but if that's the case we can do tighter checking on the python side before the plasma store is started and give a better error message. It's certainly bad to have two different and inconsistent checks here.
+		</comment>
+		<comment id='4' author='robertnishihara' date='2019-03-07T21:23:17Z'>
+		A safer method is to keep the check in plasma and start the store with as much memory as is available, and then get that amount through the python client and issue a warning/error if it is not enough.
+		</comment>
+		<comment id='5' author='robertnishihara' date='2020-03-05T23:21:30Z'>
+		Stale - please open new issue if still relevant
+		</comment>
+		<comment id='6' author='robertnishihara' date='2020-09-09T01:03:53Z'>
+		&lt;denchmark-link:https://github.com/edoakes&gt;@edoakes&lt;/denchmark-link&gt;
+ just experienced this today. Was getting errors with placing objects into shared object store, which recommended to set . I set 500GB/768 GB RAM for object storage on a  r5.metal and was scratching my head why I was getting these errors.
+		</comment>
+	</comments>
+</bug>

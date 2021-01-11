@@ -1,0 +1,104 @@
+<bug id='42481' author='psobot' open_date='2020-08-19T02:46:03Z' closed_time='2020-08-31T17:21:50Z'>
+	<summary>TensorFlow Lite converter emits incorrect mask for StridedSlice when using ellipsis</summary>
+	<description>
+System information
+
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Linux, Ubuntu 18.04
+TensorFlow installed from (source or binary): binary
+TensorFlow version (or github SHA if from source): tf-nightly-cpu-2.4.0.dev20200818
+
+Command used to run the converter or code if you’re using the Python API
+import tensorflow as tf
+
+
+def main():
+    graph = tf.Graph()
+
+    # Create a basic graph with only an overlap_and_add on some random data.
+    shape = (1, 1, 1024, 512)
+    with graph.as_default():
+        _input = tf.random.uniform(shape)
+        ola = tf.signal.overlap_and_add(_input, 256, name='output')
+
+    # Try executing that graph in regular TensorFlow.
+    with tf.compat.v1.Session(graph=graph) as session:
+        print(f"With regular TensorFlow, result is: {session.run(ola)}")
+
+    # Convert to TFLite (using the V1 interface for simplicity)
+    converter = tf.compat.v1.lite.TFLiteConverter(graph.as_graph_def(), [_input], [ola])
+    tflite_model = converter.convert()
+
+    # Write the model to disk...
+    model_path = f'./{__file__}.tflite'
+    with open(model_path, 'wb') as f:
+        f.write(tflite_model)
+
+    # ...so that we can load it into an interpreter and see the error!
+    interpreter = tf.lite.Interpreter(model_path=model_path)
+    interpreter.allocate_tensors()
+
+    # This line should throw (as of tf-nightly-cpu-2.4.0.dev20200818):
+    #   RuntimeError: tensorflow/lite/kernels/reshape.cc:66 \
+    #   num_input_elements != num_output_elements (0 != 524800) \
+    #   Node number 5 (RESHAPE) failed to prepare.
+    interpreter.invoke()
+    print("If we got here, the bug did not appear!")
+
+
+if __name__ == "__main__":
+    main()
+Failure details
+The provided graph works in regular TensorFlow, and the TensorFlow Lite converter executes with no errors, but the TFLite model fails at runtime with:
+&lt;denchmark-code&gt;RuntimeError: tensorflow/lite/kernels/reshape.cc:66 num_input_elements != num_output_elements (0 != 524800)Node number 5 (RESHAPE) failed to prepare.
+&lt;/denchmark-code&gt;
+
+A visualization of the resulting graph in Netron shows that the node in question should have an input shape of  with no unknown dimensions:
+&lt;denchmark-link:https://user-images.githubusercontent.com/213293/90586031-3519f080-e1a4-11ea-85d0-0539ace7fa7a.png&gt;&lt;/denchmark-link&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='psobot' date='2020-08-19T15:37:30Z'>
+		I've narrowed this down to &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/77245d0/tensorflow/python/ops/signal/reconstruction_ops.py#L148&gt;one line in overlap_and_add that does a StridedSlice&lt;/denchmark-link&gt;
+:
+    # Truncate so that signal.shape = (15, 2)
+    # ab fg kl 00 00 00 cd hi mn 00 00 00 e0 j0 o0
+    signal = signal[..., :(frames + segments - 1) * segments, :]
+This seems to result in a StridedSlice op with the following properties:
+&lt;denchmark-code&gt;begin = [0, 0]
+end = [2050, 0]
+strides = [1, 1]
+begin_mask = 1 (i.e.: dims[0])
+end_mask = 1 (i.e.: dims[0])
+&lt;/denchmark-code&gt;
+
+This is odd, as the slice includes a  as its final element, which should indicate that the entire dimension should be used, but the serialized graph includes both the beginning and end of that dimension as . The  and  are both set to , indicating that the stride should use the whole of the  dimension (bit 0), according to &lt;denchmark-link:https://www.tensorflow.org/api_docs/python/tf/strided_slice&gt;the docs&lt;/denchmark-link&gt;
+:
+
+If the ith bit of begin_mask is set, begin[i] is ignored and the fullest possible range in that dimension is used instead. end_mask works analogously, except with the end range.
+
+Given that the regular TensorFlow runtime seems to handle this slice just fine, this leads me to believe that the issue might be in the TFLite converter. Indeed, before TFLite conversion, the StridedSlice takes in an additional dimension has the following properties:
+&lt;denchmark-code&gt;begin = [0, 0, 0]
+end = [0, 2050, 0]
+strides = [1, 1, 1]
+ellipsis_mask = 1
+begin_mask = 6 (i.e.: dims[1] and dims[2])
+end_mask = 4 (i.e.: dims[2] alone)
+&lt;/denchmark-code&gt;
+
+It looks like the TensorFlow Lite converter may be incorrectly optimizing the begin_mask and end_mask here, due to the ellipsis_mask. If I remove the ellipsis entirely, the problem does go away.
+A quick fix for this would be to change reconstruction_ops.py:148 to specify the exact end of its slice operation, to work around this bug:
+signal = signal[..., : (frames + segments - 1) * segments, :array_ops.shape(signal)[-1]]
+		</comment>
+		<comment id='2' author='psobot' date='2020-08-19T19:34:39Z'>
+		&lt;denchmark-link:https://github.com/renjie-liu&gt;@renjie-liu&lt;/denchmark-link&gt;
+ Can you please have a look
+		</comment>
+		<comment id='3' author='psobot' date='2020-08-31T17:21:51Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/42481&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/42481&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

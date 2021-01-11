@@ -1,0 +1,240 @@
+<bug id='260' author='WindQAQ' open_date='2019-05-22T06:19:06Z' closed_time='2019-06-15T10:42:42Z'>
+	<summary>Raise exceptions based on tensor's properties</summary>
+	<description>
+The build just failed yesterday due to some shape checking fragments in C++ code.
+&lt;denchmark-link:https://source.cloud.google.com/results/invocations/f48f6f28-c9a4-4912-b8c5-336f17167183&gt;https://source.cloud.google.com/results/invocations/f48f6f28-c9a4-4912-b8c5-336f17167183&lt;/denchmark-link&gt;
+
+Currently, there are three approaches that can check tensor's properties and raise exceptions to block the following computation in addons (migrating from core TF):
+
+
+Pure if-else and raise statement
+
+
+
+addons/tensorflow_addons/image/dense_image_warp.py
+
+
+        Lines 51 to 53
+      in
+      d46dba1
+
+
+
+
+
+
+ if len(grid.shape) != 4: 
+
+
+
+ msg = "Grid must be 4 dimensional. Received size: " 
+
+
+
+ raise ValueError(msg + str(grid.shape)) 
+
+
+
+
+
+
+
+tf.debugging.*
+
+
+
+addons/tensorflow_addons/image/dense_image_warp.py
+
+
+        Lines 70 to 71
+      in
+      d46dba1
+
+
+
+
+
+
+ tf.debugging.assert_equal( 
+
+
+
+ query_shape[2], 2, message="Query points must be size 2 in dim 2.") 
+
+
+
+
+
+
+
+OP_REQUIRES in C++
+
+
+
+addons/tensorflow_addons/custom_ops/image/cc/kernels/adjust_hsv_in_yiq_op.cc
+
+
+        Lines 57 to 59
+      in
+      d46dba1
+
+
+
+
+
+
+ OP_REQUIRES(context, input.dims() &gt;= 3, 
+
+
+
+ errors::InvalidArgument("input must be at least 3-D, got shape", 
+
+
+
+                                     input.shape().DebugString())); 
+
+
+
+
+
+
+
+However, none of them are robust enough in  and in test cases with . (&lt;denchmark-link:https://github.com/tensorflow/addons/issues/138&gt;#138&lt;/denchmark-link&gt;
+, &lt;denchmark-link:https://github.com/tensorflow/addons/pull/257&gt;#257&lt;/denchmark-link&gt;
+)
+&lt;denchmark-h:hr&gt;&lt;/denchmark-h&gt;
+
+When checking core TensorFlow, I find this commit on Apr 10:
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/4b4a39e7120b1c7744f9686bc6cce9363846d7e6#diff-68b5e47db1d9389c8d12852996845819&gt;tensorflow/tensorflow@4b4a39e#diff-68b5e47db1d9389c8d12852996845819&lt;/denchmark-link&gt;
+
+
+Op raising InvalidArgumentError unless x is all negative. This can be
+used with tf.control_dependencies inside of tf.functions to block
+followup computation until the check has executed.
+
+According to the doc, does it encourage us to use tf.control_dependencies inside tf.function to do something like shape checking?
+	</description>
+	<comments>
+		<comment id='1' author='WindQAQ' date='2019-05-22T06:20:13Z'>
+		cc &lt;denchmark-link:https://github.com/seanpmorgan&gt;@seanpmorgan&lt;/denchmark-link&gt;
+ and &lt;denchmark-link:https://github.com/facaiy&gt;@facaiy&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='2' author='WindQAQ' date='2019-05-22T12:43:14Z'>
+		&lt;denchmark-link:https://github.com/alextp&gt;@alextp&lt;/denchmark-link&gt;
+ Alexandre, could you take a look?
+		</comment>
+		<comment id='3' author='WindQAQ' date='2019-05-22T14:16:12Z'>
+		I think
+
+both 1) and 3) are static shape check: 3) is called when constructing graph (graph mode), 1) is in python runtime (graph/eager mode).
+And 2) is dynamic shape check. It's called in python runtime (eager mode), while in tf runtime (with tf.function, graph/eager mode)
+
+Please correct me if I'm wrong :-)
+		</comment>
+		<comment id='4' author='WindQAQ' date='2019-05-22T15:39:06Z'>
+		&lt;denchmark-link:https://github.com/facaiy&gt;@facaiy&lt;/denchmark-link&gt;
+ is correct. TF supports both graph-build-time shape checks and graph-run-time shape checks. In tf.function both types of checks might be useful, though tf.function graphs tend to have more static shapes than most manually built tf graphs, so you get more mileage out of the static checks.
+Looking at the bugs I see a few false / confused statements being made, so I'd like to understand better what the actual issue here is before I can help.
+		</comment>
+		<comment id='5' author='WindQAQ' date='2019-05-22T16:41:27Z'>
+		&lt;denchmark-link:https://github.com/alextp&gt;@alextp&lt;/denchmark-link&gt;
+, hi Alexandre, I have some explanations and questions here:
+
+I misunderstood the reason of failed build this time, so the C++ is now OK for me. Sorry about that.
+For tf.debugging.* part, I am very wondering how to use it inside tf.function:
+
+class TestDebugging(tf.test.TestCase):
+
+    @tf.function
+    def foo(self, x):
+        tf.debugging.assert_greater_equal(tf.shape(x)[0], 3, message="wrong shape")
+        y = x[2]
+
+    @tf.function
+    def bar(self, x):
+        with tf.control_dependencies([tf.debugging.assert_greater_equal(tf.shape(x)[0], 3, message="wrong shape")]):
+            y = x[2]
+
+    def test_assert(self):
+        with self.assertRaisesRegexp(tf.errors.InvalidArgumentError, "wrong shape"):
+            self.foo(tf.random.uniform(shape=(2,)))
+
+    def test_assert_v2(self):
+        with self.assertRaisesRegexp(tf.errors.InvalidArgumentError, "wrong shape"):
+            self.bar(tf.random.uniform(shape=(2,)))
+The test case above will fail because the statement of y = x[2] will raise ValueError, indicating that tf.debugging.* could not block the following computation even if control_dependencies is added. Is there anything I misuse?
+
+For the pure if-else statement part, should we always check the static shape with tensor.shape instead of tf.shape(tensor)? I mean the following code snippet is a wrong use case (it will fail):
+
+class TestPureIfElse(tf.test.TestCase):
+
+    @tf.function
+    def foo(self, x):
+        if tf.shape(x)[0] &lt; 3:
+            raise ValueError("wrong shape")
+
+    def test_assert(self):
+        self.foo(tf.random.uniform(shape=(3,)))
+Many thanks for the help!
+		</comment>
+		<comment id='6' author='WindQAQ' date='2019-05-22T16:54:35Z'>
+		What's happening in your two cases is that the ValueError is being raised at graph building time not graph run time, because in tf.function x has a static shape so we know that slicing it is invalid, but tf.shape returns a symbolic tensor and the assert is only evaluated at graph run time.
+So to catch the x[2] during graph building time you need a static shape check as well as a dynamic shape check:
+&lt;denchmark-code&gt;@tf.function
+def bar(x):
+    if x.shape is not None and x.shape.ndims &gt;= 1:
+      assert x.shape[0] &gt;= 3
+    with tf.control_dependencies([tf.debugging.assert_greater_equal(tf.shape(x)[0], 3, message="wrong shape")]):
+        y = x[2]
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='7' author='WindQAQ' date='2019-05-22T16:56:50Z'>
+		And you might wonder "what is the assert_greater_equal buying me, then", it buys you the case for which the shape is not known at graph build time. So for example this makes it fail:
+@tf.function
+def bar(x):
+    if x.shape is not None and x.shape.ndims &gt;= 1 and x.shape[0] is not None:
+      assert x.shape[0] &gt;= 3
+    with tf.control_dependencies([tf.debugging.assert_greater_equal(tf.shape(x)[0], 3, message="wrong shape")]):
+        y = x[2]
+
+fn = bar.get_concrete_function(tf.TensorSpec(dtype=tf.float32, shape=[None]))
+fn(tf.random.uniform(shape=(2,)))
+		</comment>
+		<comment id='8' author='WindQAQ' date='2019-05-22T17:14:54Z'>
+		Thank you for the information! I initially suppose the tf.function will convert it, but it seems that It's quite a huge work to do shape checking inside tf.function... So to conclude, we should always check both static and dynamic shape, right?
+Edit: And because C++ offers static shape checking, we should also check dynamic shape in Python?
+		</comment>
+		<comment id='9' author='WindQAQ' date='2019-05-22T17:50:33Z'>
+		I think ideally both static and dynamic shape checks should be there, yes.
+&lt;denchmark-link:#&gt;…&lt;/denchmark-link&gt;
+
+
+On Wed, May 22, 2019 at 10:21 AM Tzu-Wei Sung ***@***.***&gt; wrote:
+ Thank you for the information! I initially suppose the tf.function will
+ convert it, but it seems that It's quite a huge work to do shape checking
+ inside tf.function... So to conclude, we should always check both static
+ and dynamic shape, right?
+
+ Edit: And because C++ offers static shape checking, we should also check
+ dynamic shape in Python?
+
+ —
+ You are receiving this because you were mentioned.
+ Reply to this email directly, view it on GitHub
+ &lt;#260?email_source=notifications&amp;email_token=AAABHRKPSFLRIFB6DBQC7YTPWV6IDA5CNFSM4HORAJJKYY3PNVWWK3TUL52HS4DFVREXG43VMVBW63LNMVXHJKTDN5WW2ZLOORPWSZGODV7XG5A#issuecomment-494891892&gt;,
+ or mute the thread
+ &lt;https://github.com/notifications/unsubscribe-auth/AAABHRP2JVUIF2I7FPMUJT3PWV6IDANCNFSM4HORAJJA&gt;
+ .
+
+
+-- 
+ - Alex
+
+		</comment>
+		<comment id='10' author='WindQAQ' date='2019-05-22T17:56:42Z'>
+		Thanks very much for the help Alexandre and Tzu-Wei thanks for writing out the distinct examples. I think we should include this information in our subpackage contribution guides or somewhere else convenient.
+		</comment>
+	</comments>
+</bug>

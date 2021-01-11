@@ -1,0 +1,242 @@
+<bug id='32720' author='gstoica27' open_date='2019-09-22T22:09:34Z' closed_time='2020-06-16T20:09:23Z'>
+	<summary>tensorflow.python.framework.errors_impl.InvalidArgumentError: Retval[0] does not have value with BatchNorm and Map_fn</summary>
+	<description>
+Please make sure that this is a bug. As per our GitHub Policy, we only address code/doc bugs, performance issues, feature requests and build/installation issues on GitHub. tag:bug_template
+Any help would be very greatly appreciated! Thanks!
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): Yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Ubuntu 16.04.06 &amp; OSX 10.14.6
+Mobile device (e.g. iPhone 8, Pixel 2, Samsung Galaxy) if the issue happens on mobile device: N/A
+TensorFlow installed from (source or binary): binary
+TensorFlow version (use command below): 1.14 on both os's, tf-gpu on ubuntu
+Python version: 3.7
+CUDA/cuDNN version: (ubuntu only) 10.1
+GPU model and memory: Titan X Pascal
+
+You can collect some of this information using our environment capture
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/tree/master/tools/tf_env_collect.sh&gt;script&lt;/denchmark-link&gt;
+
+You can also obtain the TensorFlow version with: 1. TF 1.0:  2. TF 2.0: 
+Describe the current behavior
+Applying batch normalization on top of batchwise tf.map_fn results in retval[0] error.  Note that this fails even when tf.map_fn operates over convolution filters. In this latter case, we have a different filter for each batch element, and so cannot apply the normal tf.conv functions without a map.
+Describe the expected behavior
+Applying batch normalization on top of batchwise tf.map_fn should pass without issue, as in this case it should emulate batchwise matmul.
+Code to reproduce the issue
+Provide a reproducible test case that is the bare minimum necessary to generate the problem.
+Below is the code. Alternatively, it can be found in this txt file:
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/files/3643105/run_dummy.txt&gt;run_dummy.txt&lt;/denchmark-link&gt;
+
+import tensorflow as tf
+
+
+class DummyModelRunner(object):
+    def __init__(self):
+        self.optimizer = tf.train.AdamOptimizer()
+
+        with tf.variable_scope('Dummy_Vars', use_resource=True):
+            self.variables = self.create_variables()
+
+        self.is_train = tf.placeholder_with_default(False, shape=[], name='is_train')
+
+        self.batch_inputs = tf.ones(shape=[256, 10], dtype=tf.float32, name='e1_embs')
+        actual_answers = tf.ones(shape=[256, 10, 5], dtype=tf.float32, name='actual_answers')
+        targets = tf.ones(shape=[256, 5], dtype=tf.float32, name='targets')
+
+        self.batch_outputs = self.create_predictions(input_embs=self.batch_inputs)
+
+        self.predictions = self.compute_likelihoods(self.batch_outputs, actual_answers)
+
+        self.loss = self.create_loss(self.predictions, targets)
+
+        # The following control dependency is needed in order for batch
+        # normalization to work correctly.
+        self.update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
+        with tf.control_dependencies(self.update_ops):
+            self.train_op = self.optimizer.minimize(self.loss)
+            gradients, variables = zip(*self.optimizer.compute_gradients(self.loss))
+            gradients, _ = tf.clip_by_global_norm(gradients, 5.0)
+            self.train_op = self.optimizer.apply_gradients(zip(gradients, variables))
+
+    def create_variables(self):
+        """
+        create all network variables
+        :return: all variable dictionary
+        """
+        weight = tf.get_variable(name='DummyWeight',
+                                 shape=[10, 10],
+                                 dtype=tf.float32,
+                                 initializer=tf.contrib.layers.xavier_initializer())
+        bias = tf.get_variable(name='DummyBiasRel',
+                               shape=[1, 10],
+                               dtype=tf.float32,
+                               initializer=tf.zeros_initializer())
+
+        variables = {'weights': weight,
+                     'biases': bias}
+
+        return variables
+
+
+    def create_predictions(self, input_embs):
+        weight, bias = self.variables['weights'], self.variables['biases']
+        is_train_batch_norm = self.is_train
+
+        def matmul(pair):
+            input_tensor = pair[0][None]
+            projection_tensor = pair[1]
+            projection = tf.matmul(input_tensor, projection_tensor)[0]
+            return (projection, tf.zeros([]))
+
+        output = tf.reshape(input_embs, [tf.shape(input_embs)[0], -1])
+        # Next two lines cause problem
+        weight = tf.broadcast_to(weight, [256, 10, 10])
+        output = tf.map_fn(fn=matmul, elems=(output, weight))[0] + bias
+
+        output = tf.layers.batch_normalization(output, momentum=.1, reuse=tf.AUTO_REUSE,
+                                               training=is_train_batch_norm, fused=True,
+                                               name='DummyBatchNorm')
+
+        return output
+
+    def compute_likelihoods(self, input_vectors, actual_answers):
+        with tf.name_scope('output_layer'):
+
+            predictions = tf.matmul(input_vectors[:, None, :], actual_answers)[:, 0, :]
+
+        return predictions
+
+    def create_loss(self, predictions, targets):
+        with tf.name_scope('loss'):
+            loss = tf.reduce_sum(
+                tf.compat.v1.losses.sigmoid_cross_entropy(targets, predictions),
+                name='loss')
+        return loss
+
+
+if __name__ == '__main__':
+    # Create the model.
+    # Can be /GPU:0 for ubuntu
+    with tf.device('/CPU:0'):
+        # We are using resource variables because due to some implementation details, this allows us to
+        # better utilize GPUs while training.
+        with tf.variable_scope('variables', use_resource=True):
+
+            model = DummyModelRunner()
+
+    # Create a TensorFlow session and start training.
+    config = tf.ConfigProto(allow_soft_placement=True)
+    config.gpu_options.allow_growth = True
+    session = tf.Session(config=config)
+    saver = tf.train.Saver()
+
+    # Initialize the values of all variables and the train dataset iterator.
+    session.run(tf.global_variables_initializer())
+
+    for step in range(100):
+        # print('Hi!')
+        feed_dict = {model.is_train: True}
+
+        loss, _ = session.run((model.loss, model.train_op), feed_dict)
+
+        print(loss)
+        exit()
+Other info / logs
+Include any logs or source code that would be helpful to diagnose the problem. If including tracebacks, please include the full traceback. Large logs and files should be attached.
+Traceback below (deprecation warning's excluded. Please let me know if I should include those as well):
+Traceback (most recent call last):
+File "/Users/georgestoica/Desktop/Research/venvs/rl_3.7/lib/python3.7/site-packages/tensorflow/python/client/session.py", line 1356, in _do_call
+return fn(*args)
+File "/Users/georgestoica/Desktop/Research/venvs/rl_3.7/lib/python3.7/site-packages/tensorflow/python/client/session.py", line 1341, in _run_fn
+options, feed_dict, fetch_list, target_list, run_metadata)
+File "/Users/georgestoica/Desktop/Research/venvs/rl_3.7/lib/python3.7/site-packages/tensorflow/python/client/session.py", line 1429, in _call_tf_sessionrun
+run_metadata)
+tensorflow.python.framework.errors_impl.InvalidArgumentError: Retval[0] does not have value
+During handling of the above exception, another exception occurred:
+Traceback (most recent call last):
+File "/Users/georgestoica/Desktop/Research/new_exploration/src/qa_cpg/run_cpg_minimal.py", line 111, in 
+loss, _ = session.run((model.loss, model.train_op), feed_dict)
+File "/Users/georgestoica/Desktop/Research/venvs/rl_3.7/lib/python3.7/site-packages/tensorflow/python/client/session.py", line 950, in run
+run_metadata_ptr)
+File "/Users/georgestoica/Desktop/Research/venvs/rl_3.7/lib/python3.7/site-packages/tensorflow/python/client/session.py", line 1173, in _run
+feed_dict_tensor, options, run_metadata)
+File "/Users/georgestoica/Desktop/Research/venvs/rl_3.7/lib/python3.7/site-packages/tensorflow/python/client/session.py", line 1350, in _do_run
+run_metadata)
+File "/Users/georgestoica/Desktop/Research/venvs/rl_3.7/lib/python3.7/site-packages/tensorflow/python/client/session.py", line 1370, in _do_call
+raise type(e)(node_def, op, message)
+tensorflow.python.framework.errors_impl.InvalidArgumentError: Retval[0] does not have value
+	</description>
+	<comments>
+		<comment id='1' author='gstoica27' date='2019-09-23T05:29:30Z'>
+		&lt;denchmark-link:https://github.com/gstoica27&gt;@gstoica27&lt;/denchmark-link&gt;
+ ,
+Thank you for reporting the issue.
+Can you please provide code in any text-file with right indentation ?Thanks!
+		</comment>
+		<comment id='2' author='gstoica27' date='2019-09-23T15:50:40Z'>
+		Please use &lt;denchmark-link:https://guides.github.com/features/mastering-markdown/#&gt;proper markdown&lt;/denchmark-link&gt;
+ to format the code so that it is easier to read. Thanks.
+		</comment>
+		<comment id='3' author='gstoica27' date='2019-09-23T16:26:52Z'>
+		Hi, thanks for your responses and apologies for the code malformatting! I've just formatted the code according to &lt;denchmark-link:https://github.com/mihaimaruseac&gt;@mihaimaruseac&lt;/denchmark-link&gt;
+'s suggestions and added a txt file as per &lt;denchmark-link:https://github.com/oanush&gt;@oanush&lt;/denchmark-link&gt;
+ request.
+Hope this helps! Please let me know if there is anything I else I can/should provide. Thanks!
+		</comment>
+		<comment id='4' author='gstoica27' date='2019-09-25T09:15:44Z'>
+		Issue replicating for TF-&lt;denchmark-link:https://colab.sandbox.google.com/gist/oanush/f481f4351f8ab1b74a2ceaeba90b05b3/32720.ipynb&gt;1.15rc1&lt;/denchmark-link&gt;
+ and also TF-nightly-1.15,kindly find the gist of colab.Thanks!
+		</comment>
+		<comment id='5' author='gstoica27' date='2019-10-04T20:33:36Z'>
+		Following warning log can help understand the behaviour:
+WARNING:tensorflow:From &lt;ipython-input-1-227adad630b4&gt;:69: batch_normalization (from tensorflow.python.layers.normalization) is deprecated and will be removed in a future version.
+Instructions for updating:
+Use keras.layers.BatchNormalization instead.  In particular, `tf.control_dependencies(tf.GraphKeys.UPDATE_OPS)` should not be used (consult the `tf.keras.layers.batch_normalization` documentation).
+The script executes successfully if control dependencies are eliminated.
+		</comment>
+		<comment id='6' author='gstoica27' date='2019-10-05T16:01:52Z'>
+		I saw that warning at the time, but I understood that warning as stating "you shouldn't use tf.control_dependencies(...) with keras.layers.BatchNormalization", especially because the &lt;denchmark-link:https://www.tensorflow.org/versions/r1.14/api_docs/python/tf/layers/batch_normalization&gt;documentation&lt;/denchmark-link&gt;
+ on tf.layers.batch_normalization contains the starred section:
+
+Note: when training, the moving_mean and moving_variance need to be updated. By default the update ops are placed in tf.GraphKeys.UPDATE_OPS, so they need to be executed alongside the train_op. Also, be sure to add any batch_normalization ops before getting the update_ops collection. Otherwise, update_ops will be empty, and training/inference will not work properly.
+
+Is that warning overwriting the documentation, and instead stating to not use control dependencies for this tf.layers.batchnorm anymore?
+Thanks for the help!
+		</comment>
+		<comment id='7' author='gstoica27' date='2019-10-05T19:07:52Z'>
+		TensorFlow's default way of updating BatchNorm moving statistics by a collection, is known to cause various kind of bugs.
+By replacing your BatchNorm layer with &lt;denchmark-link:https://tensorpack.readthedocs.io/modules/models.html#tensorpack.models.BatchNorm&gt;tensorpack's BatchNorm layer&lt;/denchmark-link&gt;
+, your code can then run correctly. The diff is:
+70,72c70,71
+&lt;         output = tf.layers.batch_normalization(output, momentum=.1, reuse=tf.AUTO_REUSE,
+&lt;                                                training=is_train_batch_norm, fused=True,
+&lt;                                                name='DummyBatchNorm')
+---
+&gt;         from tensorpack.models import BatchNorm
+&gt;         output = BatchNorm('DummyBatchNorm', output, momentum=.1, ema_update='internal')
+93a93
+&gt;     from tensorpack.tfutils import TowerContext
+97c97
+&lt;         with tf.variable_scope('variables', use_resource=True):
+---
+&gt;         with TowerContext('', is_training=True), tf.variable_scope('variables', use_resource=True):
+		</comment>
+		<comment id='8' author='gstoica27' date='2020-06-02T18:54:49Z'>
+		Is this still an issue? Can you please test with latest version of TensorFlow 2.X and check if the issue exists.
+Thanks!
+		</comment>
+		<comment id='9' author='gstoica27' date='2020-06-09T19:34:35Z'>
+		This issue has been automatically marked as stale because it has not had recent activity. It will be closed if no further activity occurs. Thank you.
+		</comment>
+		<comment id='10' author='gstoica27' date='2020-06-16T20:09:21Z'>
+		Closing as stale. Please reopen if you'd like to work on this further.
+		</comment>
+		<comment id='11' author='gstoica27' date='2020-06-16T20:09:24Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/32720&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/32720&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

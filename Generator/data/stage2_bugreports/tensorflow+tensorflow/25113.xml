@@ -1,0 +1,199 @@
+<bug id='25113' author='liamuk' open_date='2019-01-22T19:22:13Z' closed_time='2019-07-31T22:09:21Z'>
+	<summary>Can't access resource variable using GetResourceFromContext in a custom op, probably because of binary incompatibility</summary>
+	<description>
+System information
+
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): OSX Mojave
+TensorFlow installed from (source or binary): binary
+TensorFlow version: 1.12.0
+Python version: 3.6
+Installed using virtualenv? pip? conda?: pip
+GCC/Compiler version (for custom op): g++ 4.2.1 Apple LLVM version 10.0.0 (clang-1000.11.45.5)
+
+Describe the problem
+When I try to use GetResourceFromContext with T being Var from a custom op, I get the following error InvalidArgumentError (see above for traceback): Trying to access resource using the wrong type. Expected N10tensorflow3VarE got N10tensorflow3VarE
+So it seems like the types match up, but for whatever reason the std::type_indexs generated from them don't? My hypothesis is it's because using std::type_index across a shared library is implementation defined behavior and the compiler does not produce the same std::type_index for the same type in both the custom op library and libtensorflow_framework.
+For context, I'm trying to get access to the resource's underlying tensor so that I can modify it.
+	</description>
+	<comments>
+		<comment id='1' author='liamuk' date='2019-02-15T00:05:22Z'>
+		&lt;denchmark-link:https://github.com/liamuk&gt;@liamuk&lt;/denchmark-link&gt;
+ Could you provide more details about the error and context? Thanks!
+		</comment>
+		<comment id='2' author='liamuk' date='2019-02-15T00:43:26Z'>
+		This bug is no longer relevant to me, and I don't have the original code that triggered it.
+You should be able to reproduce it, though, if you create a c++ custom op that takes an argument of type resource like how ResourceApplyGradientDescent in ops/training_ops.cc does, and then attempt to use GetResourceFromContext defined in framework/resource_mgr.h to access it from the op.
+The context is trying to write a custom op that manipulates the buffer underlying a resource variable.
+		</comment>
+		<comment id='3' author='liamuk' date='2019-07-29T18:50:22Z'>
+		Is this bug still an issue?
+		</comment>
+		<comment id='4' author='liamuk' date='2019-07-29T19:54:14Z'>
+		Not an issue for me personally bc I’m no longer working with custom ops.
+Not sure if it still exists in Tensorflow.
+		</comment>
+		<comment id='5' author='liamuk' date='2019-07-31T10:48:35Z'>
+		&lt;denchmark-link:https://github.com/liamuk&gt;@liamuk&lt;/denchmark-link&gt;
+ ,
+Can you confirm if we can proceed for closure?Thanks!
+		</comment>
+		<comment id='6' author='liamuk' date='2019-07-31T22:04:28Z'>
+		I don't mind if you close it.
+		</comment>
+		<comment id='7' author='liamuk' date='2019-07-31T22:09:21Z'>
+		I am closing this issue. If the issue persists with latest TF versions, please feel free to open the issue again. Thanks!
+		</comment>
+		<comment id='8' author='liamuk' date='2019-07-31T22:09:23Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=25113&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=25113&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='9' author='liamuk' date='2020-09-30T13:07:30Z'>
+		I am facing the same issue when trying to compile a custom op on Mac and on Windows (it works fine on Linux though), using Tensorflow 2.3. When running on Mac, I get the same error, i.e.:
+Trying to access resource using the wrong type. Expected N10tensorflow3VarE got N10tensorflow3VarE [Op:CustomOp]
+On Windows, the error is similar:
+Trying to access resource using the wrong type. Expected class tensorflow::Var got class tensorflow::Var [Op:CustomOp]
+On Linux, there is no error and the op works as expected.
+I think this issue is due to the use of an address of a static variable hash_bit in TypeIndex::Make&lt;T&gt; as a hash. When the shared library with the custom is compiled, it will have its own copy of TypeIndex::Make&lt;Var&gt;::hash_bit, so the hash codes for the same type (e.g. Var) will be different. I think it works on Linux because a STB_GNU_UNIQUE symbol is generated for hash_bit, so that there is only one definition of it (per type) in the whole process. Mac and Windows don't have this feature though.
+Is it possible to rewrite TypeIndex in a way that will make it work across shared libraries on all platforms? Or perhaps various instantiations of TypeIndex::Make&lt;T&gt; could be exported from tensorflow framework library?
+For some reason I cannot attach a zipped reproducer to this comment, so I will try pasting the code in a reply below.
+		</comment>
+		<comment id='10' author='liamuk' date='2020-09-30T13:12:55Z'>
+		Reproducer: a simple custom op to set a value of a variable.
+&lt;denchmark-code&gt;#define EIGEN_USE_THREADS
+
+#include "tensorflow/core/framework/op_kernel.h"
+#include "tensorflow/core/framework/resource_mgr.h"
+#include "tensorflow/core/framework/register_types.h"
+#include "tensorflow/core/framework/tensor.h"
+#include "tensorflow/core/framework/shape_inference.h"
+#include "tensorflow/core/platform/types.h"
+#include "tensorflow/core/kernels/training_op_helpers.h"
+
+using namespace tensorflow;
+
+
+template&lt;typename Device, typename T&gt;
+class CustomOp: public OpKernel {
+ public:
+  explicit CustomOp(OpKernelConstruction* c) : OpKernel(c) {
+    OP_REQUIRES_OK(c, c-&gt;GetAttr("use_locking", &amp;use_exclusive_lock_));
+  }
+
+  void Compute(OpKernelContext* c) override {
+    core::RefCountPtr&lt;Var&gt; v;
+    OP_REQUIRES_OK(c, LookupResource(c, HandleFromInput(c, 0), &amp;v));
+    OP_REQUIRES_OK(c, EnsureSparseVariableAccess&lt;Device, T&gt;(c, v.get()));
+    const Tensor&amp; value = c-&gt;input(1);
+    if (use_exclusive_lock_) {
+      mutex_lock lock(*v-&gt;mu());
+      DoCompute(c, *v-&gt;tensor(), value);
+    } else {
+      tf_shared_lock lock(*v-&gt;mu());
+      DoCompute(c, *v-&gt;tensor(), value);
+    }
+  }
+
+ private:
+  bool use_exclusive_lock_;
+
+  void DoCompute(OpKernelContext* c, Tensor&amp; v, const Tensor&amp; value) {
+    OP_REQUIRES(c, v.IsInitialized(),
+                errors::FailedPrecondition("Null ref for var"));
+    OP_REQUIRES(c, TensorShapeUtils::IsVector(v.shape()),
+                errors::InvalidArgument("var must be 1-D, got shape ",
+                                        v.shape().DebugString()));
+    OP_REQUIRES(c, TensorShapeUtils::IsScalar(value.shape()),
+                errors::InvalidArgument("value must be a scalar, got shape ",
+                                        value.shape().DebugString()));
+    if (!c-&gt;status().ok()) return;
+
+    T* data = v.flat&lt;T&gt;().data();
+    T set_to = *value.flat&lt;T&gt;().data(); 
+    for (size_t i = 0; i &lt; v.NumElements(); ++i) {
+      data[i] = set_to;
+    }
+  }
+};
+  
+
+#define REGISTER_CUSTOM_KERNEL(type, dev, name) \
+  REGISTER_KERNEL_BUILDER(Name(name) \
+                              .Device(DEVICE_##dev) \
+                              .HostMemory("var") \
+                              .TypeConstraint&lt;type&gt;("T"), \
+                          CustomOp&lt;dev##Device, type&gt;)
+                              
+#define REGISTER_CUSTOM_CPU(type) \
+  REGISTER_CUSTOM_KERNEL(type, CPU, "CustomOp");
+
+TF_CALL_REAL_NUMBER_TYPES(REGISTER_CUSTOM_CPU);
+
+#undef REGISTER_CUSTOM_CPU
+#undef REGISTER_CUSTOM_KERNEL
+
+REGISTER_OP("CustomOp")
+    .Input("var: resource")
+    .Input("value: T")
+    .Attr("T: type")
+    .Attr("use_locking: bool = true")
+    .SetShapeFn([](::tensorflow::shape_inference::InferenceContext* c) {
+      return Status::OK();
+    });
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='11' author='liamuk' date='2020-09-30T13:15:19Z'>
+		Reproducer: build scripts and Python test.
+Linux:
+&lt;denchmark-code&gt;#!/bin/sh
+TF_CFLAGS=( $(python3 -c 'import tensorflow as tf; print(" ".join(tf.sysconfig.get_compile_flags()))') )
+TF_LFLAGS=( $(python3 -c 'import tensorflow as tf; print(" ".join(tf.sysconfig.get_link_flags()))') )
+
+g++ -shared -O2 -std=c++11 -fPIC -o custom_op.so custom_op.cpp ${TF_CFLAGS[@]} ${TF_LFLAGS[@]}
+&lt;/denchmark-code&gt;
+
+Mac:
+&lt;denchmark-code&gt;#!/bin/sh
+TF_CFLAGS=( $(python3 -c 'import tensorflow as tf; print(" ".join(tf.sysconfig.get_compile_flags()))') )
+TF_LFLAGS=( $(python3 -c 'import tensorflow as tf; print(" ".join(tf.sysconfig.get_link_flags()))') )
+
+g++ -shared -O2 -std=c++11 -fPIC -o custom_op.dylib custom_op.cpp ${TF_CFLAGS[@]} ${TF_LFLAGS[@]}
+&lt;/denchmark-code&gt;
+
+Windows:
+&lt;denchmark-code&gt;set TF_CFLAGS=/Ic:\\Python\\lib\\site-packages\\tensorflow\\include
+set TF_LFLAGS=/LIBPATH:c:\\Python\\lib\\site-packages\\tensorflow\\python _pywrap_tensorflow_internal.lib
+
+cl /LD /O2 /EHsc /MD /DNOMINMAX /wd4624 /Fecustom_op.dll custom_op.cpp %TF_CFLAGS% /link %TF_LFLAGS%
+&lt;/denchmark-code&gt;
+
+Python test:
+&lt;denchmark-code&gt;import sys
+import tensorflow as tf
+
+if sys.platform == 'win32':
+    custom_module = tf.load_op_library('custom_op.dll')
+elif sys.platform == 'darwin':
+    custom_module = tf.load_op_library('custom_op.dylib')
+else:
+    custom_module = tf.load_op_library('custom_op.so')
+
+def custom_op(var, value, use_locking=True, name=None):
+    custom_module.custom_op(var.handle, value, use_locking=use_locking, name=name)
+
+v = tf.Variable([1.0, 2.0, 3.0])
+print(v)
+custom_op(v, 2.22)
+print(v)
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='12' author='liamuk' date='2020-10-21T16:18:54Z'>
+		Since the is no activity here, I submitted a new bug report &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/44209&gt;#44209&lt;/denchmark-link&gt;
+.
+		</comment>
+	</comments>
+</bug>

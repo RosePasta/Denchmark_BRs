@@ -1,0 +1,188 @@
+<bug id='34008' author='ywpkwon' open_date='2019-11-05T12:03:51Z' closed_time='2020-01-30T23:25:34Z'>
+	<summary>Why computation time increases proportionally when using more GPUs (mirror strategy)?</summary>
+	<description>
+System
+
+Ubuntu 16.04, python 3.6, Tensorflow 2.1.0-dev20191103 (binary),
+CUDA 10.0, cuDNN 7.6.4
+4 x GPU NVIDIA Titan X 12GB
+
+I expected a similar computation time of each training step as I increase the # of GPUs thanks to parallelism (or slight increase due to possible overhead). However, I'm getting a proportional increase as if they run serially. Why am I not getting the advantage of parallelism here? Any advice, please?
+Note that
+
+I checked "per-replica" input and outputs are the same across those situations.
+I'm repeating the same dummy data here, so I don't think it's a data pipeline-related issue.
+Although I posted this question in stackoverflow, too, I post here since I'm not sure if this is a misuse or a bug.
+
+The result looks like:
+$ CUDA_VISIBLE_DEVICES=0 python train_v2_multi_example.py
+...
+Ep 01/100 | step 02 | 0.473 sec/step | loss: 46485.430
+Ep 01/100 | step 03 | 0.482 sec/step | loss: 9216.726
+
+$ CUDA_VISIBLE_DEVICES=0,1 python train_v2_multi_example.py
+...
+Ep 01/100 | step 02 | 1.141 sec/step | loss: 22627.699
+Ep 01/100 | step 03 | 1.091 sec/step | loss: 11679.490
+
+$ CUDA_VISIBLE_DEVICES=0,1,2 python train_v2_multi_example.py
+...
+Ep 01/100 | step 02 | 1.408 sec/step | loss: 32166.996
+Ep 01/100 | step 03 | 1.380 sec/step | loss: 14036.578
+Code is as follows:
+from __future__ import absolute_import, division, print_function, unicode_literals
+import os, time, sys, numpy as np
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras.layers import (Conv2D, Conv3D, Dense)
+
+
+@tf.function
+def loss_fn(y_pred, y_true):
+    return tf.reduce_mean(tf.math.square(y_pred - y_true))
+
+@tf.function
+def train_step(dist_inputs):
+    def step_fn(inputs):
+        inputs, labels = inputs
+
+        # tf.print("in", tf.shape(inputs), "out", tf.shape(labels), output_stream=sys.stdout)
+        with tf.GradientTape() as tape:
+            out = model(inputs)
+            loss_value = loss_fn(out, labels)
+        grads = tape.gradient(loss_value, model.trainable_weights)
+        optimizer.apply_gradients(zip(grads, model.trainable_weights))
+        return loss_value
+
+    per_example_losses = strategy.experimental_run_v2(step_fn, args=(dist_inputs,))
+    mean_loss = strategy.reduce(tf.distribute.ReduceOp.MEAN, per_example_losses, axis=None)
+    return mean_loss
+
+
+if __name__ == "__main__":
+
+    BATCH_SIZE_PER_SYNC = 4
+    logdir = os.path.join('logs/test')
+    strategy = tf.distribute.MirroredStrategy()
+    num_gpus = strategy.num_replicas_in_sync
+    global_batch_size = BATCH_SIZE_PER_SYNC * num_gpus
+    print('num GPUs: {}, global batch size: {}'.format(num_gpus, global_batch_size))
+
+    # fake data ------------------------------------------------------
+    fakea = np.random.rand(global_batch_size, 10, 200, 200, 128).astype(np.float32)
+    targets = np.random.rand(global_batch_size, 200, 200, 14)
+
+    # tf.Dataset ------------------------------------------------------
+    def gen():
+        while True:
+            yield (fakea, targets)
+
+    dataset = tf.data.Dataset.from_generator(gen,
+        (tf.float32, tf.float32),
+        (tf.TensorShape(fakea.shape), tf.TensorShape(targets.shape)))
+
+    dataset = dataset.prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
+    dist_dataset = strategy.experimental_distribute_dataset(dataset)
+
+    # Model ------------------------------------------------------
+    training = True
+    with strategy.scope():
+        # Model
+        va = keras.Input(shape=(10, 200, 200, 128), dtype=tf.float32, name='va')
+        x = Conv3D(64, kernel_size=3, strides=1, padding='same')(va)
+        x = Conv3D(64, kernel_size=3, strides=1, padding='same')(x)
+        x = Conv3D(64, kernel_size=3, strides=1, padding='same')(x)
+        x = tf.reduce_max(x, axis=1, name='maxpool')  # [ΣK, 128]
+        b = Conv2D(14, kernel_size=3, padding='same')(x)
+        model = keras.Model(inputs=va, outputs=b, name='net')
+        optimizer = keras.optimizers.RMSprop()
+    model.summary()
+
+    # TRAIN ---------------------------------------------------------
+    writer = tf.summary.create_file_writer(logdir)
+
+    num_steps = 100
+    num_epoches = 100
+    global_step = 0
+
+    with strategy.scope():
+        iterator = iter(dist_dataset)
+        with writer.as_default():
+            for epoch in range(num_epoches):
+                for step in range(num_steps):
+
+                    if global_step == 0 or 5 &lt; global_step &lt; 8:
+                        tf.summary.trace_on(graph=True, profiler=True)
+
+                    start = time.time()
+                    loss_value = train_step(next(iterator))
+                    duration = time.time() - start
+
+                    prefix = 'Ep {:02d}/{:02d} | step {:02d} '.format(epoch + 1, num_epoches, step)
+                    suffix = '| {:.3f} sec/step | loss: {:.3f} '.format(duration, float(loss_value))
+                    print(prefix + suffix)
+
+                    tf.summary.scalar("loss", loss_value, step=global_step)
+
+                    if global_step == 0 or 5 &lt; global_step &lt; 8:
+                        tf.summary.trace_export(name="model_trace", step=global_step, profiler_outdir=logdir)
+                    writer.flush()
+                    global_step += 1
+	</description>
+	<comments>
+		<comment id='1' author='ywpkwon' date='2019-11-05T15:57:26Z'>
+		&lt;denchmark-link:https://github.com/ywpkwon&gt;@ywpkwon&lt;/denchmark-link&gt;
+ I also observed a significant overhead in the communication between GPUs when using GradientTape (the overhead is negligible when using Keras' ). However, if you compute the loss correctly, then you should observe that multi-GPUs converges faster because it processes more images than single GPU training in the same number of steps.
+		</comment>
+		<comment id='2' author='ywpkwon' date='2019-11-05T20:51:51Z'>
+		&lt;denchmark-link:https://github.com/netw0rkf10w&gt;@netw0rkf10w&lt;/denchmark-link&gt;
+ Thanks for your response. It's good to know that it isn't only my experience. (Because I did a test with an official(?) MNIST example with  method and the parallelism worked well, I was planning to check a  version of this example.)
+Anyway then, what makes the .fit() method special? Simply saying, isn't it just a nicer wrapper of a training loop, but still based on the GradientTape and its source scripts are open? Shouldn't we be able to borrow the trick/secret that makes parallelism work correctly?  I'm so cuious.
+		</comment>
+		<comment id='3' author='ywpkwon' date='2019-11-05T21:17:36Z'>
+		&lt;denchmark-link:https://github.com/ywpkwon&gt;@ywpkwon&lt;/denchmark-link&gt;
+ Keras  is highly optimized. I spent a lot of time over the last weeks optimizing my custom training loop but I was never able to reach  performance (mine was about 1.2-1.3 times slower). And this is only for multi-GPU training because for single-GPU I observed similar performance between the two. I guess the issue has to do with  (note the  prefix).
+I don't know exactly what makes .fit() that efficient, maybe somebody here could help.
+		</comment>
+		<comment id='4' author='ywpkwon' date='2019-11-07T02:31:56Z'>
+		What I said above, "for single-GPU I observed similar performance", is not true!!
+I've just tested my code on a different dataset (Coco segmentation, previous was Oxford Pet), and even for single-GPU training, GradientTape is 1.7-1.8 times slower than .fit().
+Keras .fit() is &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/33988&gt;unusable with custom loss functions&lt;/denchmark-link&gt;
+, while GradientTape is too slow. I am fucked up for the next deadline. BIG mistake choosing TensorFlow for the work (I was too excited by the release). I should have realized that this "stable" release was pushed by the timing of the TensorFlow World conference...
+		</comment>
+		<comment id='5' author='ywpkwon' date='2019-11-11T01:03:52Z'>
+		For the original scaling issue with multi-gpu, few things to check/try out:
+
+is the GPU saturated in the one GPU case? or are you able to increase the batch size and get better performance? I am wondering if the batch size is too small/step time too small. In such cases, sometimes the overhead of synchronization across GPUs can be large. So try increasing the batch size and see what happens?
+input pipeline: even with a synthetic input pipeline, there can be overhead of copying the data to the GPU. I see you're using a generator, I am not sure of the performance implications of that. Can you instead simply use tf.data.Dataset.from_tensor_slices() followed by dataset.repeat() to create your dataset?
+Can you provide us with profiles? I see you already have the code to do the profiling                      tf.summary.trace_on(graph=True, profiler=True) etc. Here is some information on how to get and use profiling in TF: https://www.tensorflow.org/tensorboard/tensorboard_profiling_keras.
+
+Re: the questions re: .fit() vs GradientTape, .fit() does use &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/1d3db869f9154b537a5bfedc2c01eadbb167919b/tensorflow/python/keras/engine/training_eager.py#L245&gt;GradientTape&lt;/denchmark-link&gt;
+. .fit() also uses the same tf.distribute APIs that you use in your code above (experimental_run_v2, as well as experimental_distribute_dataset).
+So none of these are fundamental reasons why custom training loop should be slower. In fact, in general we are able to make it as fast or better than fit() as you can customize it much more.
+But of course there could very well be inefficiencies in any custom code, that could cause it to be slower. I don't think there is any fundamental reason it should be. (And of course entire tensorflow is open source so you can definitely look at the .fit() implementation).
+		</comment>
+		<comment id='6' author='ywpkwon' date='2019-11-11T21:12:53Z'>
+		&lt;denchmark-link:https://github.com/guptapriya&gt;@guptapriya&lt;/denchmark-link&gt;
+ Thanks for the detailed reply. In two weeks I'll create a small benchmark for comparing GradientTape and .fit().
+		</comment>
+		<comment id='7' author='ywpkwon' date='2019-11-11T21:52:03Z'>
+		&lt;denchmark-link:https://github.com/guptapriya&gt;@guptapriya&lt;/denchmark-link&gt;
+ Thanks for the reply. I'll investigate more. Really good to know that  has nothing special as I initially guessed.  &lt;denchmark-link:https://github.com/netw0rkf10w&gt;@netw0rkf10w&lt;/denchmark-link&gt;
+ Once you create a small benchmark, could you also include/tag me? I'm so curious.
+		</comment>
+		<comment id='8' author='ywpkwon' date='2020-01-09T12:35:14Z'>
+		It has been 30 days with no activity and the awaiting response label was assigned. Is this still an issue?
+		</comment>
+		<comment id='9' author='ywpkwon' date='2020-01-30T23:25:33Z'>
+		Automatically closing due to lack of recent activity. Please update the issue when new information becomes available, and we will reopen the issue. Thanks!
+		</comment>
+		<comment id='10' author='ywpkwon' date='2020-01-30T23:25:35Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/34008&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/34008&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

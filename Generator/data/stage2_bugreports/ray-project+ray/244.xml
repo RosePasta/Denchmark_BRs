@@ -1,0 +1,65 @@
+<bug id='244' author='stephanie-wang' open_date='2017-02-03T00:36:17Z' closed_time='2020-01-15T23:58:10Z'>
+	<summary>Recursive reconstruction for dependencies on `ray.put`.</summary>
+	<description>
+Similar to the deadlock described in &lt;denchmark-link:https://github.com/ray-project/ray/issues/231&gt;#231&lt;/denchmark-link&gt;
+, we can get a deadlock when reconstructing an object that was created by .
+# Define a task with a single dependency, which returns its one argument.
+@ray.remote
+def single_dependency(arg):
+  return arg
+
+@ray.remote
+def root_task(size):
+  # Do the initial put.
+  array = np.zeros(size)
+  arg = ray.put(array)
+
+  # Launch num_objects instances of the remote task, each dependent on the
+  # one before it.
+  args = []
+  for i in range(num_objects):
+    arg = single_dependency.remote(arg)
+    args.append(arg)
+
+  # Get each value to force each task to finish. After some number of gets,
+  # old values should be evicted.
+  for i in range(num_objects):
+    value = ray.get(args[i])
+  # Get each value again to force reconstruction.
+  for i in range(num_objects):
+    value = ray.get(args[i])
+
+ray.get(root_task.remote(size))
+We hang when trying to reconstruct because each time we lose the initial argument and try to reconstruct it, we will submit another instance of root_task, and eventually we will run out of workers. If we reconstruct naively, this becomes a workload with infinite recursion depth, which means that this problem cannot be solved by starting workers alone.
+A possible solution is to spill over certain values (e.g., the initial ray.put) to disk.
+	</description>
+	<comments>
+		<comment id='1' author='stephanie-wang' date='2017-02-04T02:29:28Z'>
+		This is a great point. The assumption is that all the data from the task doesn't fit in the object store, right? In situations where we have plenty of memory and reconstruction is only being triggered due to node failures, this example should work, right?
+In the case where things don't fit in memory, it'll be tough to handle this example correctly. Spilling over to disk would extend the range of situations that get handled appropriately, but we could come up with workloads where that wouldn't save us.
+Btw, I think the same problem is present even without the initial ray.put. if you just did arg = array, then the first time you called single_dependency.remote(arg), ray.put would be called under the hood on the argument (this happens for basically all large or complicated arguments).
+		</comment>
+		<comment id='2' author='stephanie-wang' date='2017-06-13T17:15:40Z'>
+		Are there proposals for solving this issue? Have you considered adding tracing to the object store to detect repeated evictions and return an error? Have you considered adding user-controlled pinning to prevent the object store from evicting data?
+		</comment>
+		<comment id='3' author='stephanie-wang' date='2017-06-13T18:16:07Z'>
+		We haven't seen this problem occur in practice, so we haven't prioritized it a huge amount.
+I'd eventually like to have ways to give hints to the object store about which objects won't be needed anymore and which ones will. For object's that contain numpy arrays, it's already sort of possible to prevent an object from being evicted by calling x = ray.get(x_id) on the object ID. As long as x is in scope, the object won't be evicted from the local object store (because the numpy arrays are backed by shared memory in the object store). However, I wouldn't want people to rely on that implementation detail.
+Detecting repeated evictions and acting based on that is definitely doable. It'd require some thought about which component would be responsible for doing that.
+As for concrete proposals, we'd like to be able to diagnose precisely when this is happening and make that information available to the user (this may be doable with a count of how many times each object has been reconstructed).
+		</comment>
+		<comment id='4' author='stephanie-wang' date='2018-01-18T22:44:26Z'>
+		Here is a solution that &lt;denchmark-link:https://github.com/pcmoritz&gt;@pcmoritz&lt;/denchmark-link&gt;
+ and I discussed that we think will cover this case as long as a task's  objects fit in the object store.
+The key issue is that by having a task do a ray.put, and then calling ray.get on other tasks that are dependent on the put value, we create a cyclic dependency. The caller waits on the return values of the other tasks, but the other tasks wait on the object that was put by the caller. If we lose that object but the caller is still waiting on the other tasks in a ray.get, then we will deadlock because we can't re-execute the caller.
+We can avoid deadlock by ensuring that the object is available when the other tasks execute. We can do this by having the caller pin the object to its local object store. It's okay if that node dies, because then we will lose both the object and the caller, so we can simply re-execute the caller to reconstruct the object. If it's an option, we can also "pin" the object by replicating it to another node or writing it to disk, in case there's not enough memory in the local store.
+Another option that is more radical is to break the cycle completely by splitting the caller into two tasks, one which returns the values that it called ray.put on and another that is the continuation. This would require us to introspect and mutate application code, and it's unlikely that we'll cover all cases in Python.
+		</comment>
+		<comment id='5' author='stephanie-wang' date='2018-01-18T22:54:34Z'>
+		The first solution (pinning) makes sense. In that case we should consider enhancing the plasma API to support this kind of thing so we don't have to keep creating dummy numpy arrays.
+		</comment>
+		<comment id='6' author='stephanie-wang' date='2018-02-25T02:09:33Z'>
+		Pinning the puts in the object store of the local node makes sense to me. Implementation wise,  I assume this means that when  a task puts an object, we record this so that we remember to add the object entry to the gcs when the task finishes and then unpin the object.
+		</comment>
+	</comments>
+</bug>

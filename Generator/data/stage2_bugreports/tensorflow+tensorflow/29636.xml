@@ -1,0 +1,269 @@
+<bug id='29636' author='EmielBoss' open_date='2019-06-11T10:36:50Z' closed_time='2020-01-10T22:07:04Z'>
+	<summary>Can't call tf.contrib.layers.group_norm() due to supplying a DeferredTensor instead of (Eager)Tensor during eager execution.</summary>
+	<description>
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): yes
+OS Platform and Distribution: Linux Ubuntu 16.04
+TensorFlow installed from (source or binary): binary
+TensorFlow version (use command below): 1.12
+Python version: 3.5
+CUDA/cuDNN version: V8.0.61
+GPU model and memory: Tesla P100-PCIE, 12193MiB
+
+Describe the current behavior
+I run the following snippet of code in eager execution:
+&lt;denchmark-code&gt;tensor = tf.keras.layers.Conv2D(128, (3, 3), padding='same')(tensor)
+tensor = tf.contrib.layers.group_norm(tensor)
+&lt;/denchmark-code&gt;
+
+However, the call to tf.contrib.layers.group_norm(tensor) gives me the following error:
+&lt;denchmark-code&gt;ValueError: Attempt to convert a value (&lt;DeferredTensor 'None' shape=(?, 16, 16, 128) dtype=float32&gt;) with an unsupported type (&lt;class 'tensorflow.python.keras.engine.base_layer.DeferredTensor'&gt;) to a Tensor.
+&lt;/denchmark-code&gt;
+
+Also, I am not able to find any documentation on DeferredTensors whatsoever. Can anyone link me to some?
+Describe the expected behavior
+A possible conversion from the DeferredTensor to a Tensor or EagerTensor, or alternatively to perform group normalization in another way.
+Code to reproduce the issue
+&lt;denchmark-code&gt;from __future__ import absolute_import, division, print_function
+import tensorflow as tf
+import numpy as np
+import sys
+import os
+import cv2
+import json
+from sklearn.metrics import confusion_matrix
+
+ORIGINAL_WIDTH = 4608
+ORIGINAL_HEIGHT = 4608
+SCALED_WIDTH = 512
+SCALED_HEIGHT = 512
+
+tf.enable_eager_execution()
+
+def identity_block(input_tensor, kernel_size, filters, stage, block):
+    filters1, filters2, filters3 = filters
+    conv_name_base = 'res' + str(stage) + block + '_branch'
+    bn_name_base = 'bn' + str(stage) + block + '_branch'
+
+    x = tf.keras.layers.Conv2D(filters1, (1, 1), name=conv_name_base + '2a')(input_tensor)
+    x = tf.keras.layers.BatchNormalization(axis=3, name=bn_name_base + '2a')(x)
+    x = tf.keras.layers.Activation('relu')(x)
+
+    x = tf.keras.layers.Conv2D(filters2, kernel_size, padding='same', name=conv_name_base + '2b')(x)
+    x = tf.keras.layers.BatchNormalization(axis=3, name=bn_name_base + '2b')(x)
+    x = tf.keras.layers.Activation('relu')(x)
+
+    x = tf.keras.layers.Conv2D(filters3, (1, 1), name=conv_name_base + '2c')(x)
+    x = tf.keras.layers.BatchNormalization(axis=3, name=bn_name_base + '2c')(x)
+
+    x = tf.keras.layers.add([x, input_tensor])
+    x = tf.keras.layers.Activation('relu')(x)
+    return x
+
+def conv_block(input_tensor, kernel_size, filters, stage, block, strides=(2,2)):
+
+    filters1, filters2, filters3 = filters
+    conv_name_base = 'res' + str(stage) + block + '_branch'
+    bn_name_base = 'bn' + str(stage) + block + '_branch'
+    x = tf.keras.layers.Conv2D(filters1, (1, 1), strides=strides, name=conv_name_base + '2a')(input_tensor)
+    x = tf.keras.layers.BatchNormalization(axis=3, name=bn_name_base + '2a')(x)
+    x = tf.keras.layers.Activation('relu')(x)
+
+    x = tf.keras.layers.Conv2D(filters2, kernel_size, padding='same', name=conv_name_base + '2b')(x)
+    x = tf.keras.layers.BatchNormalization(axis=3, name=bn_name_base + '2b')(x)
+    x = tf.keras.layers.Activation('relu')(x)
+
+    x = tf.keras.layers.Conv2D(filters3, (1, 1), name=conv_name_base + '2c')(x)
+    x = tf.keras.layers.BatchNormalization(axis=3, name=bn_name_base + '2c')(x)
+
+    shortcut = tf.keras.layers.Conv2D(filters3, (1, 1), strides=strides, name=conv_name_base + '1')(input_tensor)
+    shortcut = tf.keras.layers.BatchNormalization(axis=3, name=bn_name_base + '1')(shortcut)
+
+    x = tf.keras.layers.add([x, shortcut])
+    x = tf.keras.layers.Activation('relu')(x)
+    return x
+
+def get_fpn(num_channels=3):
+
+    input = tf.keras.Input(shape=(SCALED_HEIGHT, SCALED_WIDTH, num_channels))
+    x = tf.keras.layers.Conv2D(64, (7, 7), strides=(2, 2), padding='same', name='conv1')(input)
+    x = tf.keras.layers.BatchNormalization(axis=3, name='bn_conv1')(x)
+    x = tf.keras.layers.Activation('relu')(x)
+    x = tf.keras.layers.MaxPooling2D((3, 3), strides=(2, 2), padding='same')(x)
+    x = conv_block(x, 3, [64, 64, 256], stage=2, block='a', strides=(1, 1))
+    x = identity_block(x, 3, [64, 64, 256], stage=2, block='b')
+    bottomup_xl = identity_block(x, 3, [64, 64, 256], stage=2, block='c') # (?, 127, 127, 256)
+
+    x = conv_block(bottomup_xl, 3, [128, 128, 512], stage=3, block='a')
+    x = identity_block(x, 3, [128, 128, 512], stage=3, block='b')
+    x = identity_block(x, 3, [128, 128, 512], stage=3, block='c')
+    bottomup_l = identity_block(x, 3, [128, 128, 512], stage=3, block='d') # (?, 64, 64, 512)
+
+    x = conv_block(bottomup_l, 3, [256, 256, 1024], stage=4, block='a')
+    x = identity_block(x, 3, [256, 256, 1024], stage=4, block='b')
+    x = identity_block(x, 3, [256, 256, 1024], stage=4, block='c')
+    x = identity_block(x, 3, [256, 256, 1024], stage=4, block='d')
+    x = identity_block(x, 3, [256, 256, 1024], stage=4, block='e')
+    bottomup_m = identity_block(x, 3, [256, 256, 1024], stage=4, block='f') # (?, 32, 32, 1024)
+
+    x = conv_block(bottomup_m, 3, [512, 512, 2048], stage=5, block='a')
+    x = identity_block(x, 3, [512, 512, 2048], stage=5, block='b')
+    bottomup_s = identity_block(x, 3, [512, 512, 2048], stage=5, block='c') # (?, 16, 16, 2048)
+
+    topdown_s = tf.keras.layers.Conv2D(1024, (1, 1), padding='same')(bottomup_s)
+    x = tf.keras.layers.UpSampling2D(size=(2,2))(topdown_s)
+    #x = tf.image.resize_images(topdown_s, (topdown_s.shape[1] * 2, topdown_s.shape[2] * 2), method=tf.image.ResizeMethod.NEAREST_NEIGHBOR)
+    #x = tf.convert_to_tensor(cv2.resize(np.array(topdown_s), dsize=None, fx=2, fy=2, interpolation=cv2.INTER_NEAREST))
+    topdown_m = tf.keras.layers.add([x, tf.keras.layers.Conv2D(1024, (1, 1), padding='same')(bottomup_m)])
+
+    x = tf.keras.layers.UpSampling2D(size=(2, 2))(topdown_m)
+    topdown_l = tf.keras.layers.add([x, tf.keras.layers.Conv2D(1024, (1, 1), padding='same')(bottomup_l)])
+    x = tf.keras.layers.UpSampling2D(size=(2, 2))(topdown_l)
+    topdown_xl = tf.keras.layers.add([x, tf.keras.layers.Conv2D(1024, (1, 1), padding='same')(bottomup_xl)])
+
+    pyramid_s = tf.keras.layers.Conv2D(256, (3, 3), padding='same')(topdown_s)
+    pyramid_m = tf.keras.layers.Conv2D(256, (3, 3), padding='same')(topdown_m)
+    pyramid_l = tf.keras.layers.Conv2D(256, (3, 3), padding='same')(topdown_l)
+    pyramid_xl = tf.keras.layers.Conv2D(256, (3, 3), padding='same')(topdown_xl)
+
+    # extra_channels = num_channels - 3
+    # paddings = tf.constant([[0, 0, ], [0, 0], [0, extra_channels], [0, 0]])
+    # weights[0] = tf.pad(weights[0], paddings, mode='REFLECT')
+    # model.set_weights(weights[:36])
+    return tf.keras.Model(input, [pyramid_s, pyramid_m, pyramid_l, pyramid_xl])
+
+def get_semantic_fpn(num_channels=3):
+    def upsample(tensor, repetitions):
+        print(tf.executing_eagerly())
+        if repetitions == 0:
+            tensor = tf.keras.layers.Conv2D(128, (3, 3), padding='same')(tensor)
+            tensor = tf.contrib.layers.group_norm(tensor) # Problematic line
+            return tf.keras.layers.ReLU()(tensor)
+        for _ in range(repetitions):
+            tensor = tf.keras.layers.Conv2D(128, (3, 3), padding='same')(tensor)
+            tensor = tf.contrib.layers.group_norm(tensor) # Problematic line
+            tensor = tf.keras.layers.ReLU()(tensor)
+            tensor = tf.image.resize_images(tensor, (tensor.shape[1] * 2, tensor.shape[2] * 2))
+        return tensor
+
+    input = tf.keras.Input(shape=(SCALED_HEIGHT, SCALED_WIDTH, num_channels))
+    fpn = get_fpn(num_channels)
+    pyramid_s, pyramid_m, pyramid_l, pyramid_xl = fpn(input)
+    from_s = upsample(pyramid_s, 3)
+    from_m = upsample(pyramid_m, 2)
+    from_l = upsample(pyramid_l, 1)
+    from_xl = upsample(pyramid_xl, 0)
+
+    x = tf.keras.layers.add([from_s, from_m, from_l, from_xl])
+    x = tf.keras.layers.Conv2D(NUM_LABELS, (1, 1), padding='same')(x)
+    output = tf.image.resize_images(x, (x.shape[1] * 4, x.shape[2] * 4))
+    return tf.keras.Model(input, output)
+
+model = get_semantic_fpn()
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='EmielBoss' date='2019-06-17T09:45:34Z'>
+		me too. It looks like that this op can run on CPU but not GPU for the recent version no matter in eager mode or not.
+		</comment>
+		<comment id='2' author='EmielBoss' date='2019-06-18T08:48:14Z'>
+		&lt;denchmark-link:https://github.com/MaeThird&gt;@MaeThird&lt;/denchmark-link&gt;
+ What version are you running?
+		</comment>
+		<comment id='3' author='EmielBoss' date='2019-06-18T12:27:40Z'>
+		&lt;denchmark-link:https://github.com/EmielBoss&gt;@EmielBoss&lt;/denchmark-link&gt;
+ Please help us to reproduce the issue, we see some undefined entities like conv_block, identity_block. Thanks!
+		</comment>
+		<comment id='4' author='EmielBoss' date='2019-06-18T14:30:39Z'>
+		&lt;denchmark-link:https://github.com/EmielBoss&gt;@EmielBoss&lt;/denchmark-link&gt;
+ tf-1.13.1 installed from binary with python-3.6
+		</comment>
+		<comment id='5' author='EmielBoss' date='2019-06-18T14:35:38Z'>
+		&lt;denchmark-link:https://github.com/gadagashwini&gt;@gadagashwini&lt;/denchmark-link&gt;
+ Apologies, I forgot about those and they've been added. I didn't think it would matter much, since I would assume 's output would always be of the same type, but that's probably incorrect.
+		</comment>
+		<comment id='6' author='EmielBoss' date='2019-06-19T08:24:43Z'>
+		&lt;denchmark-code&gt;import tensorflow as tf
+slim = tf.contrib.slim
+
+def test():
+    x = tf.placeholder(dtype=tf.float32,shape=[None,112,112,3])
+    net = slim.conv2d(x,32,[3,3])
+    out = tf.contrib.layers.group_norm(net,groups=4)
+
+    sess = tf.Session()
+    sess.run(tf.global_variables_initializer())
+    sess.run(tf.local_variables_initializer())
+
+    import numpy as np
+    inputs = np.random.rand(2,112,112,3)
+
+    print(sess.run(out,feed_dict={x:inputs}))
+
+
+if __name__ == "__main__":
+    test()
+&lt;/denchmark-code&gt;
+
+Try out this snippets with log out like this TypeError: Failed to convert object of type &lt;class 'list'&gt; to Tensor. Contents: [None, 112, 112, 4, 8]. Consider casting elements to a supported type.
+		</comment>
+		<comment id='7' author='EmielBoss' date='2019-06-19T10:44:38Z'>
+		&lt;denchmark-link:https://github.com/EmielBoss&gt;@EmielBoss&lt;/denchmark-link&gt;
+ I tried reproducing issue with above code but i got this NameError: name 'SCALED_HEIGHT' is not defined. Please help us to reproduce the issue. Thanks!
+		</comment>
+		<comment id='8' author='EmielBoss' date='2019-06-19T10:46:08Z'>
+		
+import tensorflow as tf
+slim = tf.contrib.slim
+
+def test():
+    x = tf.placeholder(dtype=tf.float32,shape=[None,112,112,3])
+    net = slim.conv2d(x,32,[3,3])
+    out = tf.contrib.layers.group_norm(net,groups=4)
+
+    sess = tf.Session()
+    sess.run(tf.global_variables_initializer())
+    sess.run(tf.local_variables_initializer())
+
+    import numpy as np
+    inputs = np.random.rand(2,112,112,3)
+
+    print(sess.run(out,feed_dict={x:inputs}))
+
+
+if __name__ == "__main__":
+    test()
+
+Try out this snippets with log out like this TypeError: Failed to convert object of type &lt;class 'list'&gt; to Tensor. Contents: [None, 112, 112, 4, 8]. Consider casting elements to a supported type.
+
+&lt;denchmark-link:https://github.com/MaeThird&gt;@MaeThird&lt;/denchmark-link&gt;
+ Can you please post a new issue by providing the information asked by the template?
+The reason for this is we can focus on your specific configuration and problem since the root cause can be unrelated even though the error messages are similar. Thanks!
+		</comment>
+		<comment id='9' author='EmielBoss' date='2019-06-19T11:49:26Z'>
+		&lt;denchmark-link:https://github.com/gadagashwini&gt;@gadagashwini&lt;/denchmark-link&gt;
+ &lt;denchmark-link:29961&gt;issues&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='10' author='EmielBoss' date='2019-06-20T09:26:41Z'>
+		&lt;denchmark-link:https://github.com/gadagashwini&gt;@gadagashwini&lt;/denchmark-link&gt;
+ Gee, that's embarrassing. I checked if I could run that code in isolation without any (other) issues, but of course I was still importing my own ... A thousand apologies! The code should now work out-of-the-box.
+		</comment>
+		<comment id='11' author='EmielBoss' date='2019-06-20T11:33:48Z'>
+		&lt;denchmark-link:https://github.com/EmielBoss&gt;@EmielBoss&lt;/denchmark-link&gt;
+ Now I am able to reproduce the issue on colab with Tf 1.12.0
+		</comment>
+		<comment id='12' author='EmielBoss' date='2020-01-09T22:35:02Z'>
+		Apologies for the delay in response. This  executes successfully with TF 1.15. Thanks!
+		</comment>
+		<comment id='13' author='EmielBoss' date='2020-01-10T22:07:06Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/29636&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/29636&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

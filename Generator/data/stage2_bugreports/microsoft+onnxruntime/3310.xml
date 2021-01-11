@@ -1,0 +1,428 @@
+<bug id='3310' author='addisonklinke' open_date='2020-03-24T20:29:01Z' closed_time='2020-04-21T05:04:49Z'>
+	<summary>Outputs from C/Python APIs don't match - how to properly load image data?</summary>
+	<description>
+Describe the bug
+Using a simple model with only one convolution operation, I am able to get the same inference results using PyTorch and ONNX Runtime's Python API. However, when I load the same image for inference with your C API, I cannot get the same results despite (as far as I can tell) passing the exact same pixel values to the model
+This seems similar to &lt;denchmark-link:https://github.com/microsoft/onnxruntime/issues/1204&gt;#1204&lt;/denchmark-link&gt;
+, but unfortunately the only proposed solution was proper normalizing. In my case, the normalization is explicitly controlled in both the Python and C APIs and can be shown to produce identical pixel values prior to feeding the model
+Urgency
+None
+System information
+
+OS Platform and Distribution: Linux Ubuntu 18.04
+ONNX Runtime installed from (source or binary): source
+ONNX Runtime version: 1.2.0
+Python version: 3.6.10
+Visual Studio version (if applicable): NA
+GCC/Compiler version (if compiling from source): 7.5.0
+CUDA/cuDNN version: CUDA 10.2 / cuDNN 7.3.1
+GPU model and memory: Nvidia GeForce GTX 1060 mobile (6 GB)
+
+To Reproduce
+8 steps total - it just looks long because of the included scripts and sample output!
+
+Build from commit a02638e
+
+&lt;denchmark-code&gt;./build.sh --config Debug --enable_pybind --build_wheel --build_shared_lib --parallel
+&lt;/denchmark-code&gt;
+
+
+Install the Python wheel
+
+&lt;denchmark-code&gt;pip install build/Linux/Debug/dist/onnxruntime-1.2.0-cp36-cp36m-linux_x86_64.whl
+&lt;/denchmark-code&gt;
+
+
+pip install other Python requirements
+
+&lt;denchmark-code&gt;numpy==1.18.1
+opencv-python==4.2.0
+onnx==1.6.0
+torch==1.4.0
+&lt;/denchmark-code&gt;
+
+
+Add the two following scripts to a folder
+
+ort-capi.py
+&lt;denchmark-code&gt;import os
+import random
+import cv2
+import numpy as np
+import onnx
+import onnxruntime
+import torch
+import torch.onnx
+import torch.nn as nn
+
+
+def load_image(img_path):
+    """Load image data to PyTorch tensor
+
+    :param str img_path: Filepath to image data on disk
+    :return torch.tensor img: Shape ``(C, H, W)``
+    """
+    loaded = cv2.imread(img_path)
+    img = torch.tensor(loaded).permute(2, 0, 1) / 255.0
+    print('Python first 3 pixels')
+    for channel in range(3):
+        print(f'{loaded.flatten()[channel]} --&gt; {img[channel, 0, 0]:.6f}')
+    return img
+
+
+def seed_everything(seed=1234):
+    """Control all random seeds that could potentially be used by PyTorch"""
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def to_numpy(tensor):
+    return tensor.detach().cpu().numpy() if tensor.requires_grad else tensor.cpu().numpy()
+
+
+class ReduceDims(nn.Module):
+
+    def __init__(self):
+        super(ReduceDims, self).__init__()
+        self.conv = nn.Conv2d(3, 3, (32, 64), (32, 64))
+
+    def forward(self, image):
+        """Convolve with large filter to shrink spatial dimensions
+
+        :param torch.tensor image: Shape ``(N, C, H, W)`` in BGR order
+        :return:
+        """
+        return self.conv(image)
+
+
+if __name__ == '__main__':
+
+    # Export ONNX model
+    seed_everything()
+    model = ReduceDims()
+    image = load_image('crop.jpg').unsqueeze(0)
+    torch_out = model(image)
+    onnx_path = 'simple.onnx'
+    torch.onnx.export(model, image, onnx_path, input_names=['images'], output_names=['conv'])
+
+    # Run ORT inference
+    onnx_model = onnx.load(onnx_path)
+    onnx.checker.check_model(onnx_model)
+    ort_session = onnxruntime.InferenceSession(onnx_path)
+    ort_inputs = {'images': to_numpy(image)}
+    ort_outs = ort_session.run(None, ort_inputs)
+
+    # Compare and print results
+    np.testing.assert_allclose(to_numpy(torch_out), ort_outs[0], rtol=1e-03)
+    print(f'PyTorch: {torch_out.shape} \n{torch_out}')
+    print(f'ORT-Py: {ort_outs[0].shape} \n{ort_outs[0]}')
+&lt;/denchmark-code&gt;
+
+ (adapted with minimal changes from the C API &lt;denchmark-link:https://github.com/microsoft/onnxruntime/blob/master/csharp/test/Microsoft.ML.OnnxRuntime.EndToEndTests.Capi/C_Api_Sample.cpp&gt;sample&lt;/denchmark-link&gt;
+)
+&lt;denchmark-code&gt;#include &lt;assert.h&gt;
+#include &lt;onnxruntime_c_api.h&gt;
+#include &lt;cmath&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;vector&gt;
+#include &lt;opencv2/core.hpp&gt;
+#include &lt;opencv2/highgui.hpp&gt;
+#include &lt;opencv2/imgcodecs.hpp&gt;
+#include &lt;opencv2/imgproc/imgproc.hpp&gt;
+
+const OrtApi* g_ort = OrtGetApiBase()-&gt;GetApi(ORT_API_VERSION);
+
+void CheckStatus(OrtStatus* status) {
+    if (status != NULL) {
+        const char* msg = g_ort-&gt;GetErrorMessage(status);
+        fprintf(stderr, "%s\n", msg);
+        g_ort-&gt;ReleaseStatus(status);
+        exit(1);
+    }
+}
+
+int main(int argc, char* argv[]) {
+
+    // Initialize enviroment (one per process) to maintain thread pools and other state info
+    OrtEnv* env;
+    CheckStatus(g_ort-&gt;CreateEnv(ORT_LOGGING_LEVEL_WARNING, "test", &amp;env));
+
+    // Initialize session options if needed
+    OrtSessionOptions* session_options;
+    CheckStatus(g_ort-&gt;CreateSessionOptions(&amp;session_options));
+    g_ort-&gt;SetIntraOpNumThreads(session_options, 1);
+
+    // Sets graph optimization level
+    g_ort-&gt;SetSessionGraphOptimizationLevel(session_options, ORT_ENABLE_BASIC);
+
+    // Create session and load model into memory
+    OrtSession* session;
+    const char* model_path = "simple.onnx";
+    printf("Using Onnxruntime C API\n");
+    CheckStatus(g_ort-&gt;CreateSession(env, model_path, session_options, &amp;session));
+
+    // Print model input layer (node names, types, shape etc.)
+    size_t num_input_nodes;
+    OrtStatus* status;
+    OrtAllocator* allocator;
+    CheckStatus(g_ort-&gt;GetAllocatorWithDefaultOptions(&amp;allocator));
+
+    // Print number of model input nodes
+    status = g_ort-&gt;SessionGetInputCount(session, &amp;num_input_nodes);
+    std::vector&lt;const char*&gt; input_node_names(num_input_nodes);
+    std::vector&lt;int64_t&gt; input_node_dims;
+    printf("Number of inputs = %zu\n", num_input_nodes);
+
+    // Iterate over all input nodes and print names/types/shapes
+    std::vector&lt;char*&gt; input_names;
+    for (size_t i = 0; i &lt; num_input_nodes; i++) {
+        char* input_name;
+        status = g_ort-&gt;SessionGetInputName(session, i, allocator, &amp;input_name);
+        printf("Input %zu : name=%s\n", i, input_name);
+        input_node_names[i] = input_name;
+        input_names.push_back(input_name);
+
+        OrtTypeInfo* typeinfo;
+        status = g_ort-&gt;SessionGetInputTypeInfo(session, i, &amp;typeinfo);
+        const OrtTensorTypeAndShapeInfo* tensor_info;
+        CheckStatus(g_ort-&gt;CastTypeInfoToTensorInfo(typeinfo, &amp;tensor_info));
+        ONNXTensorElementDataType type;
+        CheckStatus(g_ort-&gt;GetTensorElementType(tensor_info, &amp;type));
+        printf("Input %zu : type=%d\n", i, type);
+
+        size_t num_dims;
+        CheckStatus(g_ort-&gt;GetDimensionsCount(tensor_info, &amp;num_dims));
+        printf("Input %zu : num_dims=%zu\n", i, num_dims);
+        input_node_dims.resize(num_dims);
+        g_ort-&gt;GetDimensions(tensor_info, (int64_t*)input_node_dims.data(), num_dims);
+        for (size_t j = 0; j &lt; num_dims; j++) {
+            printf("Input %zu : dim %zu=%jd\n", i, j, input_node_dims[j]);
+        }
+        g_ort-&gt;ReleaseTypeInfo(typeinfo);
+    }
+
+    // Load image data to array
+    size_t input_tensor_size = 68 * 136 * 3;  // eventually use OrtGetTensorShapeElementCount() to get official size!
+    float input_tensor_values[input_tensor_size];
+    std::vector&lt;const char*&gt; output_node_names = {"conv"};
+    cv::Mat image_bgr = cv::imread("crop.jpg", cv::IMREAD_COLOR);
+    if (!image_bgr.isContinuous()) {
+        image_bgr = image_bgr.clone();
+    }
+    for (size_t i = 0; i &lt; input_tensor_size; i++) {
+        input_tensor_values[i] = image_bgr.data[i] / 255.0;
+    }
+
+    // Create input tensor object from data values
+    OrtMemoryInfo* memory_info;
+    CheckStatus(g_ort-&gt;CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &amp;memory_info));
+    OrtValue* input_tensor = NULL;
+    CheckStatus(g_ort-&gt;CreateTensorWithDataAsOrtValue(memory_info, input_tensor_values, input_tensor_size * sizeof(float), input_node_dims.data(), 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &amp;input_tensor));
+    int is_tensor;
+    CheckStatus(g_ort-&gt;IsTensor(input_tensor, &amp;is_tensor));
+    assert(is_tensor);
+    g_ort-&gt;ReleaseMemoryInfo(memory_info);
+    float* input_ort;
+    CheckStatus(g_ort-&gt;GetTensorMutableData(input_tensor, (void**)&amp;input_ort));
+    printf("ORT first 3 pixels\n");
+    for (int i=0; i&lt;3; i++) {
+        printf("%f\n", input_ort[i]);
+    }
+
+    // Run inference
+    std::vector&lt;OrtValue*&gt; outputs(output_node_names.size());
+    CheckStatus(g_ort-&gt;Run(session, NULL, input_node_names.data(), (const OrtValue* const*)&amp;input_tensor, 1, output_node_names.data(), output_node_names.size(), outputs.data()));
+    CheckStatus(g_ort-&gt;IsTensor(outputs[0], &amp;is_tensor));
+    assert(is_tensor);
+
+    // Get pointer to output tensor float values
+    float* conv;
+    CheckStatus(g_ort-&gt;GetTensorMutableData(outputs[0], (void**)&amp;conv));
+    printf("ORT-C outputs\n");
+    for (int i=0; i&lt;12; i++) {
+        printf("%f\n", conv[i]);
+    }
+    g_ort-&gt;ReleaseValue(outputs[0]);
+    g_ort-&gt;ReleaseValue(input_tensor);
+    g_ort-&gt;ReleaseSession(session);
+    g_ort-&gt;ReleaseSessionOptions(session_options);
+    g_ort-&gt;ReleaseEnv(env);
+    for (int i=0; i&lt;input_names.size(); i++) {
+        free(input_names[i]);
+    }
+    printf("Done!\n");
+    return 0;
+}
+&lt;/denchmark-code&gt;
+
+
+
+Download the sample image (68x136 pixels) from the screenshots section below and save it as crop.jpg in the same folder as the Python and C++ scripts from above
+
+
+Run the Python script: python3 ort-capi.py. This should generate a simple.onnx file in the current directory and output the following results
+
+
+&lt;denchmark-code&gt;Python first 3 pixels
+43 --&gt; 0.168627
+44 --&gt; 0.172549
+40 --&gt; 0.156863
+Called inference_session.cc:1054
+PyTorch: torch.Size([1, 3, 2, 2]) 
+tensor([[[[-0.2275, -0.2554],
+          [-0.2656, -0.0904]],
+
+         [[ 0.2442,  0.2813],
+          [ 0.1520,  0.1503]],
+
+         [[ 0.4388,  0.4080],
+          [ 0.4567,  0.6156]]]], grad_fn=&lt;MkldnnConvolutionBackward&gt;)
+ORT-Py: (1, 3, 2, 2) 
+[[[[-0.22749133 -0.25542438]
+   [-0.26560846 -0.09042263]]
+
+  [[ 0.24415745  0.2812824 ]
+   [ 0.15198623  0.15028757]]
+
+  [[ 0.43876082  0.40797257]
+   [ 0.45668074  0.61562276]]]]
+&lt;/denchmark-code&gt;
+
+
+
+Compile the C++ program: g++ ort-decode.cpp -g -o ort-decode -I . -lonnxruntime -lopencv_core -lopencv_imgcodecs -lopencv_imgproc (you may need to apt install libopencv-dev for the OpenCV includes to work)
+
+
+Run the C++ executable: ./ort-decode which will print
+
+
+&lt;denchmark-code&gt;Using Onnxruntime C API
+Number of inputs = 1
+Input 0 : name=images
+Input 0 : type=1
+Input 0 : num_dims=4
+Input 0 : dim 0=1
+Input 0 : dim 1=3
+Input 0 : dim 2=68
+Input 0 : dim 3=136
+ORT first 3 pixels
+0.168627
+0.172549
+0.156863
+Called inference_session.cc:1054
+ORT-C outputs
+-0.152388
+-0.278834
+-0.122822
+-0.277305
+0.098833
+-0.003909
+-0.030183
+0.163025
+0.328772
+0.277781
+0.425203
+0.529667
+Done!
+&lt;/denchmark-code&gt;
+
+Expected behavior
+The outputs from PyTorch, ORT-Py, and ORT-C should all be identical. As demonstrated by the Python/C++ scripts, the pixel values passed to the model are the same, yet the C API comes back with a different set of 12 values for the (1, 3, 2, 2) shaped output tensor
+It would be very helpful to have a C API sample script that shows loading of actual image data since the current sample only uses dummy pixels at &lt;denchmark-link:https://github.com/microsoft/onnxruntime/blob/master/csharp/test/Microsoft.ML.OnnxRuntime.EndToEndTests.Capi/C_Api_Sample.cpp#L129&gt;line 129&lt;/denchmark-link&gt;
+. If you cannot directly help with loading image data so that the C and Python APIs return the same results, I would really appreciate guidance on how to better debug following my approach in the "Additional context" section
+Screenshots
+Sample image to be used as crop.jpg
+&lt;denchmark-link:https://user-images.githubusercontent.com/39926682/77471045-428aa480-6dd7-11ea-9a54-51f046cc02c4.jpg&gt;&lt;/denchmark-link&gt;
+
+
+My assumption is that this is a user error related to passing the pixel values to the C API, so I have tried unsuccessfully to compile in debug prints to identify the exact values used in the  call on . My thought was to adapt the Run function definition in &lt;denchmark-link:https://github.com/microsoft/onnxruntime/blob/435f014d71436f63527a939ece9b4c460e2a8bba/onnxruntime/core/session/inference_session.cc#L1054&gt;inference_session.cc:1054&lt;/denchmark-link&gt;
+ to print the values of the  parameter. However, I am not familiar enough with the ORT library to know the appropriate method for this. The closest I got was
+&lt;denchmark-code&gt;const OrtApi* g_ort = OrtGetApiBase()-&gt;GetApi(ORT_API_VERSION);
+
+Status InferenceSession::Run(const RunOptions&amp; run_options, const std::vector&lt;std::string&gt;&amp; feed_names,
+                             std::vector&lt;OrtValue&gt;&amp; feeds, const std::vector&lt;std::string&gt;&amp; output_names,
+                             std::vector&lt;OrtValue&gt;* p_fetches) {
+  std::cout &lt;&lt; "At inference_session.cc:1048" &lt;&lt; std::endl;
+  float* input_data;
+  g_ort-&gt;GetTensorMutableData(&amp;feeds[0], (void**)&amp;input_data);
+  ... rest of the function unchanged ...
+&lt;/denchmark-code&gt;
+
+However, this fails to compile because feeds is declared as a constant parameter in the function prototype, so I am stuck on how to access the underlying data of the input OrtValue
+&lt;denchmark-code&gt;onnxruntime/onnxruntime/core/session/inference_session.cc: 
+In member function ‘onnxruntime::common::Status onnxruntime::InferenceSession::Run(const RunOptions&amp;, const std::vector&lt;std::__cxx11::basic_string&lt;char&gt; &gt;&amp;, const std::vector&lt;OrtValue&gt;&amp;, const std::vector&lt;std::__cxx11::basic_string&lt;char&gt; &gt;&amp;, std::vector&lt;OrtValue&gt;*)’:
+onnxruntime/onnxruntime/core/session/inference_session.cc:1050:31: 
+error: invalid conversion from ‘const value_type* {aka const OrtValue*}’ to ‘OrtValue*’ [-fpermissive]
+   g_ort-&gt;GetTensorMutableData(&amp;feeds[0], (void**)&amp;input_data);
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='addisonklinke' date='2020-03-25T18:03:51Z'>
+		I believe I figured out the proper way to pass pixel data from OpenCV to your C API. To start, I compiled in extra print statements to &lt;denchmark-link:https://github.com/microsoft/onnxruntime/blob/master/onnxruntime/core/session/inference_session.cc&gt;inference_session.cc&lt;/denchmark-link&gt;
+ at the beginning of the  function defined on line 1054
+&lt;denchmark-code&gt;Status InferenceSession::Run(const RunOptions&amp; run_options, const std::vector&lt;std::string&gt;&amp; feed_names,
+                             const std::vector&lt;OrtValue&gt;&amp; feeds, const std::vector&lt;std::string&gt;&amp; output_names,
+                             std::vector&lt;OrtValue&gt;* p_fetches) {
+  std::cout &lt;&lt; "Input data from inference_session.cc:1054" &lt;&lt; std::endl;
+  // From onnxruntime/core/framework/execution_frame.cc:195
+  std::vector&lt;std::reference_wrapper&lt;const TensorShape&gt;&gt; input_shapes;
+  input_shapes.reserve(feeds.size());
+  for (const auto&amp; feed : feeds) {
+    auto&amp; tensor = feed.Get&lt;Tensor&gt;();
+    std::cout &lt;&lt; tensor.Shape() &lt;&lt; std::endl;
+    input_shapes.push_back(std::cref(tensor.Shape()));
+    const float* data = tensor.Data&lt;float&gt;();
+    for (uint32_t i = 0; i &lt; 6; i++)
+       std::cout &lt;&lt; "data " &lt;&lt; i &lt;&lt; ": " &lt;&lt; data[i] * 255 &lt;&lt; std::endl;
+  }
+&lt;/denchmark-code&gt;
+
+If you compare the C/Python APIs with this added debug info, it is clear they are receiving different pixel values. Particularly, when running ort-capi.py, you can see that the pixel data comes through in channel blocks. For instance, all the rows/columns for the blue channel, then green, and then red
+&lt;denchmark-code&gt;blue[0, 0], blue[0, 1], blue[0, 2], ... blue[W, H], 
+green[0, 0], green[0, 1], ... green[W, H], 
+red[0, 0], ... red[W, H]
+&lt;/denchmark-code&gt;
+
+In comparison, using the data attribute of a cv::Mat object gives you the pixels in spatial blocks. For instance, all channels for each spatial location sequentially
+&lt;denchmark-code&gt;blue[0, 0], green[0, 0], red[0, 0], 
+blue[0, 1], green[0, 1], red[0, 1],
+...
+blue[W, H], green[W, H], red[W, H]
+&lt;/denchmark-code&gt;
+
+The solution is to format a flat array of channels blocks in  as shown in this OpenCV forum &lt;denchmark-link:https://answers.opencv.org/question/64837&gt;post&lt;/denchmark-link&gt;
+
+&lt;denchmark-code&gt;// Create expected ORT format (channel blocks by row): https://answers.opencv.org/question/64837
+cv::Mat image_bgr = cv::imread("crop.jpg", cv::IMREAD_COLOR);
+std::vector&lt;cv::Mat&gt; channels;
+cv::split(image_bgr, channels);
+cv::Mat image_by_channel;
+for (size_t i=0; i&lt;channels.size(); i++)
+    image_by_channel.push_back(channels[i]);
+if (!image_by_channel.isContinuous())
+    image_by_channel = image_by_channel.clone();
+for (size_t i = 0; i &lt; input_tensor_size; i++)
+    input_tensor_values[i] = image_by_channel.data[i] / 255.0;
+&lt;/denchmark-code&gt;
+
+I think it would be very helpful for other users to add the above code into your C API sample script. Perhaps also some tutorials on how to access OrtValue and Tensor objects? It took me quite a while to find the appropriate class methods to print the internal values from InferenceSession::Run, and that information was key to debugging the proper pixel ordering
+		</comment>
+		<comment id='2' author='addisonklinke' date='2020-03-26T22:28:14Z'>
+		&lt;denchmark-link:https://github.com/addisonklinke&gt;@addisonklinke&lt;/denchmark-link&gt;
+ seems like this might be an issue of NHWC vs NCHW order? The python example does  after the cv image load to swap the order but it doesn't look like the C example does so.
+		</comment>
+		<comment id='3' author='addisonklinke' date='2020-04-21T05:04:48Z'>
+		Thanks &lt;denchmark-link:https://github.com/addisonklinke&gt;@addisonklinke&lt;/denchmark-link&gt;
+ for the investigation and &lt;denchmark-link:https://github.com/pranav-prakash&gt;@pranav-prakash&lt;/denchmark-link&gt;
+ is spot on. It is NHWC vs NCHW. I think this is not API bound. It is the data order required by the ONNX model itself. If the ONNX model requires input data in the NCHW data order then the user is required to give it in that order. If any intermediate image parsing library (OpenCV here) were to provide data back in a different order than what is expected, the necessary "pre-processing" of the raw data parsed is required.
+Closing as this is no longer an issue. Thanks for raising the issue.
+		</comment>
+	</comments>
+</bug>

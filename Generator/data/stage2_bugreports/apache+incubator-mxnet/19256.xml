@@ -1,0 +1,185 @@
+<bug id='19256' author='samskalicky' open_date='2020-09-30T07:13:03Z' closed_time='2020-10-02T22:52:31Z'>
+	<summary>Multiple subgraph properties with single backend issue with optimize_for</summary>
+	<description>
+&lt;denchmark-h:h2&gt;Description&lt;/denchmark-h&gt;
+
+Theres a difference in the flow between get_backend_symbol and optimize_for when a single backend has multiple subgraph properties that results in the indexed graph not being updated between subgraph properties.
+&lt;denchmark-h:h3&gt;Error Message&lt;/denchmark-h&gt;
+
+&lt;denchmark-code&gt;Traceback (most recent call last):
+  File "test.py", line 22, in &lt;module&gt;
+    sym_block.optimize_for(mx.nd.zeros((64, 4, 10, 10)), backend='MKLDNN_QUANTIZE')
+  File "/home/ubuntu/v1.7.x/python/mxnet/gluon/block.py", line 1089, in optimize_for
+    self._build_cache(x, *args)
+  File "/home/ubuntu/v1.7.x/python/mxnet/gluon/block.py", line 979, in _build_cache
+    out = out.optimize_for(self._backend, arg_array, aux_array, ctx, **self._backend_opts)
+  File "/home/ubuntu/v1.7.x/python/mxnet/symbol/symbol.py", line 1531, in optimize_for
+    ctypes.byref(new_aux_names)))
+  File "/home/ubuntu/v1.7.x/python/mxnet/base.py", line 246, in check_call
+    raise get_last_ffi_error()
+mxnet.base.MXNetError: Traceback (most recent call last):
+  File "src/operator/subgraph/build_subgraph.cc", line 80
+MXNetError: Check failed: input_nid &lt; simple_nodes-&gt;size() (6 vs. 6) :
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h2&gt;To Reproduce&lt;/denchmark-h&gt;
+
+&lt;denchmark-code&gt;from mxnet.util import use_np
+from mxnet.gluon import nn, HybridBlock
+import mxnet as mx
+import numpy as np
+attr = {'sg_mkldnn_conv_bn_0' : {'with_bn': 'true'}}
+data = mx.symbol.Variable('data', shape=(64, 4, 10, 10), dtype='float32')
+data2 = mx.symbol.Variable('data2', shape=(64, 64, 10, 10), dtype='float32')
+weight1 = mx.symbol.Variable('conv1_weight', dtype='float32')
+weight2 = mx.symbol.Variable('conv2_weight', dtype='float32', shape=(64,64,1,1))
+conv1 = mx.symbol.Convolution(data=data, weight=weight1, name='conv1', num_filter=64,
+                           kernel=(1, 1), stride=(1, 1), no_bias=True)
+bn1 = mx.symbol.BatchNorm(data=conv1, name="bn1")
+conv2 = mx.symbol.Convolution(data=bn1, weight=weight2, name='conv2', num_filter=64,
+                           kernel=(1, 1), stride=(1, 1), no_bias=True)
+bn2 = mx.symbol.BatchNorm(data=conv2, name="bn2")
+sum = bn2 + data2
+inputs = mx.sym.var('data', dtype='float32')
+sym_block = mx.gluon.SymbolBlock(sum, [inputs])
+for k, v in sym_block.collect_params().items():
+    v.initialize()
+mm = sym_block(mx.nd.zeros((64, 4, 10, 10)))
+sym_block.optimize_for(mx.nd.zeros((64, 4, 10, 10)), backend='MKLDNN_QUANTIZE')
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h3&gt;Steps to reproduce&lt;/denchmark-h&gt;
+
+
+clone v1.7.x branch and build from source
+run code above
+
+&lt;denchmark-h:h3&gt;Analysis&lt;/denchmark-h&gt;
+
+The error is occurring at the  on line 80 where theres a mismatch in the Graph definition (the input of a node is pointing to another node ID that hasnt been seen yet, so this is breaking topological ordering):
+
+
+Some debugging finds that the indexed graph inside of an &lt;denchmark-link:https://github.com/apache/incubator-tvm/blob/master/nnvm/src/core/graph.cc#L31-L36&gt;nnvm::Graph object is only built once&lt;/denchmark-link&gt;
+:
+const IndexedGraph&amp; Graph::indexed_graph() const {
+  if (indexed_graph_ == nullptr) {
+    indexed_graph_.reset(new IndexedGraph(*this));
+  }
+  return *indexed_graph_;
+}
+So after subsequent subgraph properties the graph is not updated, causing the error in this issue. Since the indexed_graph_ is private, theres no way to reset it.
+Comparing the get_backend_symbol flow the Graph is created every iteration for each subgraph property and stored in the Symbol between iterations:
+
+
+
+incubator-mxnet/src/c_api/c_api_symbolic.cc
+
+
+        Lines 1302 to 1308
+      in
+      16280ad
+
+
+
+
+
+
+ nnvm::Graph g = Symbol2Graph(*s); 
+
+
+
+ property-&gt;SetAttr("graph", g); 
+
+
+
+ g.attrs["subgraph_property"] = std::make_shared&lt;nnvm::any&gt;(property); 
+
+
+
+ g = ApplyPass(std::move(g), "BuildSubgraph"); 
+
+
+
+ property-&gt;RemoveAttr("graph"); 
+
+
+
+ g.attrs.erase("subgraph_property"); 
+
+
+
+ s-&gt;outputs = g.outputs; 
+
+
+
+
+
+Where as in the optimize_for flow the Graph is created once:
+
+
+
+incubator-mxnet/src/c_api/c_api_symbolic.cc
+
+
+         Line 1375
+      in
+      16280ad
+
+
+
+
+
+
+ nnvm::Graph g = Symbol2Graph(*s); 
+
+
+
+
+
+and then re-used for each subgraph propery:
+
+
+
+incubator-mxnet/src/c_api/c_api_symbolic.cc
+
+
+        Lines 1498 to 1502
+      in
+      16280ad
+
+
+
+
+
+
+ property-&gt;PrePartition(g, options_map); 
+
+
+
+ g.attrs["subgraph_property"] = std::make_shared&lt;nnvm::any&gt;(property); 
+
+
+
+ g = ApplyPass(std::move(g), "BuildSubgraph"); 
+
+
+
+ g.attrs.erase("subgraph_property"); 
+
+
+
+ property-&gt;PostPartition(g); 
+
+
+
+
+
+So we need to create a new Graph object for each iteration in order to fix this.
+FYI &lt;denchmark-link:https://github.com/mseth10&gt;@mseth10&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/Kh4L&gt;@Kh4L&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/ptrendx&gt;@ptrendx&lt;/denchmark-link&gt;
+
+	</description>
+	<comments>
+	</comments>
+</bug>

@@ -1,0 +1,1965 @@
+<bug id='43039' author='wulikai1993' open_date='2020-09-08T10:33:27Z' closed_time='2020-09-12T05:55:55Z'>
+	<summary>MultiWorkerMirroredStrategy.experimental_distribute_dataset return an empty DistributedDataset</summary>
+	<description>
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04):  docker hub image: tensorflow/tensorflow:2.3.0-gpu
+TensorFlow version (use command below): 2.3.0-gpu
+Python version: 3
+CUDA/cuDNN version: 7.6.4.38-1
+GPU model and memory:GeForce GTX 1080 Ti , 12G memory
+
+Describe the current behavior
+I use MultiWorkerMirroredStrategy with three machines, one GPU on each. And create Dataset from tfrecord, then wrap it with experimental_distribute_dataset. I want to iterator the returned DistributedDataset, but encounter tensorflow.python.framework.errors_impl.OutOfRangeError: End of sequence error. It means the DistributedDataset is empty. But I succeed to print the tensors in original dataset.
+Describe the expected behavior
+Print the DistributedDataset elements properly.
+Standalone code to reproduce the issue
+tfrecord file &lt;denchmark-link:https://drive.google.com/file/d/1bvqxBHB3jiZewDpKt85tT3pjau6AvEpQ/view?usp=sharing&gt;link:&lt;/denchmark-link&gt;
+
+You should change the dataset_path in dict cfg to proper location after you download the tfrecord file.
+import os
+import tensorflow as tf
+from absl import app, flags, logging
+
+import math
+import tensorflow as tf
+import numpy as np
+from itertools import product as product
+
+
+###############################################################################
+#   Tensorflow / Numpy Priors                                                 #
+###############################################################################
+def prior_box(image_sizes, min_sizes, steps, clip=False):
+    """prior box"""
+    feature_maps = [
+        [math.ceil(image_sizes[0] / step), math.ceil(image_sizes[1] / step)]
+        for step in steps]
+
+    anchors = []
+    for k, f in enumerate(feature_maps):
+        for i, j in product(range(f[0]), range(f[1])):
+            for min_size in min_sizes[k]:
+                s_kx = min_size / image_sizes[1]
+                s_ky = min_size / image_sizes[0]
+                cx = (j + 0.5) * steps[k] / image_sizes[1]
+                cy = (i + 0.5) * steps[k] / image_sizes[0]
+                anchors += [cx, cy, s_kx, s_ky]
+
+    output = np.asarray(anchors).reshape([-1, 4])
+
+    if clip:
+        output = np.clip(output, 0, 1)
+
+    return output
+
+
+def prior_box_tf(image_sizes, min_sizes, steps, clip=False):
+    """prior box"""
+    image_sizes = tf.cast(tf.convert_to_tensor(image_sizes), tf.float32)
+    feature_maps = tf.math.ceil(
+        tf.reshape(image_sizes, [1, 2]) /
+        tf.reshape(tf.cast(steps, tf.float32), [-1, 1]))
+
+    anchors = []
+    for k in range(len(min_sizes)):
+        grid_x, grid_y = _meshgrid_tf(tf.range(feature_maps[k][1]),
+                                      tf.range(feature_maps[k][0]))
+        cx = (grid_x + 0.5) * steps[k] / image_sizes[1]
+        cy = (grid_y + 0.5) * steps[k] / image_sizes[0]
+        cxcy = tf.stack([cx, cy], axis=-1)
+        cxcy = tf.reshape(cxcy, [-1, 2])
+        cxcy = tf.repeat(cxcy, repeats=tf.shape(min_sizes[k])[0], axis=0)
+
+        sx = min_sizes[k] / image_sizes[1]
+        sy = min_sizes[k] / image_sizes[0]
+        sxsy = tf.stack([sx, sy], 1)
+        sxsy = tf.repeat(sxsy[tf.newaxis],
+                         repeats=tf.shape(grid_x)[0] * tf.shape(grid_x)[1],
+                         axis=0)
+        sxsy = tf.reshape(sxsy, [-1, 2])
+
+        anchors.append(tf.concat([cxcy, sxsy], 1))
+
+    output = tf.concat(anchors, axis=0)
+
+    if clip:
+        output = tf.clip_by_value(output, 0, 1)
+
+    return output
+
+
+def _meshgrid_tf(x, y):
+    """ workaround solution of the tf.meshgrid() issue:
+        https://github.com/tensorflow/tensorflow/issues/34470"""
+    grid_shape = [tf.shape(y)[0], tf.shape(x)[0]]
+    grid_x = tf.broadcast_to(tf.reshape(x, [1, -1]), grid_shape)
+    grid_y = tf.broadcast_to(tf.reshape(y, [-1, 1]), grid_shape)
+    return grid_x, grid_y
+
+
+###############################################################################
+#   Tensorflow Encoding                                                       #
+###############################################################################
+def encode_tf(labels, priors, match_thresh, ignore_thresh,
+              variances=[0.1, 0.2]):
+    """tensorflow encoding"""
+    assert ignore_thresh &lt;= match_thresh
+    priors = tf.cast(priors, tf.float32)
+    bbox = labels[:, :4]
+    landm = labels[:, 4:-1]
+    landm_valid = labels[:, -1]  # 1: with landm, 0: w/o landm.
+
+    # jaccard index
+    overlaps = _jaccard(bbox, _point_form(priors))
+
+    # (Bipartite Matching)
+    # [num_objects] best prior for each ground truth
+    best_prior_overlap, best_prior_idx = tf.math.top_k(overlaps, k=1)
+    best_prior_overlap = best_prior_overlap[:, 0]
+    best_prior_idx = best_prior_idx[:, 0]
+
+    # [num_priors] best ground truth for each prior
+    overlaps_t = tf.transpose(overlaps)
+    best_truth_overlap, best_truth_idx = tf.math.top_k(overlaps_t, k=1)
+    best_truth_overlap = best_truth_overlap[:, 0]
+    best_truth_idx = best_truth_idx[:, 0]
+
+    # ensure best prior
+    def _loop_body(i, bt_idx, bt_overlap):
+        bp_mask = tf.one_hot(best_prior_idx[i], tf.shape(bt_idx)[0])
+        bp_mask_int = tf.cast(bp_mask, tf.int32)
+        new_bt_idx = bt_idx * (1 - bp_mask_int) + bp_mask_int * i
+        bp_mask_float = tf.cast(bp_mask, tf.float32)
+        new_bt_overlap = bt_overlap * (1 - bp_mask_float) + bp_mask_float * 2
+        return tf.cond(best_prior_overlap[i] &gt; match_thresh,
+                       lambda: (i + 1, new_bt_idx, new_bt_overlap),
+                       lambda: (i + 1, bt_idx, bt_overlap))
+    _, best_truth_idx, best_truth_overlap = tf.while_loop(
+        lambda i, bt_idx, bt_overlap: tf.less(i, tf.shape(best_prior_idx)[0]),
+        _loop_body, [tf.constant(0), best_truth_idx, best_truth_overlap])
+
+    matches_bbox = tf.gather(bbox, best_truth_idx)  # [num_priors, 4]
+    matches_landm = tf.gather(landm, best_truth_idx)  # [num_priors, 10]
+    matches_landm_v = tf.gather(landm_valid, best_truth_idx)  # [num_priors]
+
+    loc_t = _encode_bbox(matches_bbox, priors, variances)
+    landm_t = _encode_landm(matches_landm, priors, variances)
+    landm_valid_t = tf.cast(matches_landm_v &gt; 0, tf.float32)
+    conf_t = tf.cast(best_truth_overlap &gt; match_thresh, tf.float32)
+    conf_t = tf.where(
+        tf.logical_and(best_truth_overlap &lt; match_thresh,
+                       best_truth_overlap &gt; ignore_thresh),
+        tf.ones_like(conf_t) * -1, conf_t)    # 1: pos, 0: neg, -1: ignore
+
+    return tf.concat([loc_t, landm_t, landm_valid_t[..., tf.newaxis],
+                      conf_t[..., tf.newaxis]], axis=1)
+
+
+def _encode_bbox(matched, priors, variances):
+    """Encode the variances from the priorbox layers into the ground truth
+    boxes we have matched (based on jaccard overlap) with the prior boxes.
+    Args:
+        matched: (tensor) Coords of ground truth for each prior in point-form
+            Shape: [num_priors, 4].
+        priors: (tensor) Prior boxes in center-offset form
+            Shape: [num_priors,4].
+        variances: (list[float]) Variances of priorboxes
+    Return:
+        encoded boxes (tensor), Shape: [num_priors, 4]
+    """
+
+    # dist b/t match center and prior's center
+    g_cxcy = (matched[:, :2] + matched[:, 2:]) / 2 - priors[:, :2]
+    # encode variance
+    g_cxcy /= (variances[0] * priors[:, 2:])
+    # match wh / prior wh
+    g_wh = (matched[:, 2:] - matched[:, :2]) / priors[:, 2:]
+    g_wh = tf.math.log(g_wh) / variances[1]
+    # return target for smooth_l1_loss
+    return tf.concat([g_cxcy, g_wh], 1)  # [num_priors,4]
+
+
+def _encode_landm(matched, priors, variances):
+    """Encode the variances from the priorbox layers into the ground truth
+    boxes we have matched (based on jaccard overlap) with the prior boxes.
+    Args:
+        matched: (tensor) Coords of ground truth for each prior in point-form
+            Shape: [num_priors, 10].
+        priors: (tensor) Prior boxes in center-offset form
+            Shape: [num_priors,4].
+        variances: (list[float]) Variances of priorboxes
+    Return:
+        encoded landm (tensor), Shape: [num_priors, 10]
+    """
+
+    # dist b/t match center and prior's center
+    matched = tf.reshape(matched, [tf.shape(matched)[0], 5, 2])
+    priors = tf.broadcast_to(
+        tf.expand_dims(priors, 1), [tf.shape(matched)[0], 5, 4])
+    g_cxcy = matched[:, :, :2] - priors[:, :, :2]
+    # encode variance
+    g_cxcy /= (variances[0] * priors[:, :, 2:])
+    # g_cxcy /= priors[:, :, 2:]
+    g_cxcy = tf.reshape(g_cxcy, [tf.shape(g_cxcy)[0], -1])
+    # return target for smooth_l1_loss
+    return g_cxcy
+
+
+def _point_form(boxes):
+    """ Convert prior_boxes to (xmin, ymin, xmax, ymax)
+    representation for comparison to point form ground truth data.
+    Args:
+        boxes: (tensor) center-size default boxes from priorbox layers.
+    Return:
+        boxes: (tensor) Converted xmin, ymin, xmax, ymax form of boxes.
+    """
+    return tf.concat((boxes[:, :2] - boxes[:, 2:] / 2,
+                      boxes[:, :2] + boxes[:, 2:] / 2), axis=1)
+
+
+def _intersect(box_a, box_b):
+    """ We resize both tensors to [A,B,2]:
+    [A,2] -&gt; [A,1,2] -&gt; [A,B,2]
+    [B,2] -&gt; [1,B,2] -&gt; [A,B,2]
+    Then we compute the area of intersect between box_a and box_b.
+    Args:
+      box_a: (tensor) bounding boxes, Shape: [A,4].
+      box_b: (tensor) bounding boxes, Shape: [B,4].
+    Return:
+      (tensor) intersection area, Shape: [A,B].
+    """
+    A = tf.shape(box_a)[0]
+    B = tf.shape(box_b)[0]
+    max_xy = tf.minimum(
+        tf.broadcast_to(tf.expand_dims(box_a[:, 2:], 1), [A, B, 2]),
+        tf.broadcast_to(tf.expand_dims(box_b[:, 2:], 0), [A, B, 2]))
+    min_xy = tf.maximum(
+        tf.broadcast_to(tf.expand_dims(box_a[:, :2], 1), [A, B, 2]),
+        tf.broadcast_to(tf.expand_dims(box_b[:, :2], 0), [A, B, 2]))
+    inter = tf.maximum((max_xy - min_xy), tf.zeros_like(max_xy - min_xy))
+    return inter[:, :, 0] * inter[:, :, 1]
+
+
+def _jaccard(box_a, box_b):
+    """Compute the jaccard overlap of two sets of boxes.  The jaccard overlap
+    is simply the intersection over union of two boxes.  Here we operate on
+    ground truth boxes and default boxes.
+    E.g.:
+        A ∩ B / A ∪ B = A ∩ B / (area(A) + area(B) - A ∩ B)
+    Args:
+        box_a: (tensor) Ground truth bounding boxes, Shape: [num_objects,4]
+        box_b: (tensor) Prior boxes from priorbox layers, Shape: [num_priors,4]
+    Return:
+        jaccard overlap: (tensor) Shape: [box_a.size(0), box_b.size(0)]
+    """
+    inter = _intersect(box_a, box_b)
+    area_a = tf.broadcast_to(
+        tf.expand_dims(
+            (box_a[:, 2] - box_a[:, 0]) * (box_a[:, 3] - box_a[:, 1]), 1),
+        tf.shape(inter))  # [A,B]
+    area_b = tf.broadcast_to(
+        tf.expand_dims(
+            (box_b[:, 2] - box_b[:, 0]) * (box_b[:, 3] - box_b[:, 1]), 0),
+        tf.shape(inter))  # [A,B]
+    union = area_a + area_b - inter
+    return inter / union  # [A,B]
+
+
+###############################################################################
+#   Tensorflow Decoding                                                       #
+###############################################################################
+def decode_tf(labels, priors, variances=[0.1, 0.2]):
+    """tensorflow decoding"""
+    bbox = _decode_bbox(labels[:, :4], priors, variances)
+    landm = _decode_landm(labels[:, 4:14], priors, variances)
+    landm_valid = labels[:, 14][:, tf.newaxis]
+    conf = labels[:, 15][:, tf.newaxis]
+
+    return tf.concat([bbox, landm, landm_valid, conf], axis=1)
+
+
+def _decode_bbox(pre, priors, variances=[0.1, 0.2]):
+    """Decode locations from predictions using priors to undo
+    the encoding we did for offset regression at train time.
+    Args:
+        pre (tensor): location predictions for loc layers,
+            Shape: [num_priors,4]
+        priors (tensor): Prior boxes in center-offset form.
+            Shape: [num_priors,4].
+        variances: (list[float]) Variances of priorboxes
+    Return:
+        decoded bounding box predictions
+    """
+    centers = priors[:, :2] + pre[:, :2] * variances[0] * priors[:, 2:]
+    sides = priors[:, 2:] * tf.math.exp(pre[:, 2:] * variances[1])
+
+    return tf.concat([centers - sides / 2, centers + sides / 2], axis=1)
+
+
+def _decode_landm(pre, priors, variances=[0.1, 0.2]):
+    """Decode landm from predictions using priors to undo
+    the encoding we did for offset regression at train time.
+    Args:
+        pre (tensor): landm predictions for loc layers,
+            Shape: [num_priors,10]
+        priors (tensor): Prior boxes in center-offset form.
+            Shape: [num_priors,4].
+        variances: (list[float]) Variances of priorboxes
+    Return:
+        decoded landm predictions
+    """
+    landms = tf.concat(
+        [priors[:, :2] + pre[:, :2] * variances[0] * priors[:, 2:],
+         priors[:, :2] + pre[:, 2:4] * variances[0] * priors[:, 2:],
+         priors[:, :2] + pre[:, 4:6] * variances[0] * priors[:, 2:],
+         priors[:, :2] + pre[:, 6:8] * variances[0] * priors[:, 2:],
+         priors[:, :2] + pre[:, 8:10] * variances[0] * priors[:, 2:]], axis=1)
+    return landms
+
+def _parse_tfrecord(img_dim, using_bin, using_flip, using_distort,
+                    using_encoding, priors, match_thresh, ignore_thresh,
+                    variances):
+    def parse_tfrecord(tfrecord):
+        features = {
+            'image/img_name': tf.io.FixedLenFeature([], tf.string),
+            'image/object/bbox/xmin': tf.io.VarLenFeature(tf.float32),
+            'image/object/bbox/ymin': tf.io.VarLenFeature(tf.float32),
+            'image/object/bbox/xmax': tf.io.VarLenFeature(tf.float32),
+            'image/object/bbox/ymax': tf.io.VarLenFeature(tf.float32),
+            'image/object/landmark0/x': tf.io.VarLenFeature(tf.float32),
+            'image/object/landmark0/y': tf.io.VarLenFeature(tf.float32),
+            'image/object/landmark1/x': tf.io.VarLenFeature(tf.float32),
+            'image/object/landmark1/y': tf.io.VarLenFeature(tf.float32),
+            'image/object/landmark2/x': tf.io.VarLenFeature(tf.float32),
+            'image/object/landmark2/y': tf.io.VarLenFeature(tf.float32),
+            'image/object/landmark3/x': tf.io.VarLenFeature(tf.float32),
+            'image/object/landmark3/y': tf.io.VarLenFeature(tf.float32),
+            'image/object/landmark4/x': tf.io.VarLenFeature(tf.float32),
+            'image/object/landmark4/y': tf.io.VarLenFeature(tf.float32),
+            'image/object/landmark/valid': tf.io.VarLenFeature(tf.float32)}
+        if using_bin:
+            features['image/encoded'] = tf.io.FixedLenFeature([], tf.string)
+            x = tf.io.parse_single_example(tfrecord, features)
+            img = tf.image.decode_jpeg(x['image/encoded'], channels=3)
+        else:
+            features['image/img_path'] = tf.io.FixedLenFeature([], tf.string)
+            x = tf.io.parse_single_example(tfrecord, features)
+            image_encoded = tf.io.read_file(x['image/img_path'])
+            img = tf.image.decode_jpeg(image_encoded, channels=3)
+
+        labels = tf.stack(
+            [tf.sparse.to_dense(x['image/object/bbox/xmin']),
+             tf.sparse.to_dense(x['image/object/bbox/ymin']),
+             tf.sparse.to_dense(x['image/object/bbox/xmax']),
+             tf.sparse.to_dense(x['image/object/bbox/ymax']),
+             tf.sparse.to_dense(x['image/object/landmark0/x']),
+             tf.sparse.to_dense(x['image/object/landmark0/y']),
+             tf.sparse.to_dense(x['image/object/landmark1/x']),
+             tf.sparse.to_dense(x['image/object/landmark1/y']),
+             tf.sparse.to_dense(x['image/object/landmark2/x']),
+             tf.sparse.to_dense(x['image/object/landmark2/y']),
+             tf.sparse.to_dense(x['image/object/landmark3/x']),
+             tf.sparse.to_dense(x['image/object/landmark3/y']),
+             tf.sparse.to_dense(x['image/object/landmark4/x']),
+             tf.sparse.to_dense(x['image/object/landmark4/y']),
+             tf.sparse.to_dense(x['image/object/landmark/valid'])], axis=1)
+
+        img, labels = _transform_data(
+            img_dim, using_flip, using_distort, using_encoding, priors,
+            match_thresh, ignore_thresh, variances)(img, labels)
+
+        return img, labels
+    return parse_tfrecord
+
+
+def _transform_data(img_dim, using_flip, using_distort, using_encoding, priors,
+                    match_thresh, ignore_thresh, variances):
+    def transform_data(img, labels):
+        img = tf.cast(img, tf.float32)
+
+        # randomly crop
+        img, labels = _crop(img, labels)
+
+        # padding to square
+        img = _pad_to_square(img)
+
+        # resize
+        img, labels = _resize(img, labels, img_dim)
+
+        # randomly left-right flip
+        if using_flip:
+            img, labels = _flip(img, labels)
+
+        # distort
+        if using_distort:
+            img = _distort(img)
+
+        # encode labels to feature targets
+        if using_encoding:
+            labels = encode_tf(labels=labels, priors=priors,
+                               match_thresh=match_thresh,
+                               ignore_thresh=ignore_thresh,
+                               variances=variances)
+
+        return img, labels
+    return transform_data
+
+
+def load_tfrecord_dataset(tfrecord_name, batch_size, img_dim,
+                          using_bin=True, using_flip=True, using_distort=True,
+                          using_encoding=True, priors=None, match_thresh=0.45,
+                          ignore_thresh=0.3, variances=[0.1, 0.2],
+                          shuffle=True, buffer_size=10240):
+    """load dataset from tfrecord"""
+    if not using_encoding:
+        assert batch_size == 1  # dynamic data len when using_encoding
+    else:
+        assert priors is not None
+
+    raw_dataset = tf.data.TFRecordDataset(tfrecord_name)
+    raw_dataset = raw_dataset.repeat()
+    if shuffle:
+        raw_dataset = raw_dataset.shuffle(buffer_size=buffer_size)
+    dataset = raw_dataset.map(
+        _parse_tfrecord(img_dim, using_bin, using_flip, using_distort,
+                        using_encoding, priors, match_thresh, ignore_thresh,
+                        variances),
+        num_parallel_calls=tf.data.experimental.AUTOTUNE)
+    dataset = dataset.batch(batch_size, drop_remainder=True)
+    dataset = dataset.prefetch(
+        buffer_size=tf.data.experimental.AUTOTUNE)
+
+    return dataset
+
+
+###############################################################################
+#   Data Augmentation                                                         #
+###############################################################################
+def _flip(img, labels):
+    flip_case = tf.random.uniform([], 0, 2, dtype=tf.int32)
+
+    def flip_func():
+        flip_img = tf.image.flip_left_right(img)
+        flip_labels = tf.stack([1 - labels[:, 2],  labels[:, 1],
+                                1 - labels[:, 0],  labels[:, 3],
+                                1 - labels[:, 6],  labels[:, 7],
+                                1 - labels[:, 4],  labels[:, 5],
+                                1 - labels[:, 8],  labels[:, 9],
+                                1 - labels[:, 12], labels[:, 13],
+                                1 - labels[:, 10], labels[:, 11],
+                                labels[:, 14]], axis=1)
+
+        return flip_img, flip_labels
+
+    img, labels = tf.case([(tf.equal(flip_case, 0), flip_func)],
+                          default=lambda: (img, labels))
+
+    return img, labels
+
+
+def _crop(img, labels, max_loop=250):
+    shape = tf.shape(img)
+
+    def matrix_iof(a, b):
+        """
+        return iof of a and b, numpy version for data augenmentation
+        """
+        lt = tf.math.maximum(a[:, tf.newaxis, :2], b[:, :2])
+        rb = tf.math.minimum(a[:, tf.newaxis, 2:], b[:, 2:])
+
+        area_i = tf.math.reduce_prod(rb - lt, axis=2) * \
+            tf.cast(tf.reduce_all(lt &lt; rb, axis=2), tf.float32)
+        area_a = tf.math.reduce_prod(a[:, 2:] - a[:, :2], axis=1)
+        return area_i / tf.math.maximum(area_a[:, tf.newaxis], 1)
+
+    def crop_loop_body(i, img, labels):
+        valid_crop = tf.constant(1, tf.int32)
+
+        pre_scale = tf.constant([0.3, 0.45, 0.6, 0.8, 1.0], dtype=tf.float32)
+        scale = pre_scale[tf.random.uniform([], 0, 5, dtype=tf.int32)]
+        short_side = tf.cast(tf.minimum(shape[0], shape[1]), tf.float32)
+        h = w = tf.cast(scale * short_side, tf.int32)
+        h_offset = tf.random.uniform([], 0, shape[0] - h + 1, dtype=tf.int32)
+        w_offset = tf.random.uniform([], 0, shape[1] - w + 1, dtype=tf.int32)
+        roi = tf.stack([w_offset, h_offset, w_offset + w, h_offset + h])
+        roi = tf.cast(roi, tf.float32)
+
+        value = matrix_iof(labels[:, :4], roi[tf.newaxis])
+        valid_crop = tf.cond(tf.math.reduce_any(value &gt;= 1),
+                             lambda: valid_crop, lambda: 0)
+
+        centers = (labels[:, :2] + labels[:, 2:4]) / 2
+        mask_a = tf.reduce_all(
+            tf.math.logical_and(roi[:2] &lt; centers, centers &lt; roi[2:]),
+            axis=1)
+        labels_t = tf.boolean_mask(labels, mask_a)
+        valid_crop = tf.cond(tf.reduce_any(mask_a),
+                             lambda: valid_crop, lambda: 0)
+
+        img_t = img[h_offset:h_offset + h, w_offset:w_offset + w, :]
+        h_offset = tf.cast(h_offset, tf.float32)
+        w_offset = tf.cast(w_offset, tf.float32)
+        labels_t = tf.stack(
+            [labels_t[:, 0] - w_offset,  labels_t[:, 1] - h_offset,
+             labels_t[:, 2] - w_offset,  labels_t[:, 3] - h_offset,
+             labels_t[:, 4] - w_offset,  labels_t[:, 5] - h_offset,
+             labels_t[:, 6] - w_offset,  labels_t[:, 7] - h_offset,
+             labels_t[:, 8] - w_offset,  labels_t[:, 9] - h_offset,
+             labels_t[:, 10] - w_offset, labels_t[:, 11] - h_offset,
+             labels_t[:, 12] - w_offset, labels_t[:, 13] - h_offset,
+             labels_t[:, 14]], axis=1)
+
+        return tf.cond(valid_crop == 1,
+                       lambda: (max_loop, img_t, labels_t),
+                       lambda: (i + 1, img, labels))
+
+    _, img, labels = tf.while_loop(
+        lambda i, img, labels: tf.less(i, max_loop),
+        crop_loop_body,
+        [tf.constant(-1), img, labels],
+        shape_invariants=[tf.TensorShape([]),
+                          tf.TensorShape([None, None, 3]),
+                          tf.TensorShape([None, 15])])
+
+    return img, labels
+
+
+def _pad_to_square(img):
+    height = tf.shape(img)[0]
+    width = tf.shape(img)[1]
+
+    def pad_h():
+        img_pad_h = tf.ones([width - height, width, 3]) * \
+            tf.reduce_mean(img, axis=[0, 1], keepdims=True)
+        return tf.concat([img, img_pad_h], axis=0)
+
+    def pad_w():
+        img_pad_w = tf.ones([height, height - width, 3]) * \
+            tf.reduce_mean(img, axis=[0, 1], keepdims=True)
+        return tf.concat([img, img_pad_w], axis=1)
+
+    img = tf.case([(tf.greater(height, width), pad_w),
+                   (tf.less(height, width), pad_h)], default=lambda: img)
+
+    return img
+
+
+def _resize(img, labels, img_dim):
+    w_f = tf.cast(tf.shape(img)[1], tf.float32)
+    h_f = tf.cast(tf.shape(img)[0], tf.float32)
+    locs = tf.stack([labels[:, 0] / w_f,  labels[:, 1] / h_f,
+                     labels[:, 2] / w_f,  labels[:, 3] / h_f,
+                     labels[:, 4] / w_f,  labels[:, 5] / h_f,
+                     labels[:, 6] / w_f,  labels[:, 7] / h_f,
+                     labels[:, 8] / w_f,  labels[:, 9] / h_f,
+                     labels[:, 10] / w_f, labels[:, 11] / h_f,
+                     labels[:, 12] / w_f, labels[:, 13] / h_f], axis=1)
+    locs = tf.clip_by_value(locs, 0, 1)
+    labels = tf.concat([locs, labels[:, 14][:, tf.newaxis]], axis=1)
+
+    resize_case = tf.random.uniform([], 0, 5, dtype=tf.int32)
+
+    def resize(method):
+        def _resize():
+            return tf.image.resize(
+                img, [img_dim, img_dim], method=method, antialias=True)
+        return _resize
+
+    img = tf.case([(tf.equal(resize_case, 0), resize('bicubic')),
+                   (tf.equal(resize_case, 1), resize('area')),
+                   (tf.equal(resize_case, 2), resize('nearest')),
+                   (tf.equal(resize_case, 3), resize('lanczos3'))],
+                  default=resize('bilinear'))
+
+    return img, labels
+
+
+def _distort(img):
+    img = tf.image.random_brightness(img, 0.4)
+    img = tf.image.random_contrast(img, 0.5, 1.5)
+    img = tf.image.random_saturation(img, 0.5, 1.5)
+    img = tf.image.random_hue(img, 0.1)
+
+    return img
+
+def load_dataset(cfg, priors, shuffle=True, buffer_size=10240):
+    """load dataset"""
+    logging.info("load dataset from {}".format(cfg['dataset_path']))
+    dataset = load_tfrecord_dataset(
+        tfrecord_name=cfg['dataset_path'],
+        batch_size=cfg['batch_size'],
+        img_dim=cfg['input_size'],
+        using_bin=cfg['using_bin'],
+        using_flip=cfg['using_flip'],
+        using_distort=cfg['using_distort'],
+        using_encoding=True,
+        priors=priors,
+        match_thresh=cfg['match_thresh'],
+        ignore_thresh=cfg['ignore_thresh'],
+        variances=cfg['variances'],
+        shuffle=shuffle,
+        buffer_size=buffer_size)
+    return dataset
+
+def set_memory_growth():
+    gpus = tf.config.experimental.list_physical_devices('GPU')
+    if gpus:
+        try:
+            # Currently, memory growth needs to be the same across GPUs
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+                logical_gpus = tf.config.experimental.list_logical_devices(
+                    'GPU')
+                logging.info(
+                    "Detect {} Physical GPUs, {} Logical GPUs.".format(
+                        len(gpus), len(logical_gpus)))
+        except RuntimeError as e:
+            # Memory growth must be set before GPUs have been initialized
+            logging.info(e)
+
+def prior_box(image_sizes, min_sizes, steps, clip=False):
+    """prior box"""
+    feature_maps = [
+        [math.ceil(image_sizes[0] / step), math.ceil(image_sizes[1] / step)]
+        for step in steps]
+
+    anchors = []
+    for k, f in enumerate(feature_maps):
+        for i, j in product(range(f[0]), range(f[1])):
+            for min_size in min_sizes[k]:
+                s_kx = min_size / image_sizes[1]
+                s_ky = min_size / image_sizes[0]
+                cx = (j + 0.5) * steps[k] / image_sizes[1]
+                cy = (i + 0.5) * steps[k] / image_sizes[0]
+                anchors += [cx, cy, s_kx, s_ky]
+
+    output = np.asarray(anchors).reshape([-1, 4])
+
+    if clip:
+        output = np.clip(output, 0, 1)
+
+    return output
+
+cfg = {
+    # general setting
+    "batch_size": 8,
+    "input_size": 640,  # (h,w)
+
+    "backbone_type": 'ResNet50',  # 'ResNet50', 'MobileNetV2'
+    "sub_name": 'retinaface_res50',
+
+    # training dataset
+    "dataset_path": '/mnt/retinaface-tf2/data/widerface_test_bin.tfrecord',  # 'dataset/trainval_mask.tfrecord'
+    "testing_dataset_path": './data/widerface/val',  #
+    "dataset_len": 12880,  # train 6115 , trainval 7954, number of training samples
+    "val_len": 1839,
+    "using_crop": True,
+    "using_bin": True,
+    "using_flip": True,
+    "using_distort": True,
+    "using_normalizing": True,
+    "labels_list": ['background', 'mask', 'unmask'],  # xml annotation
+
+    # anchor setting
+    # "min_sizes": [[(9, 7), (24, 20), (39, 35)], [(54, 41), (65, 61), (81, 66)],
+    #               [(94, 86), (113, 95), (131, 122)], [(137, 128), (172, 162), (176, 210)]],
+    "min_sizes": [[16, 32], [64, 128], [256, 512]],
+    "steps": [8, 16, 32],
+    "match_thresh": 0.45,
+    "ignore_thresh": 0.3,
+    "variances": [0.1, 0.2],
+    "clip": False,
+
+    # network
+    "out_channel": 256,
+
+    # training setting
+    "resume": False,  # if False,training from scratch
+    "epoch": 100,
+    "init_lr": 1e-2,
+    "lr_decay_epoch": [50, 68],
+    "lr_rate": 0.1,
+    "warmup_epoch": 5,
+    "min_lr": 1e-3,
+    "pretrain": True,
+
+    "save_steps": 2000,
+
+    "weights_decay": 5e-4,
+    "momentum": 0.9,
+    "save_freq": 1, #frequency of save model weights
+
+    # inference
+    "score_threshold": 0.5,
+    "nms_threshold": 0.4,
+    "max_number_keep": 200
+}
+
+def main(_):
+
+    multiworker_strategy = tf.distribute.experimental.MultiWorkerMirroredStrategy()
+    # init
+    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+    os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+
+    logger = tf.get_logger()
+    logger.disabled = True
+    set_memory_growth()
+    priors = prior_box((cfg['input_size'], cfg['input_size']),
+                           cfg['min_sizes'],  cfg['steps'], cfg['clip'])
+    dataset = load_dataset(cfg, priors, shuffle=True)
+    train_iter = iter(dataset)
+    print(next(train_iter))
+    dist_dataset = multiworker_strategy.experimental_distribute_dataset(dataset)
+    dist_train_iter = iter(dist_dataset)
+    print(next(dist_train_iter))
+
+
+if __name__ == '__main__':
+    app.run(main)
+Other info / logs Include any logs or source code that would be helpful to
+diagnose the problem. If including tracebacks, please include the full
+traceback. Large logs and files should be attached.
+2020-09-08 10:19:16.853430: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcudart.so.10.1
+2020-09-08 10:19:18.227937: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcuda.so.1
+2020-09-08 10:19:18.254671: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1716] Found device 0 with properties: 
+pciBusID: 0000:82:00.0 name: GeForce GTX 1080 Ti computeCapability: 6.1
+coreClock: 1.582GHz coreCount: 28 deviceMemorySize: 10.92GiB deviceMemoryBandwidth: 451.17GiB/s
+2020-09-08 10:19:18.254730: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcudart.so.10.1
+2020-09-08 10:19:18.257145: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcublas.so.10
+2020-09-08 10:19:18.259279: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcufft.so.10
+2020-09-08 10:19:18.259620: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcurand.so.10
+2020-09-08 10:19:18.262046: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcusolver.so.10
+2020-09-08 10:19:18.263487: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcusparse.so.10
+2020-09-08 10:19:18.268749: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcudnn.so.7
+2020-09-08 10:19:18.271254: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1858] Adding visible gpu devices: 0
+2020-09-08 10:19:18.271693: I tensorflow/core/platform/cpu_feature_guard.cc:142] This TensorFlow binary is optimized with oneAPI Deep Neural Network Library (oneDNN)to use the following CPU instructions in performance-critical operations:  AVX2 FMA
+To enable them in other operations, rebuild TensorFlow with the appropriate compiler flags.
+2020-09-08 10:19:18.283629: I tensorflow/core/platform/profile_utils/cpu_utils.cc:104] CPU Frequency: 2199875000 Hz
+2020-09-08 10:19:18.286517: I tensorflow/compiler/xla/service/service.cc:168] XLA service 0x597c600 initialized for platform Host (this does not guarantee that XLA will be used). Devices:
+2020-09-08 10:19:18.286539: I tensorflow/compiler/xla/service/service.cc:176]   StreamExecutor device (0): Host, Default Version
+2020-09-08 10:19:19.151667: I tensorflow/compiler/xla/service/service.cc:168] XLA service 0x59e8480 initialized for platform CUDA (this does not guarantee that XLA will be used). Devices:
+2020-09-08 10:19:19.151723: I tensorflow/compiler/xla/service/service.cc:176]   StreamExecutor device (0): GeForce GTX 1080 Ti, Compute Capability 6.1
+2020-09-08 10:19:19.154118: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1716] Found device 0 with properties: 
+pciBusID: 0000:82:00.0 name: GeForce GTX 1080 Ti computeCapability: 6.1
+coreClock: 1.582GHz coreCount: 28 deviceMemorySize: 10.92GiB deviceMemoryBandwidth: 451.17GiB/s
+2020-09-08 10:19:19.154177: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcudart.so.10.1
+2020-09-08 10:19:19.154212: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcublas.so.10
+2020-09-08 10:19:19.154246: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcufft.so.10
+2020-09-08 10:19:19.154274: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcurand.so.10
+2020-09-08 10:19:19.154302: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcusolver.so.10
+2020-09-08 10:19:19.154328: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcusparse.so.10
+2020-09-08 10:19:19.154352: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcudnn.so.7
+2020-09-08 10:19:19.158471: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1858] Adding visible gpu devices: 0
+2020-09-08 10:19:19.158536: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcudart.so.10.1
+2020-09-08 10:19:19.793164: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1257] Device interconnect StreamExecutor with strength 1 edge matrix:
+2020-09-08 10:19:19.793223: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1263]      0 
+2020-09-08 10:19:19.793233: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1276] 0:   N 
+2020-09-08 10:19:19.795000: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1402] Created TensorFlow device (/job:localhost/replica:0/task:0/device:GPU:0 with 10265 MB memory) -&gt; physical GPU (device: 0, name: GeForce GTX 1080 Ti, pci bus id: 0000:82:00.0, compute capability: 6.1)
+2020-09-08 10:19:19.800484: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1716] Found device 0 with properties: 
+pciBusID: 0000:82:00.0 name: GeForce GTX 1080 Ti computeCapability: 6.1
+coreClock: 1.582GHz coreCount: 28 deviceMemorySize: 10.92GiB deviceMemoryBandwidth: 451.17GiB/s
+2020-09-08 10:19:19.800568: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcudart.so.10.1
+2020-09-08 10:19:19.800618: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcublas.so.10
+2020-09-08 10:19:19.800650: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcufft.so.10
+2020-09-08 10:19:19.800681: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcurand.so.10
+2020-09-08 10:19:19.800711: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcusolver.so.10
+2020-09-08 10:19:19.800741: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcusparse.so.10
+2020-09-08 10:19:19.800768: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcudnn.so.7
+2020-09-08 10:19:19.803844: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1858] Adding visible gpu devices: 0
+2020-09-08 10:19:19.803916: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1257] Device interconnect StreamExecutor with strength 1 edge matrix:
+2020-09-08 10:19:19.803935: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1263]      0 
+2020-09-08 10:19:19.803953: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1276] 0:   N 
+2020-09-08 10:19:19.806763: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1402] Created TensorFlow device (/job:worker/replica:0/task:0/device:GPU:0 with 10265 MB memory) -&gt; physical GPU (device: 0, name: GeForce GTX 1080 Ti, pci bus id: 0000:82:00.0, compute capability: 6.1)
+2020-09-08 10:19:19.814394: I tensorflow/core/distributed_runtime/rpc/grpc_channel.cc:301] Initialize GrpcChannelCache for job worker -&gt; {0 -&gt; dist-data-worker-0.t9k-sample.svc:2222, 1 -&gt; dist-data-worker-1.t9k-sample.svc:2222, 2 -&gt; dist-data-worker-2.t9k-sample.svc:2222}
+2020-09-08 10:19:19.816567: I tensorflow/core/distributed_runtime/rpc/grpc_server_lib.cc:405] Started server with target: grpc://dist-data-worker-0.t9k-sample.svc:2222
+INFO:tensorflow:Enabled multi-worker collective ops with available devices: ['/job:worker/replica:0/task:0/device:CPU:0', '/job:worker/replica:0/task:0/device:XLA_CPU:0', '/job:worker/replica:0/task:0/device:XLA_GPU:0', '/job:worker/replica:0/task:0/device:GPU:0']
+I0908 10:19:19.817300 139928804230976 collective_all_reduce_strategy.py:329] Enabled multi-worker collective ops with available devices: ['/job:worker/replica:0/task:0/device:CPU:0', '/job:worker/replica:0/task:0/device:XLA_CPU:0', '/job:worker/replica:0/task:0/device:XLA_GPU:0', '/job:worker/replica:0/task:0/device:GPU:0']
+INFO:tensorflow:Using MirroredStrategy with devices ('/job:worker/task:0/device:GPU:0',)
+I0908 10:19:19.818905 139928804230976 mirrored_strategy.py:341] Using MirroredStrategy with devices ('/job:worker/task:0/device:GPU:0',)
+INFO:tensorflow:MultiWorkerMirroredStrategy with cluster_spec = {'worker': ['dist-data-worker-0.t9k-sample.svc:2222', 'dist-data-worker-1.t9k-sample.svc:2222', 'dist-data-worker-2.t9k-sample.svc:2222']}, task_type = 'worker', task_id = 0, num_workers = 3, local_devices = ('/job:worker/task:0/device:GPU:0',), communication = CollectiveCommunication.AUTO
+I0908 10:19:19.819303 139928804230976 collective_all_reduce_strategy.py:380] MultiWorkerMirroredStrategy with cluster_spec = {'worker': ['dist-data-worker-0.t9k-sample.svc:2222', 'dist-data-worker-1.t9k-sample.svc:2222', 'dist-data-worker-2.t9k-sample.svc:2222']}, task_type = 'worker', task_id = 0, num_workers = 3, local_devices = ('/job:worker/task:0/device:GPU:0',), communication = CollectiveCommunication.AUTO
+I0908 10:19:19.819926 139928804230976 dist_data.py:600] Physical devices cannot be modified after being initialized
+I0908 10:19:19.850645 139928804230976 dist_data.py:569] load dataset from /mnt/retinaface-tf2/data/widerface_test_bin.tfrecord
+(&lt;tf.Tensor: shape=(8, 640, 640, 3), dtype=float32, numpy=
+array([[[[ 1.24728775e+02,  1.22055222e+02,  1.15999634e+02],
+         [ 1.22892578e+02,  1.20219025e+02,  1.14163445e+02],
+         [ 1.22099586e+02,  1.19426033e+02,  1.13370453e+02],
+         ...,
+         [ 8.73357391e+01,  8.56875610e+01,  7.93239059e+01],
+         [ 8.93529053e+01,  8.77047119e+01,  8.13410645e+01],
+         [ 9.24133301e+01,  9.07651443e+01,  8.44014969e+01]],
+
+        [[ 1.09426826e+02,  1.06753273e+02,  1.00697693e+02],
+         [ 1.08657150e+02,  1.05983597e+02,  9.99280167e+01],
+         [ 1.08476242e+02,  1.05802689e+02,  9.97471085e+01],
+         ...,
+         [ 9.34566040e+01,  9.18084183e+01,  8.54447632e+01],
+         [ 9.55525665e+01,  9.39043808e+01,  8.75407257e+01],
+         [ 9.91462860e+01,  9.74981003e+01,  9.11344452e+01]],
+
+        [[ 9.72546539e+01,  9.45811005e+01,  8.85255203e+01],
+         [ 9.70970535e+01,  9.44235001e+01,  8.83679199e+01],
+         [ 9.78483429e+01,  9.51747971e+01,  8.91192169e+01],
+         ...,
+         [ 9.82655640e+01,  9.66173859e+01,  9.02537308e+01],
+         [ 9.94642181e+01,  9.78160324e+01,  9.14523773e+01],
+         [ 1.02227783e+02,  1.00579597e+02,  9.42159424e+01]],
+
+        ...,
+
+        [[ 1.03908783e+02,  1.07768463e+02,  7.75826416e+01],
+         [ 1.02116661e+02,  1.05932289e+02,  7.63713684e+01],
+         [ 9.66357956e+01,  1.00444916e+02,  7.09763565e+01],
+         ...,
+         [ 9.68215866e+01,  9.82557907e+01,  7.19535065e+01],
+         [ 1.00859833e+02,  1.02294022e+02,  7.59917374e+01],
+         [ 9.64176331e+01,  9.78518372e+01,  7.15495605e+01]],
+
+        [[ 1.06085648e+02,  1.09945328e+02,  7.97595062e+01],
+         [ 1.04293526e+02,  1.08109146e+02,  7.85482330e+01],
+         [ 9.88126526e+01,  1.02621773e+02,  7.31532135e+01],
+         ...,
+         [ 9.66639557e+01,  9.80981598e+01,  7.17958755e+01],
+         [ 1.00690552e+02,  1.02124748e+02,  7.58224716e+01],
+         [ 9.57151184e+01,  9.71493149e+01,  7.08470383e+01]],
+
+        [[ 1.06697701e+02,  1.10557381e+02,  8.03715591e+01],
+         [ 1.04905586e+02,  1.08721207e+02,  7.91602936e+01],
+         [ 9.94247055e+01,  1.03233826e+02,  7.37652664e+01],
+         ...,
+         [ 9.55974274e+01,  9.70316315e+01,  7.07293549e+01],
+         [ 9.99996796e+01,  1.01433876e+02,  7.51315994e+01],
+         [ 9.44909668e+01,  9.59251709e+01,  6.96228943e+01]]],
+
+
+       [[[ 1.79020119e+01,  2.19689369e+01,  2.99244499e+00],
+         [ 1.58624716e+01,  2.06704369e+01,  0.00000000e+00],
+         [ 1.51764307e+01,  1.90834465e+01,  0.00000000e+00],
+         ...,
+         [ 8.16278076e+01,  9.86631927e+01,  6.32296028e+01],
+         [ 6.73102951e+01,  8.42869415e+01,  4.91317062e+01],
+         [ 6.12751694e+01,  7.79278717e+01,  4.47397270e+01]],
+
+        [[ 1.95028820e+01,  2.17408943e+01,  7.81370163e-01],
+         [ 1.96296520e+01,  2.13537941e+01,  0.00000000e+00],
+         [ 2.09664173e+01,  2.15310116e+01,  0.00000000e+00],
+         ...,
+         [ 8.06434631e+01,  9.79421234e+01,  6.09631004e+01],
+         [ 5.99489441e+01,  7.71724243e+01,  4.05182495e+01],
+         [ 5.25240326e+01,  6.93798370e+01,  3.49581909e+01]],
+
+        [[ 2.45029068e+01,  2.24879875e+01,  0.00000000e+00],
+         [ 2.51510925e+01,  2.26621895e+01,  0.00000000e+00],
+         [ 2.70248432e+01,  2.31384068e+01,  0.00000000e+00],
+         ...,
+         [ 7.55968781e+01,  9.31968842e+01,  5.44395905e+01],
+         [ 4.63827667e+01,  6.39156876e+01,  2.53827095e+01],
+         [ 3.69936066e+01,  5.42851677e+01,  1.72176933e+01]],
+
+        ...,
+
+        [[-1.93025589e+00, -1.93025589e+00, -1.93025589e+00],
+         [-2.22468567e+00, -2.22468567e+00, -2.22468567e+00],
+         [-3.08513641e+00, -3.08513641e+00, -3.08513641e+00],
+         ...,
+         [ 7.91158600e+01,  9.09350739e+01,  3.32669144e+01],
+         [ 7.68767090e+01,  8.71371689e+01,  2.85244370e+01],
+         [ 7.47488556e+01,  8.26550827e+01,  2.33686600e+01]],
+
+        [[-6.81667328e-01, -6.81667328e-01, -6.81667328e-01],
+         [-1.40288925e+00, -1.40288925e+00, -1.40288925e+00],
+         [-2.36134720e+00, -2.36134720e+00, -2.36134720e+00],
+         ...,
+         [ 8.02405701e+01,  9.04674072e+01,  3.20591087e+01],
+         [ 7.76517258e+01,  8.66896591e+01,  2.68999023e+01],
+         [ 7.68033295e+01,  8.36673737e+01,  2.28854980e+01]],
+
+        [[-1.89395905e-01, -1.89395905e-01, -1.89395905e-01],
+         [-7.97077179e-01, -7.97077179e-01, -7.97077179e-01],
+         [-1.66807556e+00, -1.66807556e+00, -1.66807556e+00],
+         ...,
+         [ 8.23338089e+01,  9.02438660e+01,  3.09343338e+01],
+         [ 7.98906250e+01,  8.67535095e+01,  2.59786530e+01],
+         [ 7.89819565e+01,  8.43535233e+01,  2.31105156e+01]]],
+
+
+       [[[ 9.29103622e+01,  8.38115387e+01,  9.26200790e+01],
+         [ 9.21722794e+01,  8.30734787e+01,  9.18819885e+01],
+         [ 9.14833374e+01,  8.23845596e+01,  9.11930695e+01],
+         ...,
+         [ 5.40838509e+01,  4.53541336e+01,  4.25934219e+00],
+         [ 5.80340424e+01,  4.97181396e+01,  1.29117203e+00],
+         [ 5.84229126e+01,  4.98948250e+01,  0.00000000e+00]],
+
+        [[ 8.68602219e+01,  7.79978180e+01,  8.60694427e+01],
+         [ 8.78025208e+01,  7.89401245e+01,  8.70117950e+01],
+         [ 8.75972595e+01,  7.87348328e+01,  8.68065033e+01],
+         ...,
+         [ 5.68775215e+01,  4.34964104e+01,  3.66986465e+00],
+         [ 5.98933830e+01,  4.68066788e+01,  0.00000000e+00],
+         [ 6.04419479e+01,  4.84969749e+01,  0.00000000e+00]],
+
+        [[ 9.39529495e+01,  8.52325211e+01,  9.65406189e+01],
+         [ 9.61381149e+01,  8.74176636e+01,  9.87257614e+01],
+         [ 9.64990234e+01,  8.77786179e+01,  9.90867004e+01],
+         ...,
+         [ 5.81260529e+01,  4.53354836e+01,  5.51031113e+00],
+         [ 6.04816360e+01,  4.78775520e+01,  8.11939240e-01],
+         [ 6.11883049e+01,  4.94758110e+01,  0.00000000e+00]],
+
+        ...,
+
+        [[ 1.24503052e+02,  1.62149078e+02,  8.95797729e-01],
+         [ 1.24353889e+02,  1.59983643e+02,  0.00000000e+00],
+         [ 1.25073418e+02,  1.57816925e+02,  0.00000000e+00],
+         ...,
+         [ 1.29795639e+02,  1.66753372e+02,  2.55889435e+01],
+         [ 1.27766533e+02,  1.65338638e+02,  2.42820740e+01],
+         [ 1.29873688e+02,  1.64272003e+02,  2.05228882e+01]],
+
+        [[ 1.24627296e+02,  1.61203949e+02,  0.00000000e+00],
+         [ 1.24903076e+02,  1.59984085e+02,  0.00000000e+00],
+         [ 1.24675163e+02,  1.57494263e+02,  0.00000000e+00],
+         ...,
+         [ 1.32041168e+02,  1.68460938e+02,  2.15579376e+01],
+         [ 1.33513550e+02,  1.69203796e+02,  2.11235657e+01],
+         [ 1.32195358e+02,  1.66914062e+02,  1.70703583e+01]],
+
+        [[ 1.28943268e+02,  1.65691986e+02,  0.00000000e+00],
+         [ 1.28879425e+02,  1.64225494e+02,  1.00944519e+00],
+         [ 1.29246002e+02,  1.62467010e+02,  3.57754517e+00],
+         ...,
+         [ 1.34914566e+02,  1.71236755e+02,  1.62087860e+01],
+         [ 1.34592255e+02,  1.68047272e+02,  1.38260651e+01],
+         [ 1.31932831e+02,  1.66052216e+02,  8.41160583e+00]]],
+
+
+       ...,
+
+
+       [[[ 7.57140045e+01,  1.32128372e+02,  1.51906891e+02],
+         [ 7.55561981e+01,  1.31970551e+02,  1.51749100e+02],
+         [ 7.58803101e+01,  1.32294662e+02,  1.52073212e+02],
+         ...,
+         [ 7.63204269e+01,  1.38002457e+02,  1.55694473e+02],
+         [ 7.63204346e+01,  1.38002441e+02,  1.55694458e+02],
+         [ 7.63204346e+01,  1.38002441e+02,  1.55694458e+02]],
+
+        [[ 7.60969543e+01,  1.32511337e+02,  1.52289871e+02],
+         [ 7.55828400e+01,  1.31997223e+02,  1.51775757e+02],
+         [ 7.59586639e+01,  1.32373047e+02,  1.52151581e+02],
+         ...,
+         [ 7.68187943e+01,  1.38500839e+02,  1.56192856e+02],
+         [ 7.68188095e+01,  1.38500854e+02,  1.56192841e+02],
+         [ 7.68188095e+01,  1.38500854e+02,  1.56192841e+02]],
+
+        [[ 7.60515213e+01,  1.32465881e+02,  1.52244431e+02],
+         [ 7.59733200e+01,  1.32387695e+02,  1.52166214e+02],
+         [ 7.63387985e+01,  1.32753159e+02,  1.52531708e+02],
+         ...,
+         [ 7.67181396e+01,  1.38400146e+02,  1.56092163e+02],
+         [ 7.67181244e+01,  1.38400162e+02,  1.56092178e+02],
+         [ 7.67181320e+01,  1.38400177e+02,  1.56092163e+02]],
+
+        ...,
+
+        [[ 9.98160553e+01,  1.20287552e+02,  3.95508881e+01],
+         [ 1.03795059e+02,  1.25791283e+02,  4.36515121e+01],
+         [ 1.05114639e+02,  1.28117142e+02,  4.40065994e+01],
+         ...,
+         [ 1.06390022e+02,  1.25751274e+02,  4.62075577e+01],
+         [ 1.05510178e+02,  1.24841278e+02,  4.33839493e+01],
+         [ 9.98391418e+01,  1.19300049e+02,  3.51180725e+01]],
+
+        [[ 9.31870270e+01,  1.14661629e+02,  3.25725708e+01],
+         [ 1.07921799e+02,  1.29681992e+02,  4.67424469e+01],
+         [ 1.07605896e+02,  1.30248184e+02,  4.56777954e+01],
+         ...,
+         [ 1.00495163e+02,  1.19859558e+02,  4.13804169e+01],
+         [ 9.99863281e+01,  1.19170776e+02,  3.83058929e+01],
+         [ 9.57622681e+01,  1.15001633e+02,  3.31129532e+01]],
+
+        [[ 1.01265877e+02,  1.22496277e+02,  4.03028183e+01],
+         [ 1.12068802e+02,  1.33676376e+02,  5.00867157e+01],
+         [ 1.08309929e+02,  1.31249863e+02,  4.57988663e+01],
+         ...,
+         [ 9.07576447e+01,  1.09978981e+02,  3.21097488e+01],
+         [ 8.99604492e+01,  1.09427834e+02,  2.96014786e+01],
+         [ 9.18549347e+01,  1.10977539e+02,  3.00187531e+01]]],
+
+
+       [[[ 1.91680695e+02,  2.38228241e+02,  2.35225067e+02],
+         [ 1.92582962e+02,  2.39130493e+02,  2.36127335e+02],
+         [ 1.93529877e+02,  2.40061951e+02,  2.37057846e+02],
+         ...,
+         [ 1.72848755e+02,  1.60696655e+02,  1.06524742e+02],
+         [ 1.72897552e+02,  1.60745483e+02,  1.06573517e+02],
+         [ 1.72923737e+02,  1.60771683e+02,  1.06599754e+02]],
+
+        [[ 1.90356064e+02,  2.37042603e+02,  2.34052338e+02],
+         [ 1.91232483e+02,  2.37919006e+02,  2.34928741e+02],
+         [ 1.92235733e+02,  2.38913666e+02,  2.35919846e+02],
+         ...,
+         [ 1.73280212e+02,  1.61128143e+02,  1.06956184e+02],
+         [ 1.72987717e+02,  1.60835648e+02,  1.06663681e+02],
+         [ 1.72798050e+02,  1.60645981e+02,  1.06474014e+02]],
+
+        [[ 1.88877411e+02,  2.35250122e+02,  2.32223495e+02],
+         [ 1.89737762e+02,  2.36111267e+02,  2.33084335e+02],
+         [ 1.90798828e+02,  2.37171631e+02,  2.34137512e+02],
+         ...,
+         [ 1.73966415e+02,  1.61814331e+02,  1.07642403e+02],
+         [ 1.73338882e+02,  1.61186813e+02,  1.07014870e+02],
+         [ 1.72980103e+02,  1.60828033e+02,  1.06656113e+02]],
+
+        ...,
+
+        [[ 1.62996979e+01,  9.67771759e+01,  1.01026886e+02],
+         [ 1.63509140e+01,  9.67883759e+01,  1.01029572e+02],
+         [ 1.63950500e+01,  9.67980347e+01,  1.01031891e+02],
+         ...,
+         [ 1.03893127e+01,  1.00420944e+02,  1.02773575e+02],
+         [ 1.03893280e+01,  1.00420883e+02,  1.02773560e+02],
+         [ 1.03893280e+01,  1.00420883e+02,  1.02773560e+02]],
+
+        [[ 1.56857376e+01,  9.51733170e+01,  1.01032059e+02],
+         [ 1.56471558e+01,  9.51697311e+01,  1.01032059e+02],
+         [ 1.56139221e+01,  9.51666565e+01,  1.01032059e+02],
+         ...,
+         [ 1.06467667e+01,  9.76320877e+01,  1.02251343e+02],
+         [ 1.06467667e+01,  9.76320877e+01,  1.02251343e+02],
+         [ 1.06467667e+01,  9.76320877e+01,  1.02251343e+02]],
+
+        [[ 1.49750595e+01,  9.38345718e+01,  1.01032059e+02],
+         [ 1.49750671e+01,  9.38345947e+01,  1.01032059e+02],
+         [ 1.49750671e+01,  9.38345947e+01,  1.01032059e+02],
+         ...,
+         [ 1.08568802e+01,  9.53557205e+01,  1.01825073e+02],
+         [ 1.08568802e+01,  9.53557205e+01,  1.01825073e+02],
+         [ 1.08568802e+01,  9.53557205e+01,  1.01825073e+02]]],
+
+
+       [[[ 7.83921051e+01,  1.24869156e+02,  7.64564514e+01],
+         [ 7.83407288e+01,  1.22990463e+02,  7.69286194e+01],
+         [ 9.65125351e+01,  1.37986038e+02,  9.52618561e+01],
+         ...,
+         [ 1.18475189e+02,  1.53988434e+02,  1.06111961e+02],
+         [ 1.15520340e+02,  1.49667419e+02,  1.04680801e+02],
+         [ 1.05429680e+02,  1.39591858e+02,  9.70172577e+01]],
+
+        [[ 8.45359344e+01,  1.31023071e+02,  8.38709183e+01],
+         [ 8.28325424e+01,  1.27507378e+02,  8.16269608e+01],
+         [ 9.68063507e+01,  1.38501221e+02,  9.59045181e+01],
+         ...,
+         [ 1.09455978e+02,  1.43719650e+02,  9.77291107e+01],
+         [ 1.13780060e+02,  1.46499756e+02,  1.03052628e+02],
+         [ 1.12625420e+02,  1.45448212e+02,  1.03386864e+02]],
+
+        [[ 9.08953476e+01,  1.36272064e+02,  9.05691833e+01],
+         [ 8.86048050e+01,  1.32403290e+02,  8.71840515e+01],
+         [ 1.01192871e+02,  1.42970306e+02,  1.00444214e+02],
+         ...,
+         [ 1.06194847e+02,  1.38833054e+02,  9.51865082e+01],
+         [ 1.17479927e+02,  1.49704147e+02,  1.07861160e+02],
+         [ 1.11618668e+02,  1.43836151e+02,  1.02608093e+02]],
+
+        ...,
+
+        [[ 4.97378540e+01,  6.34630661e+01,  3.84943619e+01],
+         [ 4.56276321e+01,  5.83987885e+01,  3.39005966e+01],
+         [ 4.70007172e+01,  5.92259178e+01,  3.53177795e+01],
+         ...,
+         [ 1.30571686e+02,  1.43362213e+02,  1.07660027e+02],
+         [ 1.26607735e+02,  1.35462082e+02,  1.00648926e+02],
+         [ 1.20941162e+02,  1.26461502e+02,  9.25070038e+01]],
+
+        [[ 5.56412773e+01,  6.93217773e+01,  4.46427994e+01],
+         [ 5.28044205e+01,  6.67666626e+01,  4.17459335e+01],
+         [ 5.03333588e+01,  6.32095261e+01,  4.01224670e+01],
+         ...,
+         [ 1.30266159e+02,  1.45737137e+02,  1.06612762e+02],
+         [ 1.25733429e+02,  1.37645782e+02,  1.00882072e+02],
+         [ 1.19405090e+02,  1.28468903e+02,  9.46394958e+01]],
+
+        [[ 6.66966553e+01,  8.03032684e+01,  5.69682922e+01],
+         [ 6.34833031e+01,  7.71879883e+01,  5.36312714e+01],
+         [ 5.69458885e+01,  6.96463470e+01,  4.78098984e+01],
+         ...,
+         [ 1.32660233e+02,  1.49680664e+02,  1.07838509e+02],
+         [ 1.26706856e+02,  1.41510147e+02,  1.03348465e+02],
+         [ 1.19581390e+02,  1.32401215e+02,  9.78807983e+01]]]],
+      dtype=float32)&gt;, &lt;tf.Tensor: shape=(8, 16800, 16), dtype=float32, numpy=
+array([[[  5.612871  ,  68.04673   ,  -5.210217  , ...,  -2.4999998 ,
+           0.        ,   0.        ],
+        [  2.8064356 ,  34.023365  ,  -8.675953  , ...,  -1.2499999 ,
+           0.        ,   0.        ],
+        [  0.6128713 ,  68.04673   ,  -5.210217  , ...,  -2.4999998 ,
+           0.        ,   0.        ],
+        ...,
+        [-11.308971  ,  -9.982915  , -22.538898  , ..., -12.187499  ,
+           0.        ,   0.        ],
+        [-23.867945  , -19.96583   , -19.07316   , ..., -24.374998  ,
+           0.        ,   0.        ],
+        [-11.933972  ,  -9.982915  , -22.538898  , ..., -12.187499  ,
+           0.        ,   0.        ]],
+
+       [[ 26.56724   ,  30.905638  ,   8.800869  , ...,  55.820175  ,
+           1.        ,   0.        ],
+        [ 13.28362   ,  15.452819  ,   5.3351336 , ...,  27.910088  ,
+           1.        ,   0.        ],
+        [ 21.56724   ,  30.905638  ,   8.800869  , ...,  55.820175  ,
+           1.        ,   0.        ],
+        ...,
+        [-10.654148  , -11.143574  ,  -8.52781   , ..., -10.364994  ,
+           1.        ,   0.        ],
+        [-22.558296  , -22.287148  ,  -5.062074  , ..., -20.729988  ,
+           1.        ,   0.        ],
+        [-11.279148  , -11.143574  ,  -8.52781   , ..., -10.364994  ,
+           1.        ,   0.        ]],
+
+       [[ 38.281437  ,  85.41209   ,   2.6807168 , ...,  -2.4999998 ,
+           0.        ,   0.        ],
+        [ 19.140718  ,  42.706043  ,  -0.78501904, ...,  -1.2499999 ,
+           0.        ,   0.        ],
+        [ 33.281437  ,  85.41209   ,   2.6807168 , ...,  -2.4999998 ,
+           0.        ,   0.        ],
+        ...,
+        [-10.288079  ,  -9.440247  , -14.647963  , ..., -12.187499  ,
+           0.        ,   0.        ],
+        [-21.826159  , -18.880493  , -11.182227  , ..., -24.374998  ,
+           0.        ,   0.        ],
+        [-10.913079  ,  -9.440247  , -14.647963  , ..., -12.187499  ,
+           0.        ,   0.        ]],
+
+       ...,
+
+       [[337.60413   , 152.18748   ,  -0.9116125 , ..., 155.5406    ,
+           1.        ,   0.        ],
+        [168.80206   ,  76.09374   ,  -4.3773484 , ...,  77.7703    ,
+           1.        ,   0.        ],
+        [332.60413   , 152.18748   ,  -0.9116125 , ..., 155.5406    ,
+           1.        ,   0.        ],
+        ...,
+        [ -0.93424535,  -7.3535156 , -18.240292  , ...,  -7.2487307 ,
+           1.        ,   0.        ],
+        [ -3.118491  , -14.707031  , -14.774556  , ..., -14.497461  ,
+           1.        ,   0.        ],
+        [ -1.5592455 ,  -7.3535156 , -18.240292  , ...,  -7.2487307 ,
+           1.        ,   0.        ]],
+
+       [[298.7106    , 101.13196   ,  14.91776   , ..., 126.88885   ,
+           1.        ,   0.        ],
+        [149.3553    ,  50.56598   ,  11.4520235 , ...,  63.444424  ,
+           1.        ,   0.        ],
+        [293.7106    , 101.13196   ,  14.91776   , ..., 126.88885   ,
+           1.        ,   0.        ],
+        ...,
+        [ -2.1496675 ,  -8.949     ,  -2.4109201 , ...,  -8.144098  ,
+           1.        ,   0.        ],
+        [ -5.549335  , -17.898     ,   1.0548158 , ..., -16.288197  ,
+           1.        ,   0.        ],
+        [ -2.7746675 ,  -8.949     ,  -2.4109201 , ...,  -8.144098  ,
+           1.        ,   0.        ]],
+
+       [[193.08823   , 121.7647    ,  10.969757  , ..., 152.64705   ,
+           1.        ,   0.        ],
+        [ 96.54411   ,  60.88235   ,   7.5040207 , ...,  76.323524  ,
+           1.        ,   0.        ],
+        [188.08821   , 121.7647    ,  10.969757  , ..., 152.64705   ,
+           1.        ,   0.        ],
+        ...,
+        [ -5.4503675 ,  -8.304227  ,  -6.3589225 , ...,  -7.339154  ,
+           1.        ,   0.        ],
+        [-12.150735  , -16.608454  ,  -2.8931866 , ..., -14.678308  ,
+           1.        ,   0.        ],
+        [ -6.0753675 ,  -8.304227  ,  -6.3589225 , ...,  -7.339154  ,
+           1.        ,   0.        ]]], dtype=float32)&gt;)
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/eager/context.py", line 2102, in execution_mode
+    yield
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/data/ops/iterator_ops.py", line 758, in _next_internal
+    output_shapes=self._flat_output_shapes)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/ops/gen_dataset_ops.py", line 2610, in iterator_get_next
+    _ops.raise_from_not_ok_status(e, name)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/framework/ops.py", line 6843, in raise_from_not_ok_status
+    six.raise_from(core._status_to_exception(e.code, message), None)
+  File "&lt;string&gt;", line 3, in raise_from
+tensorflow.python.framework.errors_impl.OutOfRangeError: End of sequence [Op:IteratorGetNext]
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/distribute/input_lib.py", line 649, in __next__
+    return self.get_next()
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/distribute/input_lib.py", line 721, in get_next
+    strict=True,
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/util/dispatch.py", line 201, in wrapper
+    return target(*args, **kwargs)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/util/deprecation.py", line 507, in new_func
+    return func(*args, **kwargs)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/ops/control_flow_ops.py", line 1210, in cond
+    result = false_fn()
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/distribute/input_lib.py", line 720, in &lt;lambda&gt;
+    lambda: out_of_range_fn(i, device),
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/distribute/input_lib.py", line 702, in out_of_range_fn
+    data = self._iterators[worker_index].get_next(device)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/distribute/input_lib.py", line 1457, in get_next
+    return self._iterator.get_next(device)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/data/ops/multi_device_iterator_ops.py", line 576, in get_next
+    return self._device_iterators[index].get_next()
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/data/ops/iterator_ops.py", line 825, in get_next
+    return self._next_internal()
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/data/ops/iterator_ops.py", line 764, in _next_internal
+    return structure.from_compatible_tensor_list(self._element_spec, ret)
+  File "/usr/lib/python3.6/contextlib.py", line 99, in __exit__
+    self.gen.throw(type, value, traceback)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/eager/context.py", line 2105, in execution_mode
+    executor_new.wait()
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/eager/executor.py", line 67, in wait
+    pywrap_tfe.TFE_ExecutorWaitForAllPendingNodes(self._handle)
+tensorflow.python.framework.errors_impl.OutOfRangeError: End of sequence
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/mnt/retinaface-tf2/dist_data.py", line 701, in &lt;module&gt;
+    app.run(main)
+  File "/usr/local/lib/python3.6/dist-packages/absl/app.py", line 299, in run
+    _run_main(main, args)
+  File "/usr/local/lib/python3.6/dist-packages/absl/app.py", line 250, in _run_main
+    sys.exit(main(argv))
+  File "/mnt/retinaface-tf2/dist_data.py", line 697, in main
+    print(next(dist_train_iter))
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/distribute/input_lib.py", line 651, in __next__
+    raise StopIteration
+StopIteration
+2020-09-08 10:19:30.991376: W tensorflow/core/common_runtime/eager/context.cc:566] Unable to destroy server_ object, so releasing instead. Servers don't support clean shutdown.
+
+	</description>
+	<comments>
+		<comment id='1' author='wulikai1993' date='2020-09-09T21:31:06Z'>
+		Hi &lt;denchmark-link:https://github.com/wulikai1993&gt;@wulikai1993&lt;/denchmark-link&gt;
+, this is a lot of custom code. Can you please trim it down and provide a minimal reproduction? Looks like the majority of the code here is not relevant to the specific issue you're facing.
+From the error message, sounds to me like the problem here is not having enough data in each batch to distribute evenly across your replicas. Can you try running this in nightly and let me know if the error persists? You can also try making your batch size evenly divisible by multiworker_strategy.num_replicas_in_sync.
+		</comment>
+		<comment id='2' author='wulikai1993' date='2020-09-10T02:11:58Z'>
+		&lt;denchmark-link:https://github.com/nikitamaia&gt;@nikitamaia&lt;/denchmark-link&gt;
+ The custom code is mostly used in Dataset.map. In the main function, I succeed in printing the original Dataset's elements, which means the custom code is working correctly in the original Dataset. And you can see the element's shape is (8, 640, 640, 3), which means the batch size is 8. I used 3 workers with 1 gpu on each, so the elements should be enough for each worker.
+Then I just wrap the original Dataset as following
+dist_dataset = multiworker_strategy.experimental_distribute_dataset(dataset)
+If normally, each worker should print the tensor with 2 or 3 batch sizes. The strange thing I want to say is the wrapped DistributedDataset seems like to be empty. Because the End of sequence error demonstrates there is nothing in it.
+		</comment>
+		<comment id='3' author='wulikai1993' date='2020-09-10T03:52:39Z'>
+		I can try and reproduce this on my end if you provide minimal reproducible code. Having minimal code helps a lot in expediting the troubleshooting process. Thanks!
+		</comment>
+		<comment id='4' author='wulikai1993' date='2020-09-10T07:42:59Z'>
+		&lt;denchmark-link:https://github.com/nikitamaia&gt;@nikitamaia&lt;/denchmark-link&gt;
+ I try my best to trim down redundant code. The reserved code is used to parse the tfrecord file, mainly to crop images so that they can be batched together. In my opinion, now that I can iterate  successfully, I can iterate  easily. But the fact is not so, that's the most confusing part for me. Thank you for your patience!
+import os
+import tensorflow as tf
+from absl import app, flags, logging
+
+import math
+import tensorflow as tf
+import numpy as np
+from itertools import product as product
+
+
+###############################################################################
+#   Tensorflow / Numpy Priors                                                 #
+###############################################################################
+def prior_box(image_sizes, min_sizes, steps, clip=False):
+    """prior box"""
+    feature_maps = [
+        [math.ceil(image_sizes[0] / step), math.ceil(image_sizes[1] / step)]
+        for step in steps]
+
+    anchors = []
+    for k, f in enumerate(feature_maps):
+        for i, j in product(range(f[0]), range(f[1])):
+            for min_size in min_sizes[k]:
+                s_kx = min_size / image_sizes[1]
+                s_ky = min_size / image_sizes[0]
+                cx = (j + 0.5) * steps[k] / image_sizes[1]
+                cy = (i + 0.5) * steps[k] / image_sizes[0]
+                anchors += [cx, cy, s_kx, s_ky]
+
+    output = np.asarray(anchors).reshape([-1, 4])
+
+    if clip:
+        output = np.clip(output, 0, 1)
+
+    return output
+
+
+###############################################################################
+#   Tensorflow Encoding                                                       #
+###############################################################################
+def encode_tf(labels, priors, match_thresh, ignore_thresh,
+              variances=[0.1, 0.2]):
+    """tensorflow encoding"""
+    assert ignore_thresh &lt;= match_thresh
+    priors = tf.cast(priors, tf.float32)
+    bbox = labels[:, :4]
+    landm = labels[:, 4:-1]
+    landm_valid = labels[:, -1]  # 1: with landm, 0: w/o landm.
+
+    # jaccard index
+    overlaps = _jaccard(bbox, _point_form(priors))
+
+    # (Bipartite Matching)
+    # [num_objects] best prior for each ground truth
+    best_prior_overlap, best_prior_idx = tf.math.top_k(overlaps, k=1)
+    best_prior_overlap = best_prior_overlap[:, 0]
+    best_prior_idx = best_prior_idx[:, 0]
+
+    # [num_priors] best ground truth for each prior
+    overlaps_t = tf.transpose(overlaps)
+    best_truth_overlap, best_truth_idx = tf.math.top_k(overlaps_t, k=1)
+    best_truth_overlap = best_truth_overlap[:, 0]
+    best_truth_idx = best_truth_idx[:, 0]
+
+    # ensure best prior
+    def _loop_body(i, bt_idx, bt_overlap):
+        bp_mask = tf.one_hot(best_prior_idx[i], tf.shape(bt_idx)[0])
+        bp_mask_int = tf.cast(bp_mask, tf.int32)
+        new_bt_idx = bt_idx * (1 - bp_mask_int) + bp_mask_int * i
+        bp_mask_float = tf.cast(bp_mask, tf.float32)
+        new_bt_overlap = bt_overlap * (1 - bp_mask_float) + bp_mask_float * 2
+        return tf.cond(best_prior_overlap[i] &gt; match_thresh,
+                       lambda: (i + 1, new_bt_idx, new_bt_overlap),
+                       lambda: (i + 1, bt_idx, bt_overlap))
+    _, best_truth_idx, best_truth_overlap = tf.while_loop(
+        lambda i, bt_idx, bt_overlap: tf.less(i, tf.shape(best_prior_idx)[0]),
+        _loop_body, [tf.constant(0), best_truth_idx, best_truth_overlap])
+
+    matches_bbox = tf.gather(bbox, best_truth_idx)  # [num_priors, 4]
+    matches_landm = tf.gather(landm, best_truth_idx)  # [num_priors, 10]
+    matches_landm_v = tf.gather(landm_valid, best_truth_idx)  # [num_priors]
+
+    loc_t = _encode_bbox(matches_bbox, priors, variances)
+    landm_t = _encode_landm(matches_landm, priors, variances)
+    landm_valid_t = tf.cast(matches_landm_v &gt; 0, tf.float32)
+    conf_t = tf.cast(best_truth_overlap &gt; match_thresh, tf.float32)
+    conf_t = tf.where(
+        tf.logical_and(best_truth_overlap &lt; match_thresh,
+                       best_truth_overlap &gt; ignore_thresh),
+        tf.ones_like(conf_t) * -1, conf_t)    # 1: pos, 0: neg, -1: ignore
+
+    return tf.concat([loc_t, landm_t, landm_valid_t[..., tf.newaxis],
+                      conf_t[..., tf.newaxis]], axis=1)
+
+
+def _encode_bbox(matched, priors, variances):
+    """Encode the variances from the priorbox layers into the ground truth
+    boxes we have matched (based on jaccard overlap) with the prior boxes.
+    Args:
+        matched: (tensor) Coords of ground truth for each prior in point-form
+            Shape: [num_priors, 4].
+        priors: (tensor) Prior boxes in center-offset form
+            Shape: [num_priors,4].
+        variances: (list[float]) Variances of priorboxes
+    Return:
+        encoded boxes (tensor), Shape: [num_priors, 4]
+    """
+
+    # dist b/t match center and prior's center
+    g_cxcy = (matched[:, :2] + matched[:, 2:]) / 2 - priors[:, :2]
+    # encode variance
+    g_cxcy /= (variances[0] * priors[:, 2:])
+    # match wh / prior wh
+    g_wh = (matched[:, 2:] - matched[:, :2]) / priors[:, 2:]
+    g_wh = tf.math.log(g_wh) / variances[1]
+    # return target for smooth_l1_loss
+    return tf.concat([g_cxcy, g_wh], 1)  # [num_priors,4]
+
+
+def _encode_landm(matched, priors, variances):
+    """Encode the variances from the priorbox layers into the ground truth
+    boxes we have matched (based on jaccard overlap) with the prior boxes.
+    Args:
+        matched: (tensor) Coords of ground truth for each prior in point-form
+            Shape: [num_priors, 10].
+        priors: (tensor) Prior boxes in center-offset form
+            Shape: [num_priors,4].
+        variances: (list[float]) Variances of priorboxes
+    Return:
+        encoded landm (tensor), Shape: [num_priors, 10]
+    """
+
+    # dist b/t match center and prior's center
+    matched = tf.reshape(matched, [tf.shape(matched)[0], 5, 2])
+    priors = tf.broadcast_to(
+        tf.expand_dims(priors, 1), [tf.shape(matched)[0], 5, 4])
+    g_cxcy = matched[:, :, :2] - priors[:, :, :2]
+    # encode variance
+    g_cxcy /= (variances[0] * priors[:, :, 2:])
+    # g_cxcy /= priors[:, :, 2:]
+    g_cxcy = tf.reshape(g_cxcy, [tf.shape(g_cxcy)[0], -1])
+    # return target for smooth_l1_loss
+    return g_cxcy
+
+
+def _point_form(boxes):
+    """ Convert prior_boxes to (xmin, ymin, xmax, ymax)
+    representation for comparison to point form ground truth data.
+    Args:
+        boxes: (tensor) center-size default boxes from priorbox layers.
+    Return:
+        boxes: (tensor) Converted xmin, ymin, xmax, ymax form of boxes.
+    """
+    return tf.concat((boxes[:, :2] - boxes[:, 2:] / 2,
+                      boxes[:, :2] + boxes[:, 2:] / 2), axis=1)
+
+
+def _intersect(box_a, box_b):
+    """ We resize both tensors to [A,B,2]:
+    [A,2] -&gt; [A,1,2] -&gt; [A,B,2]
+    [B,2] -&gt; [1,B,2] -&gt; [A,B,2]
+    Then we compute the area of intersect between box_a and box_b.
+    Args:
+      box_a: (tensor) bounding boxes, Shape: [A,4].
+      box_b: (tensor) bounding boxes, Shape: [B,4].
+    Return:
+      (tensor) intersection area, Shape: [A,B].
+    """
+    A = tf.shape(box_a)[0]
+    B = tf.shape(box_b)[0]
+    max_xy = tf.minimum(
+        tf.broadcast_to(tf.expand_dims(box_a[:, 2:], 1), [A, B, 2]),
+        tf.broadcast_to(tf.expand_dims(box_b[:, 2:], 0), [A, B, 2]))
+    min_xy = tf.maximum(
+        tf.broadcast_to(tf.expand_dims(box_a[:, :2], 1), [A, B, 2]),
+        tf.broadcast_to(tf.expand_dims(box_b[:, :2], 0), [A, B, 2]))
+    inter = tf.maximum((max_xy - min_xy), tf.zeros_like(max_xy - min_xy))
+    return inter[:, :, 0] * inter[:, :, 1]
+
+
+def _jaccard(box_a, box_b):
+    """Compute the jaccard overlap of two sets of boxes.  The jaccard overlap
+    is simply the intersection over union of two boxes.  Here we operate on
+    ground truth boxes and default boxes.
+    E.g.:
+        A ∩ B / A ∪ B = A ∩ B / (area(A) + area(B) - A ∩ B)
+    Args:
+        box_a: (tensor) Ground truth bounding boxes, Shape: [num_objects,4]
+        box_b: (tensor) Prior boxes from priorbox layers, Shape: [num_priors,4]
+    Return:
+        jaccard overlap: (tensor) Shape: [box_a.size(0), box_b.size(0)]
+    """
+    inter = _intersect(box_a, box_b)
+    area_a = tf.broadcast_to(
+        tf.expand_dims(
+            (box_a[:, 2] - box_a[:, 0]) * (box_a[:, 3] - box_a[:, 1]), 1),
+        tf.shape(inter))  # [A,B]
+    area_b = tf.broadcast_to(
+        tf.expand_dims(
+            (box_b[:, 2] - box_b[:, 0]) * (box_b[:, 3] - box_b[:, 1]), 0),
+        tf.shape(inter))  # [A,B]
+    union = area_a + area_b - inter
+    return inter / union  # [A,B]
+
+
+def _parse_tfrecord(img_dim, using_bin, using_flip, using_distort,
+                    using_encoding, priors, match_thresh, ignore_thresh,
+                    variances):
+    def parse_tfrecord(tfrecord):
+        features = {
+            'image/img_name': tf.io.FixedLenFeature([], tf.string),
+            'image/object/bbox/xmin': tf.io.VarLenFeature(tf.float32),
+            'image/object/bbox/ymin': tf.io.VarLenFeature(tf.float32),
+            'image/object/bbox/xmax': tf.io.VarLenFeature(tf.float32),
+            'image/object/bbox/ymax': tf.io.VarLenFeature(tf.float32),
+            'image/object/landmark0/x': tf.io.VarLenFeature(tf.float32),
+            'image/object/landmark0/y': tf.io.VarLenFeature(tf.float32),
+            'image/object/landmark1/x': tf.io.VarLenFeature(tf.float32),
+            'image/object/landmark1/y': tf.io.VarLenFeature(tf.float32),
+            'image/object/landmark2/x': tf.io.VarLenFeature(tf.float32),
+            'image/object/landmark2/y': tf.io.VarLenFeature(tf.float32),
+            'image/object/landmark3/x': tf.io.VarLenFeature(tf.float32),
+            'image/object/landmark3/y': tf.io.VarLenFeature(tf.float32),
+            'image/object/landmark4/x': tf.io.VarLenFeature(tf.float32),
+            'image/object/landmark4/y': tf.io.VarLenFeature(tf.float32),
+            'image/object/landmark/valid': tf.io.VarLenFeature(tf.float32)}
+        if using_bin:
+            features['image/encoded'] = tf.io.FixedLenFeature([], tf.string)
+            x = tf.io.parse_single_example(tfrecord, features)
+            img = tf.image.decode_jpeg(x['image/encoded'], channels=3)
+        else:
+            features['image/img_path'] = tf.io.FixedLenFeature([], tf.string)
+            x = tf.io.parse_single_example(tfrecord, features)
+            image_encoded = tf.io.read_file(x['image/img_path'])
+            img = tf.image.decode_jpeg(image_encoded, channels=3)
+
+        labels = tf.stack(
+            [tf.sparse.to_dense(x['image/object/bbox/xmin']),
+             tf.sparse.to_dense(x['image/object/bbox/ymin']),
+             tf.sparse.to_dense(x['image/object/bbox/xmax']),
+             tf.sparse.to_dense(x['image/object/bbox/ymax']),
+             tf.sparse.to_dense(x['image/object/landmark0/x']),
+             tf.sparse.to_dense(x['image/object/landmark0/y']),
+             tf.sparse.to_dense(x['image/object/landmark1/x']),
+             tf.sparse.to_dense(x['image/object/landmark1/y']),
+             tf.sparse.to_dense(x['image/object/landmark2/x']),
+             tf.sparse.to_dense(x['image/object/landmark2/y']),
+             tf.sparse.to_dense(x['image/object/landmark3/x']),
+             tf.sparse.to_dense(x['image/object/landmark3/y']),
+             tf.sparse.to_dense(x['image/object/landmark4/x']),
+             tf.sparse.to_dense(x['image/object/landmark4/y']),
+             tf.sparse.to_dense(x['image/object/landmark/valid'])], axis=1)
+
+        img, labels = _transform_data(
+            img_dim, using_flip, using_distort, using_encoding, priors,
+            match_thresh, ignore_thresh, variances)(img, labels)
+
+        return img, labels
+    return parse_tfrecord
+
+
+def _transform_data(img_dim, using_flip, using_distort, using_encoding, priors,
+                    match_thresh, ignore_thresh, variances):
+    def transform_data(img, labels):
+        img = tf.cast(img, tf.float32)
+
+        # randomly crop
+        img, labels = _crop(img, labels)
+
+        # padding to square
+        img = _pad_to_square(img)
+
+        # resize
+        img, labels = _resize(img, labels, img_dim)
+
+        # encode labels to feature targets
+        if using_encoding:
+            labels = encode_tf(labels=labels, priors=priors,
+                               match_thresh=match_thresh,
+                               ignore_thresh=ignore_thresh,
+                               variances=variances)
+
+        return img, labels
+    return transform_data
+
+
+def load_tfrecord_dataset(tfrecord_name, batch_size, img_dim,
+                          using_bin=True, using_flip=True, using_distort=True,
+                          using_encoding=True, priors=None, match_thresh=0.45,
+                          ignore_thresh=0.3, variances=[0.1, 0.2],
+                          shuffle=True, buffer_size=10240):
+    """load dataset from tfrecord"""
+    if not using_encoding:
+        assert batch_size == 1  # dynamic data len when using_encoding
+    else:
+        assert priors is not None
+
+    raw_dataset = tf.data.TFRecordDataset(tfrecord_name)
+    raw_dataset = raw_dataset.repeat()
+    if shuffle:
+        raw_dataset = raw_dataset.shuffle(buffer_size=buffer_size)
+    dataset = raw_dataset.map(
+        _parse_tfrecord(img_dim, using_bin, using_flip, using_distort,
+                        using_encoding, priors, match_thresh, ignore_thresh,
+                        variances),
+        num_parallel_calls=tf.data.experimental.AUTOTUNE)
+    dataset = dataset.batch(batch_size, drop_remainder=True)
+    dataset = dataset.prefetch(
+        buffer_size=tf.data.experimental.AUTOTUNE)
+
+    return dataset
+
+
+###############################################################################
+#   Data Augmentation                                                         #
+###############################################################################
+
+
+def _crop(img, labels, max_loop=250):
+    shape = tf.shape(img)
+
+    def matrix_iof(a, b):
+        """
+        return iof of a and b, numpy version for data augenmentation
+        """
+        lt = tf.math.maximum(a[:, tf.newaxis, :2], b[:, :2])
+        rb = tf.math.minimum(a[:, tf.newaxis, 2:], b[:, 2:])
+
+        area_i = tf.math.reduce_prod(rb - lt, axis=2) * \
+            tf.cast(tf.reduce_all(lt &lt; rb, axis=2), tf.float32)
+        area_a = tf.math.reduce_prod(a[:, 2:] - a[:, :2], axis=1)
+        return area_i / tf.math.maximum(area_a[:, tf.newaxis], 1)
+
+    def crop_loop_body(i, img, labels):
+        valid_crop = tf.constant(1, tf.int32)
+
+        pre_scale = tf.constant([0.3, 0.45, 0.6, 0.8, 1.0], dtype=tf.float32)
+        scale = pre_scale[tf.random.uniform([], 0, 5, dtype=tf.int32)]
+        short_side = tf.cast(tf.minimum(shape[0], shape[1]), tf.float32)
+        h = w = tf.cast(scale * short_side, tf.int32)
+        h_offset = tf.random.uniform([], 0, shape[0] - h + 1, dtype=tf.int32)
+        w_offset = tf.random.uniform([], 0, shape[1] - w + 1, dtype=tf.int32)
+        roi = tf.stack([w_offset, h_offset, w_offset + w, h_offset + h])
+        roi = tf.cast(roi, tf.float32)
+
+        value = matrix_iof(labels[:, :4], roi[tf.newaxis])
+        valid_crop = tf.cond(tf.math.reduce_any(value &gt;= 1),
+                             lambda: valid_crop, lambda: 0)
+
+        centers = (labels[:, :2] + labels[:, 2:4]) / 2
+        mask_a = tf.reduce_all(
+            tf.math.logical_and(roi[:2] &lt; centers, centers &lt; roi[2:]),
+            axis=1)
+        labels_t = tf.boolean_mask(labels, mask_a)
+        valid_crop = tf.cond(tf.reduce_any(mask_a),
+                             lambda: valid_crop, lambda: 0)
+
+        img_t = img[h_offset:h_offset + h, w_offset:w_offset + w, :]
+        h_offset = tf.cast(h_offset, tf.float32)
+        w_offset = tf.cast(w_offset, tf.float32)
+        labels_t = tf.stack(
+            [labels_t[:, 0] - w_offset,  labels_t[:, 1] - h_offset,
+             labels_t[:, 2] - w_offset,  labels_t[:, 3] - h_offset,
+             labels_t[:, 4] - w_offset,  labels_t[:, 5] - h_offset,
+             labels_t[:, 6] - w_offset,  labels_t[:, 7] - h_offset,
+             labels_t[:, 8] - w_offset,  labels_t[:, 9] - h_offset,
+             labels_t[:, 10] - w_offset, labels_t[:, 11] - h_offset,
+             labels_t[:, 12] - w_offset, labels_t[:, 13] - h_offset,
+             labels_t[:, 14]], axis=1)
+
+        return tf.cond(valid_crop == 1,
+                       lambda: (max_loop, img_t, labels_t),
+                       lambda: (i + 1, img, labels))
+
+    _, img, labels = tf.while_loop(
+        lambda i, img, labels: tf.less(i, max_loop),
+        crop_loop_body,
+        [tf.constant(-1), img, labels],
+        shape_invariants=[tf.TensorShape([]),
+                          tf.TensorShape([None, None, 3]),
+                          tf.TensorShape([None, 15])])
+
+    return img, labels
+
+
+def _pad_to_square(img):
+    height = tf.shape(img)[0]
+    width = tf.shape(img)[1]
+
+    def pad_h():
+        img_pad_h = tf.ones([width - height, width, 3]) * \
+            tf.reduce_mean(img, axis=[0, 1], keepdims=True)
+        return tf.concat([img, img_pad_h], axis=0)
+
+    def pad_w():
+        img_pad_w = tf.ones([height, height - width, 3]) * \
+            tf.reduce_mean(img, axis=[0, 1], keepdims=True)
+        return tf.concat([img, img_pad_w], axis=1)
+
+    img = tf.case([(tf.greater(height, width), pad_w),
+                   (tf.less(height, width), pad_h)], default=lambda: img)
+
+    return img
+
+
+def _resize(img, labels, img_dim):
+    w_f = tf.cast(tf.shape(img)[1], tf.float32)
+    h_f = tf.cast(tf.shape(img)[0], tf.float32)
+    locs = tf.stack([labels[:, 0] / w_f,  labels[:, 1] / h_f,
+                     labels[:, 2] / w_f,  labels[:, 3] / h_f,
+                     labels[:, 4] / w_f,  labels[:, 5] / h_f,
+                     labels[:, 6] / w_f,  labels[:, 7] / h_f,
+                     labels[:, 8] / w_f,  labels[:, 9] / h_f,
+                     labels[:, 10] / w_f, labels[:, 11] / h_f,
+                     labels[:, 12] / w_f, labels[:, 13] / h_f], axis=1)
+    locs = tf.clip_by_value(locs, 0, 1)
+    labels = tf.concat([locs, labels[:, 14][:, tf.newaxis]], axis=1)
+
+    resize_case = tf.random.uniform([], 0, 5, dtype=tf.int32)
+
+    def resize(method):
+        def _resize():
+            return tf.image.resize(
+                img, [img_dim, img_dim], method=method, antialias=True)
+        return _resize
+
+    img = tf.case([(tf.equal(resize_case, 0), resize('bicubic')),
+                   (tf.equal(resize_case, 1), resize('area')),
+                   (tf.equal(resize_case, 2), resize('nearest')),
+                   (tf.equal(resize_case, 3), resize('lanczos3'))],
+                  default=resize('bilinear'))
+
+    return img, labels
+
+
+def load_dataset(cfg, priors, shuffle=True, buffer_size=10240):
+    """load dataset"""
+    logging.info("load dataset from {}".format(cfg['dataset_path']))
+    dataset = load_tfrecord_dataset(
+        tfrecord_name=cfg['dataset_path'],
+        batch_size=cfg['batch_size'],
+        img_dim=cfg['input_size'],
+        using_bin=True,
+        using_flip=False,
+        using_distort=False,
+        using_encoding=True,
+        priors=priors,
+        match_thresh=cfg['match_thresh'],
+        ignore_thresh=cfg['ignore_thresh'],
+        variances=cfg['variances'],
+        shuffle=shuffle,
+        buffer_size=buffer_size)
+    return dataset
+
+def set_memory_growth():
+    gpus = tf.config.experimental.list_physical_devices('GPU')
+    if gpus:
+        try:
+            # Currently, memory growth needs to be the same across GPUs
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+                logical_gpus = tf.config.experimental.list_logical_devices(
+                    'GPU')
+                logging.info(
+                    "Detect {} Physical GPUs, {} Logical GPUs.".format(
+                        len(gpus), len(logical_gpus)))
+        except RuntimeError as e:
+            # Memory growth must be set before GPUs have been initialized
+            logging.info(e)
+
+def prior_box(image_sizes, min_sizes, steps, clip=False):
+    """prior box"""
+    feature_maps = [
+        [math.ceil(image_sizes[0] / step), math.ceil(image_sizes[1] / step)]
+        for step in steps]
+
+    anchors = []
+    for k, f in enumerate(feature_maps):
+        for i, j in product(range(f[0]), range(f[1])):
+            for min_size in min_sizes[k]:
+                s_kx = min_size / image_sizes[1]
+                s_ky = min_size / image_sizes[0]
+                cx = (j + 0.5) * steps[k] / image_sizes[1]
+                cy = (i + 0.5) * steps[k] / image_sizes[0]
+                anchors += [cx, cy, s_kx, s_ky]
+
+    output = np.asarray(anchors).reshape([-1, 4])
+
+    if clip:
+        output = np.clip(output, 0, 1)
+
+    return output
+
+cfg = {
+    # general setting
+    "batch_size": 8,
+    "input_size": 640,  # (h,w)
+
+    "backbone_type": 'ResNet50',  # 'ResNet50', 'MobileNetV2'
+    "sub_name": 'retinaface_res50',
+
+    # training dataset
+    "dataset_path": '/mnt/retinaface-tf2/data/widerface_test_bin.tfrecord',  # 'dataset/trainval_mask.tfrecord'
+    "testing_dataset_path": './data/widerface/val',  #
+    "dataset_len": 12880,  # train 6115 , trainval 7954, number of training samples
+    "val_len": 1839,
+    "labels_list": ['background', 'mask', 'unmask'],  # xml annotation
+
+    # anchor setting
+    "min_sizes": [[16, 32], [64, 128], [256, 512]],
+    "steps": [8, 16, 32],
+    "match_thresh": 0.45,
+    "ignore_thresh": 0.3,
+    "variances": [0.1, 0.2],
+    "clip": False,
+
+    # network
+    "out_channel": 256,
+
+}
+
+def main(_):
+
+    multiworker_strategy = tf.distribute.experimental.MultiWorkerMirroredStrategy()
+    # init
+    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+    os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+
+    logger = tf.get_logger()
+    logger.disabled = True
+    set_memory_growth()
+    priors = prior_box((cfg['input_size'], cfg['input_size']),
+                           cfg['min_sizes'],  cfg['steps'], cfg['clip'])
+    dataset = load_dataset(cfg, priors, shuffle=True)
+    train_iter = iter(dataset)
+    for _ in range(10):
+        print(next(train_iter)[0].shape)
+    dist_dataset = multiworker_strategy.experimental_distribute_dataset(dataset)
+    dist_train_iter = iter(dist_dataset)
+    for _ in range(10):
+        print(next(dist_train_iter)[0].shape)
+
+
+if __name__ == '__main__':
+    app.run(main)
+
+The log as following:
+2020-09-10 07:37:16.503276: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcudart.so.10.1
+2020-09-10 07:37:17.829609: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcuda.so.1
+2020-09-10 07:37:18.105548: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1716] Found device 0 with properties: 
+pciBusID: 0000:02:00.0 name: GeForce GTX 1080 Ti computeCapability: 6.1
+coreClock: 1.683GHz coreCount: 28 deviceMemorySize: 10.92GiB deviceMemoryBandwidth: 451.17GiB/s
+2020-09-10 07:37:18.105661: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcudart.so.10.1
+2020-09-10 07:37:18.109466: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcublas.so.10
+2020-09-10 07:37:18.112812: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcufft.so.10
+2020-09-10 07:37:18.113402: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcurand.so.10
+2020-09-10 07:37:18.116045: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcusolver.so.10
+2020-09-10 07:37:18.117442: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcusparse.so.10
+2020-09-10 07:37:18.122760: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcudnn.so.7
+2020-09-10 07:37:18.141044: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1858] Adding visible gpu devices: 0
+2020-09-10 07:37:18.141716: I tensorflow/core/platform/cpu_feature_guard.cc:142] This TensorFlow binary is optimized with oneAPI Deep Neural Network Library (oneDNN)to use the following CPU instructions in performance-critical operations:  AVX2 FMA
+To enable them in other operations, rebuild TensorFlow with the appropriate compiler flags.
+2020-09-10 07:37:18.156381: I tensorflow/core/platform/profile_utils/cpu_utils.cc:104] CPU Frequency: 2199875000 Hz
+2020-09-10 07:37:18.158897: I tensorflow/compiler/xla/service/service.cc:168] XLA service 0x6029f90 initialized for platform Host (this does not guarantee that XLA will be used). Devices:
+2020-09-10 07:37:18.158941: I tensorflow/compiler/xla/service/service.cc:176]   StreamExecutor device (0): Host, Default Version
+2020-09-10 07:37:18.640931: I tensorflow/compiler/xla/service/service.cc:168] XLA service 0x6095e10 initialized for platform CUDA (this does not guarantee that XLA will be used). Devices:
+2020-09-10 07:37:18.641017: I tensorflow/compiler/xla/service/service.cc:176]   StreamExecutor device (0): GeForce GTX 1080 Ti, Compute Capability 6.1
+2020-09-10 07:37:18.643033: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1716] Found device 0 with properties: 
+pciBusID: 0000:02:00.0 name: GeForce GTX 1080 Ti computeCapability: 6.1
+coreClock: 1.683GHz coreCount: 28 deviceMemorySize: 10.92GiB deviceMemoryBandwidth: 451.17GiB/s
+2020-09-10 07:37:18.643099: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcudart.so.10.1
+2020-09-10 07:37:18.643141: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcublas.so.10
+2020-09-10 07:37:18.643172: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcufft.so.10
+2020-09-10 07:37:18.643202: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcurand.so.10
+2020-09-10 07:37:18.643232: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcusolver.so.10
+2020-09-10 07:37:18.643261: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcusparse.so.10
+2020-09-10 07:37:18.643287: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcudnn.so.7
+2020-09-10 07:37:18.646399: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1858] Adding visible gpu devices: 0
+2020-09-10 07:37:18.646451: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcudart.so.10.1
+2020-09-10 07:37:19.301344: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1257] Device interconnect StreamExecutor with strength 1 edge matrix:
+2020-09-10 07:37:19.301386: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1263]      0 
+2020-09-10 07:37:19.301399: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1276] 0:   N 
+2020-09-10 07:37:19.303428: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1402] Created TensorFlow device (/job:localhost/replica:0/task:0/device:GPU:0 with 10265 MB memory) -&gt; physical GPU (device: 0, name: GeForce GTX 1080 Ti, pci bus id: 0000:02:00.0, compute capability: 6.1)
+2020-09-10 07:37:19.327745: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1716] Found device 0 with properties: 
+pciBusID: 0000:02:00.0 name: GeForce GTX 1080 Ti computeCapability: 6.1
+coreClock: 1.683GHz coreCount: 28 deviceMemorySize: 10.92GiB deviceMemoryBandwidth: 451.17GiB/s
+2020-09-10 07:37:19.327814: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcudart.so.10.1
+2020-09-10 07:37:19.327857: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcublas.so.10
+2020-09-10 07:37:19.327887: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcufft.so.10
+2020-09-10 07:37:19.327914: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcurand.so.10
+2020-09-10 07:37:19.327940: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcusolver.so.10
+2020-09-10 07:37:19.327964: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcusparse.so.10
+2020-09-10 07:37:19.327990: I tensorflow/stream_executor/platform/default/dso_loader.cc:48] Successfully opened dynamic library libcudnn.so.7
+2020-09-10 07:37:19.331434: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1858] Adding visible gpu devices: 0
+2020-09-10 07:37:19.331512: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1257] Device interconnect StreamExecutor with strength 1 edge matrix:
+2020-09-10 07:37:19.331538: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1263]      0 
+2020-09-10 07:37:19.331559: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1276] 0:   N 
+2020-09-10 07:37:19.334657: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1402] Created TensorFlow device (/job:worker/replica:0/task:0/device:GPU:0 with 10265 MB memory) -&gt; physical GPU (device: 0, name: GeForce GTX 1080 Ti, pci bus id: 0000:02:00.0, compute capability: 6.1)
+2020-09-10 07:37:19.342618: I tensorflow/core/distributed_runtime/rpc/grpc_channel.cc:301] Initialize GrpcChannelCache for job worker -&gt; {0 -&gt; dist-data-worker-0.t9k-sample.svc:2222, 1 -&gt; dist-data-worker-1.t9k-sample.svc:2222, 2 -&gt; dist-data-worker-2.t9k-sample.svc:2222}
+2020-09-10 07:37:19.345112: I tensorflow/core/distributed_runtime/rpc/grpc_server_lib.cc:405] Started server with target: grpc://dist-data-worker-0.t9k-sample.svc:2222
+INFO:tensorflow:Enabled multi-worker collective ops with available devices: ['/job:worker/replica:0/task:0/device:CPU:0', '/job:worker/replica:0/task:0/device:XLA_CPU:0', '/job:worker/replica:0/task:0/device:XLA_GPU:0', '/job:worker/replica:0/task:0/device:GPU:0']
+I0910 07:37:19.346995 140561422595904 collective_all_reduce_strategy.py:329] Enabled multi-worker collective ops with available devices: ['/job:worker/replica:0/task:0/device:CPU:0', '/job:worker/replica:0/task:0/device:XLA_CPU:0', '/job:worker/replica:0/task:0/device:XLA_GPU:0', '/job:worker/replica:0/task:0/device:GPU:0']
+INFO:tensorflow:Using MirroredStrategy with devices ('/job:worker/task:0/device:GPU:0',)
+I0910 07:37:19.348705 140561422595904 mirrored_strategy.py:341] Using MirroredStrategy with devices ('/job:worker/task:0/device:GPU:0',)
+INFO:tensorflow:MultiWorkerMirroredStrategy with cluster_spec = {'worker': ['dist-data-worker-0.t9k-sample.svc:2222', 'dist-data-worker-1.t9k-sample.svc:2222', 'dist-data-worker-2.t9k-sample.svc:2222']}, task_type = 'worker', task_id = 0, num_workers = 3, local_devices = ('/job:worker/task:0/device:GPU:0',), communication = CollectiveCommunication.AUTO
+I0910 07:37:19.349095 140561422595904 collective_all_reduce_strategy.py:380] MultiWorkerMirroredStrategy with cluster_spec = {'worker': ['dist-data-worker-0.t9k-sample.svc:2222', 'dist-data-worker-1.t9k-sample.svc:2222', 'dist-data-worker-2.t9k-sample.svc:2222']}, task_type = 'worker', task_id = 0, num_workers = 3, local_devices = ('/job:worker/task:0/device:GPU:0',), communication = CollectiveCommunication.AUTO
+I0910 07:37:19.349557 140561422595904 dist_data.py:469] Physical devices cannot be modified after being initialized
+I0910 07:37:19.374378 140561422595904 dist_data.py:438] load dataset from /mnt/retinaface-tf2/data/widerface_test_bin.tfrecord
+(8, 640, 640, 3)
+(8, 640, 640, 3)
+(8, 640, 640, 3)
+(8, 640, 640, 3)
+(8, 640, 640, 3)
+(8, 640, 640, 3)
+(8, 640, 640, 3)
+(8, 640, 640, 3)
+(8, 640, 640, 3)
+(8, 640, 640, 3)
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/eager/context.py", line 2102, in execution_mode
+    yield
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/data/ops/iterator_ops.py", line 758, in _next_internal
+    output_shapes=self._flat_output_shapes)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/ops/gen_dataset_ops.py", line 2610, in iterator_get_next
+    _ops.raise_from_not_ok_status(e, name)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/framework/ops.py", line 6843, in raise_from_not_ok_status
+    six.raise_from(core._status_to_exception(e.code, message), None)
+  File "&lt;string&gt;", line 3, in raise_from
+tensorflow.python.framework.errors_impl.OutOfRangeError: End of sequence [Op:IteratorGetNext]
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/distribute/input_lib.py", line 649, in __next__
+    return self.get_next()
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/distribute/input_lib.py", line 721, in get_next
+    strict=True,
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/util/dispatch.py", line 201, in wrapper
+    return target(*args, **kwargs)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/util/deprecation.py", line 507, in new_func
+    return func(*args, **kwargs)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/ops/control_flow_ops.py", line 1210, in cond
+    result = false_fn()
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/distribute/input_lib.py", line 720, in &lt;lambda&gt;
+    lambda: out_of_range_fn(i, device),
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/distribute/input_lib.py", line 702, in out_of_range_fn
+    data = self._iterators[worker_index].get_next(device)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/distribute/input_lib.py", line 1457, in get_next
+    return self._iterator.get_next(device)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/data/ops/multi_device_iterator_ops.py", line 576, in get_next
+    return self._device_iterators[index].get_next()
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/data/ops/iterator_ops.py", line 825, in get_next
+    return self._next_internal()
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/data/ops/iterator_ops.py", line 764, in _next_internal
+    return structure.from_compatible_tensor_list(self._element_spec, ret)
+  File "/usr/lib/python3.6/contextlib.py", line 99, in __exit__
+    self.gen.throw(type, value, traceback)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/eager/context.py", line 2105, in execution_mode
+    executor_new.wait()
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/eager/executor.py", line 67, in wait
+    pywrap_tfe.TFE_ExecutorWaitForAllPendingNodes(self._handle)
+tensorflow.python.framework.errors_impl.OutOfRangeError: End of sequence
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/mnt/retinaface-tf2/dist_data.py", line 545, in &lt;module&gt;
+    app.run(main)
+  File "/usr/local/lib/python3.6/dist-packages/absl/app.py", line 299, in run
+    _run_main(main, args)
+  File "/usr/local/lib/python3.6/dist-packages/absl/app.py", line 250, in _run_main
+    sys.exit(main(argv))
+  File "/mnt/retinaface-tf2/dist_data.py", line 541, in main
+    print(next(dist_train_iter)[0].shape)
+  File "/usr/local/lib/python3.6/dist-packages/tensorflow/python/distribute/input_lib.py", line 651, in __next__
+    raise StopIteration
+StopIteration
+2020-09-10 07:37:29.088617: W tensorflow/core/common_runtime/eager/context.cc:566] Unable to destroy server_ object, so releasing instead. Servers don't support clean shutdown. Thank you for your patience!
+
+		</comment>
+		<comment id='5' author='wulikai1993' date='2020-09-10T20:47:34Z'>
+		Can you remove any of the augmentation functions? The tf.record doesn't have to be loaded in the exact format you ultimately want it to be in as long as we can reproduce the error. I understand that some of the preprocessing code is necessary, but just trying to throw out whatever we don't need (while still preserving the error message).
+		</comment>
+		<comment id='6' author='wulikai1993' date='2020-09-11T22:35:27Z'>
+		Can you also try setting the tf.data.experimental.AutoShardPolicy to DATA ?
+&lt;denchmark-link:https://www.tensorflow.org/tutorials/distribute/input#tfdistributestrategyexperimental_distribute_dataset&gt;From the docs&lt;/denchmark-link&gt;
+, the policy is by default AUTO:
+
+So since you have more than 1 worker, but only one input file, that could be causing the problem.
+		</comment>
+		<comment id='7' author='wulikai1993' date='2020-09-12T05:55:54Z'>
+		Thanks a lot ! It works for me ! I add following codes:
+options = tf.data.Options()
+options.experimental_distribute.auto_shard_policy = tf.data.experimental.AutoShardPolicy.DATA
+dataset = dataset.with_options(options)
+		</comment>
+		<comment id='8' author='wulikai1993' date='2020-09-12T05:55:57Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/43039&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/43039&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,131 @@
+<bug id='2385' author='lcy-seso' open_date='2017-06-05T14:10:19Z' closed_time='2017-06-12T03:35:26Z'>
+	<summary>beam search cannot be parsed correctly.</summary>
+	<description>
+
+
+This PR #2288 changes the way v2 APIs parse the network configuration. But currently, beam search cannot be parsed correctly. It causes bugs to machine translation in PaddleBook.
+
+
+This PR #2384 fix the training process but hasn't fixed bugs in the generation.
+
+
+I change is_generating=True in this line https://github.com/PaddlePaddle/book/blob/develop/08.machine_translation/train.py#L129, the error information go as follows
+
+
+&lt;denchmark-code&gt;I0605 18:50:24.263185 18007 Util.cpp:166] commandline:  --use_gpu=False --trainer_count=1
+F0605 18:50:46.687893 18007 NeuralNetwork.h:94] Check failed: it != layerMap_.end() Unknown layer __decoder_group_eos_layer__@decoder_group
+*** Check failure stack trace: ***
+    @     0x7f7019fed7bd  google::LogMessage::Fail()
+    @     0x7f7019ff126c  google::LogMessage::SendToLog()
+    @     0x7f7019fed2e3  google::LogMessage::Flush()
+    @     0x7f7019ff277e  google::LogMessageFatal::~LogMessageFatal()
+    @     0x7f7019c2afef  paddle::NeuralNetwork::getLayer()
+    @     0x7f7019c3932c  paddle::RecurrentGradientMachine::resizeOrCreateFrames()
+    @     0x7f7019c3873b  paddle::RecurrentGradientMachine::init()
+    @     0x7f7019bd3be9  paddle::RecurrentLayerGroup::initSubNetwork()
+    @     0x7f7019c285c5  paddle::NeuralNetwork::init()
+    @     0x7f7019c52bde  paddle::GradientMachine::create()
+    @     0x7f7019fc10cc  GradientMachine::createFromPaddleModelPtr()
+    @     0x7f7019fc120d  GradientMachine::createByConfigProtoStr()
+    @     0x7f7019ab07d5  _wrap_GradientMachine_createByConfigProtoStr__SWIG_0
+    @     0x7f7019ab0e10  _wrap_GradientMachine_createByConfigProtoStr
+    @     0x7f7021f513a3  PyEval_EvalFrameEx
+    @     0x7f7021f53130  PyEval_EvalCodeEx
+    @     0x7f7021f514a1  PyEval_EvalFrameEx
+    @     0x7f7021f53130  PyEval_EvalCodeEx
+    @     0x7f7021f514a1  PyEval_EvalFrameEx
+    @     0x7f7021f53130  PyEval_EvalCodeEx
+    @     0x7f7021edf27d  function_call
+    @     0x7f7021eb70f3  PyObject_Call
+    @     0x7f7021ec9f7f  instancemethod_call
+    @     0x7f7021eb70f3  PyObject_Call
+    @     0x7f7021f0d80e  slot_tp_init
+    @     0x7f7021f0c478  type_call
+    @     0x7f7021eb70f3  PyObject_Call
+    @     0x7f7021f50887  PyEval_EvalFrameEx
+    @     0x7f7021f53130  PyEval_EvalCodeEx
+    @     0x7f7021f514a1  PyEval_EvalFrameEx
+    @     0x7f7021f51c56  PyEval_EvalFrameEx
+    @     0x7f7021f53130  PyEval_EvalCodeEx
+&lt;/denchmark-code&gt;
+
+Besides eos_layer, several other layers are not created in generation.
+	</description>
+	<comments>
+		<comment id='1' author='lcy-seso' date='2017-06-06T06:33:34Z'>
+		以上错误的原因是：
+
+
+当调用 paddle.layer.A 时将 A 的信息写入 g_layer_map 这个全局的 layer 字典中
+
+
+一个 layer 的 output 成为下一个 layer 的 input，output--&gt;input 的记录了网络的连接性。
+
+
+指定一个”根“结点，以广度优先遍历选择出用到的layer：https://github.com/PaddlePaddle/Paddle/blob/develop/python/paddle/v2/layer.py#L141
+
+
+生成任务中， eos_id 比较特殊。生成任务指定下面的 max_id 来作为”根“，然后遍历 max_id 的每一个输入，而 eos 以 max_id 作为输入，在遍历的时候不会被选择。
+                  /--&gt; eos
+softmax --&gt; max_id 
+
+
+
+		</comment>
+		<comment id='2' author='lcy-seso' date='2017-06-06T08:17:06Z'>
+		
+eos layer 接近于 Topology 类中的 extra_layers。
+或者换一个角度，包在 layer_group 之中的一组layer 都应该被认为是 ”被使用“，而总是被选择。
+
+		</comment>
+		<comment id='3' author='lcy-seso' date='2017-06-06T09:19:00Z'>
+		如果不通过规则来修正  在生成时这种比较特殊的情况，怎样的修改会更好一些呢？&lt;denchmark-link:https://github.com/emailweixu&gt;@emailweixu&lt;/denchmark-link&gt;
+
+例如下面这种方式：
+在 __get_used_submodels__ 时，如果 submodels 是 recurrent_layer_group，检查一个 layer group
+中的 layer 是否都被加入 layer_names，如果没有加入，则添加。
+		</comment>
+		<comment id='4' author='lcy-seso' date='2017-06-06T10:29:08Z'>
+		def __get_used_submodels__(layer_names):
+    submodel_names = set()
+    for submodel in cp.g_config.model_config.sub_models:
+        if submodel.name in layer_names:
+            submodel_names.add(submodel.name)
+            if submodel.is_recurrent_layer_group:
+                layer_names |= set(submodel.layer_names)
+    return submodel_names
+按照上述代码，修改 __get_used_submodels__ 函数，将 recurrent_layer_group 括起来的一组 layer 总认为是一组被使用的 layer，可以解决生成过程 eos_layer 未定义的问题。
+但会出现另一个 bug：
+
+Generator 定义了一个 data_layer，来存储 predict_word，这个data_layer 会被自动识别为网络的输入层: https://github.com/PaddlePaddle/Paddle/blob/develop/python/paddle/v2/layer.py#L141
+生成时会在这一行挂掉：https://github.com/PaddlePaddle/Paddle/blob/develop/python/paddle/v2/topology.py#L95
+
+出错信息如下：
+&lt;denchmark-code&gt;Traceback (most recent call last):
+  File "train.py", line 216, in &lt;module&gt;
+    main()
+  File "train.py", line 189, in main
+    field=['prob', 'id'])
+  File "/home/caoying/paddle_codes/paddle_book/08.machine_translation/paddle/v2/inference.py", line 133, in infer
+    inferer = Inference(output_layer=output_layer, parameters=parameters)
+  File "/home/caoying/paddle_codes/paddle_book/08.machine_translation/paddle/v2/inference.py", line 41, in __init__
+    self.__data_types__ = topo.data_type()
+  File "/home/caoying/paddle_codes/paddle_book/08.machine_translation/paddle/v2/topology.py", line 95, in data_type
+    for nm in self.proto().input_layer_names]
+KeyError: u'__beam_search_predict__'
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='5' author='lcy-seso' date='2017-06-06T11:26:14Z'>
+		生成时这个特殊的 data_layer 可以用比较简单的方式解决，因为，这个data layer 实际上恰好已经被指定为整个网络的输出，可以判断已经被指定为输出的 data_layer 不再被加入作为整个网络的输入。
+正在测试。
+		</comment>
+		<comment id='6' author='lcy-seso' date='2017-06-06T23:41:05Z'>
+		eos这个问题修改一下v2/layer.py 里的 def add_additional_parents() 可以解决
+		</comment>
+		<comment id='7' author='lcy-seso' date='2017-06-06T23:44:09Z'>
+		通过  修改  的问题，在这个PR &lt;denchmark-link:https://github.com/PaddlePaddle/Paddle/pull/2384&gt;#2384&lt;/denchmark-link&gt;
+ 中。
+		</comment>
+	</comments>
+</bug>

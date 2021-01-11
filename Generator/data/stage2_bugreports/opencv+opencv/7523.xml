@@ -1,0 +1,183 @@
+<bug id='7523' author='tomoaki0705' open_date='2016-10-19T09:08:53Z' closed_time='2016-10-20T09:37:27Z'>
+	<summary>core: performance test OCL_DivFixture_Divide.Divide fails on ARM</summary>
+	<description>
+&lt;denchmark-h:h5&gt;System information (version)&lt;/denchmark-h&gt;
+
+
+OpenCV =&gt; master (8213e57)
+Operating System / Platform =&gt; ARM 32bit (Jetson TK1)
+Compiler =&gt; gcc 4.8.4
+
+&lt;denchmark-h:h5&gt;Summary of the issue&lt;/denchmark-h&gt;
+
+
+Divide using NEON is too aggressive of losing precision
+I'd like to ask a suggestion of way to fix it
+
+&lt;denchmark-h:h5&gt;Detailed description&lt;/denchmark-h&gt;
+
+
+opencv_perf_core fails on OCL_DivFixture_Divide.Divide
+
+&lt;denchmark-code&gt;[  FAILED  ] OCL_DivFixture_Divide.Divide/0, where GetParam() = (640x480, 8UC1)
+[  FAILED  ] OCL_DivFixture_Divide.Divide/2, where GetParam() = (640x480, 8UC3)
+[  FAILED  ] OCL_DivFixture_Divide.Divide/4, where GetParam() = (640x480, 8UC4)
+[  FAILED  ] OCL_DivFixture_Divide.Divide/6, where GetParam() = (1280x720, 8UC1)
+[  FAILED  ] OCL_DivFixture_Divide.Divide/8, where GetParam() = (1280x720, 8UC3)
+[  FAILED  ] OCL_DivFixture_Divide.Divide/10, where GetParam() = (1280x720, 8UC4)
+[  FAILED  ] OCL_DivFixture_Divide.Divide/14, where GetParam() = (1920x1080, 8UC3)
+[  FAILED  ] OCL_DivFixture_Divide.Divide/16, where GetParam() = (1920x1080, 8UC4)
+[  FAILED  ] OCL_DivFixture_Divide.Divide/18, where GetParam() = (3840x2160, 8UC1)
+[  FAILED  ] OCL_DivFixture_Divide.Divide/20, where GetParam() = (3840x2160, 8UC3)
+[  FAILED  ] OCL_DivFixture_Divide.Divide/22, where GetParam() = (3840x2160, 8UC4)
+&lt;/denchmark-code&gt;
+
+
+The failure is because the values are slightly different (expected value was 2 when the actual value was 1)
+
+&lt;denchmark-code&gt;[ RUN      ] OCL_DivFixture_Divide.Divide/0
+/home/ubuntu/opencv-fork/modules/ts/src/ts_perf.cpp:377: Failure
+The difference between expect_last and actual_last is 1, which exceeds eps, where
+expect_last evaluates to 2,
+actual_last evaluates to 1, and
+eps evaluates to 0.00025499999999999996.
+Argument "dst" has unexpected value of the last element
+
+params    = (640x480, 8UC1)
+termination reason:  unknown
+bytesIn   =     614400
+bytesOut  =     307200
+samples   =         13 of 100
+outliers  =          1
+frequency = 1000000000
+min       =     640664 = 0.64ms
+median    =     644664 = 0.64ms
+gmean     =     644412 = 0.64ms
+gstddev   = 0.00548082 = 0.02ms for 97% dispersion interval
+mean      =     644421 = 0.64ms
+stddev    =       3539 = 0.00ms
+[  FAILED  ] OCL_DivFixture_Divide.Divide/0, where GetParam() = (640x480, 8UC1) (27 ms)
+&lt;/denchmark-code&gt;
+
+
+I digged in a bit, and OCL_DivFixture goes to here 
+
+&lt;denchmark-code&gt;void div8u( const uchar* src1, size_t step1, const uchar* src2, size_t step2,
+                   uchar* dst, size_t step, int width, int height, void* scale)
+{
+CALL_HAL(div8u, cv_hal_div8u, src1, step1, src2, step2, dst, step, width, height, *(const double*)scale
+&lt;/denchmark-code&gt;
+
+
+and this function will call div in carotene which is here
+
+&lt;denchmark-code&gt;template &lt;typename T&gt;
+void div(const Size2D &amp;size,
+         const T * src0Base, ptrdiff_t src0Stride,
+         const T * src1Base, ptrdiff_t src1Stride,
+         T * dstBase, ptrdiff_t dstStride,
+         f32 scale,
+         CONVERT_POLICY cpolicy)
+{
+internal::assertSupportedConfiguration();
+&lt;/denchmark-code&gt;
+
+
+and calls the function divSaturateQ which is here
+
+&lt;denchmark-code&gt;{ return vcvtq_s32_f32(vmulq_f32(vmulq_n_f32(vcvtq_f32_s32(v1), scale), internal::vrecpq_f32(vcvtq_f32_s32(v2)))); }
+&lt;/denchmark-code&gt;
+
+
+Now the real cause is that the divide is computed by reciprocal value 
+
+&lt;denchmark-code&gt;inline float32x4_t vrecpq_f32(float32x4_t val)
+{
+    float32x4_t reciprocal = vrecpeq_f32(val);
+    reciprocal = vmulq_f32(vrecpsq_f32(val, reciprocal), reciprocal);
+    reciprocal = vmulq_f32(vrecpsq_f32(val, reciprocal), reciprocal);
+    return reciprocal;
+}
+&lt;/denchmark-code&gt;
+
+
+Approach of using Newton-Raphson method with reciprocal is quite useful to accelerate, but it causes difference in some cases.
+I wrote a small program to verify that, and based on this program, more than 200 cases causes difference in range of char (i.e. -128---128)
+The actual value below shows the result using vrecpeq and expected show the result from normal float operation and then rounded to int.
+
+&lt;denchmark-code&gt;iteration:2 expected:1 actual:0 -126/-126
+iteration:2 expected:1 actual:0 -125/-125
+iteration:2 expected:2 actual:1 -126/-63
+iteration:2 expected:3 actual:2 -126/-42
+iteration:2 expected:6 actual:5 -126/-21
+iteration:2 expected:-6 actual:-5 -126/21
+iteration:2 expected:-3 actual:-2 -126/42
+iteration:2 expected:-2 actual:-1 -126/63
+iteration:2 expected:-1 actual:0 -125/125
+iteration:2 expected:-1 actual:0 -126/126
+iteration:2 expected:1 actual:0 -122/-122
+iteration:2 expected:1 actual:0 -121/-121
+iteration:2 expected:2 actual:1 -122/-61
+&lt;/denchmark-code&gt;
+
+
+Now, I think there are three ways to fix this issue
+
+loosen the threshold on performance test of division
+deactivate the NEON optimization just for division
+avoid including this test case on ARM
+
+
+In the past, I was suggested to loosen the threshold only for ARM platform, but in this case, I don't agree about loosing the threshold.  The result differs in int, not float.
+At least for division on integer types, I propose to deactivate any NEON optimization on this.
+
+&lt;denchmark-h:h5&gt;Steps to reproduce&lt;/denchmark-h&gt;
+
+
+Run opencv_perf_core --gtest_filter=OCL_DivFixture_Divide.Divide*
+
+	</description>
+	<comments>
+		<comment id='1' author='tomoaki0705' date='2016-10-19T10:47:11Z'>
+		Thanks for report!
+I'm enable "OCL" tests on our ARMv7-TK1 builder (T-API tests, not OpenCL only), so these (and other) failures are &lt;denchmark-link:http://pullrequest.opencv.org/buildbot/builders/precommit_armv7/builds/72&gt;reproduced&lt;/denchmark-link&gt;
+.
+		</comment>
+		<comment id='2' author='tomoaki0705' date='2016-10-19T12:27:03Z'>
+		BTW, this doesn't occur on 64bit ARM (PINE64 for instance)
+&lt;denchmark-code&gt;[----------] 24 tests from OCL_DivFixture_Divide
+[ RUN      ] OCL_DivFixture_Divide.Divide/0
+[ PERFSTAT ]    (samples = 10, mean = 8.49, median = 8.51, stddev = 0.20 (2.3%))
+[ VALUE    ]    (640x480, 8UC1)
+[       OK ] OCL_DivFixture_Divide.Divide/0 (94 ms)
+
+&lt;snip&gt;
+
+[----------] 24 tests from OCL_DivFixture_Divide (57393 ms total)
+&lt;/denchmark-code&gt;
+
+Though, there are many performance test failure.
+I'll try to fix one by one.
+		</comment>
+		<comment id='3' author='tomoaki0705' date='2016-10-19T15:10:38Z'>
+		
+Some values of src2 are 0. Division by zero is not good and result is undefined.
+vcvtq_s32_f32 rounds toward zero. Round to nearest/even should be used instead. Something like cvRound, but for float32x4_t type.
+Check tolerance should be 1 for integer-based types.
+
+		</comment>
+		<comment id='4' author='tomoaki0705' date='2016-10-19T23:49:42Z'>
+		Thanks for your comment.
+I tried round-to-nearest and that behavior improves a lot.
+Unfortunately, it still cause error in 34 cases, so I agree we have to enlarge tolerance to 1.
+		</comment>
+		<comment id='5' author='tomoaki0705' date='2016-10-20T07:43:32Z'>
+		&lt;denchmark-link:https://github.com/alalek&gt;@alalek&lt;/denchmark-link&gt;
+ , I updated the PR.
+Now the PR will do round-to-nearest instead of round-to-zero.
+This fix was sufficient enough to let the performance test pass through, but there are still some corner case that division with SIMD doesn't match normal division.
+I think it's sufficient to merge now, but if I should update the opencv_extra too, please let me know.
+Best.
+		</comment>
+	</comments>
+</bug>

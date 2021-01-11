@@ -1,0 +1,95 @@
+<bug id='30393' author='aleist' open_date='2019-07-04T05:27:06Z' closed_time='2019-07-12T18:48:31Z'>
+	<summary>TFLite on Android (JNI) gives inconsistent results when the input ByteBuffer is reused</summary>
+	<description>
+System information
+
+Have I written custom code: yes
+OS Platform and Distribution: Android 7.1 (compileSdkVersion 28)
+Mobile device: Galaxy S7 (custom ROM Android 7.1)
+TensorFlow version: TFLite 1.14.0
+
+Describe the current behavior
+I create a TFLite Interpreter and allocate a direct ByteBuffer in Java to process a sequence of images. I then copy image data into the buffer for inference, which runs in an AsyncTask with a serial executor, so the Interpreter and buffer are only used by one forward pass at a time.
+Doing this the predictions sometimes (always?) relate to an earlier (possibly always the first) image in the sequence, not the current image. So things work reliably for the first image, but not for the following images.
+I can circumvent this problem by allocating a new ByteBuffer for every frame. I'd like to avoid these frequent allocations, but more importantly I am having a hard time figuring out why I am getting this behaviour in the first place. It's almost like TFLite doesn't use the updated data in the buffer when it sees that the buffer reference hasn't changed.
+Describe the expected behavior
+I expect to be able to reuse the input ByteBuffer with updated contents across multiple inference calls.
+	</description>
+	<comments>
+		<comment id='1' author='aleist' date='2019-07-12T18:48:31Z'>
+		You should be able to reuse a ByteBuffer, as &lt;denchmark-link:https://github.com/tensorflow/examples/blob/master/lite/examples/image_classification/android/app/src/main/java/org/tensorflow/lite/examples/classification/tflite/Classifier.java#L84&gt;that is what we do in all of our samples&lt;/denchmark-link&gt;
+. When re-populating the ByteBuffer each frame, make sure you &lt;denchmark-link:https://github.com/tensorflow/examples/blob/master/lite/examples/image_classification/android/app/src/main/java/org/tensorflow/lite/examples/classification/tflite/Classifier.java#L230&gt;rewind it first&lt;/denchmark-link&gt;
+. You'll also need to make sure you provided that ByteBuffer to every Interpreter.run() call.
+		</comment>
+		<comment id='2' author='aleist' date='2019-07-12T18:48:33Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=30393&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=30393&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='3' author='aleist' date='2019-07-12T23:41:19Z'>
+		I update the ByteBuffer in a native library via JNI calls. The C++ code does not update the position or limit values, it simply retrieves the pointer and overwrites all RGB pixel values of the buffer, so rewind isn't necessary. This JNI call happens from the same AsyncTask instance that is also running inference. Here is the relevant code snippet run by AsyncTask.doInBackground. Variable floatImage is the ByteBuffer used for inference. The outputMap is newly allocated for this inference call.
+&lt;denchmark-code&gt;  // Convert the image to float in range [-1, 1].
+  Trace.beginSection("convertToFloat");
+  try {
+    Utils.convertImageToFloat(mInput, mInputWidth, mInputHeight, NUM_CHANNELS, 1f / 127.5f,
+        -1f, floatImage);
+  } catch (Exception e) {
+    Log.e(TAG, mData.id, ": ", e.getMessage());
+    return;
+  } finally {
+    Trace.endSection(); // convertToFloat
+  }
+
+  Trace.beginSection("inference");
+  try {
+    mTFLite.runForMultipleInputsOutputs(new Object[]{floatImage}, outputMap);
+  } catch (Exception e) {
+    Log.e(TAG, mData.id, ": ", e.getMessage());
+    return;
+  } finally {
+    Trace.endSection(); // inference
+  }
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='4' author='aleist' date='2019-07-15T17:13:28Z'>
+		Just curious, if you're using JNI to convert to a ByteBuffer in native code, why not simply use the native C++ APIs that we provide? Or is it for convenience in using the BinTray/JCenter .aars that we distribute?
+Just confirming that your ByteBuffer is a direct ByteBuffer (allocateDirect())? Are you using the 1.14 .aar that we just published? Or a nightly build?
+		</comment>
+		<comment id='5' author='aleist' date='2019-07-16T00:58:22Z'>
+		Yes I could have used the native APIs. It was simply familiarity with the JNI APIs, as I had used them before. Given that the input data is in a direct ByteBuffer (yes, allocated with allocateDirect()), the overhead seemed negligible.
+I used the JCenter implementation 'org.tensorflow:tensorflow-lite:1.13.1' dependency previously, but for this model I needed TFLite 1.14.0 and the dependency wasn't available yet when I was working on this a couple of weeks ago. I ended up building libtensorflowlite.jar and libtensorflowlite_jni.so from the source revision tagged 1.14.0 in Git. I'll go back to using the dependency when I next touch this code.
+I haven't spent any more time on this as it works correctly with a new ByteBuffer per frame, but I'm still at a loss as to what's causing the issues I encountered when reusing a single buffer.
+		</comment>
+		<comment id='6' author='aleist' date='2019-07-16T15:50:26Z'>
+		Yeah, this is very odd given that all of our samples reuse a persistent ByteBuffer across frames. The only difference is that we populate the (direct) ByteBuffer from Java, not from native.
+In your native code, are you calling GetDirectBufferAddress() every single frame? Or are you caching the native pointer? If the latter, I'm not sure there are guarantees that the address will remain persistent for the duration of the ByteBuffer's lifetime.
+		</comment>
+		<comment id='7' author='aleist' date='2019-07-17T00:28:07Z'>
+		Yes I call GetDirectBufferAddress() for every frame. The implementation of convertImageToFloat is very straight forward (with only a couple of checks omitted):
+&lt;denchmark-code&gt;  const size_t inSize = static_cast&lt;size_t&gt;(height) * width * channels;
+  const auto* inData = sns::bufferAs&lt;const uint8_t&gt;(env, image);
+  auto* outData = sns::bufferAs&lt;float&gt;(env, out);
+  if (!inData || !outData) return;
+
+  for (size_t i = 0; i &lt; inSize; i++) {
+    outData[i] = static_cast&lt;float&gt;(inData[i]) * scale + add;
+  }
+
+template&lt;class T&gt;
+T* bufferAs(JNIEnv* env, jobject buffer) {
+  void* buf = env-&gt;GetDirectBufferAddress(buffer);
+  if (buf == nullptr) {
+    throwException(env, JEX_ILLEGAL_ARGUMENT, "Cannot access the buffer");
+    return nullptr;
+  }
+  return reinterpret_cast&lt;T*&gt;(buf);
+}
+&lt;/denchmark-code&gt;
+
+I'll experiment some more when I have time for it.
+		</comment>
+	</comments>
+</bug>

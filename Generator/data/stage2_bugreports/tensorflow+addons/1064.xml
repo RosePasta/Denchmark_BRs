@@ -1,0 +1,798 @@
+<bug id='1064' author='AlexWang1900' open_date='2020-02-10T07:39:21Z' closed_time='2020-07-16T01:16:03Z'>
+	<summary>tfa.activations.mish doesn't work in Keras</summary>
+	<description>
+System information
+
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04):Windows 10
+TensorFlow version and how it was installed (source or binary): 2.1
+TensorFlow-Addons version and how it was installed (source or binary): 7.1, pip installed
+Python version: 3.7
+Is GPU used? (yes/no): yes
+
+Describe the bug
+when using tfa.activations.mish  in keras , training halt at begining.
+
+Train for 353 steps, validate for 40 steps
+
+
+Learning rate:  0.001
+Epoch 1/60
+10/353 [..............................] - ETA: 2:58:34 - loss: 8.9578 - dense_1_loss: 4.9835 - dense_2_loss: 2.2109 - dense_3_loss: 1.7634 - dense_1_accuracy: 0.0195 - dense_2_accuracy: 0.1937 - dense_3_accuracy: 0.4625
+
+Code to reproduce the issue
+&lt;denchmark-code&gt;import tensorflow as tf
+from tensorflow import keras
+import tensorflow_addons as tfa
+from tensorflow.keras.layers import Dense,Conv2D,Flatten,MaxPool2D,Dropout,BatchNormalization, Input,Activation,AveragePooling2D
+from tensorflow.keras.regularizers import l2
+from tensorflow.keras.optimizers import Adam
+class Mish(Activation):
+
+    def __init__(self, activation, **kwargs):
+
+        super(Mish, self).__init__(activation, **kwargs)
+
+        self.__name__ = 'Mish'
+get_custom_objects().update({'Mish': Mish(tfa.activations.mish)})
+
+def resnet_layer(inputs,
+                 num_filters=16,
+                 kernel_size=3,
+                 strides=1,
+                 activation='Mish',
+                 batch_normalization=True,
+                 conv_first=True):
+    """2D Convolution-Batch Normalization-Activation stack builder
+
+    # Arguments
+        inputs (tensor): input tensor from input image or previous layer
+        num_filters (int): Conv2D number of filters
+        kernel_size (int): Conv2D square kernel dimensions
+        strides (int): Conv2D square stride dimensions
+        activation (string): activation name
+        batch_normalization (bool): whether to include batch normalization
+        conv_first (bool): conv-bn-activation (True) or
+            bn-activation-conv (False)
+
+    # Returns
+        x (tensor): tensor as input to the next layer
+    """
+    conv = Conv2D(num_filters,
+                  kernel_size=kernel_size,
+                  strides=strides,
+                  padding='same',
+                  kernel_initializer='he_normal',
+                  kernel_regularizer=None)#l2(1e-4))# change to Weight decay
+
+    x = inputs
+    if conv_first:
+        x = conv(x)
+        if batch_normalization:
+            x = BatchNormalization()(x)
+        if activation is not None:
+            x = Activation(activation)(x)
+    else:
+        if batch_normalization:
+            x = BatchNormalization()(x)
+        if activation is not None:
+            x = Activation(activation)(x)
+        x = conv(x)
+    return x
+
+def resnet_v2(input_shape, depth, num_classes=10):
+    """ResNet Version 2 Model builder [b]
+
+    Stacks of (1 x 1)-(3 x 3)-(1 x 1) BN-ReLU-Conv2D or also known as
+    bottleneck layer
+    First shortcut connection per layer is 1 x 1 Conv2D.
+    Second and onwards shortcut connection is identity.
+    At the beginning of each stage, the feature map size is halved (downsampled)
+    by a convolutional layer with strides=2, while the number of filter maps is
+    doubled. Within each stage, the layers have the same number filters and the
+    same filter map sizes.
+    Features maps sizes:
+    conv1  : 32x32,  16
+    stage 0: 32x32,  64
+    stage 1: 16x16, 128
+    stage 2:  8x8,  256
+
+    # Arguments
+        input_shape (tensor): shape of input image tensor
+        depth (int): number of core convolutional layers
+        num_classes (int): number of classes (CIFAR10 has 10)
+
+    # Returns
+        model (Model): Keras model instance
+    """
+    if (depth - 2) % 9 != 0:
+        raise ValueError('depth should be 9n+2 (eg 56 or 110 in [b])')
+    # Start model definition.
+    num_filters_in = 32
+    num_res_blocks = int((depth - 2) / 9)
+
+    inputs = Input(shape=input_shape)
+    # v2 performs Conv2D with BN-ReLU on input before splitting into 2 paths
+    x = resnet_layer(inputs=inputs,
+                     num_filters=num_filters_in,
+                     conv_first=True,
+                    kernel_size=5,
+                    strides=2)
+
+    # Instantiate the stack of residual units
+    for stage in range(3):
+        for res_block in range(num_res_blocks):
+            activation = 'Mish'
+            batch_normalization = True
+            strides = 1
+            if stage == 0:
+                num_filters_out = num_filters_in * 4
+                if res_block == 0:  # first layer and first stage
+                    activation = None
+                    batch_normalization = False
+            else:
+                num_filters_out = num_filters_in * 2
+                if res_block == 0:  # first layer but not first stage
+                    strides = 2    # downsample
+
+            # bottleneck residual unit
+            y = resnet_layer(inputs=x,
+                             num_filters=num_filters_in,
+                             kernel_size=1,
+                             strides=strides,
+                             activation=activation,
+                             batch_normalization=batch_normalization,
+                             conv_first=False)
+            y = resnet_layer(inputs=y,
+                             num_filters=num_filters_in,
+                             conv_first=False)
+            y = resnet_layer(inputs=y,
+                             num_filters=num_filters_out,
+                             kernel_size=1,
+                             conv_first=False)
+            if res_block == 0:
+                # linear projection residual shortcut connection to match
+                # changed dims
+                x = resnet_layer(inputs=x,
+                                 num_filters=num_filters_out,
+                                 kernel_size=1,
+                                 strides=strides,
+                                 activation=None,
+                                 batch_normalization=False)
+            x = keras.layers.add([x, y])
+
+        num_filters_in = num_filters_out
+
+    # Add classifier on top.
+    # v2 has BN-ReLU before Pooling
+    x = BatchNormalization()(x)
+    x = Activation('Mish')(x)
+    x = AveragePooling2D(pool_size=8)(x)
+    #x = keras.layers.GlobalAveragePooling2D()(x)
+    y = Flatten()(x)
+    y = Dense(512,activation = "Mish",kernel_initializer='he_normal')(y)
+    
+    out = Dense(168, activation = 'softmax',kernel_initializer='he_normal',dtype='float32',name = "dense_1")(y)
+    
+    # Instantiate model.
+    model = Model(inputs=inputs, outputs=out )
+    return model
+
+# Model parameter
+# ----------------------------------------------------------------------------
+#           |      | 200-epoch | Orig Paper| 200-epoch | Orig Paper| sec/epoch
+# Model     |  n   | ResNet v1 | ResNet v1 | ResNet v2 | ResNet v2 | GTX1080Ti
+#           |v1(v2)| %Accuracy | %Accuracy | %Accuracy | %Accuracy | v1 (v2)
+# ----------------------------------------------------------------------------
+# ResNet20  | 3 (2)| 92.16     | 91.25     | -----     | -----     | 35 (---)
+# ResNet32  | 5(NA)| 92.46     | 92.49     | NA        | NA        | 50 ( NA)
+# ResNet44  | 7(NA)| 92.50     | 92.83     | NA        | NA        | 70 ( NA)
+# ResNet56  | 9 (6)| 92.71     | 93.03     | 93.01     | NA        | 90 (100)
+# ResNet110 |18(12)| 92.65     | 93.39+-.16 | 93.15     | 93.63     | 165(180)
+# ResNet164 |27(18)| -----     | 94.07     | -----     | 94.54     | ---(---)
+# ResNet1001| (111)| -----     | 92.39     | -----     | 95.08+-.14| ---(---)
+# ---------------------------------------------------------------------------
+n = 2
+
+# Model version
+# Orig paper: version = 1 (ResNet v1), Improved ResNet: version = 2 (ResNet v2)
+version = 2
+
+# Computed depth from supplied model parameter n
+input_shape = [IMG_SIZE,IMG_SIZE,N_CHANNELS]
+
+depth = n * 9 + 2
+model_type = 'ResNet%dv%d' % (depth, version)
+# In[ ]:
+model = resnet_v2(input_shape=input_shape, depth=depth)
+&lt;/denchmark-code&gt;
+
+Other info / logs
+when using  Activation('Addons&gt;mish')  ,I have the same problem, training halted at beginning.
+	</description>
+	<comments>
+		<comment id='1' author='AlexWang1900' date='2020-02-11T07:51:24Z'>
+		cc: &lt;denchmark-link:https://github.com/digantamisra98&gt;@digantamisra98&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='2' author='AlexWang1900' date='2020-02-12T00:54:30Z'>
+		More comments: although I can implement python mish function in Keras , but it is a bit slow,
+I wish I can use tfa.mish, CUDNN implemention is a lot faster
+		</comment>
+		<comment id='3' author='AlexWang1900' date='2020-02-12T11:02:20Z'>
+		&lt;denchmark-link:https://github.com/AlexWang1900&gt;@AlexWang1900&lt;/denchmark-link&gt;
+ I've been trying to reproduce your problem. Could you be so kind to provide the full example? Optimizer? Loss? Everything matters. Even   constants that as of now are undeclared. I've just put arbitrary ones and that worked very well (model trains, no halt). But that is not what we are expecting this time. :) Either please try to think out any other example that halts too, if your full code exposes sensitive information.
+		</comment>
+		<comment id='4' author='AlexWang1900' date='2020-02-13T03:18:18Z'>
+		
+@AlexWang1900 I've been trying to reproduce your problem. Could you be so kind to provide the full example? Optimizer? Loss? Everything matters. Even IMG_SIZE N_CHANNELS constants that as of now are undeclared. I've just put arbitrary ones and that worked very well (model trains, no halt). But that is not what we are expecting this time. :) Either please try to think out any other example that halts too, if your full code exposes sensitive information.
+
+sorry for delay, the full code have 10Gdata, so I tried to make a cifar-10 case,with my model. will be back soon
+		</comment>
+		<comment id='5' author='AlexWang1900' date='2020-02-13T05:38:18Z'>
+		
+sorry for delay, the full code have 10Gdata, so I tried to make a cifar-10 case,with my model. will be back soon
+
+I mean the program code. 😄 Although the remote access to the isolated virtual machine with the full-blown model deployed would be even better.
+		</comment>
+		<comment id='6' author='AlexWang1900' date='2020-02-13T08:02:54Z'>
+		&lt;denchmark-link:https://github.com/failure-to-thrive&gt;@failure-to-thrive&lt;/denchmark-link&gt;
+
+here is the full code which can trigger the problem:
+as I use local defined "mish" function , it runs ok , fast, only problem is consuming too much video card mem.
+when I change one line from "get_custom_objects().update({'Mish': Mish(mish)})"
+to : "get_custom_objects().update({'Mish': Mish(tfa.activations.mish)})"
+it halt training, or to say very very slow, GPU capacity is 2%, and status bar stops moving.
+&lt;denchmark-code&gt;# -*- coding: utf-8 -*-
+from __future__ import print_function
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras.layers import Dense, Conv2D, BatchNormalization, Activation
+from tensorflow.keras.layers import AveragePooling2D, Input, Flatten
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import ModelCheckpoint, LearningRateScheduler
+from tensorflow.keras.callbacks import ReduceLROnPlateau
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.regularizers import l2
+from tensorflow.keras import backend as K
+from tensorflow.keras.models import Model
+from tensorflow.keras.datasets import cifar10
+#from cs231n.data_utils import get_CIFAR10_data
+import tensorflow_addons as tfa
+import numpy as np
+import os
+# In[ ]:
+
+gpus = tf.config.experimental.list_physical_devices(device_type='GPU')
+tf.config.experimental.set_memory_growth(gpus[0], True)
+
+# Enable XLA
+#tf.config.optimizer.set_jit(True)
+
+# Enable AMP
+tf.keras.mixed_precision.experimental.set_policy('mixed_float16')
+
+batch_size = 128  # orig paper trained all networks with batch_size=128
+epochs = 100#200
+data_augmentation = True
+num_classes = 10
+
+# Subtracting pixel mean improves accuracy
+subtract_pixel_mean = True
+# In[ ]:
+# Model parameter
+# ----------------------------------------------------------------------------
+#           |      | 200-epoch | Orig Paper| 200-epoch | Orig Paper| sec/epoch
+# Model     |  n   | ResNet v1 | ResNet v1 | ResNet v2 | ResNet v2 | GTX1080Ti
+#           |v1(v2)| %Accuracy | %Accuracy | %Accuracy | %Accuracy | v1 (v2)
+# ----------------------------------------------------------------------------
+# ResNet20  | 3 (2)| 92.16     | 91.25     | -----     | -----     | 35 (---)
+# ResNet32  | 5(NA)| 92.46     | 92.49     | NA        | NA        | 50 ( NA)
+# ResNet44  | 7(NA)| 92.50     | 92.83     | NA        | NA        | 70 ( NA)
+# ResNet56  | 9 (6)| 92.71     | 93.03     | 93.01     | NA        | 90 (100)
+# ResNet110 |18(12)| 92.65     | 93.39+-.16| 93.15     | 93.63     | 165(180)
+# ResNet164 |27(18)| -----     | 94.07     | -----     | 94.54     | ---(---)
+# ResNet1001| (111)| -----     | 92.39     | -----     | 95.08+-.14| ---(---)
+# ---------------------------------------------------------------------------
+n = 2
+
+# Model version
+# Orig paper: version = 1 (ResNet v1), Improved ResNet: version = 2 (ResNet v2)
+version = 2
+
+# Computed depth from supplied model parameter n
+if version == 1:
+    depth = n * 6 + 2
+elif version == 2:
+    depth = n * 9 + 2
+
+# Model name, depth and version
+model_type = 'ResNet%dv%d' % (depth, version)
+#cifar10.load_data()
+# Load the CIFAR10 data.
+(x_train, y_train), (x_test, y_test) = cifar10.load_data()
+
+# Input image dimensions.
+input_shape = x_train.shape[1:]
+
+# Normalize data.
+x_train = x_train.astype('float32') / 255
+x_test = x_test.astype('float32') / 255
+
+# If subtract pixel mean is enabled
+if subtract_pixel_mean:
+    x_train_mean = np.mean(x_train, axis=0)
+    x_train -= x_train_mean
+    x_test -= x_train_mean
+
+print('x_train shape:', x_train.shape)
+print(x_train.shape[0], 'train samples')
+print(x_test.shape[0], 'test samples')
+print('y_train shape:', y_train.shape)
+# In[ ]:
+
+def lr_schedule(epoch):
+    """Learning Rate Schedule
+
+    Learning rate is scheduled to be reduced after 80, 120, 160, 180 epochs.
+    Called automatically every epoch as part of callbacks during training.
+
+    # Arguments
+        epoch (int): The number of epochs
+
+    # Returns
+        lr (float32): learning rate
+    """
+    lr = 1e-3#1e-3*128/32
+    # if epoch &gt;=20 :
+    #     lr = 1e-4
+    # elif epoch &gt;=6 :
+    #     lr = 1e-3
+    
+    
+    if epoch &gt; 180:
+        lr *= 0.5e-3
+    elif epoch &gt; 80:
+        lr *= 1e-3
+    elif epoch &gt; 60:
+        lr *= 1e-2
+    elif epoch &gt; 40:
+        lr *= 1e-1
+    print('Learning rate: ', lr)
+    return lr
+
+# In[ ]:
+
+from tensorflow.keras.utils import get_custom_objects
+
+
+
+class Mish(Activation):
+
+    def __init__(self, activation, **kwargs):
+
+        super(Mish, self).__init__(activation, **kwargs)
+
+        self.__name__ = 'Mish'
+
+@tf.function
+def mish(x):
+    x = tf.convert_to_tensor(x)
+    return tf.math.multiply(x, tf.math.tanh(tf.math.softplus(x)))
+
+
+get_custom_objects().update({'Mish': Mish(tfa.activations.mish)})
+
+    
+
+
+def resnet_layer(inputs,
+                 num_filters=16,
+                 kernel_size=3,
+                 strides=1,
+                 activation='Mish',
+                 batch_normalization=True,
+                 conv_first=True):
+    """2D Convolution-Batch Normalization-Activation stack builder
+
+    # Arguments
+        inputs (tensor): input tensor from input image or previous layer
+        num_filters (int): Conv2D number of filters
+        kernel_size (int): Conv2D square kernel dimensions
+        strides (int): Conv2D square stride dimensions
+        activation (string): activation name
+        batch_normalization (bool): whether to include batch normalization
+        conv_first (bool): conv-bn-activation (True) or
+            bn-activation-conv (False)
+
+    # Returns
+        x (tensor): tensor as input to the next layer
+    """
+    conv = Conv2D(num_filters,
+                  kernel_size=kernel_size,
+                  strides=strides,
+                  padding='same',
+                  kernel_initializer='he_normal',
+                  kernel_regularizer=l2(1e-4))
+
+    x = inputs
+    if conv_first:
+        x = conv(x)
+        if batch_normalization:
+            x = BatchNormalization()(x)
+        if activation is not None:
+            x = Activation(activation)(x)
+    else:
+        if batch_normalization:
+            x = BatchNormalization()(x)
+        if activation is not None:
+            x = Activation(activation)(x)
+        x = conv(x)
+    return x
+
+# In[ ]:
+def resnet_v1(input_shape, depth, num_classes=10):
+    """ResNet Version 1 Model builder [a]
+
+    Stacks of 2 x (3 x 3) Conv2D-BN-ReLU
+    Last ReLU is after the shortcut connection.
+    At the beginning of each stage, the feature map size is halved (downsampled)
+    by a convolutional layer with strides=2, while the number of filters is
+    doubled. Within each stage, the layers have the same number filters and the
+    same number of filters.
+    Features maps sizes:
+    stage 0: 32x32, 16
+    stage 1: 16x16, 32
+    stage 2:  8x8,  64
+    The Number of parameters is approx the same as Table 6 of [a]:
+    ResNet20 0.27M
+    ResNet32 0.46M
+    ResNet44 0.66M
+    ResNet56 0.85M
+    ResNet110 1.7M
+
+    # Arguments
+        input_shape (tensor): shape of input image tensor
+        depth (int): number of core convolutional layers
+        num_classes (int): number of classes (CIFAR10 has 10)
+
+    # Returns
+        model (Model): Keras model instance
+    """
+    if (depth - 2) % 6 != 0:
+        raise ValueError('depth should be 6n+2 (eg 20, 32, 44 in [a])')
+    # Start model definition.
+    num_filters = 16
+    num_res_blocks = int((depth - 2) / 6)
+
+    inputs = Input(shape=input_shape)
+    x = resnet_layer(inputs=inputs)
+    # Instantiate the stack of residual units
+    for stack in range(3):
+        for res_block in range(num_res_blocks):
+            strides = 1
+            if stack &gt; 0 and res_block == 0:  # first layer but not first stack
+                strides = 2  # downsample
+            y = resnet_layer(inputs=x,
+                             num_filters=num_filters,
+                             strides=strides)
+            y = resnet_layer(inputs=y,
+                             num_filters=num_filters,
+                             activation=None)
+            if stack &gt; 0 and res_block == 0:  # first layer but not first stack
+                # linear projection residual shortcut connection to match
+                # changed dims
+                x = resnet_layer(inputs=x,
+                                 num_filters=num_filters,
+                                 kernel_size=1,
+                                 strides=strides,
+                                 activation=None,
+                                 batch_normalization=False)
+            x = keras.layers.add([x, y])
+            x = Activation('Mish')(x)
+        num_filters *= 2
+
+    # Add classifier on top.
+    # v1 does not use BN after last shortcut connection-ReLU
+    x = AveragePooling2D(pool_size=8)(x)
+    y = Flatten()(x)
+    y = Dense(num_classes,kernel_initializer='he_normal')(y)
+    outputs = Activation('softmax', dtype='float32')(y)
+
+    # Instantiate model.
+    model = Model(inputs=inputs, outputs=outputs)
+    return model
+
+# In[ ]:
+def resnet_v2(input_shape, depth, num_classes=10):
+    """ResNet Version 2 Model builder [b]
+
+    Stacks of (1 x 1)-(3 x 3)-(1 x 1) BN-ReLU-Conv2D or also known as
+    bottleneck layer
+    First shortcut connection per layer is 1 x 1 Conv2D.
+    Second and onwards shortcut connection is identity.
+    At the beginning of each stage, the feature map size is halved (downsampled)
+    by a convolutional layer with strides=2, while the number of filter maps is
+    doubled. Within each stage, the layers have the same number filters and the
+    same filter map sizes.
+    Features maps sizes:
+    conv1  : 32x32,  16
+    stage 0: 32x32,  64
+    stage 1: 16x16, 128
+    stage 2:  8x8,  256
+
+    # Arguments
+        input_shape (tensor): shape of input image tensor
+        depth (int): number of core convolutional layers
+        num_classes (int): number of classes (CIFAR10 has 10)
+
+    # Returns
+        model (Model): Keras model instance
+    """
+    if (depth - 2) % 9 != 0:
+        raise ValueError('depth should be 9n+2 (eg 56 or 110 in [b])')
+    # Start model definition.
+    num_filters_in = 16
+    num_res_blocks = int((depth - 2) / 9)
+
+    inputs = Input(shape=input_shape)
+    # v2 performs Conv2D with BN-ReLU on input before splitting into 2 paths
+    x = resnet_layer(inputs=inputs,
+                     num_filters=num_filters_in,
+                     conv_first=True)
+
+    # Instantiate the stack of residual units
+    for stage in range(3):
+        for res_block in range(num_res_blocks):
+            activation = 'relu'
+            batch_normalization = True
+            strides = 1
+            if stage == 0:
+                num_filters_out = num_filters_in * 4
+                if res_block == 0:  # first layer and first stage
+                    activation = None
+                    batch_normalization = False
+            else:
+                num_filters_out = num_filters_in * 2
+                if res_block == 0:  # first layer but not first stage
+                    strides = 2    # downsample
+
+            # bottleneck residual unit
+            y = resnet_layer(inputs=x,
+                             num_filters=num_filters_in,
+                             kernel_size=1,
+                             strides=strides,
+                             activation=activation,
+                             batch_normalization=batch_normalization,
+                             conv_first=False)
+            y = resnet_layer(inputs=y,
+                             num_filters=num_filters_in,
+                             conv_first=False)
+            y = resnet_layer(inputs=y,
+                             num_filters=num_filters_out,
+                             kernel_size=1,
+                             conv_first=False)
+            if res_block == 0:
+                # linear projection residual shortcut connection to match
+                # changed dims
+                x = resnet_layer(inputs=x,
+                                 num_filters=num_filters_out,
+                                 kernel_size=1,
+                                 strides=strides,
+                                 activation=None,
+                                 batch_normalization=False)
+            x = keras.layers.add([x, y])
+
+        num_filters_in = num_filters_out
+
+    # Add classifier on top.
+    # v2 has BN-ReLU before Pooling
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = AveragePooling2D(pool_size=8)(x)
+    y = Flatten()(x)
+    y = Dense(num_classes,kernel_initializer='he_normal')(y)
+    outputs = Activation('softmax', dtype='float32')(y)
+
+    # Instantiate model.
+    model = Model(inputs=inputs, outputs=outputs)
+    return model
+
+# In[ ]:
+if version == 2:
+    model = resnet_v2(input_shape=input_shape, depth=depth)
+else:
+    model = resnet_v1(input_shape=input_shape, depth=depth)
+
+model.compile(loss='categorical_crossentropy',
+              optimizer=Adam(lr=lr_schedule(0),amsgrad = True),
+              metrics=['accuracy'])
+model.summary()
+print(model_type)
+# In[ ]:
+# Prepare model model saving directory.
+save_dir = os.path.join(os.getcwd(), 'saved_models')
+model_name = 'cifar10_%s_model.{epoch:03d}.h5' % model_type
+if not os.path.isdir(save_dir):
+    os.makedirs(save_dir)
+filepath = os.path.join(save_dir, model_name)
+
+# Prepare callbacks for model saving and for learning rate adjustment.
+checkpoint = ModelCheckpoint(filepath=filepath,
+                             monitor='val_accuracy',
+                             verbose=1,
+                             save_best_only=True)
+
+lr_scheduler = LearningRateScheduler(lr_schedule)
+
+lr_reducer = ReduceLROnPlateau(factor=np.sqrt(0.1),
+                               cooldown=0,
+                               patience=5,
+                               min_lr=0.5e-6)
+
+callbacks = [checkpoint, lr_reducer, lr_scheduler]
+# In[ ]:
+# Run training, with or without data augmentation.
+if not data_augmentation:
+    print('Not using data augmentation.')
+    model.fit(x_train, y_train,
+              batch_size=batch_size,
+              epochs=epochs,
+              validation_data=(x_test, y_test),
+              shuffle=True,
+              callbacks=callbacks)
+else:
+    print('Using real-time data augmentation.')
+    # This will do preprocessing and realtime data augmentation:
+    datagen = ImageDataGenerator(
+        # set input mean to 0 over the dataset
+        featurewise_center=False,
+        # set each sample mean to 0
+        samplewise_center=False,
+        # divide inputs by std of dataset
+        featurewise_std_normalization=False,
+        # divide each input by its std
+        samplewise_std_normalization=False,
+        # apply ZCA whitening
+        zca_whitening=False,
+        # epsilon for ZCA whitening
+        zca_epsilon=1e-06,
+        # randomly rotate images in the range (deg 0 to 180)
+        rotation_range=0,
+        # randomly shift images horizontally
+        width_shift_range=0.1,
+        # randomly shift images vertically
+        height_shift_range=0.1,
+        # set range for random shear
+        shear_range=0.,
+        # set range for random zoom
+        zoom_range=0.,
+        # set range for random channel shifts
+        channel_shift_range=0.,
+        # set mode for filling points outside the input boundaries
+        fill_mode='nearest',
+        # value used for fill_mode = "constant"
+        cval=0.,
+        # randomly flip images
+        horizontal_flip=True,
+        # randomly flip images
+        vertical_flip=False,
+        # set rescaling factor (applied before any other transformation)
+        rescale=None,
+        # set function that will be applied on each input
+        preprocessing_function=None,
+        # image data format, either "channels_first" or "channels_last"
+        data_format=None,
+        # fraction of images reserved for validation (strictly between 0 and 1)
+        validation_split=0.0)
+
+    # Compute quantities required for featurewise normalization
+    # (std, mean, and principal components if ZCA whitening is applied).
+    datagen.fit(x_train)
+    
+    iterator = datagen.flow(x_train, y_train, batch_size=batch_size)
+    
+    def iterator_wrapper ():
+        return iterator.__iter__()
+    ds = tf.data.Dataset.from_generator(iterator_wrapper,(tf.float32,tf.float32),
+                                         (tf.TensorShape([None,x_train.shape[1],x_train.shape[2],x_train.shape[3]]), tf.TensorShape([None,num_classes])))
+    def mapped_function(s,b):
+    # Do some hard pre-processing
+        return s,b
+    # ds.prefetch(100)
+    # ds.cache()
+    # Fit the model on the batches generated by datagen.flow().
+    model.fit( ds.map(mapped_function,num_parallel_calls=tf.data.experimental.AUTOTUNE),
+                validation_data=(x_test, y_test),
+                steps_per_epoch=len(x_train) / batch_size,
+                validation_steps = len(y_test)/batch_size,
+                epochs=epochs, verbose=1, #workers=4,max_queue_size = 10,
+                callbacks=callbacks,
+                )
+# In[ ]:
+# Score trained model.
+scores = model.evaluate(x_test, y_test, verbose=0)
+print('Test loss:', scores[0])
+print('Test accuracy:', scores[1])
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='7' author='AlexWang1900' date='2020-02-13T17:52:30Z'>
+		
+, or to say very very slow, GPU capacity is 2%
+
+Hey, that is a completely different story! What about CPU load? Looks like TFA fallbacks to a CPU for a whatever reason. Could you please execute nvcc --version from the command line?
+		</comment>
+		<comment id='8' author='AlexWang1900' date='2020-02-13T18:55:12Z'>
+		&lt;denchmark-link:https://github.com/AakashKumarNain&gt;@AakashKumarNain&lt;/denchmark-link&gt;
+ Thanks for the tag. &lt;denchmark-link:https://github.com/AlexWang1900&gt;@AlexWang1900&lt;/denchmark-link&gt;
+ I'll try your code tomorrow and see if the issue replicates for me.
+		</comment>
+		<comment id='9' author='AlexWang1900' date='2020-02-14T02:28:07Z'>
+		
+nvcc --version
+
+&lt;denchmark-code&gt;nvcc: NVIDIA (R) Cuda compiler driver
+Copyright (c) 2005-2019 NVIDIA Corporation
+Built on Sun_Jul_28_19:12:52_Pacific_Daylight_Time_2019
+Cuda compilation tools, release 10.1, V10.1.243
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='10' author='AlexWang1900' date='2020-02-14T02:31:55Z'>
+		
+, or to say very very slow, GPU capacity is 2%
+Hey, that is a completely different story! What about CPU load? Looks like TFA fallbacks to a CPU for a whatever reason. Could you please execute nvcc --version from the command line?
+
+the CPU LOAD is 100%.   when in the case of nornal training, it is 100% because it runs ImageDataGenerator . but here since training is halted , it seems it is running the tfa.activation.
+and :
+Train for 353 steps, validate for 40 steps
+Learning rate: 0.001
+Epoch 1/60
+10/353 [..............................] - ETA: 2:58:34 - loss: 8.9578 - dense_1_loss: 4.9835 - dense_2_loss: 2.2109 - dense_3_loss: 1.7634 - dense_1_accuracy: 0.0195 - dense_2_accuracy: 0.1937 - dense_3_accuracy: 0.4625
+shows it is not dead ,like oom problem, it is just too slow..
+		</comment>
+		<comment id='11' author='AlexWang1900' date='2020-02-14T06:38:44Z'>
+		
+Train for 353 steps, validate for 40 steps
+Learning rate: 0.001
+Epoch 1/60
+10/353 [..............................] - ETA: 2:58:34 - loss: 8.9578 - dense_1_loss: 4.9835 - dense_2_loss: 2.2109 - dense_3_loss: 1.7634 - dense_1_accuracy: 0.0195 - dense_2_accuracy: 0.1937 - dense_3_accuracy: 0.4625
+
+Please provide full list of messages, from the very beginning, not only the training ones.
+Also, what about trying the latest version of TFA?
+		</comment>
+		<comment id='12' author='AlexWang1900' date='2020-02-14T06:41:56Z'>
+		
+Train for 353 steps, validate for 40 steps
+Learning rate: 0.001
+Epoch 1/60
+10/353 [..............................] - ETA: 2:58:34 - loss: 8.9578 - dense_1_loss: 4.9835 - dense_2_loss: 2.2109 - dense_3_loss: 1.7634 - dense_1_accuracy: 0.0195 - dense_2_accuracy: 0.1937 - dense_3_accuracy: 0.4625
+Please provide full list of messages, from the very beginning, not only the training ones
+
+there are no more messages, I don't know how to switch debug level log message.
+I will try tfa nightly later today.
+		</comment>
+		<comment id='13' author='AlexWang1900' date='2020-02-24T22:23:34Z'>
+		&lt;denchmark-link:https://github.com/WindQAQ&gt;@WindQAQ&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='14' author='AlexWang1900' date='2020-07-16T01:16:03Z'>
+		Closing as the python implementation is the only available mish activation for the time being. An RFC is incoming to propose custom-ops alongside composite ops
+		</comment>
+		<comment id='15' author='AlexWang1900' date='2020-07-20T21:35:44Z'>
+		Hey &lt;denchmark-link:https://github.com/seanpmorgan&gt;@seanpmorgan&lt;/denchmark-link&gt;
+ can you link that RFC when it's available?
+Also, just for absolute clarity: what you're saying is that Mish is not yet available for usage with Keras. Is that correct?
+Thanks.
+		</comment>
+		<comment id='16' author='AlexWang1900' date='2020-07-20T23:45:37Z'>
+		
+Hey @seanpmorgan can you link that RFC when it's available?
+Also, just for absolute clarity: what you're saying is that Mish is not yet available for usage with Keras. Is that correct?
+Thanks.
+
+Hi &lt;denchmark-link:https://github.com/willbattel&gt;@willbattel&lt;/denchmark-link&gt;
+, no, it is still available but the implementation is going to be pure python ops (probably in Addons 0.12).
+		</comment>
+	</comments>
+</bug>

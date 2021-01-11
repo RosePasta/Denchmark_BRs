@@ -1,0 +1,121 @@
+<bug id='1128' author='mrbungie' open_date='2019-09-18T16:22:58Z' closed_time='2020-05-06T22:33:13Z'>
+	<summary>make_label_dictionary takes too much to run and eventually dies</summary>
+	<description>
+Describe the bug
+make_label_dictionary takes too much to run and eventually dies from MemoryErrors for datasets of +15M samples.
+To Reproduce
+
+Use a big (ymmv) CSV single-labeled corpus of about 13.500.000 samples in train set (90% from train.csv), 1.500.000 in dev set (10% from train.csv) and 5.000.000 in test set (test.csv).
+Load using CSVClassificationCorpus
+Then use Corpus.make_label_dictionary
+Wait until it consumes all RAM and Swap.
+
+Expected behavior
+
+It should work without needing to edit flair's code (setting num_workers = 0, see below)
+
+Code
+&lt;denchmark-code&gt;from flair.data import Corpus
+from flair.datasets import CSVClassificationCorpus
+
+def main():
+    # Corpus y label dictionary
+    csv_path = './flair_training_data'
+    column_name_map = {0: "text", 3: "label_topic"}
+
+    print("Loading corpus")
+    corpus: Corpus = CSVClassificationCorpus(csv_path,
+                                            column_name_map,
+                                            skip_header=True,
+                                            delimiter=',',
+                                            in_memory=False    # tab-separated files
+    ) 
+
+    # Label Dict
+    print("Loading label_dict")
+    label_dict = corpus.make_label_dictionary()
+
+    return corpus, label_dict
+
+if __name__ == '__main__':
+    data, label_dict = main()
+
+    import joblib
+    joblib.dump([data, label_dict], 'data.pkl')
+&lt;/denchmark-code&gt;
+
+Environment (please complete the following information):
+
+OS: Both Windows 10 and Ubuntu Linux 18.04 exhibit this behaviour.
+Version [e.g. flair-0.3.2]: flair==0.4.3 using pytorch==1.2.0
+Specs: Intel i7 4790, 32GB of RAM, GTX1070.
+
+Additional context
+Some findings:
+
+In Windows I can't even run make_label_dictionary (Tqdm's loading bar won't show up) without editing flair's code and forcing num_workers = 0. If I do that, it runs perfectly and relatively quickly, I've yet to test this in Linux.
+In Linux TQDM reports a expected running time of about 30 mins, but it starts leaking memory up until ~4.9M samples and by then it's using swap and expecting to run for more than 30 hours. I've to skim through your code, but I thought that pytorch's DataLoader class role was to manage things like avoiding memory usage for big datasets and loading only what's necessary in the moment. Afaik, generating a idx2item and item2idx dictionary shouldn't use that much memory for a training+dev set of 15.000.000 samples.
+
+Thank you for the great job you've doing.
+	</description>
+	<comments>
+		<comment id='1' author='mrbungie' date='2019-09-18T17:39:37Z'>
+		&lt;denchmark-link:https://github.com/mrbungie&gt;@mrbungie&lt;/denchmark-link&gt;
+ thanks for reporting this. So if you set  in the  it works?
+This could have something to do with the way in_memory=False is implemented in CSVClassificationCorpus. While this causes other datasets to always read the data points they need from disk, in this case in_memory=False causes the base CSV file to be held in memory and a row is converted to a Sentence object on-the-fly if requested. I'll have to take a closer look.
+		</comment>
+		<comment id='2' author='mrbungie' date='2019-09-18T18:06:37Z'>
+		Yep, confirmed. I just tested the same modification in Linux, and it increased the speed from 6.000 it/s (using the default value for num_workers in flair's code) to almost 9.000 it/s, which is the same behaviour I see in Windows with the edited code. I will wait until it finishes, but it seems like that fixes it.
+The only difference in Windows is that it won't even run if I don't modify the code, while on Linux it will run but eventually crash.
+		</comment>
+		<comment id='3' author='mrbungie' date='2019-09-18T18:12:50Z'>
+		PS: Something that I didn't add to the report, but may affect something. In this case I'm using both train.csv and test.csv, but no dev.csv (it extracts 10% of the train.csv as dev set afaik).
+		</comment>
+		<comment id='4' author='mrbungie' date='2019-09-18T19:28:43Z'>
+		
+@mrbungie thanks for reporting this. So if you set num_workers=0 in the DataLoader it works?
+
+Yep, it works, confirmed.
+
+This could have something to do with the way in_memory=False is implemented in CSVClassificationCorpus. While this causes other datasets to always read the data points they need from disk, in this case in_memory=False causes the base CSV file to be held in memory and a row is converted to a Sentence object on-the-fly if requested. I'll have to take a closer look.
+
+That appears to be case. See this issue in pytorch (&lt;denchmark-link:https://github.com/pytorch/pytorch/issues/19946&gt;pytorch/pytorch#19946&lt;/denchmark-link&gt;
+), currently solved in pytorch 1.2.0 with this: &lt;denchmark-link:https://github.com/pytorch/pytorch/blob/master/torch/utils/data/dataset.py#L35&gt;https://github.com/pytorch/pytorch/blob/master/torch/utils/data/dataset.py#L35&lt;/denchmark-link&gt;
+. It appears that while flair's current solution works, it eventually fails if the file is too big.
+I think that might solve these kind of problems with bigger CSVs (in classification tasks at least), but that depends if you're willing to target pytorch 1.2.0.
+		</comment>
+		<comment id='5' author='mrbungie' date='2019-09-18T23:23:06Z'>
+		I'm sorry for this endless stream of messages, but I'm still investigating the issue and I have some insights, take them with a grain of salt, as I'm just introducing myself to pytorch and flair:
+1.- The issue itself may have to do with this &lt;denchmark-link:https://github.com/pytorch/pytorch/issues/13246&gt;pytorch/pytorch#13246&lt;/denchmark-link&gt;
+ and the use of the torch.multiprocessing module with Python objects. The bigger the shared Python object, the worse the eventual leak due to refcounts increase on copy-on-access.
+1.a.- I already tried changing the code to store smaller and more manageable data, I already modified from the raw_data (strings) to just row_numbers (integers pointing to rows in the CSVs) and that relaxes the memory leaks. It seems the easy fix would be to change self.raw_data to something that's actually shareable, like a np.array (but as they are NON fixed strings most of the time, I'm not sure that's going to work). 
+1.b.- Maybe changing from torch.multiprocessing fork default mode to forkserver or spawn may help, I've yet to test these options. This may explain differences in the way everything operates in Windows (and why it doesn't even work when num_workers &gt; 0).
+2.- Why is batch_size = 1 in DataLoader for this task (&lt;denchmark-link:https://github.com/zalandoresearch/flair/blob/master/flair/data.py#L1107&gt;https://github.com/zalandoresearch/flair/blob/master/flair/data.py#L1107&lt;/denchmark-link&gt;
+)? It seems the memory leaks become smaller the bigger the batch_size (I tried with and afaik it should't affect for this operation. Also the overhead of reusing workers each time for each row in 15M rows is not negligible.
+3.- Considering points [1.b and 2]: There is no guard against reading the CSV completely again when reinitalizing a CSVClassificationDataset object even if self.sentences or self.raw_data are already filled with the CSV data, is this OK considering this may happen each time it tries to process a row in Windows?
+4.- Maybe generating [Sentence]s objects for the sole purpose of getting the labels from a CSV is just too heavy, a smaller method using just csv.reader in CSVClassificationDataset (and corresponding methods in other ClassificationDataset subclasses) may be sufficient.
+If I find anything new, or come up with a good solution I will send a PR. I'll keep you posted.
+		</comment>
+		<comment id='6' author='mrbungie' date='2019-09-19T14:16:08Z'>
+		&lt;denchmark-link:https://github.com/mrbungie&gt;@mrbungie&lt;/denchmark-link&gt;
+ thanks for looking into this! To question 2, we use batch_size 1 because we end up iterating through each item one by one anyway. But if it makes sense to use a greater batch size we can change this. I also agree with 4 that generating Sentence objects only to get the label is a pretty big overhead.
+One possible solution for you might me to switch to a  instead. Unlike the  it always performs file reads if , so it is designed for larger datasets. You would have to convert your dataset to &lt;denchmark-link:https://github.com/zalandoresearch/flair/blob/master/resources/docs/TUTORIAL_6_CORPUS.md#fasttext-format&gt;FastText format&lt;/denchmark-link&gt;
+, but maybe this would work for you?
+		</comment>
+		<comment id='7' author='mrbungie' date='2019-09-19T18:50:22Z'>
+		
+@mrbungie thanks for looking into this! To question 2, we use batch_size 1 because we end up iterating through each item one by one anyway. But if it makes sense to use a greater batch size we can change this. I also agree with 4 that generating Sentence objects only to get the label is a pretty big overhead.
+
+2: I think increasing batch_size might have some benefits, but that doesn't account for all the memory consumption/leak. Right now, changing the batch_size means playing with a "memory leak/total memory usage" tradeoff that depends on system specs.
+4: Yeah, maybe each Corpus subclass should override it's make_label_dictionary method with a more efficient implementation with support from some auxiliary corresponding Dataset methods.
+
+One possible solution for you might me to switch to a ClassificationCorpus instead. Unlike the CSVClassificationCorpus it always performs file reads if in_memory=False, so it is designed for larger datasets. You would have to convert your dataset to FastText format, but maybe this would work for you?
+
+I actually tried, but it is actually slower at reading the files than CSVClassificationCorpus and its performance at make_label_dictionary is practically the same. I will try to implement a custom CSVArrowClassificatrionCorpus based on Apache Arrow to have shared memory for now.
+Thank you for time and feedback!
+		</comment>
+		<comment id='8' author='mrbungie' date='2020-04-29T21:10:57Z'>
+		This issue has been automatically marked as stale because it has not had recent activity. It will be closed if no further activity occurs. Thank you for your contributions.
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,316 @@
+<bug id='354' author='zhanpenghe' open_date='2018-10-23T20:29:07Z' closed_time='2020-04-11T00:25:47Z'>
+	<summary>Plotter does not work with recurrent policies</summary>
+	<description>
+
+No description provided.
+
+	</description>
+	<comments>
+		<comment id='1' author='zhanpenghe' date='2018-10-23T20:32:31Z'>
+		Launcher which reproduces the error?
+		</comment>
+		<comment id='2' author='zhanpenghe' date='2018-10-23T22:27:14Z'>
+		&lt;denchmark-code&gt;import gym
+
+from garage.envs import normalize
+from garage.misc.instrument import run_experiment
+from garage.tf.algos import TRPO
+from garage.tf.baselines import GaussianMLPBaseline
+from garage.tf.envs import TfEnv
+from garage.tf.policies import GaussianLSTMPolicy
+from garage.baselines import LinearFeatureBaseline
+
+
+def run_task(*_):
+    """
+    Wrap PPO training task in the run_task function.
+
+    :param _:
+    :return:
+    """
+    env = TfEnv(normalize(gym.make("InvertedDoublePendulum-v2")))
+    policy = GaussianLSTMPolicy(env_spec=env.spec, hidden_dim=3)
+    baseline = GaussianMLPBaseline(env_spec=env.spec)
+
+    algo = TRPO(
+        env=env,
+        policy=policy,
+        baseline=baseline,
+        batch_size=2048,
+        max_path_length=100,
+        n_itr=1000,
+        discount=0.99,
+        step_size=1e-5,
+        # clip_range=0.08,
+        use_softplus_entropy=False,
+        optimizer_args=dict(batch_size=32, max_epochs=10),
+        plot=True)
+    algo.train()
+
+
+run_experiment(
+    run_task,
+    n_parallel=1,
+    snapshot_mode="last",
+    seed=1,
+    plot=True,
+)
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='3' author='zhanpenghe' date='2018-10-23T22:28:06Z'>
+		The error is caused by recurrent policies reset require an array of dones which is not provided in the plotter.
+		</comment>
+		<comment id='4' author='zhanpenghe' date='2020-03-20T00:34:32Z'>
+		&lt;denchmark-link:https://github.com/ryanjulian&gt;@ryanjulian&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/avnishn&gt;@avnishn&lt;/denchmark-link&gt;
+
+Update on this Issue:
+The root of the issue seems to be that when the plotter calls self.rollout(), which calls policy.reset(), there is no session for the network to evaluate on. The error message that gets thrown is as follows:
+&lt;denchmark-code&gt;Exception in thread Thread-2:
+...
+RuntimeError: Attempted to use a closed Session.
+&lt;/denchmark-code&gt;
+
+The strange thing is rollout is being called within a with self.sess.as_default() statement, and even in the line right before the rollout call the session exists and is not closed. I even check for a valid session in the line before the error is thrown inside of the gaussian lstm policy and categorical lstm policy reset() function, and it says there is a valid and open session, which is also set to default.
+If I force the eval() function to use the default session inside reset() (e.g.: self.model.networks['default'].init_hidden.eval(session=tf.compat.v1.get_default_session())), the code runs further, but throws further errors in other places about not having an open session to run on. This likely means there is a larger issue (probably with the multiprocessing) where a session is being closed before the plotter thread is done using it.
+If anyone has any knowledge on why the plotter would be attempting to use a closed session, please let me know. Any help would be appreciated!
+For reference I used the trpo_cartpole_recurrent.py example as well as a custom example I've copied below:
+&lt;denchmark-code&gt;import gym
+import tensorflow as tf
+
+from garage import wrap_experiment
+from garage.envs import normalize
+from garage.experiment.deterministic import set_seed
+from garage.tf.algos import TRPO
+from garage.tf.baselines import GaussianMLPBaseline
+from garage.tf.envs import TfEnv
+from garage.tf.policies import GaussianLSTMPolicy
+from garage.tf.experiment import LocalTFRunner
+from garage.tf.optimizers import FiniteDifferenceHvp
+
+
+@wrap_experiment
+def tf_trpo_pendulum(ctxt=None, seed=1):
+    """Train PPO with InvertedDoublePendulum-v2 environment.
+
+    Args:
+        ctxt (garage.experiment.ExperimentContext): The experiment
+            configuration used by LocalRunner to create the snapshotter.
+        seed (int): Used to seed the random number generator to produce
+            determinism.
+
+    """
+    # import ipdb; ipdb.set_trace()
+
+    set_seed(seed)
+    with LocalTFRunner(snapshot_config=ctxt) as runner:
+        env = TfEnv(normalize(gym.make('InvertedDoublePendulum-v2')))
+
+        policy = GaussianLSTMPolicy(env_spec=env.spec, hidden_dim=3)
+        baseline = GaussianMLPBaseline(env_spec=env.spec)
+
+
+        algo = TRPO(
+            env_spec=env.spec, #CHANGED FROM ENV=ENV
+            policy=policy,
+            baseline=baseline,
+            # batch_size=2048,
+            max_path_length=100,
+            # n_itr=1000,
+            discount=0.99,
+            # step_size=1e-5,
+            max_kl_step=0.01, # CHANGED ADDED
+            # clip_range=0.08,
+            use_softplus_entropy=False,
+            # optimizer_args=dict(batch_size=32, max_epochs=10),
+            optimizer_args=dict(hvp_approach=FiniteDifferenceHvp( # CHANGED see above
+                base_eps =1e-5))
+            # plot=True
+        )
+
+        runner.setup(algo, env)
+        runner.train(n_epochs=3, batch_size=2048, plot=True)
+
+
+tf_trpo_pendulum(seed=1)
+&lt;/denchmark-code&gt;
+
+And an example of a full error message is as follows:
+&lt;denchmark-code&gt;Exception in thread Thread-2:
+Traceback (most recent call last):
+  File "/Users/adithya/anaconda3/envs/garage/lib/python3.6/threading.py", line 916, in _bootstrap_inner
+    self.run()
+  File "/Users/adithya/anaconda3/envs/garage/lib/python3.6/threading.py", line 864, in run
+    self._target(*self._args, **self._kwargs)
+  File "/Users/adithya/Documents/Spring20/RESL/garage/src/garage/tf/plotter/plotter.py", line 133, in _start_worker
+    speedup=5)
+  File "/Users/adithya/Documents/Spring20/RESL/garage/src/garage/sampler/utils.py", line 57, in rollout
+    agent.reset()
+  File "/Users/adithya/Documents/Spring20/RESL/garage/src/garage/tf/policies/categorical_lstm_policy.py", line 202, in reset
+    'default'].init_cell.eval()
+  File "/Users/adithya/anaconda3/envs/garage/lib/python3.6/site-packages/tensorflow_core/python/ops/variables.py", line 2024, in eval
+    return self._variable.eval(session=session)
+  File "/Users/adithya/anaconda3/envs/garage/lib/python3.6/site-packages/tensorflow_core/python/framework/ops.py", line 798, in eval
+    return _eval_using_default_session(self, feed_dict, self.graph, session)
+  File "/Users/adithya/anaconda3/envs/garage/lib/python3.6/site-packages/tensorflow_core/python/framework/ops.py", line 5407, in _eval_using_default_session
+    return session.run(tensors, feed_dict)
+  File "/Users/adithya/anaconda3/envs/garage/lib/python3.6/site-packages/tensorflow_core/python/client/session.py", line 956, in run
+    run_metadata_ptr)
+  File "/Users/adithya/anaconda3/envs/garage/lib/python3.6/site-packages/tensorflow_core/python/client/session.py", line 1103, in _run
+    raise RuntimeError('Attempted to use a closed Session.')
+RuntimeError: Attempted to use a closed Session.
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='5' author='zhanpenghe' date='2020-03-20T00:38:54Z'>
+		Hmm. Which example file (or launcher code) are you using?
+Some suggestions
+
+Does your recurrent example algorithm work otherwise without plotting?
+Is the plotter being run here the one which lives in garage.plotter or garage.tf.plotter? It should be the latter because these are TF algorithms.
+Did the plotter enter a TF session at any time? i.e. with self.sess? If it doesn't do this, evaluating a TF policy would never work (though it should break the same for RNN and non-RNN policies)
+
+		</comment>
+		<comment id='6' author='zhanpenghe' date='2020-03-20T00:44:58Z'>
+		I updated my message with the custom launcher file I used to duplicate the original issue as close as possible. the error also occurs when I use trpo_cartpole_recurrent.py
+
+
+Does your recurrent example algorithm work otherwise without plotting?
+
+
+Yes both run the completion.
+
+
+Is the plotter being run here the one which lives in garage.plotter or garage.tf.plotter? It should be the latter because these are TF algorithms.
+
+
+It is garage.tf.plotter that is being used
+
+
+Did the plotter enter a TF session at any time? i.e. with self.sess? If it doesn't do this, evaluating a TF policy would never work (though it should break the same for RNN and non-RNN policies)
+
+
+Yes I am checking if there is a an active session and there is. The garage.tf.plotter code runs self.rollout within a with statement and I verified there is a session active in the line prior to the line which breaks the code.
+Thank you so much for the quick response. I'll keep looking into the issue and let you know if I find out anything else!
+		</comment>
+		<comment id='7' author='zhanpenghe' date='2020-03-20T00:47:04Z'>
+		Just to verify, have you made sure plotting still works for a non-recurrent example (using otherwise exactly the same launcher)?
+		</comment>
+		<comment id='8' author='zhanpenghe' date='2020-03-20T00:58:53Z'>
+		I tested the non-recurring error on trpo_cartpole.py, which worked most of the time, but sometimes it throws the following error. Rerunning it got the plotter to work.
+&lt;denchmark-code&gt;Traceback (most recent call last):
+  File "trpo_cartpole.py", line 44, in &lt;module&gt;
+    seed=1,
+  File "/Users/adithya/Documents/Spring20/RESL/garage/src/garage/experiment/experiment.py", line 133, in run_experiment
+    check=True)
+  File "/Users/adithya/anaconda3/envs/garage/lib/python3.6/subprocess.py", line 438, in run
+    output=stdout, stderr=stderr)
+subprocess.CalledProcessError: Command 'python -m garage.experiment.experiment_wrapper...died with &lt;Signals.SIGSEGV: 11&gt;
+&lt;/denchmark-code&gt;
+
+This is a multithreading error and I am unsure as to why it only fails some of the time, but it never threw this error during the recurrent policies.
+		</comment>
+		<comment id='9' author='zhanpenghe' date='2020-03-20T01:08:41Z'>
+		Okay, that one is strange but believeable. To be clear though, you're not seeing the same session-related errors in the non-recurrent version as the recurrent version?
+		</comment>
+		<comment id='10' author='zhanpenghe' date='2020-03-20T01:11:18Z'>
+		Yes that is correct. It has no session issues.
+		</comment>
+		<comment id='11' author='zhanpenghe' date='2020-03-20T17:48:01Z'>
+		At this point I would recommend using (i)pdb to figure out what's going on.
+		</comment>
+		<comment id='12' author='zhanpenghe' date='2020-03-23T16:54:37Z'>
+		I think I recommended that he do this too &lt;denchmark-link:https://github.com/ryanjulian&gt;@ryanjulian&lt;/denchmark-link&gt;
+. However, I don't think this worked because he can't wasn't able to attach ipdb breakpoints in forked processes.
+Do you have any recommendations for a python debugger that would work with forked processes?
+		</comment>
+		<comment id='13' author='zhanpenghe' date='2020-03-23T16:58:38Z'>
+		pyspy can show you where the code is even though it's a profiler and not a debugger.
+The TF plotter is multithread, not multiprocess. ipdb breakpoints should work from any thread.
+		</comment>
+		<comment id='14' author='zhanpenghe' date='2020-03-28T00:32:36Z'>
+		&lt;denchmark-link:https://github.com/ryanjulian&gt;@ryanjulian&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/avnishn&gt;@avnishn&lt;/denchmark-link&gt;
+
+Update on the issue:
+So I found the bug regarding the eval() issue. It was being passed None as the default session instead of our default session, so I made the quick fix. Now I have run into more errors later in the training process.
+
+If I leave on pause_for_plot=True during the run of the plotter, the session does not close during the middle of plotting. If I do not do this, the session closes and I get similar errors to the original error above due to a closed session. This seems like a larger multithreading issue in all of plotter and I am not sure how to proceed on this.
+There is a second error with the get_actions() command inside the categorical_lstm and gaussian_lstm policies. in this function, the policy concatenates self._prev_actions and self.observation_space.flatten_n(observations). In the 0th epoch, these values are both arrays of arrays all of size 1 (e.g. [[0],[1]]). In the 1st epoch, self.observation_space.flatten_n(observations) changes at some point to arrays of arrays size 4 (e.g. [[0,1,2,3],[4,6,7,8]]). And when it tries to concatenate the previous actions of size 1 with the current actions of size 4, it throws an error. I have attached the error to the bottom of this message. I think this is a problem related to the recurrent natures of the policy. Do you know someone who I could talk with to help me understand why the shape of the prev_actions and current observations change and how to fix it without breaking the intent of the policy? I don't want to make any serious changes to the workings of the policy without fully understanding how these 2 policies work. I am trying to add small checks to identify when this mismatch occurs, but I am not sure the best way to address it without potentially breaking the effectiveness of the policy.
+
+&lt;denchmark-code&gt;Traceback (most recent call last):
+  File "/Users/adithya/anaconda3/envs/garage/lib/python3.6/threading.py", line 916, in _bootstrap_inner
+    self.run()
+  File "/Users/adithya/anaconda3/envs/garage/lib/python3.6/threading.py", line 864, in run
+    self._target(*self._args, **self._kwargs)
+  File "/Users/adithya/Documents/Spring20/RESL/garage/src/garage/tf/plotter/plotter.py", line 116, in _start_worker
+    speedup=5)
+  File "/Users/adithya/Documents/Spring20/RESL/garage/src/garage/sampler/utils.py", line 62, in rollout
+    a, agent_info = agent.get_action(o)
+  File "/Users/adithya/Documents/Spring20/RESL/garage/src/garage/tf/policies/gaussian_lstm_policy.py", line 243, in get_action
+    actions, agent_infos = self.get_actions([observation])
+  File "/Users/adithya/Documents/Spring20/RESL/garage/src/garage/tf/policies/gaussian_lstm_policy.py", line 268, in get_actions
+    all_input = np.concatenate([flat_obs, self._prev_actions], axis=-1)
+  File "&lt;__array_function__ internals&gt;", line 6, in concatenate
+ValueError: all the input array dimensions for the concatenation axis must match exactly, but along dimension 0, the array at index 0 has size 1 and the array at index 1 has size 4
+&lt;/denchmark-code&gt;
+
+The launcher code is the same as above.
+Finally, regarding the fix for the first bug, I have fixed that error, but the code is still not completely working. Would you like me to submit a pull request with those fixes? Or wait until I have the larger changes done and plotter works in its entirety? Let me know the best approach. Thanks!
+		</comment>
+		<comment id='15' author='zhanpenghe' date='2020-03-29T19:58:30Z'>
+		&lt;denchmark-link:https://github.com/adibellathur&gt;@adibellathur&lt;/denchmark-link&gt;
+ thanks for the great work.
+I think you should chat with &lt;denchmark-link:https://github.com/ahtsan&gt;@ahtsan&lt;/denchmark-link&gt;
+ about the issues with recurrent policies. He is most familiar.
+This is not the first time we've had trouble with multithreading in the TF plotter. Perhaps see if you can get  to work with TF instead (it's based on multi-process rather than multi-threading). We'd like to have only one plotter, anyway. &lt;denchmark-link:https://github.com/zequnyu&gt;@zequnyu&lt;/denchmark-link&gt;
+ has also worked on the plotters recently.
+As for how to sequence your contributions, usually we prefer to get to the root cause of  an issue first, then we can decide which PR(s) to sequence to fix it (if it needs to be more than one).
+		</comment>
+		<comment id='16' author='zhanpenghe' date='2020-03-29T22:15:39Z'>
+		Thanks &lt;denchmark-link:https://github.com/ryanjulian&gt;@ryanjulian&lt;/denchmark-link&gt;
+. And that sounds like a good plan. I will try and get the standard plotter working with TF now. And regarding the people you mentioned I should reach out to, what's the best way to get in touch?
+		</comment>
+		<comment id='17' author='zhanpenghe' date='2020-03-31T00:04:02Z'>
+		This comment thread! &lt;denchmark-link:https://github.com/ahtsan&gt;@ahtsan&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/zequnyu&gt;@zequnyu&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='18' author='zhanpenghe' date='2020-03-31T20:45:44Z'>
+		&lt;denchmark-link:https://github.com/adibellathur&gt;@adibellathur&lt;/denchmark-link&gt;
+ Sorry for the late reply! I've been looking into the issue and wanted to come up with a complete explanation and proposed solution.
+Regarding the issues you encountered:
+
+
+"Attempt to use uninitialized variables" when you call eval(): Yes, I believe you found out the bug. LocalRunner does not provide a session when plotter is constructed. Passing sess=tf.get_default_session() as an extra argument to plotter will fix the issue.
+
+
+Attempted to use a closed session: Since the main thread and plotter thread share the same session, at the end of the training, the main thread will close the session but we forgot to close the plotter. Adding self._shutdown_worker() at the end of LocalRunner.train() will fix the issue.
+
+
+There are two issues for shape mismatch going on here:
+a. dones shape mismatch from the second epoch when calling policy.reset()
+b. flat_obs and self._prev_actions cannot be concatenated together in policy.get_actions()
+
+
+The root cause is the same -- Our main training loop employs vectorized training, i.e. we construct n environments (where n is 4 in this case) and train in batch. In contrast, the plotter thread only performs rollout on a single environment. Since we use the same policy for both threads, shape mismatch happens. Here's an example: Imagine in the main thread, the policy receives observations of shape [4, *obs_dim], thus has a previous action of shape [4, *action_dim]. Suddenly it's being used in the plotter thread, where it receives a single observation, then things start to go wrong.
+A quick solution is to clone a policy where the parameters will be retained but the networks built will not. This function exists in some other policies, e.g. &lt;denchmark-link:https://github.com/rlworkgroup/garage/blob/master/src/garage/tf/policies/continuous_mlp_policy.py#L169&gt;ContinuousMLPPolicy&lt;/denchmark-link&gt;
+. Then instead of sharing the same policy between threads, we can do  in the plotter.
+I am working on a patch to fix all the above issues and will let you know when it's done. Again, thank you for bringing this up.
+		</comment>
+		<comment id='19' author='zhanpenghe' date='2020-04-01T02:37:57Z'>
+		check out &lt;denchmark-link:https://github.com/rlworkgroup/garage/pull/1270&gt;#1270&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='20' author='zhanpenghe' date='2020-04-02T02:29:01Z'>
+		Hello &lt;denchmark-link:https://github.com/ahtsan&gt;@ahtsan&lt;/denchmark-link&gt;
+
+Thank you so much for taking a good look at this! It seems like you have made all the fixes with that PR. And your explanation makes a lot of sense. I will pull the changes you made and take a good look at it. Thanks again. Also let me know if you would like me to do anything to help out I'll do what I can.
+		</comment>
+		<comment id='21' author='zhanpenghe' date='2020-04-03T18:40:20Z'>
+		&lt;denchmark-link:https://github.com/ahtsan&gt;@ahtsan&lt;/denchmark-link&gt;
+ is this fixed?
+		</comment>
+	</comments>
+</bug>

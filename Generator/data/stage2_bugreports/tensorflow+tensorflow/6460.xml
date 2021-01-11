@@ -1,0 +1,115 @@
+<bug id='6460' author='Bobrosoft98' open_date='2016-12-22T18:14:13Z' closed_time='2017-03-16T04:18:01Z'>
+	<summary>Slow Adam sparse updates in distributed TF</summary>
+	<description>
+I am trying to train a model with the  operation. Small example: &lt;denchmark-link:https://gist.github.com/Bobrosoft98/2d639d3924dfbc4ec7bc620fd5a4d480&gt;https://gist.github.com/Bobrosoft98/2d639d3924dfbc4ec7bc620fd5a4d480&lt;/denchmark-link&gt;
+
+When I run this code with NUM_WORKERS = 1, the output is as follows
+&lt;denchmark-code&gt;0 calc in 0.0176000595093
+0 apply in 0.184364080429
+0 calc in 0.0167639255524
+0 apply in 0.189659118652
+...
+&lt;/denchmark-code&gt;
+
+However, when I increase the number of workers to 30, every single process works more than 30 times slower:
+&lt;denchmark-code&gt;6 calc in 0.432843923569
+11 calc in 0.787642002106
+3 calc in 0.440953016281
+14 calc in 0.377243995667
+20 calc in 0.569782018661
+...
+6 apply in 5.63959908485
+&lt;/denchmark-code&gt;
+
+The CPU load is only ~50%, so there is a lot of resources available for the computation. This makes me think that sparse updates use locking, even though the use_locking flag is set to False by default. There is no such problem with other optimizers (I tried GradientDescentOptimizer and AdadeltaOptimizer). Also if I exclude sparse operations from the graph (commented lines), the problem disappears.
+&lt;denchmark-h:h3&gt;What related GitHub issues or StackOverflow threads have you found by searching the web for your problem?&lt;/denchmark-h&gt;
+
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/464&gt;#464&lt;/denchmark-link&gt;
+ - there was mentioned that Adam was slower on sparse updates in general
+&lt;denchmark-h:h3&gt;Environment info&lt;/denchmark-h&gt;
+
+Operating System: Ubuntu 16.04
+Installed version of CUDA and cuDNN: I used the CPU version
+If installed from binary pip package, provide:
+
+A link to the pip package you installed: https://storage.googleapis.com/tensorflow/linux/cpu/tensorflow-0.12.0-cp27-none-linux_x86_64.whl
+The output from python -c "import tensorflow; print(tensorflow.__version__)".
+
+&lt;denchmark-code&gt;$ python -c "import tensorflow; print(tensorflow.__version__)"
+0.12.0-rc1
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='Bobrosoft98' date='2017-01-05T01:30:36Z'>
+		&lt;denchmark-link:https://github.com/theweiho&gt;@theweiho&lt;/denchmark-link&gt;
+ can you comment?
+		</comment>
+		<comment id='2' author='Bobrosoft98' date='2017-01-06T00:11:11Z'>
+		This seems to be more a sparse tensor/Adam interaction issue than an embedding issue. &lt;denchmark-link:https://github.com/concretevitamin&gt;@concretevitamin&lt;/denchmark-link&gt;
+ - any idea about the sparse updates part?
+Or &lt;denchmark-link:https://github.com/vrv&gt;@vrv&lt;/denchmark-link&gt;
+ for general performance issues - or any idea who might know more about the Adam optimizer?
+		</comment>
+		<comment id='3' author='Bobrosoft98' date='2017-01-09T02:34:43Z'>
+		+cc &lt;denchmark-link:https://github.com/mrry&gt;@mrry&lt;/denchmark-link&gt;
+ in case this could be solved by your recent optimizations on distributed runtime performance!
+		</comment>
+		<comment id='4' author='Bobrosoft98' date='2017-01-11T18:36:00Z'>
+		I tried profiling the code as described &lt;denchmark-link:http://stackoverflow.com/a/37774470&gt;here&lt;/denchmark-link&gt;
+ and got interesting results.
+This is what I get with GradientDescentOptimizer and 30 workers:
+&lt;denchmark-link:https://cloud.githubusercontent.com/assets/9952727/21861086/6a3148f8-d844-11e6-89b9-a1bdef990be9.png&gt;&lt;/denchmark-link&gt;
+
+This is AdamOptimizer with 30 workers
+&lt;denchmark-link:https://cloud.githubusercontent.com/assets/9952727/21861026/30a21568-d844-11e6-8933-329dc9e7f143.png&gt;&lt;/denchmark-link&gt;
+
+And this is Adam with 1 worker
+&lt;denchmark-link:https://cloud.githubusercontent.com/assets/9952727/21861027/30a45508-d844-11e6-9bd2-5a7149ca7bcb.png&gt;&lt;/denchmark-link&gt;
+
+So all the expensive operations are running on the PS.
+		</comment>
+		<comment id='5' author='Bobrosoft98' date='2017-01-11T19:19:09Z'>
+		&lt;denchmark-link:https://github.com/concretevitamin&gt;@concretevitamin&lt;/denchmark-link&gt;
+ Thanks for the hopefulness, but alas I don't think any of my recent optimizations will make this better.
+&lt;denchmark-link:https://github.com/Bobrosoft98&gt;@Bobrosoft98&lt;/denchmark-link&gt;
+ What is your CPU utilization like on the PS machine when running Adam with one worker? From a quick glance it looks like the ops duration might be dilating because of contention for the threadpools (in particular the intra-op parallelism) that do parallel work in a TF server. If 30 workers all attempts to send their gradients at approximately the same time, there will be 30x the amount of work to do at the PS.
+One possible mitigation would be to use tf.train.SyncReplicasOptimizer to wrap the Adam optimizer. This would have the benefit that all of the gradients from the different workers would be aggregated (relatively cheaply) before the Adam update rule is evaluated. This should cut down on the amount of work, compared to an asynchronous setup that processes the incoming batches separately. (It's not a free lunch... the synchronous replication is more vulnerable to stragglers, and a little more tricky to set up... but it might be worth it for your case.)
+		</comment>
+		<comment id='6' author='Bobrosoft98' date='2017-01-12T13:42:13Z'>
+		&lt;denchmark-link:https://github.com/mrry&gt;@mrry&lt;/denchmark-link&gt;
+ I run everything on a single machine, the CPU load with one worker is the same as with 30 workers (about 50% on all cores).
+Still, it's not clear for me why Adam has this problem, and other optimizers don't. What do mean these huge "Mul" and "Assign" blocks on the timeline? Why assigning something takes so much time?
+Does Adam in TF update the whole embedding matrix at every iteration? This seems unreasonable: only a small number of its rows can be used in a batch.
+		</comment>
+		<comment id='7' author='Bobrosoft98' date='2017-01-17T14:39:03Z'>
+		It seems to me that a problem is adam not working properly with sparse updates. Although it is said that
+
+Note that in dense implement of this algorithm, m_t, v_t and variable will 
+update even if g is zero, but in sparse implement, m_t, v_t and variable 
+will not update in iterations g is zero
+
+
+the code of _apply_sparse looks like it is updating the whole matrix.
+		</comment>
+		<comment id='8' author='Bobrosoft98' date='2017-01-18T01:03:13Z'>
+		I also met the same problem when using Adam optimizer solving a model involving big embedding matrix. Compared to Adagrad or Adadelta, Adam works 10 times slower. When I doubled the vocabulary size, the time consumption for Adam also doubled...
+		</comment>
+		<comment id='9' author='Bobrosoft98' date='2017-01-18T01:26:48Z'>
+		There is a post in Tensorflow mail list that solves this problem: &lt;denchmark-link:https://groups.google.com/a/tensorflow.org/forum/#!searchin/discuss/adam$20sparse/discuss/6GvpMz8kb-U/FaBAJkbvEQAJ&gt;https://groups.google.com/a/tensorflow.org/forum/#!searchin/discuss/adam$20sparse/discuss/6GvpMz8kb-U/FaBAJkbvEQAJ&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='10' author='Bobrosoft98' date='2017-03-15T19:05:39Z'>
+		LazyAdamOptimizer is supposed to make it faster -- &lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/819a690d&gt;819a690&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='11' author='Bobrosoft98' date='2018-11-20T04:00:19Z'>
+		SparseAdam in pytorch is same as Tensorflow LazyAdam. The convergence of LazyAdam is lower than Adam.  The main problem is if the gradient is 0, we don't update m, and v.
+Actually, m and v should be updated when other weights are updated.  This is why LazyAdam convergence is low.
+I have proposed a method to fix this issue. The performance is about the same as LazyAdam, and the convergence is the same as Adam.
+Could you please review my method:
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/23668&gt;#23668&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,365 @@
+<bug id='43107' author='cataclysmus' open_date='2020-09-10T12:50:03Z' closed_time='2020-10-19T13:33:25Z'>
+	<summary>No gradient defined for operation RaggedTensorFromVariant / or no gradients at all</summary>
+	<description>
+Please make sure that this is a bug. As per our
+GitHub Policy,
+we only address code/doc bugs, performance issues, feature requests and
+build/installation issues on GitHub. tag:bug_template
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): Yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Linux Ubuntu 20.04
+Mobile device (e.g. iPhone 8, Pixel 2, Samsung Galaxy) if the issue happens on mobile device: NA
+TensorFlow installed from (source or binary): Binary
+TensorFlow version (use command below): 2.3.0
+Python version: 3.7
+Bazel version (if compiling from source): NA
+GCC/Compiler version (if compiling from source): NA
+CUDA/cuDNN version: 10.2
+GPU model and memory: RTX 2070 SUPER, 8Gb
+
+
+Using RaggedTensor I want to minimize KL loss for different segments of a weights matrix (assuming their coefficients drawn from multivariate normal distribution in each segment). RaggedTensors is used inside tf.map_fn. First, I met &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/42189&gt;issue&lt;/denchmark-link&gt;
+
+LookupError: gradient registry has no entry for: RaggedTensorFromVariant
+I was fixed it with &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/42189#issuecomment-673529072&gt;provided code&lt;/denchmark-link&gt;
+
+However, optimization is not working. Weights are not updated during training. For simplicity, I want to minimize only trace in covariance matrix, but nothing happens. I think that provided code doesn't allow gradients to pass through.
+Describe the expected behavior
+I expect trace will be minimized to zero
+Standalone code to reproduce the issue
+&lt;denchmark-code&gt;import tensorflow as tf
+import numpy as np
+
+class DenseCov(tf.keras.layers.Dense):
+    def __init__(self, units, segments, **kwargs):
+        
+        self.segment_ids = tf.keras.backend.constant(segments, dtype=tf.int64, name='segment_ids')
+        self.W_ragged = None
+        self.embed_dim = None
+        super().__init__(units=units, use_bias=False, kernel_initializer=tf.keras.initializers.Ones(), **kwargs)
+    
+    def call(self, inputs):
+        logits = super().call(inputs)
+
+        # Want to minimize Kullback–Leibler divergence between two multivariate normal distributions
+        # But for simplicity minimize only trace
+
+        W_ragged = tf.RaggedTensor.from_value_rowids(tf.transpose(self.kernel), self.segment_ids, name='init_ragged')
+        means = tf.reduce_mean(W_ragged, axis=1, name='means')
+        W_centred = W_ragged - tf.expand_dims(means, 1)
+        cov_matrix = tf.map_fn(lambda x: tf.matmul(x, x, True) / (tf.cast(tf.shape(x)[0], tf.float32) - 1), W_centred, name='calc_covar')
+        cov_matrix = cov_matrix.to_tensor(name='convert_dense')
+        
+        traces =  tf.map_fn(lambda x: tf.linalg.trace(x), cov_matrix, name='calc_trace')
+        # traces = 0.
+
+        # logdets = tf.map_fn(lambda x: -tf.linalg.logdet(x), cov_matrix, name='calc_logdet')  # disabled for simplicity
+        logdets = 0.
+
+        # loss = traces + logdets + tf.reduce_sum(centroid_means**2, axis=1)  # disabled for simplicity
+        loss = traces
+
+        loss = tf.reduce_mean(loss, name='total_loss')        
+        self.add_loss(loss)
+        return logits
+    
+    def build(self, input_shape):
+        super().build(input_shape)
+
+        # Distorted matrix a bit
+        W = self.kernel
+        W.assign_add(np.random.randn(N_dim, N_class).astype(np.float32))
+        
+    def get_config(self):
+        config = {
+            'segments': self.segment_ids.numpy(),
+        }
+        base_config = super().get_config()
+        base_config.update(config)
+        return base_config
+
+N_class, N_domains, N_dim, N_samples = 50000, 1, 10, 100
+segments = np.random.randint(0, N_domains, N_class)
+segments = np.sort(segments)
+
+data = np.random.randn(N_samples, N_dim).astype(np.float32)
+y_true = np.random.randn(N_samples).astype(np.float32)
+
+tf.keras.backend.clear_session()
+model = tf.keras.models.Sequential()
+model.add(tf.keras.Input(shape=(N_dim,)))
+model.add(DenseCov(N_class, segments))
+model.add(tf.keras.layers.Dense(1))
+
+def dummy_loss(y_true, y_pred):
+    return 0*tf.reduce_sum(y_pred)
+
+model.compile(optimizer=tf.keras.optimizers.Adam(0.1), loss=dummy_loss)
+
+from tensorflow.raw_ops import RaggedTensorToVariant
+
+@tf.RegisterGradient("RaggedTensorFromVariant")
+def _RaggedTensorFromVariantGrad(*args):
+    if len(args) == 2:
+        op, grad = args
+        res = [RaggedTensorToVariant(rt_nested_splits=[], rt_dense_values=grad,
+                                      batched_input=False)]
+    else:
+        op, empty, grad = args
+        res = [RaggedTensorToVariant(rt_nested_splits=[op.outputs[0]], rt_dense_values=grad,
+                                    batched_input=True)]
+    return res
+
+initial_trace = np.trace(np.cov((model.layers[-2].weights[0].numpy())))
+
+loss = []
+for i in range(10):
+    res = model.train_on_batch(data[:10], y_true[:10])
+    print(f"Iter {i}, loss: {res}, delta: {initial_trace-res} ")
+&lt;/denchmark-code&gt;
+
+Returns
+&lt;denchmark-code&gt;/home/data/venv/lib/python3.7/site-packages/tensorflow/python/framework/indexed_slices.py:432: UserWarning: Converting sparse IndexedSlices to a dense Tensor of unknown shape. This may consume a large amount of memory.
+  "Converting sparse IndexedSlices to a dense Tensor of unknown shape. "
+
+Iter 0, loss: 9.99978256225586, delta: 1.1581866488086234e-07 
+Iter 1, loss: 9.99978256225586, delta: 1.1581866488086234e-07 
+Iter 2, loss: 9.99978256225586, delta: 1.1581866488086234e-07 
+Iter 3, loss: 9.99978256225586, delta: 1.1581866488086234e-07 
+Iter 4, loss: 9.99978256225586, delta: 1.1581866488086234e-07 
+Iter 5, loss: 9.99978256225586, delta: 1.1581866488086234e-07 
+Iter 6, loss: 9.99978256225586, delta: 1.1581866488086234e-07 
+Iter 7, loss: 9.99978256225586, delta: 1.1581866488086234e-07 
+Iter 8, loss: 9.99978256225586, delta: 1.1581866488086234e-07 
+Iter 9, loss: 9.99978256225586, delta: 1.1581866488086234e-07 
+
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='cataclysmus' date='2020-09-10T17:16:46Z'>
+		Was able to reproduce the issue with TF v2.3 and TF-nightly. Please find the gist of it &lt;denchmark-link:https://colab.research.google.com/gist/amahendrakar/133fb56d1e1c9cc631a8d21d08fa3dec/43107-tf-nightly.ipynb&gt;here&lt;/denchmark-link&gt;
+. Thanks!
+		</comment>
+		<comment id='2' author='cataclysmus' date='2020-09-10T19:04:47Z'>
+		&lt;denchmark-link:https://github.com/cataclysmus&gt;@cataclysmus&lt;/denchmark-link&gt;
+ I think that you can experiment to remove  from compile as it is not mandatory as you can see in:
+&lt;denchmark-link:https://www.tensorflow.org/guide/keras/custom_layers_and_models&gt;https://www.tensorflow.org/guide/keras/custom_layers_and_models&lt;/denchmark-link&gt;
+
+
+It's also possible not to pass any loss in compile,
+since the model already has a loss to minimize, via the add_loss
+call during the forward pass!
+
+Then you will see:
+&lt;denchmark-code&gt;ValueError: No gradients provided for any variable: ['dense_cov/kernel:0', 'dense/kernel:0', 'dense/bias:0'].
+&lt;/denchmark-code&gt;
+
+I think that you could try to solve this cause there is any "flow" connection between your loss and your logits.
+		</comment>
+		<comment id='3' author='cataclysmus' date='2020-09-10T20:24:51Z'>
+		
+@cataclysmus I think that you can experiment to remove loss=dummy_loss from compile as it is not mandatory as you can see in:
+https://www.tensorflow.org/guide/keras/custom_layers_and_models
+
+It's also possible not to pass any loss in compile,
+since the model already has a loss to minimize, via the add_loss
+call during the forward pass!
+
+Then you will see:
+ValueError: No gradients provided for any variable: ['dense_cov/kernel:0', 'dense/kernel:0', 'dense/bias:0'].
+
+I think that you could try to solve this cause there is any "flow" connection between your loss and your logits.
+
+You should not remove loss=dummy_loss because of ValueError: No gradients provided for any variable . Imagine this construction to be used as a regularizer of some big matrix in a classification problem. So for the real task dummy_loss  will be replaced with crossentropy. Here, I wanted to demonstrate that gradients are zeros, if map_fn is used together with RaggedTensor. I have already checked this fact with tf.GradientTape and printing gradient values.  Just replace
+loss = traces
+with
+loss = tf.reduce_sum(means**2, axis=1)
+and you will see, that matrix becomes to change and gradients are not zeros.
+		</comment>
+		<comment id='4' author='cataclysmus' date='2020-09-10T21:21:03Z'>
+		
+So for the real task dummy_loss will be replaced with crossentropy.
+
+Yes of course, but don't think it is your dummy case right?  Also cause loss = tf.reduce_sum(means**2, axis=1) and others works fine.
+Have you tried tf.map_fn with something different from RaggedTensor?
+		</comment>
+		<comment id='5' author='cataclysmus' date='2020-09-10T21:49:44Z'>
+		Same code, no RaggedTensor. It works
+&lt;denchmark-code&gt;import tensorflow as tf
+import numpy as np
+
+class DenseCov(tf.keras.layers.Dense):
+    def __init__(self, units, segments, **kwargs):
+        
+        self.segment_ids = tf.keras.backend.constant(segments, dtype=tf.int64, name='segment_ids')
+        self.W_ragged = None
+        self.embed_dim = None
+        super().__init__(units=units, use_bias=False, kernel_initializer=tf.keras.initializers.Ones(), **kwargs)
+    
+    def call(self, inputs):
+        logits = super().call(inputs)
+
+        # Want to minimize Kullback–Leibler divergence between two multivariate normal distributions
+        # But for simplicity minimize only trace
+
+#         W_ragged = tf.RaggedTensor.from_value_rowids(tf.transpose(self.kernel), self.segment_ids, name='init_ragged')
+        W_ragged = tf.transpose(self.kernel)
+        W_ragged = tf.expand_dims(W_ragged, 0)
+
+        means = tf.reduce_mean(W_ragged, axis=1, name='means')
+        W_centred = W_ragged - tf.expand_dims(means, 1)
+        cov_matrix = tf.map_fn(lambda x: tf.matmul(x, x, True) / (tf.cast(tf.shape(x)[0], tf.float32) - 1),
+                               W_centred, name='calc_covar')
+#         cov_matrix = cov_matrix.to_tensor(name='convert_dense')
+        
+        traces =  tf.map_fn(lambda x: tf.linalg.trace(x), cov_matrix, name='calc_trace')
+        # traces = 0.
+
+        # logdets = tf.map_fn(lambda x: -tf.linalg.logdet(x), cov_matrix, name='calc_logdet')  # disabled for simplicity
+        logdets = 0.
+
+        # loss = traces + logdets + tf.reduce_sum(centroid_means**2, axis=1)  # disabled for simplicity
+        loss = traces
+
+        loss = tf.reduce_mean(loss, name='total_loss')        
+        self.add_loss(loss)
+        return logits
+    
+    def build(self, input_shape):
+        super().build(input_shape)
+
+        # Distorted matrix a bit
+        W = self.kernel
+        W.assign_add(np.random.randn(N_dim, N_class).astype(np.float32))
+        
+    def get_config(self):
+        config = {
+            'segments': self.segment_ids.numpy(),
+        }
+        base_config = super().get_config()
+        base_config.update(config)
+        return base_config
+
+N_class, N_domains, N_dim, N_samples = 500, 1, 10, 100
+segments = np.random.randint(0, N_domains, N_class)
+segments = np.sort(segments)
+
+data = np.random.randn(N_samples, N_dim).astype(np.float32)
+y_true = np.random.randn(N_samples).astype(np.float32)
+
+tf.keras.backend.clear_session()
+model = tf.keras.models.Sequential()
+model.add(tf.keras.Input(shape=(N_dim,)))
+model.add(DenseCov(N_class, segments))
+model.add(tf.keras.layers.Dense(1))
+
+def dummy_loss(y_true, y_pred):
+    return 0*tf.reduce_sum(y_pred)
+
+model.compile(optimizer=tf.keras.optimizers.Adam(0.1), loss=dummy_loss)
+
+
+initial_trace = np.trace(np.cov((model.layers[-2].weights[0].numpy())))
+
+loss = []
+for i in range(10):
+    res = model.train_on_batch(data[:10], y_true[:10])
+    print(f"Iter {i}, loss: {res}, delta: {initial_trace-res} ")
+&lt;/denchmark-code&gt;
+
+Output:
+&lt;denchmark-code&gt;Iter 0, loss: 10.365920066833496, delta: 6.145684974256937e-07 
+Iter 1, loss: 8.83370590209961, delta: 1.5322147793023841 
+Iter 2, loss: 7.489259243011475, delta: 2.876661438390519 
+Iter 3, loss: 6.322910308837891, delta: 4.043010372564103 
+Iter 4, loss: 5.31702995300293, delta: 5.048890728399064 
+Iter 5, loss: 4.454628944396973, delta: 5.911291737005021 
+Iter 6, loss: 3.721179485321045, delta: 6.644741196080949 
+Iter 7, loss: 3.102418899536133, delta: 7.263501781865861 
+Iter 8, loss: 2.583615779876709, delta: 7.7823049015252845 
+Iter 9, loss: 2.150526285171509, delta: 8.215394396230485
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='6' author='cataclysmus' date='2020-09-11T02:07:10Z'>
+		/cc &lt;denchmark-link:https://github.com/edloper&gt;@edloper&lt;/denchmark-link&gt;
+ Can you take a look at this?
+		</comment>
+		<comment id='7' author='cataclysmus' date='2020-09-11T10:25:39Z'>
+		Thank you for helping me. I simplified code for the debugging
+&lt;denchmark-code&gt;from tensorflow.raw_ops import RaggedTensorToVariant
+@tf.RegisterGradient("RaggedTensorFromVariant")
+def _RaggedTensorFromVariantGrad(*args):
+
+    op, empty, grad = args
+    res = RaggedTensorToVariant(rt_nested_splits=[op.outputs[0]], rt_dense_values=grad,
+                                batched_input=True)
+    return res
+
+x = tf.constant([[1., 2.], 
+               [3., 4.],
+               [-1., 2.], 
+               [3., -4.]
+            ], dtype=tf.float32)
+
+with tf.GradientTape(persistent=True) as g:
+    g.watch(x)
+    W_ragged = tf.RaggedTensor.from_value_rowids(x, [0, 0 , 1, 1], name='init_ragged')
+    y = tf.reduce_mean(W_ragged, axis=1)
+dy_dx = g.gradient(y, W_ragged.values)
+print("Gradient means")
+print(dy_dx)
+
+
+with tf.GradientTape(persistent=True) as g:
+    g.watch(x)
+    W_ragged = tf.RaggedTensor.from_value_rowids(x, [0, 0 , 1, 1], name='init_ragged')
+    y = tf.map_fn(lambda x: tf.matmul(x, x, True) / (tf.cast(tf.shape(x)[0], tf.float32) - 1),
+                               W_ragged, name='calc_covar')
+
+dy_dx = g.gradient(y.values, W_ragged.values)
+print("\nGradient Covar")
+print(dy_dx)
+&lt;/denchmark-code&gt;
+
+Outputs:
+&lt;denchmark-code&gt;Gradient means
+tf.Tensor(
+[[0.5 0.5]
+ [0.5 0.5]
+ [0.5 0.5]
+ [0.5 0.5]], shape=(4, 2), dtype=float32)
+
+Gradient Covar
+None
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='8' author='cataclysmus' date='2020-10-06T04:59:01Z'>
+		I have similar issue. Any workaround for this? I used tf.map_fn for RaggedTensor during calculating loss, and error gradient registry has no entry for: RaggedTensorFromVariant occured in backprop using GradientTape.
+		</comment>
+		<comment id='9' author='cataclysmus' date='2020-10-09T20:19:36Z'>
+		We are working on a fix for this; hopefully it should go out in the nightly builds sometime next week.
+		</comment>
+		<comment id='10' author='cataclysmus' date='2020-10-10T16:06:44Z'>
+		I've just hit this same wall. I am using tf.map_fn for RaggedTensor in my custom layers and custom loss (inherited from keras.layers.Layer and keras.losses.Loss respectively) and get the error:
+LookupError: gradient registry has no entry for: RaggedTensorFromVariant (while using with tf.GradientTape)
+or
+ LookupError: No gradient defined for operation 'CrossEntropy_RT/map/while/RaggedFromVariant_1/RaggedTensorFromVariant' (op type: RaggedTensorFromVariant) (while using model.fit()).
+I look forward to the fix.
+		</comment>
+		<comment id='11' author='cataclysmus' date='2020-10-19T13:33:24Z'>
+		Fixed in &lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/be6b1fdb0699d4000b70ad32cc23d1503e5c7511&gt;be6b1fd&lt;/denchmark-link&gt;
+.
+		</comment>
+		<comment id='12' author='cataclysmus' date='2020-10-19T13:33:26Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/43107&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/43107&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

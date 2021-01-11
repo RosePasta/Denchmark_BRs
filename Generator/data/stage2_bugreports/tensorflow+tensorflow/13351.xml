@@ -1,0 +1,243 @@
+<bug id='13351' author='yaroslavvb' open_date='2017-09-27T22:38:43Z' closed_time='2018-11-14T20:46:41Z'>
+	<summary>TensorFlow variable initializers broken</summary>
+	<description>
+Three symptoms observed with models after upgrading tensorflow:
+
+must feed placeholder error
+or
+things hang with 100% utilization inside python _build_initializer_expr
+things succeed but sess.run call takes 100x slower than before
+
+I believe this is due to this commit:
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/07adc2ea910de715d31e16a019fcbcccb575e931&gt;07adc2e&lt;/denchmark-link&gt;
+
+Because the following work-around restores good behavior:
+&lt;denchmark-code&gt;from tensorflow.python.ops import variables
+def passthrough(obj, value): return value
+try:
+  variables.Variable._build_initializer_expr=passthrough
+except: # older versions of TF don't have this
+  pass
+&lt;/denchmark-code&gt;
+
+Here's a self contained repro: &lt;denchmark-link:https://github.com/yaroslavvb/stuff/blob/master/tf_initializer_bug_report.py&gt;https://github.com/yaroslavvb/stuff/blob/master/tf_initializer_bug_report.py&lt;/denchmark-link&gt;
+
+It works fine in tensorflow 1.2, or with the fix, in latest version is throws
+&lt;denchmark-code&gt;tensorflow.python.framework.errors_impl.InvalidArgumentError: You must feed a va
+lue for placeholder tensor 'Wf_holder' with dtype float and shape [307328]
+         [[Node: Wf_holder = Placeholder[dtype=DT_FLOAT, shape=[307328], _device
+="/job:localhost/replica:0/task:0/device:GPU:0"]()]]
+
+&lt;/denchmark-code&gt;
+
+Sorry I didn't make the repro smaller, I lost motivation after finding the quick fix :)
+	</description>
+	<comments>
+		<comment id='1' author='yaroslavvb' date='2017-09-27T22:39:25Z'>
+		cc &lt;denchmark-link:https://github.com/benoitsteiner&gt;@benoitsteiner&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/alextp&gt;@alextp&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='2' author='yaroslavvb' date='2017-09-27T22:40:45Z'>
+		&lt;denchmark-link:https://github.com/TimSalimans&gt;@TimSalimans&lt;/denchmark-link&gt;
+ who is also affected
+		</comment>
+		<comment id='3' author='yaroslavvb' date='2017-12-20T03:15:20Z'>
+		Just tested with tf nightly and it's still broken. I believe this bug is also responsible for deadlock during data-dependent init in tim's models.
+To reproduce:
+&lt;denchmark-code&gt;pip install tf-nightly
+wget https://raw.githubusercontent.com/yaroslavvb/stuff/2c716e7abde25018ccfeeeff96c6397fef4f33ba/tf_initializer_bug_report.py
+
+python tf_initializer_bug_report.py
+...
+tensorflow.python.framework.errors_impl.InvalidArgumentError: You must feed a value for placeholder tensor 'Wf_holder' with dtype float and shape [307328]
+	 [[Node: Wf_holder = Placeholder[dtype=DT_FLOAT, shape=[307328], _device="/job:localhost/replica:0/task:0/device:CPU:0"]()]]
+
+&lt;/denchmark-code&gt;
+
+If you comment out the top block, which essentially reverts &lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/07adc2ea910de715d31e16a019fcbcccb575e931&gt;07adc2e&lt;/denchmark-link&gt;
+ then things work again and you see following output
+&lt;denchmark-code&gt;Running training.
+Step 0 loss 35.58, target decrease -7.771, actual decrease, -4.621 ratio 0.59 grad norm: 22.97 pregrad norm: 77563.16
+Step 3 loss 25.41, target decrease -0.841, actual decrease, -0.740 ratio 0.88 grad norm: 1.72 pregrad norm: 1541.23
+Step 6 loss 23.99, target decrease -0.204, actual decrease, -0.189 ratio 0.93 grad norm: 0.43 pregrad norm: 295.30
+
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='4' author='yaroslavvb' date='2017-12-20T15:22:28Z'>
+		&lt;denchmark-link:https://github.com/asimshankar&gt;@asimshankar&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/josh11b&gt;@josh11b&lt;/denchmark-link&gt;
+ It's this issue again. Apparently it broke recently. I didn't know that.
+		</comment>
+		<comment id='5' author='yaroslavvb' date='2017-12-20T17:52:04Z'>
+		There is an internal bug for this which is being worked on
+		</comment>
+		<comment id='6' author='yaroslavvb' date='2017-12-20T21:47:31Z'>
+		I agree with your analysis that &lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/07adc2ea910de715d31e16a019fcbcccb575e931&gt;07adc2e&lt;/denchmark-link&gt;
+ is the culprit and that introduced likely multiple bugs.  The description of that commit "when a variable w is initialized with the value of another variable v, make sure that the initializer of v is run first." would have been fine, but the actual code change instead redirects references to v in w's initializer to v's initial value graph. This has at least a couple of problems:
+
+there are some bugs in the code, e.g. if there is a while loop it can follow the cycle in the graph forever
+if v was already initialized and has since been updated, w should get the new value not the original value
+
+Ideally, we would rewrite the logic to be less buggy:
+
+scan w's initializer init_w for references to variables, being careful to avoid visiting nodes in a graph cycle more than once
+replace w's initialize_op with: if v has not been initialized, run v's initialization op; once that is done run "w = w's initialization expression" without changes (in particular, without the rewrite to use v's initial value)
+
+		</comment>
+		<comment id='7' author='yaroslavvb' date='2018-01-05T12:25:06Z'>
+		I'm starting to push through changes to fix this. The first one is a refactoring to make subsequent changes easier as well as avoiding infinite recursion when the initial_value contains cycles (note that it also changes the name of _build_initiazier_expr to _try_guard_against_uninitialized_depenencies to clarify what it does). I'll now attempt to address more edge cases.
+Here's what I believe is a minimal reproduction of the bad behaviour in this case:
+&lt;denchmark-code&gt;p = tf.placeholder(dtype=tf.float32, shape=[])
+v0 = tf.Variable(p)
+v1 = tf.Variable(v0)
+with tf.Session() as session:
+  session.run(v0.initializer, feed_dict={p: 0})
+  session.run(v1.initializer)  # InvalidArgumentError
+&lt;/denchmark-code&gt;
+
+The transformation done by _build_initializer_expr makes v1 depend on v0.initialized_value() which is a cond of the form:
+&lt;denchmark-code&gt;cond(
+    is_variable_initialized(v0),
+    v0.read_value,
+    lambda: p)
+&lt;/denchmark-code&gt;
+
+Because p isn't actually created inside false_fn it will always be evaluated when the cond is -- which is inconsistent with the intended behaviour. If you were to run that session.run(v1.initializer) statement and feed p it would work (but we shouldn't expect the user to do that).
+This adds to the list of edge cases (that I'm aware of) where _build_initializer_expr behaves poorly:
+
+
+This issues of extraneous propagation of placeholders.
+
+
+Cyclic initializers (now "fixed" by having it ignore those graphs).
+
+
+When TF functions are involved. For example:
+
+
+&lt;denchmark-code&gt;@function.Defun(tf.float32, shape_func=lambda op: [op.inputs[0].get_shape()])
+def increment(x):
+  return x + tf.ones_like(x)
+
+v0 = tf.Variable(tf.zeros(shape=[]))
+a = increment(v0)
+v = tf.Variable(a)  # NotFoundError: Op type not registered
+&lt;/denchmark-code&gt;
+
+
+With most stateful ops. For example:
+
+&lt;denchmark-code&gt;# Graph rewriting results in wrong values when you have a variable initializer
+# which depends on a non-determinstic op which depends on a variable. Note that
+# we use random_uniform with integer types because the underlying op
+# "RandomUniformInt" takes in the minval and maxval as tensors unlike, for
+# example, random_normal with calls "RandomStandardNormal" and then transforms
+# it with the mean/stdev (so the non-determinsitic part doesn't actually)
+# depend on the variables and won't be rewritten.
+minval = tf.Variable(0, dtype=tf.int32)
+maxval = tf.Variable(1000000, dtype=tf.int32)
+r = tf.random_uniform(shape=[], minval=minval, maxval=maxval, dtype=tf.int32)
+v0 = tf.Variable(r)
+v1 = tf.Variable(v0)  # Same results even if you use v0.initialized_value()
+with tf.Session() as session:
+  session.run([minval.initializer, maxval.initializer])
+  session.run([v0.initializer, v1.initializer])
+  print(session.run([v0, v1])) # Different values.
+
+# _build_initializer_expr copies the random op so there will be two of them.
+print(sum([op.type == 'RandomUniformInt'
+           for op in tf.get_default_graph().get_operations()]))
+&lt;/denchmark-code&gt;
+
+
+If you have an initializer where there is an intermediate op X which takes an argument that must be a reference type, and that argument is a variable. This algorithm will turn the reference type into a value type and cause an error. For example:
+
+&lt;denchmark-code&gt;v0 = tf.Variable(tf.zeros(shape=[]))
+one = tf.ones_like(v0)
+v0_plus_one = tf.assign(v0, v0.initialized_value() + one)
+v1 = tf.Variable(v0_plus_one)
+with tf.Session() as session:
+  session.run(v1.initializer)  # InvalidArgumentError
+&lt;/denchmark-code&gt;
+
+
+Not a bug, as such, but the implementation will produce an exponentially large number of nodes given a diamond pattern dependency graph (now fixed by memoizing):
+
+&lt;denchmark-code&gt;# Diamond pattern - exponential growth
+# N =&gt; N + 2^N - 1 Add ops
+N = 4
+v0 = tf.Variable(tf.zeros(shape=[]))
+x = v0
+for i in range(N):
+  x = tf.add(x, x)
+v1 = tf.Variable(x)
+print(sum([op.type == 'Add'
+           for op in tf.get_default_graph().get_operations()]))
+with tf.Session() as session:
+  print(session.run(v1.initializer))
+  print(session.run(v1))
+&lt;/denchmark-code&gt;
+
+
+
+The implementation completely ignores control dependencies. Any new ops created simply don't have them.
+
+
+The implementation completely ignores control flow contexts. Any new ops created based on ops in a control flow context aren't added to that context.
+
+
+The implementation will only be able to find a Variable's initialized_value method if that variable is present in the GLOBAL_VARIABLES or LOCAL_VARIABLES collection. This is a weird inconsistency to the end user. It's even possible it could find the wrong Variable (although you'd have to be working really hard to get it to do that).
+
+
+The implementation relies on a hard-coded set of known variable ops. If new variable ops are added it won't recognize them without manual intervention.
+
+
+Even if the caller explicitly passes in a .initialized_value() to a Variable's constructor the _build_initializer_expr will probably create a bunch of new nodes in the graph anyway.
+
+
+It currently doesn't even do anything when the initial value depends on a ResourceVariable.
+
+
+There are probably even more that I'm not currently aware of.
+I'll start working through these in the coming days. I'm working under the assumption that we can't just remove this transformation since there will already be a significant number of graphs which depend on it. That means most of the work will be to whitelist and/or blacklist the set of initial_value subgraphs for which we can safely apply the transformation.
+		</comment>
+		<comment id='8' author='yaroslavvb' date='2018-01-05T15:38:02Z'>
+		Working this feature into existing client code is complicated, I wonder if it would be much simpler to add it as new functionality. Since dependent initialization has never worked in TF, this can be a new op, like VariableV5, which can eventually replace Variable.
+The example &lt;denchmark-link:https://gist.github.com/yaroslavvb/d592394c0cedd32513f8fbb87ca05938&gt;here&lt;/denchmark-link&gt;
+ worked for our code in OpenAI, and the idea there was to make variable reads have control dependency on "safe-initializer". "Safe-initializer" is an assign op that only runs when variable has not been initialized.
+PS, motivation for the breaking commit is &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/4920&gt;#4920&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='9' author='yaroslavvb' date='2018-01-23T23:25:25Z'>
+		&lt;denchmark-link:https://github.com/djvisentin&gt;@djvisentin&lt;/denchmark-link&gt;
+ I think this is fixed, right?
+		</comment>
+		<comment id='10' author='yaroslavvb' date='2018-06-10T22:48:45Z'>
+		Are there any updates on this?
+I just tried depending variables, e.g.:
+&lt;denchmark-code&gt;var = tf.Variable(some_placeholder)
+var2 = tf.Variable(var.initialized_value())
+&lt;/denchmark-code&gt;
+
+which did not work.
+After initialization, sess.run(var) gave me the correct values, but sess.run(var.initialized_value()) raised an error because of missing some_placeholder.
+		</comment>
+		<comment id='11' author='yaroslavvb' date='2018-06-12T02:22:39Z'>
+		Well as a workaround I just convert the variable to a numpy array and initialize using the numpy array, it feels as inelegant as it looks but it's the simplest way I've found &lt;denchmark-link:https://github.com/Hoeze&gt;@Hoeze&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='12' author='yaroslavvb' date='2018-06-14T18:38:17Z'>
+		That's not pretty, but simple.
+Nevertheless, imho this should be solved. A dependency tree initializing variables would be much more pretty.
+		</comment>
+		<comment id='13' author='yaroslavvb' date='2018-11-14T18:57:21Z'>
+		Nagging Assignee &lt;denchmark-link:https://github.com/djvisentin&gt;@djvisentin&lt;/denchmark-link&gt;
+: It has been 152 days with no activity and this issue has an assignee. Please update the label and/or status accordingly.
+		</comment>
+		<comment id='14' author='yaroslavvb' date='2018-11-14T20:46:41Z'>
+		If you use tf.function in tf v2 this will not be a problem, so this is how we plan on fully resolving this issue.
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,271 @@
+<bug id='2015' author='alphaf52' open_date='2016-04-19T05:46:43Z' closed_time='2016-08-12T01:49:23Z'>
+	<summary>recurrent layer on top of convolution layer fails with GPU</summary>
+	<description>
+&lt;denchmark-h:h3&gt;Environment info&lt;/denchmark-h&gt;
+
+Operating System: Ubuntu 15.04
+Installed version of CUDA and cuDNN:
+CUDA 7.5
+cuDNN 5.0.4
+(please attach the output of ls -l /path/to/cuda/lib/libcud*):
+-rw-r--r-- 1 root root 189170 Oct 10  2015 /usr/local/cuda/lib/libcudadevrt.a
+lrwxrwxrwx 1 root root     16 Oct 10  2015 /usr/local/cuda/lib/libcudart.so -&gt; libcudart.so.7.5
+lrwxrwxrwx 1 root root     19 Oct 10  2015 /usr/local/cuda/lib/libcudart.so.7.5 -&gt; libcudart.so.7.5.18
+-rwxr-xr-x 1 root root 311596 Oct 10  2015 /usr/local/cuda/lib/libcudart.so.7.5.18
+-rw-r--r-- 1 root root 558020 Oct 10  2015 /usr/local/cuda/lib/libcudart_static.a
+If installed from binary pip package, provide:
+
+Which pip package you installed.
+pip list
+tensorflow (0.7.1)
+The output from python -c "import tensorflow; print(tensorflow.version)".
+0.7.1
+
+&lt;denchmark-h:h3&gt;Problem description&lt;/denchmark-h&gt;
+
+I simply try to put a recurrent layer on top of a convolution layer, which directly manipulate the inputs. It is ok with cpu, but fails with gpu. When i remove either the convolution layer or the recurrent layer, it works well with gpu.
+The error message is
+
+python: external/eigen_archive/eigen-eigen-3f653ace7d28/unsupported/Eigen/CXX11/src/Tensor/TensorExecutor.h:223: static void Eigen::internal::TensorExecutor&lt;Expression, Eigen::GpuDevice, false&gt;::run(const Expression&amp;, const Eigen::GpuDevice&amp;) [with Expression = const Eigen::TensorAssignOp&lt;Eigen::TensorMap&lt;Eigen::TensorFixedSize&lt;float, Eigen::Sizes&lt;&gt;, 1, long int&gt;, 16&gt;, const Eigen::TensorCwiseUnaryOpEigen::internal::scalar_multiple_op&lt;float, const Eigen::TensorReductionOpEigen::internal::SumReducer&lt;float, const Eigen::DimensionList&lt;long int, 1ul&gt;, const Eigen::TensorCwiseUnaryOp&lt;Eigen::internal::scalar_square_op, const Eigen::TensorMap&lt;Eigen::Tensor&lt;const float, 1, 1, long int&gt;, 16&gt; &gt; &gt; &gt; &gt;]: Assertion `cudaGetLastError() == cudaSuccess' failed.
+
+I run some black-box test (as i don't know a better way to debug it), and found that it raises error when it try to compute gradients with the statement
+grads, _ = tf.clip_by_global_norm(tf.gradients(cost, tvars), config.max_grad_norm) 
+The following is a simplified version of the code which has the same problem. (There ought to be a softmax layer on top of the recurrent layer, but i replace it with sum to make it simpler)
+&lt;denchmark-code&gt;import numpy as np
+import tensorflow as tf
+
+import sys
+sys.path.append('/home/jiahua/tensorflow')
+import math
+import time
+
+from tensorflow.contrib.ctc import ctc_ops
+from tensorflow.python.ops import rnn_cell
+from tensorflow.python.ops import rnn
+from conv_batch_normalizer import ConvolutionalBatchNormalizer
+
+import load_data
+
+class Model(object):
+
+  def __init__(self, is_training, config):
+    self._batch_size = batch_size = config.batch_size
+    self._freq_size = freq_size = config.freq_size
+    self._hidden_size = hidden_size = config.hidden_size
+    self._seq_max_length = seq_max_length = config.seq_max_length
+
+    num_channels = 10
+    filter_dimension = 2
+    conv_stride = 2
+
+    self._inputs = inputs = tf.placeholder(tf.float32, [batch_size, seq_max_length, freq_size]) 
+    self._sequence_lengths = sequence_lengths = tf.placeholder(tf.int32, [batch_size])
+    inputs = tf.reshape(inputs, [batch_size, seq_max_length, freq_size, 1])
+
+    padding_size = filter_dimension - (seq_max_length - 1)  % conv_stride - 1 
+    print 'padding_size', padding_size
+    paddings = [[0, 0], [0, padding_size], [0, 0], [0, 0]]
+    inputs = tf.pad(inputs, paddings)
+
+    if is_training and config.keep_prob &lt; 1:
+      inputs = tf.nn.dropout(inputs, config.keep_prob)
+    print 'inputs', tf.Tensor.get_shape(inputs)
+
+    parameters = []
+    # conv1
+    with tf.name_scope('conv1') as scope:
+      kernel = tf.Variable(tf.truncated_normal([filter_dimension, freq_size, 1, num_channels], dtype=tf.float32, stddev=1e-1), name='weights')
+      conv = tf.nn.conv2d(inputs, kernel, [1, conv_stride, conv_stride, 1], padding='VALID')
+      biases = tf.Variable(tf.constant(0.0, shape=[num_channels], dtype=tf.float32), trainable=True, name='biases')
+      bias = tf.nn.bias_add(conv, biases)
+      conv1 = tf.nn.relu(bias, name=scope)
+      parameters += [kernel, biases]
+
+    # batch normalization
+    print 'conv1', tf.Tensor.get_shape(conv1)
+
+    inter1 = tf.reshape(conv1, [batch_size, -1, 1, num_channels])
+    print 'inter1', tf.Tensor.get_shape(inter1)
+
+    new_length = (seq_max_length + padding_size - filter_dimension) / conv_stride + 1
+    print 'new length = ', new_length 
+
+    # rnn
+    rnn_inputs = tf.reshape(inter1, [batch_size, new_length, num_channels])
+    print 'rnn_inputs', tf.Tensor.get_shape(rnn_inputs)
+
+    lstm_cell = rnn_cell.BasicLSTMCell(hidden_size, forget_bias=0.0)
+    if is_training and config.keep_prob &lt; 1:
+      lstm_cell = rnn_cell.DropoutWrapper(lstm_cell, output_keep_prob=config.keep_prob)
+    cell = rnn_cell.MultiRNNCell([lstm_cell] * 2)
+
+    self._initial_state = cell.zero_state(batch_size, tf.float32)
+
+    rnn_outputs = []
+    state = self._initial_state
+    with tf.variable_scope("rnn"):
+      for time_step in range(new_length):
+        if time_step &gt; 0: tf.get_variable_scope().reuse_variables()
+        (cell_output, state) = cell(rnn_inputs[:, time_step, :], state)
+        rnn_outputs.append(cell_output)
+
+    print 'rnn_outputs ', tf.Tensor.get_shape(rnn_outputs[0]) , ' * ', len(rnn_outputs)
+    self._final_state = state
+
+    self._cost = cost = tf.reduce_sum(tf.add_n(rnn_outputs)) / batch_size
+
+    if not is_training:
+      return
+
+    self._lr = tf.Variable(0.0, trainable=False)
+    tvars = tf.trainable_variables()
+    grads, _ = tf.clip_by_global_norm(tf.gradients(cost, tvars),
+                                      config.max_grad_norm)
+
+    optimizer = tf.train.GradientDescentOptimizer(self._lr)
+    self._train_op = optimizer.apply_gradients(zip(grads, tvars))
+
+
+  def assign_lr(self, session, lr_value):
+    session.run(tf.assign(self._lr, lr_value))
+
+  @property
+  def input_data(self):
+    return self._input_data
+
+  @property
+  def cost(self):
+    return self._cost
+
+  @property
+  def final_state(self):
+    return self._final_state
+
+  @property
+  def lr(self):
+    return self._lr
+
+  @property
+  def train_op(self):
+    return self._train_op
+
+  @property
+  def predict(self):
+    return self._predict
+
+
+class Config(object):
+  batch_size = 2
+  freq_size = 2
+  hidden_size = 2
+  seq_max_length = 5
+  init_scale = 1.0
+  lr_decay = 0.5
+  max_epoch = 10
+  max_max_epoch = 100
+  keep_prob = 0.9
+  max_grad_norm = 5
+  learning_rate = 1
+
+
+def run_epoch(session, m, data, eval_op):
+  start_time = time.time()
+  iters = 0
+  costs = 0.0
+  state = m._initial_state.eval()
+  for (inputs, labels_indices, labels_values, labels_shape, seq_lens) in data:
+    cost, state, _ = session.run([m._cost, m._final_state, eval_op],
+                                 {m._inputs: inputs,
+                                  m._initial_state: state})
+    costs += cost
+    iters += 1
+    if iters % 1 == 0:
+      print iters
+      print "time: %f" % (time.time() - start_time)
+      print "cost: %f" % cost
+  print 'finish'
+  print "total time: %f" % (time.time() - start_time)
+  return costs / iters
+  return 0.0
+
+
+def main():
+  config = Config()
+  with tf.Graph().as_default(), tf.Session() as session:
+    initializer = tf.random_uniform_initializer(-config.init_scale,
+                                                config.init_scale)
+    with tf.variable_scope("model", reuse=None, initializer=initializer):
+      m = Model(is_training=True, config=config)
+    init_op = tf.initialize_all_variables()
+    session.run(init_op)
+
+    train_data = [([[[0, 1], [1, 2], [2, 3], [3, 4], [4, 5]], [[1, 2], [2, 3], [3, 4], [4, 5], [5, 6]]], [[0, 0], [0, 1], [1, 0], [1, 1]], [0, 1, 1, 2], [2, 2], [2, 2])]
+    for i in range(config.max_max_epoch):
+      lr_decay = config.lr_decay ** max(i - config.max_epoch, 0.0)
+      print '#iter %d start lr: %f' % (i, config.learning_rate * lr_decay)
+      m.assign_lr(session, config.learning_rate * lr_decay)
+
+      print 'average loss: %f' % (run_epoch(session, m, train_data, m._train_op))
+
+
+if __name__ == "__main__":
+  main()
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h3&gt;What have you tried?&lt;/denchmark-h&gt;
+
+Below is the stack status printed using gdb python, in case you want to look at it. It seems that there is a problem when it tries to launch a cuda kernel to compute the l2loss.
+
+0  0x00007ffff7826267 in __GI_raise (sig=sig@entry=6) at ../sysdeps/unix/sysv/linux/raise.c:55
+1  0x00007ffff7827eca in __GI_abort () at abort.c:89
+2  0x00007ffff781f03d in assert_fail_base (fmt=0x7ffff7981028 "%s%s%s:%u: %s%sAssertion `%s' failed.\n%n", assertion=assertion@entry=0x7fffe3c03fe8 "cudaGetLastError() == cudaSuccess", file=file@entry=0x7fffe3c03f80 "external/eigen_archive/eigen-eigen-3f653ace7d28/unsupported/Eigen/CXX11/src/Tensor/TensorExecutor.h", line=line@entry=223, function=function@entry=0x7fffe3c04180 &lt;Eigen::internal::TensorExecutor&lt;Eigen::TensorAssignOp&lt;Eigen::TensorMap&lt;Eigen::TensorFixedSize&lt;float, Eigen::Sizes&lt;&gt;, 1, long&gt;, 16&gt;, Eigen::TensorCwiseUnaryOpEigen::internal::scalar_multiple_op&lt;float, Eigen::TensorReductionOpEigen::internal::SumReducer&lt;float, Eigen::DimensionList&lt;long, 1ul&gt; const, Eigen::TensorCwiseUnaryOp&lt;Eigen::internal::scalar_square_op, Eigen::TensorMap&lt;Eigen::Tensor&lt;float const, 1, 1, long&gt;, 16&gt; const&gt; const&gt; const&gt; const&gt; const, Eigen::GpuDevice, false&gt;::run(Eigen::TensorAssignOp&lt;Eigen::TensorMap&lt;Eigen::TensorFixedSize&lt;float, Eigen::Sizes&lt;&gt;, 1, long&gt;, 16&gt;, Eigen::TensorCwiseUnaryOpEigen::internal::scalar_multiple_op&lt;float, Eigen::TensorReductionOpEigen::internal::SumReducer&lt;float, Eigen::DimensionList&lt;long, 1ul&gt; const, Eigen::TensorCwiseUnaryOp&lt;Eigen::internal::scalar_square_op, Eigen::TensorMap&lt;Eigen::Tensor&lt;float const, 1, 1, long&gt;, 16&gt; const&gt; const&gt; const&gt; const&gt; const&amp;, Eigen::GpuDevice const&amp;)::__PRETTY_FUNCTION&gt; "static void Eigen::internal::TensorExecutor&lt;Expression, Eigen::GpuDevice, false&gt;::run(const Expression&amp;, const Eigen::GpuDevice&amp;) [with Expression = const Eigen::TensorAssignOp&lt;Eigen::TensorMap&lt;Eigen:"...) at assert.c:92
+3  0x00007ffff781f0f2 in GI___assert_fail (assertion=0x7fffe3c03fe8 "cudaGetLastError() == cudaSuccess", file=0x7fffe3c03f80 "external/eigen_archive/eigen-eigen-3f653ace7d28/unsupported/Eigen/CXX11/src/Tensor/TensorExecutor.h", line=223, function=0x7fffe3c04180 &lt;Eigen::internal::TensorExecutor&lt;Eigen::TensorAssignOp&lt;Eigen::TensorMap&lt;Eigen::TensorFixedSize&lt;float, Eigen::Sizes&lt;&gt;, 1, long&gt;, 16&gt;, Eigen::TensorCwiseUnaryOpEigen::internal::scalar_multiple_op&lt;float, Eigen::TensorReductionOpEigen::internal::SumReducer&lt;float, Eigen::DimensionList&lt;long, 1ul&gt; const, Eigen::TensorCwiseUnaryOp&lt;Eigen::internal::scalar_square_op, Eigen::TensorMap&lt;Eigen::Tensor&lt;float const, 1, 1, long&gt;, 16&gt; const&gt; const&gt; const&gt; const&gt; const, Eigen::GpuDevice, false&gt;::run(Eigen::TensorAssignOp&lt;Eigen::TensorMap&lt;Eigen::TensorFixedSize&lt;float, Eigen::Sizes&lt;&gt;, 1, long&gt;, 16&gt;, Eigen::TensorCwiseUnaryOpEigen::internal::scalar_multiple_op&lt;float, Eigen::TensorReductionOpEigen::internal::SumReducer&lt;float, Eigen::DimensionList&lt;long, 1ul&gt; const, Eigen::TensorCwiseUnaryOp&lt;Eigen::internal::scalar_square_op, Eigen::TensorMap&lt;Eigen::Tensor&lt;float const, 1, 1, long&gt;, 16&gt; const&gt; const&gt; const&gt; const&gt; const&amp;, Eigen::GpuDevice const&amp;)::__PRETTY_FUNCTION&gt; "static void Eigen::internal::TensorExecutor&lt;Expression, Eigen::GpuDevice, false&gt;::run(const Expression&amp;, const Eigen::GpuDevice&amp;) [with Expression = const Eigen::TensorAssignOp&lt;Eigen::TensorMap&lt;Eigen:"...) at assert.c:101
+4  0x00007fffe2487e26 in Eigen::internal::TensorExecutor&lt;Eigen::TensorAssignOp&lt;Eigen::TensorMap&lt;Eigen::TensorFixedSize&lt;float, Eigen::Sizes&lt;&gt;, 1, long&gt;, 16&gt;, Eigen::TensorCwiseUnaryOpEigen::internal::scalar_multiple_op&lt;float, Eigen::TensorReductionOpEigen::internal::SumReducer&lt;float, Eigen::DimensionList&lt;long, 1ul&gt; const, Eigen::TensorCwiseUnaryOp&lt;Eigen::internal::scalar_square_op, Eigen::TensorMap&lt;Eigen::Tensor&lt;float const, 1, 1, long&gt;, 16&gt; const&gt; const&gt; const&gt; const&gt; const, Eigen::GpuDevice, false&gt;::run(Eigen::TensorAssignOp&lt;Eigen::TensorMap&lt;Eigen::TensorFixedSize&lt;float, Eigen::Sizes&lt;&gt;, 1, long&gt;, 16&gt;, Eigen::TensorCwiseUnaryOpEigen::internal::scalar_multiple_op&lt;float, Eigen::TensorReductionOpEigen::internal::SumReducer&lt;float, Eigen::DimensionList&lt;long, 1ul&gt; const, Eigen::TensorCwiseUnaryOp&lt;Eigen::internal::scalar_square_op, Eigen::TensorMap&lt;Eigen::Tensor&lt;float const, 1, 1, long&gt;, 16&gt; const&gt; const&gt; const&gt; const&gt; const&amp;, Eigen::GpuDevice const&amp;) (expr=..., device=...) at external/eigen_archive/eigen-eigen-3f653ace7d28/unsupported/Eigen/CXX11/src/Tensor/TensorExecutor.h:223
+5  0x00007fffe24879ea in Eigen::TensorDevice&lt;Eigen::TensorMap&lt;Eigen::TensorFixedSize&lt;float, Eigen::Sizes&lt;&gt;, 1, long&gt;, 16&gt;, Eigen::GpuDevice&gt;::operator=Eigen::TensorCwiseUnaryOp&lt;Eigen::internal::scalar_multiple_op&lt;float, Eigen::TensorReductionOpEigen::internal::SumReducer&lt;float, Eigen::DimensionList&lt;long, 1ul&gt; const, Eigen::TensorCwiseUnaryOp&lt;Eigen::internal::scalar_square_op, Eigen::TensorMap&lt;Eigen::Tensor&lt;float const, 1, 1, long&gt;, 16&gt; const&gt; const&gt; const&gt; &gt;(Eigen::TensorCwiseUnaryOpEigen::internal::scalar_multiple_op&lt;float, Eigen::TensorReductionOpEigen::internal::SumReducer&lt;float, Eigen::DimensionList&lt;long, 1ul&gt; const, Eigen::TensorCwiseUnaryOp&lt;Eigen::internal::scalar_square_op, Eigen::TensorMap&lt;Eigen::Tensor&lt;float const, 1, 1, long&gt;, 16&gt; const&gt; const&gt; const&gt; const&amp;) (this=0x7fff357f91c0, other=...) at external/eigen_archive/eigen-eigen-3f653ace7d28/unsupported/Eigen/CXX11/src/Tensor/TensorDevice.h:35
+6  0x00007fffe248785a in tensorflow::functor::L2Loss&lt;Eigen::GpuDevice, float&gt;::operator()(Eigen::GpuDevice const&amp;, Eigen::TensorMap&lt;Eigen::Tensor&lt;float const, 1, 1, long&gt;, 16&gt;, Eigen::TensorMap&lt;Eigen::TensorFixedSize&lt;float, Eigen::Sizes&lt;&gt;, 1, long&gt;, 16&gt;) (this=0x7fff357f9250, d=..., input=..., output=...) at ./tensorflow/core/kernels/l2loss_op.h:32
+7  0x00007fffe247ee64 in tensorflow::L2LossOp&lt;Eigen::GpuDevice, float&gt;::Compute (this=0x402f9e0, context=0x7fff357f9b20) at tensorflow/core/kernels/l2loss_op.cc:45
+8  0x00007fffe293d927 in tensorflow::BaseGPUDevice::Compute (this=0x3dc5b60, op_kernel=0x402f9e0, context=0x7fff357f9b20) at tensorflow/core/common_runtime/gpu/gpu_device.cc:388
+9  0x00007fffe2b61689 in tensorflow::(anonymous namespace)::ExecutorState::Process (this=0x3facbc0, tagged_node=..., scheduled_usec=0) at tensorflow/core/common_runtime/executor.cc:1092
+10 0x00007fffe2b6cf89 in std::_Mem_fn&lt;void (tensorflow::(anonymous namespace)::ExecutorState::*)(tensorflow::(anonymous namespace)::ExecutorState::TaggedNode, long long)&gt;::operator()&lt;tensorflow::(anonymous namespace)::ExecutorState::TaggedNode&amp;, long long&amp;, void&gt; (this=0x7fff200008c0, __object=0x3facbc0) at /usr/include/c++/4.9/functional:569
+11 0x00007fffe2b6c3dc in std::_Bind&lt;std::_Mem_fn&lt;void (tensorflow::(anonymous namespace)::ExecutorState::)(tensorflow::(anonymous namespace)::ExecutorState::TaggedNode, long long int)&gt;(tensorflow::(anonymous namespace)::ExecutorState, tensorflow::(anonymous namespace)::ExecutorState::TaggedNode, long long int)&gt;::__call&lt;void, 0ul, 1ul, 2ul&gt;(&lt;unknown type in /home/jiahua/tensorflow/bazel-bin/speech/model.runfiles/tensorflow/python/_pywrap_tensorflow.so, CU 0xdb55fb8, DIE 0xdbd4a7f&gt;, std::_Index_tuple&lt;0ul, 1ul, 2ul&gt;) (this=0x7fff200008c0, __args=&lt;unknown type in /home/jiahua/tensorflow/bazel-bin/speech/model.runfiles/tensorflow/python/_pywrap_tensorflow.so, CU 0xdb55fb8, DIE 0xdbd4a7f&gt;) at /usr/include/c++/4.9/functional:1264
+12 0x00007fffe2b6aa38 in std::_Bind&lt;std::_Mem_fn&lt;void (tensorflow::(anonymous namespace)::ExecutorState::)(tensorflow::(anonymous namespace)::ExecutorState::TaggedNode, long long int)&gt;(tensorflow::(anonymous namespace)::ExecutorState, tensorflow::(anonymous namespace)::ExecutorState::TaggedNode, long long int)&gt;::operator()&lt;, void&gt;(void) (this=0x7fff200008c0) at /usr/include/c++/4.9/functional:1323
+13 0x00007fffe2b68c54 in std::_Function_handler&lt;void(), std::_Bind&lt;std::_Mem_fn&lt;void (tensorflow::(anonymous namespace)::ExecutorState::)(tensorflow::(anonymous namespace)::ExecutorState::TaggedNode, long long int)&gt;(tensorflow::(anonymous namespace)::ExecutorState, tensorflow::(anonymous namespace)::ExecutorState::TaggedNode, long long int)&gt; &gt;::_M_invoke(const std::_Any_data &amp;) (__functor=...) at /usr/include/c++/4.9/functional:2039
+14 0x00007fffe0b01732 in std::function&lt;void ()&gt;::operator()() const (this=0x7fff357f9dd0) at /usr/include/c++/4.9/functional:2439
+15 0x00007fffe2da977a in tensorflow:🧵:ThreadPool::Impl::WorkerLoop (this=0x3ddaa90) at tensorflow/core/lib/core/threadpool.cc:196
+16 0x00007fffe2da91bb in tensorflow:🧵:ThreadPool::Impl::Impl(tensorflow::Env*, tensorflow::ThreadOptions const&amp;, std::string const&amp;, int)::{lambda()#1}::operator()() const () at tensorflow/core/lib/core/threadpool.cc:123
+17 0x00007fffe2da9b93 in std::_Function_handler&lt;void(), tensorflow:🧵:ThreadPool::Impl::Impl(tensorflow::Env*, const tensorflow::ThreadOptions&amp;, const string&amp;, int)::&lt;lambda()&gt; &gt;::_M_invoke(const std::_Any_data &amp;) (__functor=...) at /usr/include/c++/4.9/functional:2039
+18 0x00007fffe0b01732 in std::function&lt;void ()&gt;::operator()() const (this=0x3ddba58) at /usr/include/c++/4.9/functional:2439
+19 0x00007fffe2dcb472 in std::_Bind_simple&lt;std::function&lt;void ()&gt; ()&gt;::_M_invoke&lt;&gt;(std::_Index_tuple&lt;&gt;) (this=0x3ddba58) at /usr/include/c++/4.9/functional:1700
+20 0x00007fffe2dcb3b7 in std::_Bind_simple&lt;std::function&lt;void ()&gt; ()&gt;::operator()() (this=0x3ddba58) at /usr/include/c++/4.9/functional:1688
+21 0x00007fffe2dcb334 in std:🧵:_Impl&lt;std::_Bind_simple&lt;std::function&lt;void ()&gt; ()&gt; &gt;::_M_run() (this=0x3ddba40) at /usr/include/c++/4.9/thread:115
+22 0x00007fffd4e4bf20 in ?? () from /usr/lib/x86_64-linux-gnu/libstdc++.so.6
+23 0x00007ffff7bc26aa in start_thread (arg=0x7fff357fa700) at pthread_create.c:333
+24 0x00007ffff78f7eed in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:109
+
+	</description>
+	<comments>
+		<comment id='1' author='alphaf52' date='2016-04-20T20:58:21Z'>
+		Thankyou for the detailed bug report and repro instructions!
+We are looking at a similar bug report internally, and will update this post once we know more.
+Thanks,
+Paul
+		</comment>
+		<comment id='2' author='alphaf52' date='2016-06-07T05:06:19Z'>
+		&lt;denchmark-link:https://github.com/prb12&gt;@prb12&lt;/denchmark-link&gt;
+, &lt;denchmark-link:https://github.com/benoitsteiner&gt;@benoitsteiner&lt;/denchmark-link&gt;
+: Any updates?
+		</comment>
+		<comment id='3' author='alphaf52' date='2016-08-11T22:41:15Z'>
+		I can't reproduce the issue. Is this still a problem?
+		</comment>
+		<comment id='4' author='alphaf52' date='2016-08-11T22:50:30Z'>
+		&lt;denchmark-link:https://github.com/alphaf52&gt;@alphaf52&lt;/denchmark-link&gt;
+: Is it still an issue?
+&lt;denchmark-link:https://github.com/prb12&gt;@prb12&lt;/denchmark-link&gt;
+: Were you able to reproduce this at some point?
+		</comment>
+		<comment id='5' author='alphaf52' date='2016-08-12T01:49:23Z'>
+		hi, this is solved long ago, i can't remember what was wrong at that time, but it's gone
+		</comment>
+	</comments>
+</bug>

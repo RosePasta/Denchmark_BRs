@@ -1,0 +1,209 @@
+<bug id='15079' author='tomoaki0705' open_date='2019-07-18T08:59:14Z' closed_time='2019-07-21T22:53:22Z'>
+	<summary>cudalegacy: SolvePnPRansac.Accuracy always crash</summary>
+	<description>
+&lt;denchmark-h:h5&gt;System information (version)&lt;/denchmark-h&gt;
+
+
+OpenCV =&gt; recent master(f6ec0cd + fde4b15)/3.4 (e4e0bb5)
+Operating System / Platform =&gt; Ubuntu 16.04 (Jetson TX2 )
+Compiler =&gt; GCC 5.4.0
+CUDA =&gt; 8.0
+
+&lt;denchmark-h:h5&gt;Detailed description&lt;/denchmark-h&gt;
+
+First of all, I know that this module name has the phrase "LEGACY" in it, but please let me write it down here.
+When this test runs, it either causes a core dump or test failure
+
+when it crashes
+
+&lt;denchmark-code&gt;$ ./bin/opencv_test_cudalegacy --gtest_filter=*SolvePnPRansac.Accuracy*
+
+[----------] 1 test from CUDA_Calib3D/SolvePnPRansac
+[ RUN      ] CUDA_Calib3D/SolvePnPRansac.Accuracy/0, where GetParam() = GP10B
+*** Error in `./bin/opencv_test_cudalegacy': double free or corruption (top): 0x0000007f5c002be0 ***
+Segmentation fault      (core dumped) 
+&lt;/denchmark-code&gt;
+
+
+when it fails
+
+&lt;denchmark-code&gt;$ ./bin/opencv_test_cudalegacy --gtest_filter=*SolvePnPRansac.Accuracy*
+
+[----------] 1 test from CUDA_Calib3D/SolvePnPRansac
+[ RUN      ] CUDA_Calib3D/SolvePnPRansac.Accuracy/0, where GetParam() = GP10B
+unknown file: Failure
+C++ exception with description "OpenCV(4.1.1-pre) /home/nvidia/opencv-fork/modules/calib3d/src/calibration.cpp:1171: error: (-2:Unspecified error) in function 'void cvFindExtrinsicCameraParams2(const CvMat*, const CvMat*, const CvMat*, const CvMat*, CvMat*, CvMat*, int)'
+&gt; DLT algorithm needs at least 6 points for pose estimation from 3D-2D point correspondences. (expected: 'count &gt;= 6'), where
+&gt;     'count' is 4
+&gt; must be greater than or equal to
+&gt;     '6' is 6
+" thrown in the test body.
+[  FAILED  ] CUDA_Calib3D/SolvePnPRansac.Accuracy/0, where GetParam() = GP10B (162 ms)
+[----------] 1 test from CUDA_Calib3D/SolvePnPRansac (162 ms total)
+&lt;/denchmark-code&gt;
+
+
+I haven't traced for the crash version, but I assume that exception was thrown in the middle of the process and that caused double free.
+More over, the test failure seems suspicious.
+
+
+
+the random sampling is relying on simple rand function which should not be used in the middle of parallel_for_
+https://github.com/opencv/opencv_contrib/blob/fde4b151c2bfabe013a7109946fdcfe7e14bec14/modules/cudalegacy/src/calib3d.cpp#L140
+
+
+RANSAC chooses only 4 points hard coded
+https://github.com/opencv/opencv_contrib/blob/fde4b151c2bfabe013a7109946fdcfe7e14bec14/modules/cudalegacy/src/calib3d.cpp#L224
+
+
+The input data is NOT co-plannar,
+https://github.com/opencv/opencv_contrib/blob/fde4b151c2bfabe013a7109946fdcfe7e14bec14/modules/cudalegacy/test/test_calib3d.cpp#L166
+
+
+RANSAC tries to solve the PnP by 4 points.  Thus, it always gets false at this branch
+
+
+
+opencv/modules/calib3d/src/calibration.cpp
+
+
+         Line 1112
+      in
+      f6ec0cd
+
+
+
+
+
+
+ if( W[2]/W[1] &lt; 1e-3) 
+
+
+
+
+
+
+
+and hit this assert EVERY TIME
+
+
+
+opencv/modules/calib3d/src/calibration.cpp
+
+
+         Line 1171
+      in
+      f6ec0cd
+
+
+
+
+
+
+ CV_CheckGE(count, 6, "DLT algorithm needs at least 6 points for pose estimation from 3D-2D point correspondences."); 
+
+
+
+
+
+
+
+I'm no 100% sure, but this code existed from years ago, so I guess at the beginning, it was correct (may be trying only plannar RANSAC).  But current implementation will crash (or fail).
+I'm not sure but changing the hard coded points number from 4 to 6 made the test pass.
+Before I send the PR, I'd like to ask which should I go.
+
+Shall I change the hard code value
+What should I do for the rand
+shall I keep it as is for now ? (the module has phrase "legacy" in the name)
+
+&lt;denchmark-h:h5&gt;Steps to reproduce&lt;/denchmark-h&gt;
+
+&lt;denchmark-code&gt;$ ./bin/opencv_test_cudalegacy --gtest_filter=*SolvePnPRansac.Accuracy*
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='tomoaki0705' date='2019-07-18T15:17:56Z'>
+		I made the change in &lt;denchmark-link:https://github.com/opencv/opencv/pull/14447&gt;#14447&lt;/denchmark-link&gt;
+ to assert that at least 6 points exist to perform pose estimation from DLT algorithm in the non planar case (see the PR for some reference).
+
+
+I used rand_r to do something similar. I would be interested to know an alternative or maybe using cv::RNG for each thread solves the issue?
+
+
+The minimal number of points to compute the pose is 4 (ok, not for the DLT algorithm). Main principle of RANSAC is to use the minimal number of points to solve the problem (Hypothesize) and then verify the hypothesis with all the data (Test) and rank the solutions by the consensus set size. Switching to EPnP for the method used in the first RANSAC step should solve the issue
+
+
+
+This line of code is used to determine if the input 3D object points are planar or not.
+
+
+I made this change in #14447
+
+
+
+
+Switching to EPnP should solve the issue
+
+
+Tricky I guess. Parallel RANSAC on CPU, I would introduce a cv::RNG per thread (I don't know how cv::parallel_for handles it but it should not spawn a new thread but instead use a threadpool to be able to use one seed per thread) or use something like rand_r with seed initialized with the thread index? Interested to know how to deal with this kind of problematic on GPU. Maybe there are some thread safe rand primitive on GPU?
+
+
+&lt;denchmark-h:hr&gt;&lt;/denchmark-h&gt;
+
+Related &lt;denchmark-link:https://github.com/opencv/opencv/issues/8782&gt;#8782&lt;/denchmark-link&gt;
+
+This &lt;denchmark-link:https://github.com/opencv/opencv/blob/f6ec0cd827310ba801575f846720da4433843e50/modules/calib3d/src/solvepnp.cpp#L232&gt;line of code&lt;/denchmark-link&gt;
+ always bothered me. Because the principle of RANSAC is to use the minimal number of points to have a high probability that after a certain number of iterations, we select at least once a minimal sample set composed of only inliers.
+Example: &lt;denchmark-link:http://rpg.ifi.uzh.ch/docs/IJCV11_scaramuzza.pdf&gt;1-Point-RANSAC Structure from Motion for Vehicle-Mounted Cameras by Exploiting Non-holonomic Constraints&lt;/denchmark-link&gt;
+:
+
+In the last few years, a very established method forremoving  outliers  has  been  the  “5-point  RANSAC”  algo-rithm which needs a minimum of 5 point correspondencesto estimate the model hypotheses. Because of this, however,it can require up to several hundreds of iterations to find a setof points free of outliers. In this paper, we show that by ex-ploiting the nonholonomic constraints of wheeled vehiclesit is possible to use a restrictive motion model which allowsus to parameterize the motion with only 1 point correspon-dence. Using a single feature correspondence for motion es-timation is the lowest model parameterization possible andresults in the two most efficient algorithms for removing out-liers:  1-point  RANSAC  and  histogram  voting.
+
+In the &lt;denchmark-link:https://icwww.epfl.ch/~lepetit/papers/lepetit_ijcv08.pdf&gt;EPnP IJCV&lt;/denchmark-link&gt;
+ paper, they choose:
+
+To  filterout  the  erroneous  ones,  we  use  RANSAC  on  small  sub-sets made of 7 correspondences from which we estimate thepose using our PnP method.
+
+&lt;denchmark-h:hr&gt;&lt;/denchmark-h&gt;
+
+Generally, how to test that PnP methods works? Main "issue" about the current test is that perfect point projection (small distortion is considered though) is used. In my opinion, this should be changed to use noisy projected points, or at least add a case with Gaussian image noise. This would be closest to a real use case (I made some experiments &lt;denchmark-link:https://github.com/opencv/opencv/pull/13768#issuecomment-508538656&gt;here&lt;/denchmark-link&gt;
+).
+&lt;denchmark-h:hr&gt;&lt;/denchmark-h&gt;
+
+I am a little bit skeptical about the usefulness of . It looks like it call &lt;denchmark-link:https://github.com/opencv/opencv_contrib/blob/fde4b151c2bfabe013a7109946fdcfe7e14bec14/modules/cudalegacy/src/calib3d.cpp#L184&gt;CPU code&lt;/denchmark-link&gt;
+?
+Legacy support module is totally justified in my opinion.
+		</comment>
+		<comment id='2' author='tomoaki0705' date='2019-07-19T08:39:43Z'>
+		Thanks for the reply &lt;denchmark-link:https://github.com/catree&gt;@catree&lt;/denchmark-link&gt;
+
+This modification makes sense with your explanation.
+probably the most  way to fix this is to use  at the call of  in  (&lt;denchmark-link:https://github.com/opencv/opencv_contrib/blob/fde4b151c2bfabe013a7109946fdcfe7e14bec14/modules/cudalegacy/src/calib3d.cpp#L184&gt;here&lt;/denchmark-link&gt;
+)
+I'll send a PR later.
+
+about the rand, it's from the comment in #9187
+
+
+rand() should not be used at all. This is a bug. Using rand() is not acceptable because it is not thread-safe at least, so it is hard to receive reproducible test results.
+It should be replaced to something like rng.uniform(0, 1.0f).
+
+but that's minor thing. I doubt that this crash comes from 
+(BTW, did you really used  ?  I don't see it in &lt;denchmark-link:https://github.com/opencv/opencv/pull/14447&gt;#14447&lt;/denchmark-link&gt;
+ )
+
+I am a little bit skeptical about the usefulness of cv::cuda::solvePnPRansac(). It looks like it call CPU code?
+
+Yes, it calls CPU version, BUT it calls the &lt;denchmark-link:https://github.com/opencv/opencv_contrib/blob/fde4b151c2bfabe013a7109946fdcfe7e14bec14/modules/cudalegacy/src/cuda/calib3d.cu#L172&gt;GPU version&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/opencv/opencv_contrib/blob/fde4b151c2bfabe013a7109946fdcfe7e14bec14/modules/cudalegacy/src/calib3d.cpp#L247&gt;afterward&lt;/denchmark-link&gt;
+.
+		</comment>
+		<comment id='3' author='tomoaki0705' date='2019-07-19T13:20:12Z'>
+		I used  for a personal project. It should be available only on Linux and  on Windows I think. The  code should be purely sequential, the main RANSAC code is &lt;denchmark-link:https://github.com/opencv/opencv/blob/3361c595763ac72aef73a038849558a226629c4c/modules/calib3d/src/ptsetreg.cpp#L201-L234&gt;here&lt;/denchmark-link&gt;
+.
+No idea what could be the reason for the crash.
+Thanks for the fix.
+		</comment>
+	</comments>
+</bug>

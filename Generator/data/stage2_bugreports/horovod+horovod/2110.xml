@@ -1,0 +1,147 @@
+<bug id='2110' author='hoyden' open_date='2020-07-16T03:07:22Z' closed_time='2020-07-21T03:24:29Z'>
+	<summary>Error in computing gradients when using allgather</summary>
+	<description>
+Environment:
+
+Framework: TensorFlow
+Framework version: 2.0
+Horovod version:  0.18.2
+
+I am trying to get the median of a tensor computed across all batches and all processes. However, I got an error TypeError: Expected int32, got None of type 'NoneType' instead.It seems that computing gradients does not work well with horovod's allgather operation. A simple illustration of what I would like to achieve is as follows:
+
+with tf.GradientTape() as tape:
+    my_tensor = compute_my_tensor()
+    gathered_my_tensor = hvd.allgather(my_tensor)
+    median = get_median(gathered_my_tensor)
+    loss = get_loss(my_tensor, median, training=True)
+tape = hvd.DistributedGradientTape(tape)
+grads = tape.gradient(loss, trainable_variables)
+optimizer.apply_gradients(zip(grads, trainable_variables))
+
+BTW, when I use eager mode of tensorflow, there will be no error
+	</description>
+	<comments>
+		<comment id='1' author='hoyden' date='2020-07-16T21:54:03Z'>
+		Hey &lt;denchmark-link:https://github.com/hoyden&gt;@hoyden&lt;/denchmark-link&gt;
+, where does exception get raised from?  And you're saying this only happens when wrapped in a ?
+Do you have a small example script I can run to try and repro the error?
+		</comment>
+		<comment id='2' author='hoyden' date='2020-07-17T07:17:04Z'>
+		Thanks &lt;denchmark-link:https://github.com/tgaddair&gt;@tgaddair&lt;/denchmark-link&gt;
+ for the quich reply! The exception get raised from calculating gradients.And yes, it only happens when wrapped in a , you can repro the error with the follow script:
+&lt;denchmark-code&gt;import tensorflow as tf
+import horovod.tensorflow as hvd
+
+class TestModel(tf.keras.Model):
+
+    def __init__(self):
+        super().__init__()
+        data_description = tf.TensorShape(
+                [None, 40, 1]
+            )
+        layers = tf.keras.layers
+        input_features = layers.Input(shape=data_description, dtype=tf.float32)
+        inner = layers.Conv2D(
+            filters=128,
+            kernel_size=(3, 3),
+            strides=(2, 2),
+            padding="same",
+            use_bias=False,
+            data_format="channels_last",
+        )(input_features)
+        inner = layers.BatchNormalization()(inner)
+        inner = tf.nn.relu6(inner)
+        inner = layers.Conv2D(
+            filters=128,
+            kernel_size=(3, 3),
+            strides=(2, 2),
+            padding="same",
+            use_bias=False,
+            data_format="channels_last",
+        )(inner)
+        inner = layers.BatchNormalization()(inner)
+
+        inner = tf.nn.relu6(inner)
+        _, _, dim, channels = inner.get_shape().as_list()
+        output_dim = dim * channels
+        inner = layers.Reshape((-1, output_dim))(inner)
+        inner = layers.Dense(512, activation=tf.nn.relu6)(inner)
+        self.x_net = tf.keras.Model(inputs=input_features, outputs=inner, name="x_net")
+        self.final_layer = layers.Dense(128, input_shape=(512,))
+
+    def call(self, inputs, training: bool = None):
+        x0 = inputs
+        x = self.x_net(x0, training=training)
+        x = tf.math.reduce_mean(x, axis=1)
+        y = self.final_layer(x, training=training)
+        return y
+
+    def get_loss(self, logits):
+        loss = self.loss_function(logits)
+        return loss
+
+    def loss_function(self, logits):
+        cross_entropy = tf.keras.losses.CategoricalCrossentropy(from_logits=True)
+        hidden1, hidden2 = tf.split(logits, 2, 0)
+        batch_size = tf.shape(hidden1)[0]
+        hidden1_large = hvd.allgather(hidden1)
+        hidden2_large = hvd.allgather(hidden2)
+        enlarged_batch_size = tf.shape(hidden1_large)[0]
+        replica_id = hvd.rank()
+        labels_idx = tf.range(batch_size) + replica_id * batch_size
+        labels = tf.one_hot(labels_idx, enlarged_batch_size * 2)
+        logits_aa = tf.matmul(hidden1, hidden1_large, transpose_b=True)
+        logits_ab = tf.matmul(hidden1, hidden2_large, transpose_b=True)
+        loss = cross_entropy(labels, tf.concat([logits_ab, logits_aa], 1))
+        return loss
+
+class Solver():
+    def __init__(self):
+        self.model = TestModel()
+        self.input_signature = [tf.TensorSpec(
+        shape=(None, None, None, None), dtype=tf.float32
+    )]
+        self.optimizer = tf.keras.optimizers.SGD(learning_rate=0.1)
+    def train_step(self, inputs):
+
+        with tf.GradientTape() as tape:
+            logits = self.model(inputs, training=True)
+            loss = self.model.get_loss(logits)
+        # Horovod: add Horovod Distributed GradientTape.
+        tape = hvd.DistributedGradientTape(tape)
+        grads = tape.gradient(loss, self.model.trainable_variables)
+        self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
+
+    def train(self):
+        train_step = tf.function(self.train_step, input_signature=self.input_signature)
+        x = tf.random.normal([32, 150, 40, 1])
+        hvd.broadcast_variables(self.model.trainable_variables, root_rank=0)
+        hvd.broadcast_variables(self.optimizer.variables(), root_rank=0)
+        train_step(x)
+        tf.print("Done")
+
+if __name__ == "__main__":
+    hvd.init()
+    gpus = tf.config.experimental.list_physical_devices("GPU")
+    for gpu in gpus:
+        tf.config.experimental.set_memory_growth(gpu, True)
+    if gpus:
+        tf.config.experimental.set_visible_devices(gpus[hvd.local_rank()], "GPU")
+    test_solver = Solver()
+    test_solver.train()
+
+
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='3' author='hoyden' date='2020-07-20T21:45:06Z'>
+		Thanks for the detailed repro script, &lt;denchmark-link:https://github.com/hoyden&gt;@hoyden&lt;/denchmark-link&gt;
+.  That was very helpful to figure out what was going on.  Can you try running with &lt;denchmark-link:https://github.com/horovod/horovod/pull/2121&gt;#2121&lt;/denchmark-link&gt;
+ and see if the addresses the issue?
+		</comment>
+		<comment id='4' author='hoyden' date='2020-07-21T03:02:03Z'>
+		&lt;denchmark-link:https://github.com/tgaddair&gt;@tgaddair&lt;/denchmark-link&gt;
+ Thanks a lot! It works now!
+		</comment>
+	</comments>
+</bug>

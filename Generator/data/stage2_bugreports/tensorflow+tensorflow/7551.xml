@@ -1,0 +1,174 @@
+<bug id='7551' author='taion' open_date='2017-02-16T04:13:10Z' closed_time='2017-06-17T03:06:57Z'>
+	<summary>Addition is much slower on non-last axis (non-fused batch norm with NCHW)</summary>
+	<description>
+I noticed this from observing my models training many times slower when using non-fused batch norm and the NCHW data format. When looking at the timeline, it's dominated by addition (and multiplication) operations.
+I can mostly work around this by using the fused batch norm, but DenseNet models in principle (and in practice when using NHWC here) benefit from splitting up the learned beta/gamma and the normalization steps from batch normalization, and using a straightforward implementation (included below) makes my model run significantly slower when using NCHW.
+&lt;denchmark-h:h3&gt;What related GitHub issues or StackOverflow threads have you found by searching the web for your problem?&lt;/denchmark-h&gt;
+
+I did a quick search on the issue tracker and SO, and couldn't find anything similar reported.
+&lt;denchmark-h:h3&gt;Environment info&lt;/denchmark-h&gt;
+
+gcr.io/tensorflow/tensorflow:1.0.0-devel-gpu on AWS p2.xlarge
+&lt;denchmark-h:h3&gt;If possible, provide a minimal reproducible example (We usually don't have time to read hundreds of lines of your code)&lt;/denchmark-h&gt;
+
+Compare:
+%%time
+
+with tf.Graph().as_default(), tf.Session() as sess:
+    zeros = tf.zeros((64, 32, 32, 256))
+    beta = tf.get_variable(
+        'beta',
+        (256,),
+        initializer=tf.ones_initializer(),
+        trainable=True,
+    )
+
+    loss = tf.reduce_mean((zeros + beta) ** 2)
+    optimizer = tf.train.MomentumOptimizer(0.1, 0.9)
+    train_op = optimizer.minimize(loss)
+
+    sess.run(tf.global_variables_initializer())
+
+    for i in range(500):
+        sess.run(train_op)
+&lt;denchmark-code&gt;CPU times: user 7.8 s, sys: 868 ms, total: 8.67 s
+Wall time: 9.69 s
+&lt;/denchmark-code&gt;
+
+v.
+%%time
+
+with tf.Graph().as_default(), tf.Session() as sess:
+    zeros = tf.zeros((64, 256, 32, 32))
+    beta = tf.get_variable(
+        'beta',
+        (256,),
+        initializer=tf.ones_initializer(),
+        trainable=True,
+    )
+    beta = tf.reshape(beta, (256, 1, 1))
+
+    loss = tf.reduce_mean((zeros + beta) ** 2)
+    optimizer = tf.train.MomentumOptimizer(0.1, 0.9)
+    train_op = optimizer.minimize(loss)
+
+    sess.run(tf.global_variables_initializer())
+
+    for i in range(500):
+        sess.run(train_op)
+&lt;denchmark-code&gt;CPU times: user 14.6 s, sys: 2.81 s, total: 17.4 s
+Wall time: 18.9 s
+&lt;/denchmark-code&gt;
+
+This is the scale/bias transform that triggers the problem for me in practice:
+def affine_transformation(
+    inputs,
+    axis=-1,
+    beta_initializer=tf.zeros_initializer(),
+    gamma_initializer=tf.ones_initializer(),
+    beta_regularizer=None,
+    gamma_regularizer=None,
+):
+    inputs_shape = inputs.get_shape()
+    params_dim = inputs_shape[axis]
+
+    beta = tf.get_variable(
+        'beta',
+        (params_dim,),
+        initializer=beta_initializer,
+        regularizer=beta_regularizer,
+        trainable=True,
+    )
+    gamma = tf.get_variable(
+        'gamma',
+        (params_dim,),
+        initializer=gamma_initializer,
+        regularizer=gamma_regularizer,
+        trainable=True,
+    )
+
+    if axis != -1:
+        params_shape = [1] * len(inputs_shape)
+        params_shape[axis] = params_dim.value
+
+        beta = tf.reshape(beta, params_shape)
+        gamma = tf.reshape(gamma, params_shape)
+
+    return gamma * inputs + beta
+	</description>
+	<comments>
+		<comment id='1' author='taion' date='2017-02-16T18:46:50Z'>
+		Clearer description of the issue. My per-epoch timings using the 1.0.0 gpu-devel Docker image on an AWS p2.xlarge, using WRN-16-4 without dropout:
+
+
+
+Data format
+Fused batch norm
+Batch time (ms)
+
+
+
+
+NHWC
+No
+340
+
+
+NHWC
+Yes
+320
+
+
+NCHW
+No
+1740
+
+
+NCHW
+Yes
+270
+
+
+
+I believe this is happening because the broadcasting on the unfused batch norm hits an extreme slow path.
+This is problematic because if I only follow the "use NCHW" recommendation from the performance guide, my models actually run hugely slower. This tripped me up quite a bit.
+		</comment>
+		<comment id='2' author='taion' date='2017-02-17T04:04:43Z'>
+		Thank you for the high level of detail.  Your table testing the different options is great.  I will come up with some additional wording for the data format section in relation to fused batch norm.  This is very helpful feedback.
+		</comment>
+		<comment id='3' author='taion' date='2017-03-06T20:20:09Z'>
+		It appears this doesn't happen with tf.nn.bias_add:
+%%time
+
+with tf.Graph().as_default(), tf.Session() as sess:
+    zeros = tf.zeros((64, 256, 32, 32))
+    beta = tf.get_variable(
+        'beta',
+        (256,),
+        initializer=tf.ones_initializer(),
+        trainable=True,
+    )
+
+    loss = tf.reduce_mean(tf.nn.bias_add(zeros, beta, data_format='NCHW') ** 2)
+    optimizer = tf.train.MomentumOptimizer(0.1, 0.9)
+    train_op = optimizer.minimize(loss)
+
+    sess.run(tf.global_variables_initializer())
+
+    for i in range(500):
+        sess.run(train_op)
+&lt;denchmark-code&gt;CPU times: user 7.98 s, sys: 836 ms, total: 8.81 s
+Wall time: 9.93 s
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='4' author='taion' date='2017-04-30T04:26:14Z'>
+		This rings a bell... Just a wild guess here -- I haven't checked what TF actually uses, but simple large-stride reductions can be slow because of non-coalesced memory access, and can be made much faster with a different algorithm:
+&lt;denchmark-link:https://github.com/NervanaSystems/neon/issues/188&gt;NervanaSystems/neon#188&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='5' author='taion' date='2017-06-17T03:06:57Z'>
+		Guide has been updated in github, the site should get updated soon.  Closing as the content has been added. I hope to redo the perf guide significantly with everything that has been learned in the past 3-4 months.
+		</comment>
+	</comments>
+</bug>

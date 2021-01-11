@@ -1,0 +1,245 @@
+<bug id='31588' author='mjlbach' open_date='2019-08-13T16:51:28Z' closed_time='2020-03-29T17:39:48Z'>
+	<summary>Performance issue: per-device memory usage increases with number of devices within tf.distribute strategy</summary>
+	<description>
+Please make sure that this is a bug. As per our GitHub Policy, we only address code/doc bugs, performance issues, feature requests and build/installation issues on GitHub. tag:bug_template
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): Yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Linux Ubuntu 16.04
+Mobile device (e.g. iPhone 8, Pixel 2, Samsung Galaxy) if the issue happens on mobile device: No
+TensorFlow installed from (source or binary): tf-nightly-gpu-2.0-preview==
+TensorFlow version (use command below): v1.12.1-8566-g207bd43 2.0.0-dev20190812
+Python version: 3.7.4
+Bazel version (if compiling from source):
+GCC/Compiler version (if compiling from source):
+CUDA/cuDNN version: 10.0/7.4.2
+GPU model and memory: (4) Titan Xp 12 gb
+
+You can collect some of this information using our environment capture
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/tree/master/tools/tf_env_collect.sh&gt;script&lt;/denchmark-link&gt;
+
+You can also obtain the TensorFlow version with: 1. TF 1.0:  2. TF 2.0: 
+Describe the current behavior
+Tensor memory allocation fails for the same batch size (determined by n_acton_samples)  as I scale the number of GPUs in my strategy.
+Describe the expected behavior
+Without the distributed strategy, I can readily pass a batch size of 300 to a given GPU, within the distributed strategy, this drops to 200 on 2 GPUs, and 70 on 4 GPUs.
+Code to reproduce the issue
+
+Example code snippet
+def tree_search(
+    inputs, self_model, world_model, plan_sequence
+):
+    n_action_samples = 1000
+    tree_value = tf.zeros([n_action_samples, 1], dtype=tf.float32)
+
+    for idx, action in enumerate(plan_sequence):
+        # print("idx: ", idx)
+        if idx == 0 and action:
+
+            candidate_actions = tf.random.uniform(
+                [n_action_samples, 1, num_fingers, 7],
+                minval=-1.0,
+                maxval=1.0,
+                dtype=tf.float32,
+            )
+
+
+        elif idx &gt; 0 and action:
+            pass
+
+        elif idx &gt; 0 and not action:
+               candidate_actions = tf.zeros(
+                [n_action_samples, 1, num_fingers, 7],
+                dtype=tf.float32,
+            )
+
+
+        else:
+            pass
+
+        tree_value += policy_model(candidate_actions, inputs)
+        inputs = world_model(candidate_actions, inputs)
+
+    retval = {"action": candidate_actions, "tree_value": tree_value}
+
+    return retval
+
+@tf.function
+def policy(
+    inputs,
+    policy_model,
+    world_model,
+    strategy
+):
+
+    take_action = [True, False, False]
+
+    distributed_output = strategy.experimental_run_v2(
+        tree_search,
+        args=(
+            inputs,
+            self_model,
+            world_model,
+            plan_sequence,
+        ),
+    )
+
+     distributed_output["tree_value"] = tf.concat(
+            strategy.experimental_local_results(distributed_output["tree_value"]), axis=0
+        )
+
+     distributed_output["action"] = tf.concat(
+            strategy.experimental_local_results(distributed_output["action"]), axis=0
+        )
+
+
+    action = choose_max_value_action(
+       distributed_output["action"], distributed_output["tree_value"]
+    )
+
+    return action
+
+
+Other info / logs
+On a related note, it seems like there's a regression in the tf.summary.start_trace() based method of profiling models that is required by 2.0. The new tensorboard interface allows visualizing execution time of ops, but there doesn't seem to be a way to show memory usage.
+	</description>
+	<comments>
+		<comment id='1' author='mjlbach' date='2019-08-20T16:05:18Z'>
+		As an update, it appears this was partly caused by the use of range instead of tf.range in both the unrolling of my dynamics model and composing keras layers (I converted pre 2.0 code that was built using Graph mode to autograph which iterated over a list containing each layer size). Swapping in tf.range and switching to tensor arrays to collect loop results decreased by autograph graph construction time from 15 minutes to 5 minutes, and decreased memory usage by a factor of ~5. This is still long enough that the multi-device function optimizer times out
+&lt;denchmark-code&gt;WARNING: Logging before flag parsing goes to stderr.
+W0819 20:45:18.744279 140121059866368 deprecation.py:506] From /home/mjlbach/.virtualenvs/physics3/lib/python3.6/site-packages/tensorflow_core/python/ops/resource_variable_ops.py:17
+81: calling BaseResourceVariable.__init__ (from tensorflow.python.ops.resource_variable_ops) with constraint is deprecated and will be removed in a future version.
+Instructions for updating:
+If using Keras pass *_constraint arguments to layers.
+W0819 20:45:28.425643 140121059866368 deprecation.py:323] From /home/mjlbach/.virtualenvs/physics3/lib/python3.6/site-packages/tensorflow_core/python/ops/array_ops.py:1475: where (f
+rom tensorflow.python.ops.array_ops) is deprecated and will be removed in a future version.
+Instructions for updating:
+Use tf.where in 2.0, which has the same broadcast rule as np.where
+2019-08-19 20:51:27.661471: W tensorflow/core/common_runtime/process_function_library_runtime.cc:688] Ignoring multi-device function optimization failure: Deadline exceeded: meta_op
+timizer exceeded deadline.
+&lt;/denchmark-code&gt;
+
+More problematically, I'm now getting errors of the form:
+&lt;denchmark-code&gt;2019-08-19 23:58:27.044069: W tensorflow/core/common_runtime/base_collective_executor.cc:216] BaseCollectiveExecutor::StartAbort Invalid argument: List contains uninitialized tensor
+ at index 0 but leading_dims has only 0 elements.
+         [[{{node replica_2/TensorListConcatV2}}]]
+         [[L2Loss/_890]]
+2019-08-19 23:58:27.045491: W tensorflow/core/common_runtime/base_collective_executor.cc:216] BaseCollectiveExecutor::StartAbort Invalid argument: List contains uninitialized tensor
+ at index 0 but leading_dims has only 0 elements.
+         [[{{node replica_2/TensorListConcatV2}}]]
+2019-08-19 23:58:28.630952: W tensorflow/core/common_runtime/base_collective_executor.cc:216] BaseCollectiveExecutor::StartAbort Invalid argument: List contains uninitialized tensor
+ at index 0 but leading_dims has only 0 elements.
+         [[{{node replica_2/TensorListConcatV2}}]]
+         [[Adam/Cast_9/ReadVariableOp/_52]]
+Traceback (most recent call last):
+  File "../boxphysics/scripts/train.py", line 340, in &lt;module&gt;
+    main()
+  File "../boxphysics/scripts/train.py", line 333, in main
+    train_worker.distributed_train()
+  File "/home/mjlbach/Repositories/box-physics/boxphysics/scripts/worker.py", line 499, in distributed_train
+    self.train_params,
+  File "/home/mjlbach/.virtualenvs/physics3/lib/python3.6/site-packages/tensorflow_core/python/eager/def_function.py", line 461, in __call__
+    return self._stateless_fn(*args, **kwds)
+  File "/home/mjlbach/.virtualenvs/physics3/lib/python3.6/site-packages/tensorflow_core/python/eager/function.py", line 1822, in __call__
+    return graph_function._filtered_call(args, kwargs)  # pylint: disable=protected-access
+  File "/home/mjlbach/.virtualenvs/physics3/lib/python3.6/site-packages/tensorflow_core/python/eager/function.py", line 1141, in _filtered_call
+    self.captured_inputs)
+  File "/home/mjlbach/.virtualenvs/physics3/lib/python3.6/site-packages/tensorflow_core/python/eager/function.py", line 1224, in _call_flat
+    ctx, args, cancellation_manager=cancellation_manager)
+  File "/home/mjlbach/.virtualenvs/physics3/lib/python3.6/site-packages/tensorflow_core/python/eager/function.py", line 511, in call
+    ctx=ctx)
+  File "/home/mjlbach/.virtualenvs/physics3/lib/python3.6/site-packages/tensorflow_core/python/eager/execute.py", line 67, in quick_execute
+    six.raise_from(core._status_to_exception(e.code, message), None)
+  File "&lt;string&gt;", line 3, in raise_from
+tensorflow.python.framework.errors_impl.InvalidArgumentError: 4 root error(s) found.
+  (0) Invalid argument:  List contains uninitialized tensor at index 0 but leading_dims has only 0 elements.
+         [[node replica_2/TensorListConcatV2 (defined at home/mjlbach/.virtualenvs/physics3/lib/python3.6/site-packages/tensorflow_core/python/framework/ops.py:1748) ]]
+         [[L2Loss/_890]]
+  (1) Invalid argument:  List contains uninitialized tensor at index 0 but leading_dims has only 0 elements.
+         [[node replica_2/TensorListConcatV2 (defined at home/mjlbach/.virtualenvs/physics3/lib/python3.6/site-packages/tensorflow_core/python/framework/ops.py:1748) ]]
+  (2) Cancelled:
+  (3) Cancelled:
+0 successful operations.
+1 derived errors ignored. [Op:__inference_distributed_train_step_743779]
+Function call stack:
+distributed_train_step -&gt; distributed_train_step -&gt; distributed_train_step -&gt; distributed_train_step
+
+
+If you suspect this is an IPython bug, please report it at:
+    https://github.com/ipython/ipython/issues
+or send an email to the mailing list at ipython-dev@python.org
+
+You can print a more detailed traceback right now with "%tb", or use "%debug"
+to interactively debug it.
+
+Extra-detailed tracebacks for bug-reporting purposes can be enabled via:
+    %config Application.verbose_crash=True
+
+Policy time: 10.194841623306274
+Exception ignored in: &lt;bound method Socket.__del__ of &lt;zmq.sugar.socket.Socket object at 0x7f8048041e18&gt;&gt;
+Traceback (most recent call last):
+  File "/home/mjlbach/.virtualenvs/physics3/lib/python3.6/site-packages/zmq/sugar/socket.py", line 67, in __del__
+  File "/home/mjlbach/.virtualenvs/physics3/lib/python3.6/site-packages/zmq/sugar/socket.py", line 105, in close
+  File "/home/mjlbach/.virtualenvs/physics3/lib/python3.6/site-packages/zmq/sugar/context.py", line 153, in _rm_socket
+TypeError: 'NoneType' object is not callable
+train_3obj_2for.sh: line 50: 152409 Segmentation fault      (core dumped) python 
+&lt;/denchmark-code&gt;
+
+Eager to autograph is extremely hard to debug due to how opaque the error messages are, and the lack of comparable tools for debugging like the memory profiler and analyzer which work only in the tf1 style graph mode. I saw the recent RFC 20190815-tfdbg-v2-callbacks which may go some of the way to addressing this, but currently I don't think there is a good way to view per-tensor memory usage in a way similar to 1.0.
+Having a way to pipe abseil errors to a file (not to stdout) when enabling autgraph's debug verbosity level would be nice.
+I'm assuming entries like these in the autograph debug output (set to 10) indicate the function is being called with different tensor input shapes and has to be retraced?
+&lt;denchmark-code&gt;Cache hit for entity &lt;function sum_effects at 0x7f76802d7c80&gt; key &lt;code object sum_effects at 0x7f76802d19c0, file "/home/mjlbach/Repositories/physics/physics/models/interaction_uti
+ls.py", line 11&gt; subkey (&lt;tensorflow.python.autograph.core.converter.ConversionOptions object at 0x7f74e862cef0&gt;, frozenset()): _ConvertedEntityFactoryInfo(tf__sum_effects in tmp1lu
+sxjty)
+Defaults of &lt;function create_converted_entity_factory.&lt;locals&gt;.create_converted_entity.&lt;locals&gt;.tf__sum_effects at 0x7f74e85fe2f0&gt; : None
+KW defaults of &lt;function create_converted_entity_factory.&lt;locals&gt;.create_converted_entity.&lt;locals&gt;.tf__sum_effects at 0x7f74e85fe2f0&gt; : None
+Calling &lt;function create_converted_entity_factory.&lt;locals&gt;.create_converted_entity.&lt;locals&gt;.tf__sum_effects at 0x7f74e85fe2f0&gt; with
+    E: Tensor("phiR/phiR_fc6_2/Identity:0", shape=(None, 100), dtype=float32, device=/job:localhost/replica:0/task:0/device:GPU:3)
+    Rr: Tensor("GatherNd_106:0", shape=(None, 2), dtype=int32, device=/job:localhost/replica:0/task:0/device:GPU:3)
+    bs: 450
+    no: 350
+&lt;/denchmark-code&gt;
+
+A final issue, is that there currently doesn't seem to be a way to declare a for loop uses shape_invariants as the documentation suggests for autograph, you need to manually rewrite the code to use a tf.while loop. Shape invariants are also somewhat inconvenient for nested tensors.
+		</comment>
+		<comment id='2' author='mjlbach' date='2019-09-10T13:22:11Z'>
+		Leaving aside the debugability issues and the support for shape_invariants for a moment, using range means that the loop is unrolled in the graph. So with range, a new subgraph is created for each loop iteration. That should explain the slow graph construction as well as the memory usage increase, because there are more temporary tensors involved. My wild guess would be that the graph construction time and memory usage is in the order of n_acton_samples * .
+Assigning &lt;denchmark-link:https://github.com/guptapriya&gt;@guptapriya&lt;/denchmark-link&gt;
+ for the slowness question when tf.range is involved.
+		</comment>
+		<comment id='3' author='mjlbach' date='2019-09-10T17:03:24Z'>
+		&lt;denchmark-link:https://github.com/mjlbach&gt;@mjlbach&lt;/denchmark-link&gt;
+ can you share the code that throws the error you mentioned above  (List contains uninitialized tensor at index 0 but leading_dims has only 0 elements). Do you get this error only when using dist strat?
+		</comment>
+		<comment id='4' author='mjlbach' date='2019-09-13T23:31:22Z'>
+		I agree that the memory growth issue under dist-strat was compounded due to the for loops using range, which makes sense given the creation of additional subgraphs. However, when using tf.range, it appears to impose additional constraints on the functions called within the loop which cause the uninitialized tensor errors. The issue originated because a lot of my model involves graph operations on a flat graph of the following type:
+&lt;denchmark-code&gt;outputs = list()
+for i in range(iterations):
+    output.append(MLP(graph[:, i]))
+tf.concat(output, axis=-1)
+&lt;/denchmark-code&gt;
+
+While fine under tf 1.0, these constructs throw an error if wrapped in a tf.range.
+If I convert to use TensorArrays and tf.range:
+&lt;denchmark-code&gt;outputs = tf.TensorArray(dtype=tf.float32, size=iterations, infer_size=False
+for i in tf.range(iterations):
+    outputs = outputs.write(i, MLP(input[i]))
+outputs = outputs.concat()
+&lt;/denchmark-code&gt;
+
+Are the performance reasons always in favor of using tf.range? Is there ever any reason to use range? It seems like tf.range is more memory efficient, but also might come with a bit of a performance penalty in terms of execution speed...
+Another related issue seems to be that under distribution strategy, tf.range loops cannot call models which call assign_add on a member variable (like a running mean) that is synchronized across models.
+I'm still investigating and I'll try to post a minimal example reproducing the issue and as a template for others with similar issues.
+		</comment>
+		<comment id='5' author='mjlbach' date='2019-09-16T14:45:09Z'>
+		About range vs. tf.range: in general, when the number of iterations is fixed, the memory constraints (particularly graph size) dictate the preference for tf.range. You are correct, the tf.range version might pay some runtime overhead, but that should be extremely small. There are some situations when tf.range cannot be used, for example in a loop that builds the layers of a neural net: for i in range(num_layers): build_layer(i). Otherwise, it's a good idea to use tf.range whenever possible.
+		</comment>
+		<comment id='6' author='mjlbach' date='2020-03-29T17:39:49Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/31588&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/31588&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

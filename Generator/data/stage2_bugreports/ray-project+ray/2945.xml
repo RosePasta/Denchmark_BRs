@@ -1,0 +1,96 @@
+<bug id='2945' author='stephanie-wang' open_date='2018-09-25T04:16:35Z' closed_time='2020-03-19T21:49:12Z'>
+	<summary>Object broadcast overloads the sending object manager</summary>
+	<description>
+&lt;denchmark-h:h3&gt;Describe the problem&lt;/denchmark-h&gt;
+
+When one object needs to be broadcasted to all other nodes, each of the other nodes will subscribe to the object table entry and send a Pull request once a location appears. This creates a "thundering herd" to the object's first location. The sending node then has to send the object to each of the other nodes, which may block all of its sending threads for some time, even when the object has already been sent to all of the other nodes (i.e. because they received it from the new locations).
+The desired behavior is to have a broadcast tree, where the original node sends the object to a few nodes, then each of the nodes can recursively broadcast the object to a few other nodes. One way to get this behavior is to selectively reject a fraction of Pull requests for the same object. The rejected object managers must then try the Pull again, ideally at a different node.
+	</description>
+	<comments>
+		<comment id='1' author='stephanie-wang' date='2018-09-25T19:07:05Z'>
+		The issue should appear when broadcasting an object to many machines (e.g., on 200 machines)
+x = np.zeros(10 ** 8)
+
+@ray.remote
+def f(x):
+    time.sleep(0.5)
+    pass
+
+for _ in range(100):
+    x_id = ray.put(x)
+    ray.get([f.remote(x_id) for _ in range(NUM_CORES)])
+		</comment>
+		<comment id='2' author='stephanie-wang' date='2018-09-25T19:16:59Z'>
+		&lt;denchmark-link:https://github.com/atumanov&gt;@atumanov&lt;/denchmark-link&gt;
+ and &lt;denchmark-link:https://github.com/devin-petersohn&gt;@devin-petersohn&lt;/denchmark-link&gt;
+ will review
+		</comment>
+		<comment id='3' author='stephanie-wang' date='2018-11-07T00:02:12Z'>
+		After thinking more about duplicate transfer suppression, I think I like the following design.
+
+Instead of having the sending object manager ignore object requests when it is busy, have the recipient object manager cancel all superfluous object requests when it starts receiving the object.
+If the sending object manager receives a cancellation message, then ideally it would just check its queue of pending object transfers and remove the canceled one. The catch is that their is no queue of pending object transfers. The queue is implicit in some asio internal data structure.
+Therefore, I think the right solution may be to move the queue out of asio and manage it ourselves in the object manager. This will require some scheduling logic for deciding when to dispatch transfer events to the thread pool.
+
+		</comment>
+		<comment id='4' author='stephanie-wang' date='2018-11-07T00:03:25Z'>
+		Yeah, that seems like the right design, it looks like asio operations cannot be canceled on a per-operation basis so we will have to maintain the queue ourselves.
+		</comment>
+		<comment id='5' author='stephanie-wang' date='2018-11-07T00:31:20Z'>
+		Does cancelling an object request mean sending a cancellation message to the sending object manager? I'm wary of a solution that involves adding more messages, since the problem is partly that we already have too many messages.
+		</comment>
+		<comment id='6' author='stephanie-wang' date='2018-11-07T01:05:48Z'>
+		Yes, it means sending another cancellation message. Are you concerned about the complexity of adding a new message or the performance?
+In this case, I think the performance benefit of doing a much better job of suppressing duplicate transfers will outweigh the cost of sending the message.
+		</comment>
+		<comment id='7' author='stephanie-wang' date='2018-11-07T02:43:13Z'>
+		I still think we should have the sender of the object ignore requests. Say you need to send an object to 100 machines. You get 100 requests, and then you are starting to send 100 copies. This will take a long time; in particular, it will take a long time before another node gets the object and it can act as a sender for other receivers. Thus, I think we need to do both: limit the number of requests, and cancel duplicate requests.
+		</comment>
+		<comment id='8' author='stephanie-wang' date='2018-11-07T09:00:38Z'>
+		Is this the same as the bug where the same node will request an object multiple times?
+I also agree about removing the queue from asio. We should never queue things in the event loop...
+This seems orthogonal to which side decides to cancel though.
+		</comment>
+		<comment id='9' author='stephanie-wang' date='2018-11-07T09:10:30Z'>
+		Why not do this: if I am waiting for a transfer, and see a new location pop up, with 1/N probability cancel my request and pull from the new location.
+This should spread out load naturally. Assuming basic sanity of course: a cap on maximum concurrent transfers, and no duplicate requests from/to the same node. This seems simple enough to guarantee if you only ever push from the origin node of the object, and everything else is a pull from the receiver.
+		</comment>
+		<comment id='10' author='stephanie-wang' date='2018-11-07T21:29:48Z'>
+		It seems to me there are two discussions:
+
+
+If object manager X receives N requests for object A from N other object managers, object manager X will send the same object to all N object managers, which is inefficient.
+
+
+If object manager X receives a request for object A from object manager Y multiple times, send the object once.
+
+
+For 1, I think Stephanie's proposal seems to make sense: Send the object to k &lt;&lt; N object managers instead of all N object managers. The protocol could be modified so that if the object being requested exists on L other object managers, we choose randomly from the L object managers the object manager to request from.
+For 2, I think it makes sense to not send the same object to the same object manager more than once. Maintaining a queue within the object manager of which objects are being sent where will make it easy to identify duplicate sends. There should be some period after which object manager X will send (i.e. will stop suppressing) object A to object manager Y if object manager Y requests it again after said period.
+		</comment>
+		<comment id='11' author='stephanie-wang' date='2018-11-07T21:54:28Z'>
+		Per &lt;denchmark-link:https://github.com/ray-project/ray/issues/3273&gt;#3273&lt;/denchmark-link&gt;
+,
+for deduplication, it should probably apply to both the sender and receiver side:
+
+the sender should not push the same objects multiple times to the same node. This can be implemented by keeping a table of say the most recent 10000 (obj_id, node) pairs for pushes
+the receiver should not pull the same object multiple times. If it is desirable to pull the object from more than one node to mitigate stragglers, this should be explicitly accounted for, and limited to say no more than two concurrent pulls.
+
+We can probably also skip pushes if a pull is in progress and vice versa (?)
+		</comment>
+		<comment id='12' author='stephanie-wang' date='2018-11-17T19:47:02Z'>
+		Now that &lt;denchmark-link:https://github.com/ray-project/ray/pull/3276&gt;#3276&lt;/denchmark-link&gt;
+ has been merged, the PR description may no longer be completely accurate. That is, broadcasts may not overwhelm the sender anymore. However, there is still an n^2 redundancy problem with broadcasts.
+		</comment>
+		<comment id='13' author='stephanie-wang' date='2018-11-17T19:51:46Z'>
+		I see, is this still a release blocker then?
+		</comment>
+		<comment id='14' author='stephanie-wang' date='2018-11-17T19:58:51Z'>
+		I need to do some testing on a large cluster first to see, but possibly yes.
+		</comment>
+		<comment id='15' author='stephanie-wang' date='2020-03-19T21:49:12Z'>
+		Should be fixed in future object store rewrite (cc &lt;denchmark-link:https://github.com/suquark&gt;@suquark&lt;/denchmark-link&gt;
+), closing.
+		</comment>
+	</comments>
+</bug>

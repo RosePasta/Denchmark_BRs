@@ -1,0 +1,257 @@
+<bug id='10341' author='KellenSunderland' open_date='2018-03-30T17:34:17Z' closed_time='2018-04-16T21:41:35Z'>
+	<summary>Deadlock during ThreadedEnginePerDevice destructor after CuDNNConvolutionOp&amp;lt;float&amp;gt;::SelectAlgo called.</summary>
+	<description>
+&lt;denchmark-h:h2&gt;Description&lt;/denchmark-h&gt;
+
+I haven't been able to fully track this down, but this is what I've seen so far.  CI is frequently deadlocking after the introduction of the test :  test_operator_gpu:test_op_output_names_monitor in the PR &lt;denchmark-link:https://github.com/apache/incubator-mxnet/pull/10300&gt;#10300&lt;/denchmark-link&gt;
+
+Removing the lines:
+conv_sym = mx.sym.Convolution(data, kernel=(2, 2), num_filter=1, name='conv')
+check_name(conv_sym, ['conv_output'])
+here: &lt;denchmark-link:https://github.com/apache/incubator-mxnet/pull/10300/files#diff-cb652780258e73a9cd08568f38929aa2R5417&gt;https://github.com/apache/incubator-mxnet/pull/10300/files#diff-cb652780258e73a9cd08568f38929aa2R5417&lt;/denchmark-link&gt;
+ will prevent the deadlocks
+It appears the test has exposed the deadlock, but that the deadlock was in the codebase prior to this PR.  I believe what is happening is that calling inference on the Conv operator in this way creates two zombie threads that are deadlocked on each other.  The test continues to run (and in fact the full test suite runs) until the ThreadedEnginePerDevice destructor is called, at which point the ThreadPool is brought down, it attempts to join all threads and the process hangs.
+It looks like Thread 20 is blocked waiting for this lock: &lt;denchmark-link:https://github.com/apache/incubator-mxnet/blob/master/src/operator/nn/cudnn/cudnn_convolution-inl.h#L718&gt;https://github.com/apache/incubator-mxnet/blob/master/src/operator/nn/cudnn/cudnn_convolution-inl.h#L718&lt;/denchmark-link&gt;
+ -&gt; &lt;denchmark-link:https://github.com/apache/incubator-mxnet/blob/master/src/engine/threaded_engine.cc#L385&gt;https://github.com/apache/incubator-mxnet/blob/master/src/engine/threaded_engine.cc#L385&lt;/denchmark-link&gt;
+
+Thread 16 is blocked here: &lt;denchmark-link:https://github.com/apache/incubator-mxnet/blob/master/src/operator/custom/custom-inl.h#L121&gt;https://github.com/apache/incubator-mxnet/blob/master/src/operator/custom/custom-inl.h#L121&lt;/denchmark-link&gt;
+
+&lt;denchmark-h:h2&gt;Environment info (Required)&lt;/denchmark-h&gt;
+
+CI
+&lt;denchmark-h:h2&gt;Minimal steps to reproduce&lt;/denchmark-h&gt;
+
+Reproducible locally on a gpu machine with:
+ci/build.py --build --platform ubuntu_build_cuda /work/runtime_functions.sh build_ubuntu_gpu_cuda91_cudnn7
+nvidia-docker run -v /home/ubuntu/incubator-mxnet:/work/mxnet -v /home/ubuntu/incubator-mxnet/build:/work/build -u 1000:1000 -ti mxnet/build.ubuntu_gpu bash
+Then in the container:
+export PYTHONPATH=/work/mxnet/python
+export MXNET_STORAGE_FALLBACK_LOG_VERBOSE=0
+cd tests/python/gpu/
+nosetests-3.4 -v test_operator_gpu:test_op_output_names_monitor
+You should get a stack similar to:
+&lt;denchmark-code&gt;Thread 20 (Thread 0x7f43ab149700 (LWP 95971)):
+#0  pthread_cond_wait@@GLIBC_2.3.2 () at ../sysdeps/unix/sysv/linux/x86_64/pthread_cond_wait.S:185
+#1  0x00007f4450b1a91c in std::condition_variable::wait(std::unique_lock&lt;std::mutex&gt;&amp;) () from target:/usr/lib/x86_64-linux-gnu/libstdc++.so.6
+#2  0x00007f43f7a2463f in std::condition_variable::wait&lt;mxnet::engine::ThreadedEngine::WaitForVar(mxnet::Engine::VarHandle)::&lt;lambda()&gt; &gt; (__p=..., __lock=..., this=0x30d6238)
+    at /usr/include/c++/5/condition_variable:98
+#3  mxnet::engine::ThreadedEngine::WaitForVar (this=&lt;optimized out&gt;, var=0x3d6c318) at src/engine/threaded_engine.cc:387
+#4  0x00007f43f922f411 in mxnet::op::CuDNNConvolutionOp&lt;float&gt;::SelectAlgo (this=this@entry=0x7f4328b6bdd0, ctx=..., in_shape=..., out_shape=...,
+    cudnn_forward_compute_type=cudnn_forward_compute_type@entry=CUDNN_DATA_FLOAT, cudnn_backward_compute_type=cudnn_backward_compute_type@entry=CUDNN_DATA_FLOAT)
+    at src/operator/nn/./cudnn/cudnn_convolution-inl.h:718
+#5  0x00007f43f91efa10 in mxnet::op::CuDNNConvolutionOp&lt;float&gt;::Init (ctx=..., out_shape=..., in_shape=..., backward_compute_type=0, forward_compute_type=0, param=...,
+    this=0x7f4328b6bdd0) at src/operator/nn/./cudnn/cudnn_convolution-inl.h:108
+#6  mxnet::op::GetCuDNNConvOp&lt;float&gt; (param=..., forward_compute_type=forward_compute_type@entry=0, backward_compute_type=backward_compute_type@entry=0, in_shape=...,
+    out_shape=..., ctx=...) at src/operator/nn/convolution.cu:74
+#7  0x00007f43f91f4bcc in mxnet::op::ConvolutionCompute&lt;mshadow::gpu&gt; (attrs=..., ctx=..., inputs=..., req=..., outputs=...) at src/operator/nn/convolution.cu:117
+#8  0x00007f43f7aeb100 in std::function&lt;void (nnvm::NodeAttrs const&amp;, mxnet::OpContext const&amp;, std::vector&lt;mxnet::TBlob, std::allocator&lt;mxnet::TBlob&gt; &gt; const&amp;, std::vector&lt;mxnet::Op
+ReqType, std::allocator&lt;mxnet::OpReqType&gt; &gt; const&amp;, std::vector&lt;mxnet::TBlob, std::allocator&lt;mxnet::TBlob&gt; &gt; const&amp;)&gt;::operator()(nnvm::NodeAttrs const&amp;, mxnet::OpContext const&amp;, st
+d::vector&lt;mxnet::TBlob, std::allocator&lt;mxnet::TBlob&gt; &gt; const&amp;, std::vector&lt;mxnet::OpReqType, std::allocator&lt;mxnet::OpReqType&gt; &gt; const&amp;, std::vector&lt;mxnet::TBlob, std::allocator&lt;mxne
+t::TBlob&gt; &gt; const&amp;) const (__args#4=..., __args#3=..., __args#2=..., __args#1=..., __args#0=..., this=0x3e42660) at /usr/include/c++/5/functional:2267
+#9  mxnet::exec::FComputeExecutor::Run (this=0x3e42430, rctx=..., is_gpu=true) at src/executor/attach_op_execs_pass.cc:182
+#10 0x00007f43f7abe2d6 in mxnet::exec::GraphExecutor::&lt;lambda(mxnet::RunContext, mxnet::Engine::CallbackOnComplete)&gt;::operator() (on_complete=..., ctx=..., __closure=0x4c47ad0)
+    at src/executor/graph_executor.cc:1318
+#11 std::_Function_handler&lt;void(mxnet::RunContext, mxnet::engine::CallbackOnComplete), mxnet::exec::GraphExecutor::InitCachedOps()::&lt;lambda(mxnet::RunContext, mxnet::Engine::Callbac
+kOnComplete)&gt; &gt;::_M_invoke(const std::_Any_data &amp;, &lt;unknown type in target:/work/mxnet/python/mxnet/../../lib/libmxnet.so, CU 0xb99feea, DIE 0xba766c9&gt;, &lt;unknown type in target:/wor
+k/mxnet/python/mxnet/../../lib/libmxnet.so, CU 0xb99feea, DIE 0xba766ce&gt;) (__functor=..., __args#0=&lt;optimized out&gt;, __args#1=&lt;optimized out&gt;) at /usr/include/c++/5/functional:1871
+#12 0x00007f43f7a1ca95 in std::function&lt;void (mxnet::RunContext, mxnet::engine::CallbackOnComplete)&gt;::operator()(mxnet::RunContext, mxnet::engine::CallbackOnComplete) const (
+    __args#1=..., __args#0=..., this=0x7f42b97f5438) at /usr/include/c++/5/functional:2267
+#13 mxnet::engine::ThreadedEngine::ExecuteOprBlock (this=0x30d61f0, run_ctx=..., opr_block=0x1968e578) at src/engine/./threaded_engine.h:367
+#14 0x00007f43f7a325ab in mxnet::engine::ThreadedEnginePerDevice::GPUWorker&lt;(dmlc::ConcurrentQueueType)0&gt; (this=0x30d61f0, ctx=..., is_copy_worker=&lt;optimized out&gt;,
+    block=0x19516f20, ready_event=...) at src/engine/threaded_engine_perdevice.cc:256
+#15 0x00007f43f7a3280e in mxnet::engine::ThreadedEnginePerDevice::PushToExecute(mxnet::engine::OprBlock*, bool)::{lambda()#3}::operator()() const::{lambda(std::shared_ptr&lt;dmlc::Manu
+alEvent&gt;)#1}::operator()(dmlc::ManualEvent) const (ready_event=..., __closure=0x1d115c00) at src/engine/threaded_engine_perdevice.cc:177
+#16 std::_Function_handler&lt;void (std::shared_ptr&lt;dmlc::ManualEvent&gt;), mxnet::engine::ThreadedEnginePerDevice::PushToExecute(mxnet::engine::OprBlock*, bool)::{lambda()#3}::operator()
+() const::{lambda(std::shared_ptr&lt;dmlc::ManualEvent&gt;)#1}&gt;::_M_invoke(std::_Any_data const&amp;, std::shared_ptr&lt;dmlc::ManualEvent&gt;&amp;&amp;) (__functor=..., __args#0=&lt;optimized out&gt;)
+    at /usr/include/c++/5/functional:1871
+#17 0x00007f43f7a2c74a in std::function&lt;void (std::shared_ptr&lt;dmlc::ManualEvent&gt;)&gt;::operator()(std::shared_ptr&lt;dmlc::ManualEvent&gt;) const (__args#0=..., this=&lt;optimized out&gt;)
+    at /usr/include/c++/5/functional:2267
+#18 std::_Bind_simple&lt;std::function&lt;void (std::shared_ptr&lt;dmlc::ManualEvent&gt;)&gt; (std::shared_ptr&lt;dmlc::ManualEvent&gt;)&gt;::_M_invoke&lt;0ul&gt;(std::_Index_tuple&lt;0ul&gt;) (this=&lt;optimized out&gt;)
+    at /usr/include/c++/5/functional:1531
+#19 std::_Bind_simple&lt;std::function&lt;void (std::shared_ptr&lt;dmlc::ManualEvent&gt;)&gt; (std::shared_ptr&lt;dmlc::ManualEvent&gt;)&gt;::operator()() (this=&lt;optimized out&gt;)
+    at /usr/include/c++/5/functional:1520
+#20 std::thread::_Impl&lt;std::_Bind_simple&lt;std::function&lt;void (std::shared_ptr&lt;dmlc::ManualEvent&gt;)&gt; (std::shared_ptr&lt;dmlc::ManualEvent&gt;)&gt; &gt;::_M_run() (this=&lt;optimized out&gt;)
+    at /usr/include/c++/5/thread:115
+#21 0x00007f4450b1fc80 in ?? () from target:/usr/lib/x86_64-linux-gnu/libstdc++.so.6
+#22 0x00007f44580ae6ba in start_thread (arg=0x7f43ab149700) at pthread_create.c:333
+#23 0x00007f4457de441d in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:109
+
+...
+
+Thread 16 (Thread 0x7f43a6678700 (LWP 86662)):
+#0  pthread_cond_wait@@GLIBC_2.3.2 () at ../sysdeps/unix/sysv/linux/x86_64/pthread_cond_wait.S:185
+#1  0x00007f4450b1a91c in std::condition_variable::wait(std::unique_lock&lt;std::mutex&gt;&amp;) () from target:/usr/lib/x86_64-linux-gnu/libstdc++.so.6
+#2  0x00007f43f4e8bdf6 in std::condition_variable::wait&lt;mxnet::op::custom::CustomOperator::CustomOperator()::{lambda()#1}::operator()() const::{lambda()#1}&gt;(std::unique_lock&lt;std::mu
+tex&gt;&amp;, mxnet::op::custom::CustomOperator::CustomOperator()::{lambda()#1}::operator()() const::{lambda()#1}) (__p=..., __lock=...,
+    this=0x7f44029b12d8 &lt;mxnet::op::custom::CustomOperator::Get()::inst+88&gt;) at /usr/include/c++/5/condition_variable:98
+#3  mxnet::op::custom::CustomOperator::CustomOperator()::{lambda()#1}::operator()() const (__closure=0x2d2dee8) at src/operator/custom/./custom-inl.h:121
+#4  std::_Bind_simple&lt;mxnet::op::custom::CustomOperator::CustomOperator()::{lambda()#1} ()&gt;::_M_invoke&lt;&gt;(std::_Index_tuple&lt;&gt;) (this=0x2d2dee8) at /usr/include/c++/5/functional:1531
+#5  std::_Bind_simple&lt;mxnet::op::custom::CustomOperator::CustomOperator()::{lambda()#1} ()&gt;::operator()() (this=0x2d2dee8) at /usr/include/c++/5/functional:1520
+#6  std::thread::_Impl&lt;std::_Bind_simple&lt;mxnet::op::custom::CustomOperator::CustomOperator()::{lambda()#1} ()&gt; &gt;::_M_run() (this=0x2d2ded0) at /usr/include/c++/5/thread:115
+#7  0x00007f4450b1fc80 in ?? () from target:/usr/lib/x86_64-linux-gnu/libstdc++.so.6
+#8  0x00007f44580ae6ba in start_thread (arg=0x7f43a6678700) at pthread_create.c:333
+#9  0x00007f4457de441d in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:109
+
+...
+
+Thread 1 (Thread 0x7f44584d3700 (LWP 86564)):
+#0  0x00007f44580af98d in pthread_join (threadid=139928609789696, thread_return=0x0) at pthread_join.c:90
+#1  0x00007f4450b1fb97 in std::thread::join() () from target:/usr/lib/x86_64-linux-gnu/libstdc++.so.6
+#2  0x00007f43f7a2f997 in mxnet::engine::ThreadPool::~ThreadPool (this=0x1af15540, __in_chrg=&lt;optimized out&gt;) at src/engine/./thread_pool.h:84
+#3  std::default_delete&lt;mxnet::engine::ThreadPool&gt;::operator() (this=&lt;optimized out&gt;, __ptr=0x1af15540) at /usr/include/c++/5/bits/unique_ptr.h:76
+#4  std::unique_ptr&lt;mxnet::engine::ThreadPool, std::default_delete&lt;mxnet::engine::ThreadPool&gt; &gt;::~unique_ptr (this=0x19516fe8, __in_chrg=&lt;optimized out&gt;)
+    at /usr/include/c++/5/bits/unique_ptr.h:236
+#5  mxnet::engine::ThreadedEnginePerDevice::ThreadWorkerBlock&lt;(dmlc::ConcurrentQueueType)0&gt;::~ThreadWorkerBlock (this=0x19516f20, __in_chrg=&lt;optimized out&gt;)
+    at src/engine/threaded_engine_perdevice.cc:204
+#6  std::_Sp_counted_ptr&lt;mxnet::engine::ThreadedEnginePerDevice::ThreadWorkerBlock&lt;(dmlc::ConcurrentQueueType)0&gt;*, (__gnu_cxx::_Lock_policy)2&gt;::_M_dispose (this=&lt;optimized out&gt;)
+    at /usr/include/c++/5/bits/shared_ptr_base.h:374
+#7  0x00007f43f4cf1037 in std::_Sp_counted_base&lt;(__gnu_cxx::_Lock_policy)2&gt;::_M_release (this=0x19ce5ad0) at /usr/include/c++/5/bits/shared_ptr_base.h:150
+#8  0x00007f43f7a2cf2b in std::__shared_count&lt;(__gnu_cxx::_Lock_policy)2&gt;::~__shared_count (this=&lt;optimized out&gt;, __in_chrg=&lt;optimized out&gt;)
+    at /usr/include/c++/5/bits/shared_ptr_base.h:659
+#9  std::__shared_ptr&lt;mxnet::engine::ThreadedEnginePerDevice::ThreadWorkerBlock&lt;(dmlc::ConcurrentQueueType)0&gt;, (__gnu_cxx::_Lock_policy)2&gt;::~__shared_ptr (this=&lt;optimized out&gt;,
+    __in_chrg=&lt;optimized out&gt;) at /usr/include/c++/5/bits/shared_ptr_base.h:925
+#10 std::__shared_ptr&lt;mxnet::engine::ThreadedEnginePerDevice::ThreadWorkerBlock&lt;(dmlc::ConcurrentQueueType)0&gt;, (__gnu_cxx::_Lock_policy)2&gt;::operator=(std::__shared_ptr&lt;mxnet::engine::ThreadedEnginePerDevice::ThreadWorkerBlock&lt;(dmlc::ConcurrentQueueType)0&gt;, (__gnu_cxx::_Lock_policy)2&gt;&amp;&amp;) (__r=&lt;optimized out&gt;, this=&lt;synthetic pointer&gt;)
+    at /usr/include/c++/5/bits/shared_ptr_base.h:1000
+#11 std::shared_ptr&lt;mxnet::engine::ThreadedEnginePerDevice::ThreadWorkerBlock&lt;(dmlc::ConcurrentQueueType)0&gt; &gt;::operator=(std::shared_ptr&lt;mxnet::engine::ThreadedEnginePerDevice::ThreadWorkerBlock&lt;(dmlc::ConcurrentQueueType)0&gt; &gt;&amp;&amp;) (__r=&lt;optimized out&gt;, this=&lt;synthetic pointer&gt;) at /usr/include/c++/5/bits/shared_ptr.h:294
+#12 mxnet::common::LazyAllocArray&lt;mxnet::engine::ThreadedEnginePerDevice::ThreadWorkerBlock&lt;(dmlc::ConcurrentQueueType)0&gt; &gt;::Clear (this=this@entry=0x30d6418)
+    at src/engine/../common/lazy_alloc_array.h:149
+#13 0x00007f43f7a2ea51 in mxnet::engine::ThreadedEnginePerDevice::StopNoWait (this=0x30d61f0) at src/engine/threaded_engine_perdevice.cc:79
+#14 mxnet::engine::ThreadedEnginePerDevice::~ThreadedEnginePerDevice (this=0x30d61f0, __in_chrg=&lt;optimized out&gt;) at src/engine/threaded_engine_perdevice.cc:74
+#15 0x00007f43f7a2f4b9 in mxnet::engine::ThreadedEnginePerDevice::~ThreadedEnginePerDevice (this=0x30d61f0, __in_chrg=&lt;optimized out&gt;) at src/engine/threaded_engine_perdevice.cc:75
+#16 0x00007f43f7a215f2 in std::_Sp_counted_base&lt;(__gnu_cxx::_Lock_policy)2&gt;::_M_release (this=0x1b54240) at /usr/include/c++/5/bits/shared_ptr_base.h:150
+#17 std::__shared_count&lt;(__gnu_cxx::_Lock_policy)2&gt;::~__shared_count (this=&lt;optimized out&gt;, __in_chrg=&lt;optimized out&gt;) at /usr/include/c++/5/bits/shared_ptr_base.h:659
+#18 std::__shared_ptr&lt;mxnet::Engine, (__gnu_cxx::_Lock_policy)2&gt;::~__shared_ptr (this=&lt;optimized out&gt;, __in_chrg=&lt;optimized out&gt;) at /usr/include/c++/5/bits/shared_ptr_base.h:925
+#19 std::shared_ptr&lt;mxnet::Engine&gt;::~shared_ptr (this=&lt;optimized out&gt;, __in_chrg=&lt;optimized out&gt;) at /usr/include/c++/5/bits/shared_ptr.h:93
+#20 0x00007f4457d16ff8 in __run_exit_handlers (status=0, listp=0x7f44580a15f8 &lt;__exit_funcs&gt;, run_list_atexit=run_list_atexit@entry=true) at exit.c:82
+#21 0x00007f4457d17045 in __GI_exit (status=&lt;optimized out&gt;) at exit.c:104
+#22 0x000000000060db0f in Py_Exit ()
+#23 0x000000000060dbfa in ?? ()
+#24 0x000000000060dc66 in PyErr_PrintEx ()
+#25 0x000000000060ef29 in PyRun_SimpleFileExFlags ()
+#26 0x000000000063fb26 in Py_Main ()
+#27 0x00000000004cfeb1 in main ()
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h2&gt;What have you tried to solve it?&lt;/denchmark-h&gt;
+
+
+Captured stack trace of hung process.
+Bisected to find offending commit, commented out code in commit to find offending lines.
+
+	</description>
+	<comments>
+		<comment id='1' author='KellenSunderland' date='2018-03-30T18:12:18Z'>
+		&lt;denchmark-link:https://github.com/piiswrong&gt;@piiswrong&lt;/denchmark-link&gt;
+: Do you see what the root cause is here?  Are you able to reproduce?
+		</comment>
+		<comment id='2' author='KellenSunderland' date='2018-03-30T23:33:28Z'>
+		&lt;denchmark-link:https://github.com/reminisce&gt;@reminisce&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='3' author='KellenSunderland' date='2018-04-03T19:00:16Z'>
+		I added several logging messages. It seems this function never returns. Will keep digging.
+&lt;denchmark-link:https://github.com/apache/incubator-mxnet/blob/master/src/operator/nn/cudnn/cudnn_convolution-inl.h#L718&gt;https://github.com/apache/incubator-mxnet/blob/master/src/operator/nn/cudnn/cudnn_convolution-inl.h#L718&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='4' author='KellenSunderland' date='2018-04-04T07:16:24Z'>
+		Added some prints. It seems the on_complete() can never finish while WaitForVar() keeps waiting. Since this piece of code is running in a worker thread for gpu context, we don't need to push those operations into engine for execution.
+&lt;denchmark-code&gt;ubuntu@ip-172-31-34-217:~/unison/mxnet/gpu/tests/python/gpu$ MXNET_ENGINE_INFO=1 nosetests --verbose test_operator_gpu:test_op_output_names_monitor
+/home/ubuntu/anaconda3/lib/python3.6/site-packages/h5py/__init__.py:34: FutureWarning: Conversion of the second argument of issubdtype from `float` to `np.floating` is deprecated. In future, it will be treated as `np.float64 == np.dtype(float).type`.
+  from ._conv import register_converters as _register_converters
+/home/ubuntu/anaconda3/lib/python3.6/site-packages/urllib3/contrib/pyopenssl.py:46: DeprecationWarning: OpenSSL.rand is deprecated - you should use os.urandom instead
+  import OpenSSL.SSL
+/home/ubuntu/anaconda3/lib/python3.6/site-packages/nose/util.py:453: DeprecationWarning: inspect.getargspec() is deprecated, use inspect.signature() or inspect.getfullargspec()
+  inspect.getargspec(func)
+[INFO] Setting module np/mx/python random seeds, use MXNET_MODULE_SEED=532507193 to reproduce.
+[06:57:48] src/engine/threaded_engine.cc:300: Adding write dependency: 0x561dc68271b8 thread id = 140626778085120
+[06:57:48] src/engine/threaded_engine.cc:304: Pusing opr_block to execute: 0x561dc6823000 thread id = 140626778085120
+[06:57:48] src/engine/threaded_engine.cc:300: Adding write dependency: 0x561dc6827000 thread id = 140626778085120
+[06:57:48] src/engine/threaded_engine.cc:304: Pusing opr_block to execute: 0x561dc6823028 thread id = 140626778085120
+[06:57:48] src/engine/threaded_engine.cc:300: Adding write dependency: 0x561dc68271b8 thread id = 140626778085120
+test_operator_gpu.test_op_output_names_monitor ... [06:57:48] src/engine/threaded_engine.cc:440: npending = 2 thread id = 140625260009216
+[06:57:48] src/engine/threaded_engine.cc:440: npending = 1 thread id = 140625260009216
+[06:57:48] src/engine/threaded_engine.cc:440: npending = 0 thread id = 140625260009216
+[06:57:49] src/engine/threaded_engine.cc:300: Adding write dependency: 0x561dc6827210 thread id = 140626778085120
+[06:57:49] src/engine/threaded_engine.cc:304: Pusing opr_block to execute: 0x561dc6823050 thread id = 140626778085120
+[06:57:49] src/engine/threaded_engine_perdevice.cc:186: Pushing opr_block to execute: 0x561dc6823050 thread id = 140626778085120
+[06:57:49] src/engine/threaded_engine.cc:440: npending = 0 thread id = 140624745461504
+[06:57:49] src/engine/threaded_engine.cc:300: Adding write dependency: 0x561dc6827268 thread id = 140626778085120
+[06:57:49] src/engine/threaded_engine.cc:304: Pusing opr_block to execute: 0x561dc6823050 thread id = 140626778085120
+[06:57:49] src/engine/threaded_engine_perdevice.cc:186: Pushing opr_block to execute: 0x561dc6823050 thread id = 140626778085120
+[06:57:49] src/engine/threaded_engine.cc:440: npending = 0 thread id = 140625089599232
+[06:57:49] src/engine/threaded_engine.cc:300: Adding write dependency: 0x561dc68272c0 thread id = 140626778085120
+[06:57:49] src/engine/threaded_engine.cc:304: Pusing opr_block to execute: 0x561dc6823050 thread id = 140626778085120
+[06:57:49] src/engine/threaded_engine_perdevice.cc:186: Pushing opr_block to execute: 0x561dc6823050 thread id = 140626778085120
+[06:57:49] src/engine/threaded_engine.cc:440: npending = 0 thread id = 140624745461504
+[06:57:49] src/engine/threaded_engine.cc:300: Adding write dependency: 0x561dc6827210 thread id = 140626778085120
+[06:57:49] src/engine/threaded_engine.cc:300: Adding write dependency: 0x561dc6827268 thread id = 140626778085120
+[06:57:49] src/engine/threaded_engine.cc:300: Adding write dependency: 0x561dc68272c0 thread id = 140626778085120
+[06:57:49] src/engine/threaded_engine.cc:300: Adding write dependency: 0x561dc6827318 thread id = 140626778085120
+[06:57:49] src/engine/threaded_engine.cc:300: Adding write dependency: 0x561dc6827370 thread id = 140626778085120
+[06:57:49] src/engine/threaded_engine.cc:304: Pusing opr_block to execute: 0x561dc6823050 thread id = 140626778085120
+[06:57:49] src/engine/threaded_engine.cc:440: npending = 0 thread id = 140625260009216
+[06:57:49] src/engine/threaded_engine.cc:295: Adding read dependency: 0x561dc6827210 thread id = 140626778085120
+[06:57:49] src/engine/threaded_engine.cc:295: Adding read dependency: 0x561dc6827268 thread id = 140626778085120
+[06:57:49] src/engine/threaded_engine.cc:295: Adding read dependency: 0x561dc68272c0 thread id = 140626778085120
+[06:57:49] src/engine/threaded_engine.cc:300: Adding write dependency: 0x561dc6827318 thread id = 140626778085120
+[06:57:49] src/engine/threaded_engine.cc:300: Adding write dependency: 0x561dc6827370 thread id = 140626778085120
+[06:57:49] src/engine/threaded_engine.cc:304: Pusing opr_block to execute: 0x561dc6823050 thread id = 140626778085120
+[06:57:49] src/engine/threaded_engine_perdevice.cc:186: Pushing opr_block to execute: 0x561dc6823050 thread id = 140626778085120
+[06:57:49] src/engine/threaded_engine.cc:300: Adding write dependency: 0x561dc6827210 thread id = 140626778085120
+[06:57:49] src/engine/threaded_engine.cc:300: Adding write dependency: 0x561dc6827268 thread id = 140626778085120
+[06:57:49] src/engine/threaded_engine.cc:300: Adding write dependency: 0x561dc68272c0 thread id = 140626778085120
+[06:57:49] src/engine/threaded_engine.cc:300: Adding write dependency: 0x561dc6827318 thread id = 140626778085120
+[06:57:49] src/engine/threaded_engine.cc:300: Adding write dependency: 0x561dc6827370 thread id = 140626778085120
+[06:57:49] src/engine/threaded_engine.cc:300: Adding write dependency: 0x561dc6827210 thread id = 140626778085120
+[06:57:49] src/engine/threaded_engine.cc:300: Adding write dependency: 0x561dc6827268 thread id = 140626778085120
+[06:57:49] src/engine/threaded_engine.cc:300: Adding write dependency: 0x561dc68272c0 thread id = 140626778085120
+[06:57:49] src/engine/threaded_engine.cc:300: Adding write dependency: 0x561dc6827318 thread id = 140626778085120
+[06:57:49] src/engine/threaded_engine.cc:300: Adding write dependency: 0x561dc6827370 thread id = 140626778085120
+ok
+
+----------------------------------------------------------------------
+Ran 1 test in 1.348s
+
+OK
+[06:57:49] src/operator/nn/./cudnn/cudnn_convolution-inl.h:528: CUDNN conv new var: 0x561dc6827528 thread id = 140625089599232
+[06:57:49] src/engine/threaded_engine.cc:300: Adding write dependency: 0x561dc6827528 thread id = 140625089599232
+[06:57:49] src/engine/threaded_engine.cc:304: Pusing opr_block to execute: 0x561dc6823078 thread id = 140625089599232
+[06:57:49] src/engine/threaded_engine_perdevice.cc:186: Pushing opr_block to execute: 0x561dc6823078 thread id = 140625089599232
+[06:57:49] src/engine/threaded_engine.cc:364: Wait for 0x561dc6827528 thread id = 140625089599232
+[06:57:49] src/engine/threaded_engine.cc:295: Adding read dependency: 0x561dc6827528 thread id = 140625089599232
+[06:57:49] src/engine/threaded_engine.cc:415: Complete write dep for 0x561dc6827528 thread id = 140624745461504
+[06:57:49] src/engine/threaded_engine.cc:420: PushToExecute 0x561dc68230a0 thread id = 140624745461504
+[06:57:49] src/engine/threaded_engine.cc:425[06:57:49] src/engine/./threaded_engine.h:351: ExecuteOprBlock 0x561dc68230a0shutdown_phase=: Fin PushToExecute 0x561dc68230a0 thread id = 140624745461504
+1
+[06:57:49] src/engine/threaded_engine.cc:440: npending = 4 thread id = 140624745461504
+[06:57:49] src/engine/threaded_engine.cc:440: npending = 3 thread id = 140625260009216
+[06:57:50] src/engine/threaded_engine.cc:300: Adding write dependency: 0x561dc6827000 thread id = 140626778085120
+[06:57:50] src/engine/threaded_engine.cc:304: Pusing opr_block to execute: 0x561dc68230a0 thread id = 140626778085120
+[06:57:50] src/engine/./threaded_engine.h:351: ExecuteOprBlock 0x561dc68230a0shutdown_phase=1
+[06:57:50] src/engine/threaded_engine.cc:440: npending = 3 thread id = 140626778085120
+[06:57:50] src/engine/threaded_engine.cc:300: Adding write dependency: 0x561dc6827058 thread id = 140626778085120
+[06:57:50] src/engine/threaded_engine.cc:304: Pusing opr_block to execute: 0x561dc68230a0 thread id = 140626778085120
+[06:57:50] src/engine/./threaded_engine.h:351: ExecuteOprBlock 0x561dc68230a0shutdown_phase=1
+[06:57:50] src/engine/threaded_engine.cc:440: npending = 3 thread id = 140626778085120
+[06:57:50] src/engine/threaded_engine.cc:300: Adding write dependency: 0x561dc68270b0 thread id = 140626778085120
+[06:57:50] src/engine/threaded_engine.cc:304: Pusing opr_block to execute: 0x561dc68230a0 thread id = 140626778085120
+[06:57:50] src/engine/./threaded_engine.h:351: ExecuteOprBlock 0x561dc68230a0shutdown_phase=1
+[06:57:50] src/engine/threaded_engine.cc:440: npending = 3 thread id = 140626778085120
+[06:57:50] src/engine/threaded_engine.cc:300: Adding write dependency: 0x561dc6827108 thread id = 140626778085120
+[06:57:50] src/engine/threaded_engine.cc:304: Pusing opr_block to execute: 0x561dc68230a0 thread id = 140626778085120
+[06:57:50] src/engine/./threaded_engine.h:351: ExecuteOprBlock 0x561dc68230a0shutdown_phase=1
+[06:57:50] src/engine/threaded_engine.cc:440: npending = 3 thread id = 140626778085120
+[06:57:50] src/engine/threaded_engine.cc:300: Adding write dependency: 0x561dc6827160 thread id = 140626778085120
+[06:57:50] src/engine/threaded_engine.cc:304: Pusing opr_block to execute: 0x561dc68230a0 thread id = 140626778085120
+[06:57:50] src/engine/./threaded_engine.h:351: ExecuteOprBlock 0x561dc68230a0shutdown_phase=1
+[06:57:50] src/engine/threaded_engine.cc:440: npending = 3 thread id = 140626778085120
+[06:57:50] src/engine/threaded_engine.cc:300: Adding write dependency: 0x561dc68271b8 thread id = 140626778085120
+[06:57:50] src/engine/threaded_engine.cc:304: Pusing opr_block to execute: 0x561dc68230a0 thread id = 140626778085120
+[06:57:50] src/engine/./threaded_engine.h:351: ExecuteOprBlock 0x561dc68230a0shutdown_phase=1
+[06:57:50] src/engine/threaded_engine.cc:440: npending = 3 thread id = 140626778085120
+[06:57:50] src/engine/threaded_engine.cc:300: Adding write dependency: 0x561dc6827318 thread id = 140626778085120
+&lt;/denchmark-code&gt;
+
+		</comment>
+	</comments>
+</bug>

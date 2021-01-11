@@ -1,0 +1,823 @@
+<bug id='44520' author='cookingbear' open_date='2020-11-02T13:10:46Z' closed_time='2020-12-07T01:19:13Z'>
+	<summary>tf.lite.Interpreter can not be used on the newest nightly version</summary>
+	<description>
+I use the version tf-nightly==2.5.0-dev20201029 and tested the tflite model
+when I use the code below to test the performance of the fastspeech tflite model, the first input can be converted to audio correctly. However, the second would be converted to audio full of noise. Only when I reload the interpreter, the model can be used for the next input.
+the next audio full of noise:
+&lt;denchmark-code&gt;interpreter = tf.lite.Interpreter(model_path="model.tflite")
+for samples in data_queue:
+            input_details = interpreter.get_input_details()
+            output_details = interpreter.get_output_details()
+            interpreter.resize_tensor_input(input_details[0]['index'], samples["input"].shape)
+            interpreter.allocate_tensors()
+            interpreter.set_tensor(input_details[0]['index'], samples["input"])
+            interpreter.invoke()
+            features = interpreter.get_tensor(output_details[0]['index'])
+            self.vocoder(features.numpy()) 
+&lt;/denchmark-code&gt;
+
+correct:
+&lt;denchmark-code&gt;for samples in data_queue:
+            interpreter = tf.lite.Interpreter(model_path="model.tflite")
+            input_details = interpreter.get_input_details()
+            output_details = interpreter.get_output_details()
+            interpreter.resize_tensor_input(input_details[0]['index'], samples["input"].shape)
+            interpreter.allocate_tensors()
+            interpreter.set_tensor(input_details[0]['index'], samples["input"])
+            interpreter.invoke()
+            features = interpreter.get_tensor(output_details[0]['index'])
+            self.vocoder(features.numpy()) 
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='cookingbear' date='2020-11-02T20:39:33Z'>
+		&lt;denchmark-link:https://github.com/cookingbear&gt;@cookingbear&lt;/denchmark-link&gt;
+ Can you please share a simple standalone code to reproduce the issue? Thanks!
+		</comment>
+		<comment id='2' author='cookingbear' date='2020-11-03T02:48:48Z'>
+		
+@cookingbear Can you please share a simple standalone code to reproduce the issue? Thanks!
+
+&lt;denchmark-code&gt;import tensorflow as tf
+import numpy as np
+
+
+def generate_square_subsequent_mask(size):
+    """  Generate a square mask for the sequence. The masked positions are filled with float(1.0).
+      Unmasked positions are filled with float(0.0).
+    """
+    mask = 1 - tf.linalg.band_part(tf.ones((size, size)), -1, 0)
+    return mask
+
+
+def create_multihead_mask(x, x_length, y, reverse=False):
+    r""" Generate a square mask for the sequence for mult-head attention.
+        The masked positions are filled with float(1.0).
+        Unmasked positions are filled with float(0.0).
+    """
+    x_mask, y_mask = None, None
+    if x is not None:
+        x_mask = 1.0 - tf.sequence_mask(
+            x_length, tf.shape(x)[1], dtype=tf.float32
+        )
+        x_mask = tf.expand_dims(tf.expand_dims(x_mask, 1), 1)
+        if reverse:
+            look_ahead_mask = generate_square_subsequent_mask(tf.shape(x)[1])
+            x_mask = tf.maximum(x_mask, look_ahead_mask)
+        x_mask.set_shape([None, None, None, None])
+    if y is not None:
+        y_mask = tf.cast(tf.math.equal(y, 0), tf.float32)
+        y_mask = tf.expand_dims(tf.expand_dims(y_mask, 1), 1)
+        if not reverse:
+            look_ahead_mask = generate_square_subsequent_mask(tf.shape(y)[1])
+            y_mask = tf.maximum(y_mask, look_ahead_mask)
+        y_mask.set_shape([None, None, None, None])
+    return x_mask, y_mask
+
+
+class PositionalEncoding(tf.keras.layers.Layer):
+    """ positional encoding can be used in transformer """
+
+    def make_positional_encoding(self, position, d_model):
+        """ generate a postional encoding list """
+
+        def get_angles(pos, i, d_model):
+            angle_rates = 1 / np.power(10000, (2 * (i // 2)) / np.float32(d_model))
+            return pos * angle_rates
+
+        angle_rads = get_angles(
+            np.arange(position)[:, np.newaxis], np.arange(d_model)[np.newaxis, :], d_model
+        )
+        angle_rads[:, 0::2] = np.sin(angle_rads[:, 0::2])
+        angle_rads[:, 1::2] = np.cos(angle_rads[:, 1::2])
+        pos_encoding = angle_rads[np.newaxis, ...]
+        return tf.cast(pos_encoding, dtype=tf.float32)
+
+    def __init__(self, d_model, max_position=800, scale=False):
+        super().__init__()
+        self.d_model = d_model
+        self.scale = scale
+        self.pos_encoding = self.make_positional_encoding(max_position, d_model)
+
+    def call(self, x):
+        """ call function """
+        seq_len = tf.shape(x)[1]
+        if self.scale:
+            x *= tf.math.sqrt(tf.cast(self.d_model, tf.float32))
+        x += self.pos_encoding[:, :seq_len, :]
+        return x
+
+
+class ScaledPositionalEncoding(PositionalEncoding):
+    """ scaled positional encoding,
+        reference: https://arxiv.org/pdf/1809.08895.pdf"""
+    def __init__(self, d_model, max_position=800):
+        super().__init__(d_model, max_position, scale=False)
+
+    def build(self, _):
+        self.alpha = self.add_weight(
+            name="alpha", initializer=tf.keras.initializers.constant(1)
+        )
+
+    def call(self, x):
+        seq_len = tf.shape(x)[1]
+        x += self.alpha * self.pos_encoding[:, :seq_len, :]
+        return x
+
+
+class ScaledDotProductAttention(tf.keras.layers.Layer):
+    """Calculate the attention weights.
+    q, k, v must have matching leading dimensions.
+    k, v must have matching penultimate dimension, i.e.: seq_len_k = seq_len_v.
+    The mask has different shapes depending on its type(padding or look ahead)
+    but it must be broadcastable for addition.
+
+    Args:
+        q: query shape == (..., seq_len_q, depth)
+        k: key shape == (..., seq_len_k, depth)
+        v: value shape == (..., seq_len_v, depth_v)
+        mask: Float tensor with shape broadcastable
+          to (..., seq_len_q, seq_len_k). Defaults to None.
+
+    Returns:
+        output, attention_weights
+    """
+    def __init__(self, unidirectional=False, look_ahead=0):
+        super().__init__()
+        self.uni = unidirectional
+        self.look_ahead = look_ahead
+
+    def call(self, q, k, v, mask):
+        """This is where the layer's logic lives."""
+        matmul_qk = tf.matmul(q, k, transpose_b=True)  # (..., seq_len_q, seq_len_k)
+
+        # scale matmul_qk
+        dk = tf.cast(tf.shape(k)[-1], tf.float32)
+        scaled_attention_logits = matmul_qk / tf.math.sqrt(dk)
+
+        if self.uni:
+            uni_mask = tf.ones(tf.shape(scaled_attention_logits))
+            uni_mask = tf.linalg.band_part(uni_mask, -1, self.look_ahead)
+            scaled_attention_logits += (1 - uni_mask) * -1e9
+        # add the mask to the scaled tensor.
+        if mask is not None:
+            scaled_attention_logits += mask * -1e9
+
+        # softmax is normalized on the last axis (seq_len_k) so that the scores
+        # add up to 1.
+        # (..., seq_len_q, seq_len_k)
+        attention_weights = tf.nn.softmax(scaled_attention_logits, axis=-1)
+
+        output = tf.matmul(attention_weights, v)  # (..., seq_len_q, depth_v)
+
+        return output, attention_weights
+
+
+class MultiHeadAttention(tf.keras.layers.Layer):
+    """ Multi-head attention
+
+    Multi-head attention consists of four parts: * Linear layers and split into
+    heads. * Scaled dot-product attention. * Concatenation of heads. * Final linear layer.
+    Each multi-head attention block gets three inputs; Q (query), K (key), V (value).
+    These are put through linear (Dense) layers and split up into multiple heads.
+    The scaled_dot_product_attention defined above is applied to each head (broadcasted for
+    efficiency). An appropriate mask must be used in the attention step. The attention
+    output for each head is then concatenated (using tf.transpose, and tf.reshape) and
+    put through a final Dense layer.
+    Instead of one single attention head, Q, K, and V are split into multiple heads because
+    it allows the model to jointly attend to information at different positions from
+    different representational spaces. After the split each head has a reduced dimensionality,
+    so the total computation cost is the same as a single head attention with full
+    dimensionality.
+    """
+
+    def __init__(self, d_model, num_heads, unidirectional=False, look_ahead=0):
+        super().__init__()
+        self.num_heads = num_heads
+        self.d_model = d_model
+
+        assert d_model % self.num_heads == 0
+
+        self.depth = d_model // self.num_heads
+
+        self.wq = tf.keras.layers.Dense(
+            d_model,
+            kernel_initializer=tf.compat.v1.truncated_normal_initializer(stddev=0.02),
+            input_shape=(d_model,),
+        )
+        self.wk = tf.keras.layers.Dense(
+            d_model,
+            kernel_initializer=tf.compat.v1.truncated_normal_initializer(stddev=0.02),
+            input_shape=(d_model,),
+        )
+        self.wv = tf.keras.layers.Dense(
+            d_model,
+            kernel_initializer=tf.compat.v1.truncated_normal_initializer(stddev=0.02),
+            input_shape=(d_model,),
+        )
+
+        self.attention = ScaledDotProductAttention(unidirectional, look_ahead=look_ahead)
+
+        self.dense = tf.keras.layers.Dense(
+            d_model,
+            kernel_initializer=tf.compat.v1.truncated_normal_initializer(stddev=0.02),
+            input_shape=(d_model,),
+        )
+
+    def split_heads(self, x, batch_size):
+        """Split the last dimension into (num_heads, depth).
+
+        Transpose the result such that the shape is (batch_size, num_heads, seq_len, depth)
+        """
+        x = tf.reshape(x, (batch_size, -1, self.num_heads, self.depth))
+        return tf.transpose(x, perm=[0, 2, 1, 3])
+
+    def call(self, v, k, q, mask):
+        """ call function """
+        batch_size = tf.shape(q)[0]
+
+        q = self.wq(q)  # (batch_size, seq_len, hiddn_dim)
+        k = self.wk(k)  # (batch_size, seq_len, hiddn_dim)
+        v = self.wv(v)  # (batch_size, seq_len, hiddn_dim)
+
+        q = self.split_heads(q, batch_size)  # (batch_size, num_heads, seq_len_q, depth)
+        k = self.split_heads(k, batch_size)  # (batch_size, num_heads, seq_len_k, depth)
+        v = self.split_heads(v, batch_size)  # (batch_size, num_heads, seq_len_v, depth)
+
+        # scaled_attention.shape == (batch_size, num_heads, seq_len_q, depth)
+        # attention_weights.shape == (batch_size, num_heads, seq_len_q, seq_len_k)
+        scaled_attention, attention_weights = self.attention(q, k, v, mask)
+
+        # (batch_size, seq_len_q, num_heads, depth)
+        scaled_attention = tf.transpose(scaled_attention, perm=[0, 2, 1, 3])
+
+        # (batch_size, seq_len_q, d_model)
+        concat_attention = tf.reshape(scaled_attention, (batch_size, -1, self.d_model))
+
+        output = self.dense(concat_attention)  # (batch_size, seq_len_q, d_model)
+
+        return output, attention_weights
+
+
+class TransformerEncoderLayer(tf.keras.layers.Layer):
+    """TransformerEncoderLayer is made up of self-attn and feedforward network.
+    This standard encoder layer is based on the paper "Attention Is All You Need".
+    Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez,
+    Lukasz Kaiser, and Illia Polosukhin. 2017. Attention is all you need. In Advances in
+    Neural Information Processing Systems, pages 6000-6010. Users may modify or implement
+    in a different way during application.
+
+    Args:
+        d_model: the number of expected features in the input (required).
+        nhead: the number of heads in the multiheadattention models (required).
+        dim_feedforward: the dimension of the feedforward network model (default=2048).
+        dropout: the dropout value (default=0.1).
+        activation: the activation function of intermediate layer, relu or gelu (default=relu).
+
+    Examples::
+        &gt;&gt;&gt; encoder_layer = TransformerEncoderLayer(d_model=512, nhead=8)
+        &gt;&gt;&gt; src = tf.random(10, 32, 512)
+        &gt;&gt;&gt; out = encoder_layer(src)
+    """
+
+    def __init__(
+            self, d_model, nhead, dim_feedforward=2048, dropout=0.1, activation="gelu",
+            unidirectional=False, look_ahead=0, ffn=None
+    ):
+        super().__init__()
+        self.self_attn = MultiHeadAttention(d_model, nhead, unidirectional, look_ahead=look_ahead)
+        # Implementation of Feedforward model
+        layers = tf.keras.layers
+        if ffn is None:
+            self.ffn = tf.keras.Sequential(
+                [
+                    layers.Dense(
+                        dim_feedforward,
+                        activation='gelu',
+                        kernel_initializer=tf.compat.v1.truncated_normal_initializer(
+                            stddev=0.02
+                        ),
+                        input_shape=(d_model,),
+                    ),
+                    layers.Dropout(dropout, input_shape=(dim_feedforward,)),
+                    layers.Dense(
+                        d_model,
+                        kernel_initializer=tf.compat.v1.truncated_normal_initializer(
+                            stddev=0.02
+                        ),
+                        input_shape=(dim_feedforward,),
+                    ),
+                    layers.Dropout(dropout, input_shape=(d_model,)),
+                ]
+            )
+        else:
+            self.ffn = ffn
+
+        self.norm1 = layers.LayerNormalization(epsilon=1e-8, input_shape=(d_model,))
+        self.norm2 = layers.LayerNormalization(epsilon=1e-8, input_shape=(d_model,))
+        self.dropout = layers.Dropout(dropout, input_shape=(d_model,))
+
+    def call(self, src, src_mask=None, training=None):
+        """Pass the input through the endocder layer.
+
+        Args:
+            src: the sequnce to the encoder layer (required).
+            mask: the mask for the src sequence (optional).
+
+        Shape:
+            see the docs in Transformer class.
+        """
+        out = self.self_attn(src, src, src, mask=src_mask)[0]
+        out = self.norm1(src + self.dropout(out, training=training))
+        out = self.norm2(out + self.ffn(out, training=training))
+
+        return out
+
+
+class TransformerEncoder(tf.keras.layers.Layer):
+    """TransformerEncoder is a stack of N encoder layers
+
+    Args:
+        encoder_layer: an instance of the TransformerEncoderLayer() class (required).
+        num_layers: the number of sub-encoder-layers in the encoder (required).
+        norm: the layer normalization component (optional).
+
+    Examples::
+        &gt;&gt;&gt; encoder_layer = [TransformerEncoderLayer(d_model=512, nhead=8)
+        &gt;&gt;&gt;                    for _ in range(num_layers)]
+        &gt;&gt;&gt; transformer_encoder = TransformerEncoder(encoder_layer)
+        &gt;&gt;&gt; src = torch.rand(10, 32, 512)
+        &gt;&gt;&gt; out = transformer_encoder(src)
+    """
+
+    def __init__(self, encoder_layers):
+        super().__init__()
+        self.layers = encoder_layers
+
+    def call(self, src, src_mask=None, training=None):
+        """Pass the input through the endocder layers in turn.
+
+        Args:
+            src: the sequnce to the encoder (required).
+            mask: the mask for the src sequence (optional).
+
+        Shape:
+            see the docs in Transformer class.
+        """
+        output = src
+        for i in range(len(self.layers)):
+            output = self.layers[i](output, src_mask=src_mask, training=training)
+        return output
+
+
+class FastSpeech(tf.keras.Model):
+    """
+    Reference: Fastspeech: Fast, robust and controllable text to speech
+      (http://papers.nips.cc/paper/8580-fastspeech-fast-robust-and-controllable-text-to-speech.pdf)
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        self.num_class = 314
+        self.eos = self.num_class - 1
+        self.feat_dim = 80
+        self.reduction_factor = 1
+
+        # for the x_net
+        layers = tf.keras.layers
+        input_features = layers.Input(shape=tf.TensorShape([None]), dtype=tf.int32)
+        inner = layers.Embedding(self.num_class, 384)(input_features)
+        inner = ScaledPositionalEncoding(384)(inner)
+        inner = layers.Dropout(0.1)(inner)
+        self.x_net = tf.keras.Model(inputs=input_features, outputs=inner, name="x_net")
+        print(self.x_net.summary())
+
+        ffn_list = []
+        for _ in range(2):
+            ffn_list.append(tf.keras.Sequential(
+                [
+                    layers.Conv1D(
+                        filters=1536,
+                        kernel_size=3,
+                        strides=1,
+                        padding="same",
+                        use_bias=False,
+                        data_format="channels_last"),
+                    layers.ReLU(),
+                    layers.Dropout(0.1),
+                    layers.Conv1D(
+                        filters=384,
+                        kernel_size=3,
+                        strides=1,
+                        padding="same",
+                        use_bias=False,
+                        data_format="channels_last")
+                ]
+            ))
+        # define encoder form transform.py
+        encoder_layers = [
+            TransformerEncoderLayer(384, 2, 1536, 0.1, ffn=ffn_list[0])
+            for _ in range(6)
+        ]
+        self.encoder = TransformerEncoder(encoder_layers)
+
+        # define duration predictor
+        input_features = layers.Input(shape=tf.TensorShape([None, 384]),
+                                       dtype=tf.float32)
+        inner = input_features
+        for _ in range(2):
+            inner = layers.Conv1D(
+                filters=256,
+                kernel_size=3,
+                strides=1,
+                padding="same",
+                use_bias = False,
+                data_format = "channels_last")(inner)
+            inner = layers.ReLU()(inner)
+            inner = layers.LayerNormalization()(inner)
+            inner = layers.Dropout(0.1)(inner)
+        inner = layers.Dense(1)(inner) # [batch, expanded_length, 1]
+        inner = tf.squeeze(inner, axis=-1)
+        self.duration_predictor = tf.keras.Model(inputs=input_features, outputs=inner,
+                                                 name="duration_predictor")
+        print(self.duration_predictor.summary())
+
+        # for the y_net
+        input_features = layers.Input(shape=tf.TensorShape([None, 384]),
+                                      dtype=tf.float32)
+        inner = ScaledPositionalEncoding(384, max_position=3200)(input_features)
+        inner = layers.Dropout(0.1)(inner)
+        self.y_net = tf.keras.Model(inputs=input_features, outputs=inner, name="y_net")
+        print(self.y_net.summary())
+
+        # define decoder
+        decoder_layers = [
+            TransformerEncoderLayer(384, 2, 1536, 0.1, ffn=ffn_list[1])
+            for _ in range(6)
+        ]
+        self.decoder = TransformerEncoder(decoder_layers)
+
+        # define feat_out
+        self.feat_out = layers.Dense(self.feat_dim * self.reduction_factor, use_bias=False,
+                                     name='feat_projection')
+        # define postnet
+        input_features_postnet = layers.Input(shape=tf.TensorShape([None, self.feat_dim]),
+                                              dtype=tf.float32)
+        inner = input_features_postnet
+        for _ in tf.range(5):
+            filters = 256
+            inner = layers.Conv1D(
+                filters=filters,
+                kernel_size=5,
+                strides=1,
+                padding="same",
+                use_bias=False,
+                data_format="channels_last",
+            )(inner)
+            inner = layers.BatchNormalization()(inner)
+            inner = tf.nn.tanh(inner)
+            inner = layers.Dropout(0.5)(inner)
+        inner = layers.Dense(self.feat_dim, name='projection')(inner)
+        self.postnet = tf.keras.Model(inputs=input_features_postnet, outputs=inner, name="postnet")
+        print(self.postnet.summary())
+
+    def get_loss(self, outputs, samples, training=None):
+        """ get loss used for training """
+        return None, None
+
+    def _feedforward_decoder(self, expanded_array, expanded_length, training: bool = None):
+        """feed-forward decoder
+        Args:
+            expanded_array: expanded encoder outputs after length regulation
+                shape: [batch, y_steps, d_model]
+            expanded_length: corresponding lengths, shape: [batch, y_steps]
+            training: if it is in the training stage
+        Returns:
+            before_outs: the outputs before postnet calculation
+            after_outs: the outputs after postnet calculation
+        """
+
+        expanded_mask, _ = create_multihead_mask(expanded_array, expanded_length, None)
+        expanded_output = self.y_net(expanded_array, training=training)
+        # decoder_output, shape: [batch, expanded_length, d_model]
+        decoder_output = self.decoder(expanded_output, expanded_mask, training=training)
+        batch = tf.shape(decoder_output)[0]
+        decoder_output = self.feat_out(decoder_output, training=training)
+        before_outs = tf.reshape(decoder_output, [batch, -1, self.feat_dim])
+        after_outs = before_outs + self.postnet(before_outs, training=training)
+        return before_outs, after_outs
+
+    def call(self, samples, training: bool = None):
+        return None
+
+    def synthesize(self, samples, alpha=1.0):
+        x0 = self.x_net(samples['input'], training=False)
+        _, input_mask = create_multihead_mask(None, None, samples['input'], reverse=True)
+        encoder_output = self.encoder(x0, input_mask, training=False) # [batch, x_steps, d_model]
+        duration_sequences = self.duration_predictor(encoder_output, training=False)
+        duration_sequences = tf.cast(tf.clip_by_value(tf.math.round(
+            tf.exp(duration_sequences) - 1.0),
+            0.0, tf.cast(100, dtype=tf.float32)), dtype=tf.int32)
+
+        phoneme_seq = encoder_output[0]  # [x_step, d_model]
+        duration_seq = duration_sequences[0]  # [x_step]
+        repeated_phoneme_seq = tf.repeat(phoneme_seq, repeats=duration_seq, axis=0)
+        repeated_phoneme_seq = tf.expand_dims(repeated_phoneme_seq, axis=0)
+        expanded_length = tf.reduce_sum(duration_sequences, axis=1)  # [batch]
+
+        _, after_outs = self._feedforward_decoder(repeated_phoneme_seq, expanded_length, training=False)
+        return after_outs
+
+
+def tflite_convert():
+    """ restore the best model """
+    model = FastSpeech()
+    checkpointer = tf.train.Checkpoint(model=model)
+    checkpointer.restore(tf.train.latest_checkpoint("tmp_ckpt/"))
+
+    def inference(x):
+        samples = {"input": x}
+        outputs = model.synthesize(samples)
+        return outputs
+
+    model.inference_function = tf.function(inference, experimental_relax_shapes=True,
+                                           input_signature=[tf.TensorSpec(shape=[1, None], dtype=tf.int32)])
+    tf.saved_model.save(obj=model, export_dir="tmp_model")
+    load_model = tf.saved_model.load("tmp_model")
+
+    concrete_function = load_model.inference_function.get_concrete_function()
+    converter = tf.lite.TFLiteConverter.from_concrete_functions([concrete_function])
+    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+    converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS,
+                                           tf.lite.OpsSet.SELECT_TF_OPS]
+    tflite_model = converter.convert()
+
+    with open('model.tflite', 'wb') as f:
+        f.write(tflite_model)
+
+
+if __name__ == "__main__":
+    tf.random.set_seed(1)
+    tflite_convert()
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='3' author='cookingbear' date='2020-11-03T02:51:03Z'>
+		&lt;denchmark-link:https://github.com/jvishnuvardhan&gt;@jvishnuvardhan&lt;/denchmark-link&gt;
+  I can reproduce the error using the code above, can you please look into this?
+		</comment>
+		<comment id='4' author='cookingbear' date='2020-11-04T16:46:39Z'>
+		I used the code above to create the tflite model which would be used to produce speech based on text input.
+According to my experiments, when I always feed the same input into the model, it works fine and always output the same speech. And the speech can also be produced correctly the first time after loading the tflite model.
+However, the tflite model would go wrong after one or two rounds of production and it would produce the audio with every sampling point sharing similar value.
+I just doubt that some operations and parameters may change even after interpreters have been created and loaded
+		</comment>
+		<comment id='5' author='cookingbear' date='2020-11-05T17:18:32Z'>
+		&lt;denchmark-link:https://github.com/terryheo&gt;@terryheo&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/abattery&gt;@abattery&lt;/denchmark-link&gt;
+ can you take a look? I wonder if this is an issue with state (or tensor buffers?) not being properly reset.
+		</comment>
+		<comment id='6' author='cookingbear' date='2020-11-05T20:49:55Z'>
+		&lt;denchmark-link:https://github.com/jaeyoo&gt;@jaeyoo&lt;/denchmark-link&gt;
+ Could you take a look? FYI, the issue is related to the fastspeech model.
+&lt;denchmark-link:https://github.com/cookingbear&gt;@cookingbear&lt;/denchmark-link&gt;
+ is this issue happening only with the tf nightly version or is it happening with the tf 2.3 and tf 2.4 versions as well?
+		</comment>
+		<comment id='7' author='cookingbear' date='2020-11-06T00:41:32Z'>
+		
+@jaeyoo Could you take a look? FYI, the issue is related to the fastspeech model.
+@cookingbear is this issue happening only with the tf nightly version or is it happening with the tf 2.3 and tf 2.4 versions as well?
+
+because the model contains 'embedding' and 'dynamic size' and other 'special' layers, it can not be converted to the tflite model successfully in the tf2.3 or tf2.4 version.  so I only tried the tf nightly version.
+		</comment>
+		<comment id='8' author='cookingbear' date='2020-11-09T17:33:57Z'>
+		&lt;denchmark-link:https://github.com/jaeyoo&gt;@jaeyoo&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/abattery&gt;@abattery&lt;/denchmark-link&gt;
+ If there is any update or information needed to be provided, please let me know. Thanks very much!
+		</comment>
+		<comment id='9' author='cookingbear' date='2020-11-10T06:32:33Z'>
+		&lt;denchmark-link:https://github.com/cookingbear&gt;@cookingbear&lt;/denchmark-link&gt;
+ Could you share your checkpoint data to us if possible? If not, we need to find a way to verify your situation in our side.
+		</comment>
+		<comment id='10' author='cookingbear' date='2020-11-10T08:36:39Z'>
+		
+@cookingbear Could you share your checkpoint data to us if possible? If not, we need to find a way to verify your situation in our side.
+
+Sorry, the checkpoint currently can not be provided. However, I recently found that if I add the line in the init function:
+&lt;denchmark-code&gt;        self.position = np.load('position.npy')
+        self.position = tf.convert_to_tensor(self.position)
+&lt;/denchmark-code&gt;
+
+in which position.npy is a matrix of which the value can be randomly set.
+And replace the _feedforward_decoder function with the code below:
+&lt;denchmark-code&gt;    def _feedforward_decoder(self, expanded_array, expanded_length, training: bool = None):
+        seq_len = tf.shape(expanded_array)[1]
+        expanded_output = expanded_array + 0.69105166 * self.position[:, :seq_len, :]
+        expanded_output = tf.concat([expanded_output, self.position[:, :seq_len, :]], axis=0)
+        return None, expanded_output
+&lt;/denchmark-code&gt;
+
+I convert this model into tflite, and after several rounds of calculations, I can see that the "self.position" value in "expanded_output" are all zeros.
+Meanwhile, if I use
+converter.target_spec.supported_types = [tf.float32]
+the problems can be solved.
+if I use
+converter.target_spec.supported_types = [tf.float16]
+the problem remains.
+		</comment>
+		<comment id='11' author='cookingbear' date='2020-11-11T07:02:17Z'>
+		&lt;denchmark-link:https://github.com/cookingbear&gt;@cookingbear&lt;/denchmark-link&gt;
+ what's the input samples looks like? Could you share one?
+I've tested this with simple input (such as integer array of [[1, 2, 3, 4, 5, 6, 7, 8]]) and it gives the same result with reused interpreter.
+FYI,  tf-nightly-2.5.0-dev20201029 looks bit unstable so I used tf-nightly-2.5.0.dev20201110
+		</comment>
+		<comment id='12' author='cookingbear' date='2020-11-12T17:36:09Z'>
+		Here is a checkpoint that can reproduce the error.
+&lt;denchmark-link:https://drive.google.com/file/d/10INDBq-2ZvNmRc5UxJfgFOIXabWmzKHq/view?usp=sharing&gt;https://drive.google.com/file/d/10INDBq-2ZvNmRc5UxJfgFOIXabWmzKHq/view?usp=sharing&lt;/denchmark-link&gt;
+
+If you test the converted tflite model using the inputs below:
+1). 294, 289, 159, 144, 70, 255, 301, 254, 280, 439, 389, 440, 320, 294, 1
+2). 294, 254, 88, 439, 390, 438, 209, 293, 150, 294, 1
+3). 294, 289, 159, 144, 70, 146, 371, 290, 301, 440, 300, 255, 301, 294, 1
+4). 294, 289, 159, 144, 70, 146, 371, 290, 301, 440, 300, 255, 301, 294, 1
+5). 294, 289, 159, 144, 70, 255, 301, 254, 280, 439, 389, 440, 320, 294, 1
+you would find that although 1) and 5) share the same inputs, but the outputs are different.
+Meanwhile, if I use
+
+the outputs of 1) and 5) are the same.
+&lt;denchmark-link:https://github.com/terryheo&gt;@terryheo&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/abattery&gt;@abattery&lt;/denchmark-link&gt;
+ can you please have a look?
+by the way, tf-nightly-2.5.0.dev20201110 did not work
+		</comment>
+		<comment id='13' author='cookingbear' date='2020-11-12T23:16:29Z'>
+		&lt;denchmark-link:https://github.com/cookingbear&gt;@cookingbear&lt;/denchmark-link&gt;
+ thanks for sharing the data for reproducing. We will take a look at them and get back to you.
+		</comment>
+		<comment id='14' author='cookingbear' date='2020-11-16T12:06:34Z'>
+		
+@cookingbear thanks for sharing the data for reproducing. We will take a look at them and get back to you.
+
+can you reproduce the error? please let me know, it is kind of tricky problem to us... Thank you
+		</comment>
+		<comment id='15' author='cookingbear' date='2020-11-19T09:43:06Z'>
+		&lt;denchmark-link:https://github.com/cookingbear&gt;@cookingbear&lt;/denchmark-link&gt;
+ I've reproduce the issue but I'm not sure if this is intended behavior or not.
+The first operator is GATHER and the input is indices.
+Since the input matrix is 314 x 384, some values (439, 440, 389, 320) on your inputs are out of index.
+Shouldn't you use those values? You might need some preprocessing to your inputs.
+		</comment>
+		<comment id='16' author='cookingbear' date='2020-11-19T12:37:36Z'>
+		
+@cookingbear I've reproduce the issue but I'm not sure if this is intended behavior or not.
+The first operator is GATHER and the input is indices.
+Since the input matrix is 314 x 384, some values (439, 440, 389, 320) on your inputs are out of index.
+Shouldn't you use those values? You might need some preprocessing to your inputs.
+
+Sorry for the mistake. The inputs mentioned before have some mismatch with the code above. You can also use the inputs below to reproduce the issue. thanks for your help.
+
+312, 223, 131, 117,  66, 200, 233, 199, 217, 308, 278, 309, 248, 312, 313
+312, 199,  77, 308, 279, 307, 173, 226, 122, 312, 313
+312, 223, 131, 117,  66, 119,   0, 224, 233, 309, 232, 200, 233, 312, 313
+312, 223, 131, 117,  66, 119,   0, 224, 233, 309, 232, 200, 233, 312, 313
+312, 223, 131, 117,  66, 200, 233, 199, 217, 308, 278, 309, 248, 312, 313
+
+		</comment>
+		<comment id='17' author='cookingbear' date='2020-11-19T13:00:57Z'>
+		I can't reproduce the issue with the given inputs.
+The result of input 1 and result 5 is the same.
+The result of input 3 and result 4 is the same.
+		</comment>
+		<comment id='18' author='cookingbear' date='2020-11-19T13:03:49Z'>
+		
+I can't reproduce the issue with the given inputs.
+The result of input 1 and result 5 is the same.
+The result of input 3 and result 4 is the same.
+
+have you sent the inputs into the model according to the given order?
+		</comment>
+		<comment id='19' author='cookingbear' date='2020-11-19T13:20:50Z'>
+		
+have you sent the inputs into the model according to the given order?
+
+Yes, I did.
+		</comment>
+		<comment id='20' author='cookingbear' date='2020-11-19T14:42:02Z'>
+		
+
+have you sent the inputs into the model according to the given order?
+
+Yes, I did.
+
+I just use the checkpoint and the code above to create the model.tflite, and run the code below:
+&lt;denchmark-code&gt;        interpreter = tf.lite.Interpreter(
+            model_path="model.tflite")
+        aa = [[312, 223, 131, 117, 66, 200, 233, 199, 217, 308, 278, 309, 248, 312, 313],
+              [312, 199, 77, 308, 279, 307, 173, 226, 122, 312, 313],
+              [312, 223, 131, 117, 66, 119, 0, 224, 233, 309, 232, 200, 233, 312, 313],
+              [312, 223, 131, 117, 66, 119, 0, 224, 233, 309, 232, 200, 233, 312, 313],
+              [312, 223, 131, 117, 66, 200, 233, 199, 217, 308, 278, 309, 248, 312, 313]]
+        for line in aa:
+            features = tf.convert_to_tensor([line])
+            input_details = interpreter.get_input_details()
+            output_details = interpreter.get_output_details()
+            interpreter.resize_tensor_input(input_details[0]['index'], features.shape)
+            interpreter.allocate_tensors()
+            interpreter.set_tensor(input_details[0]['index'], features)
+            interpreter.invoke()
+            features = interpreter.get_tensor(output_details[0]['index'])
+            continue
+&lt;/denchmark-code&gt;
+
+Then I can reproduce the issue. by the way, I tested it on centos-release-7-7.1908.0.el7.centos.x86_64 using CPU.
+The output of 1) is
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/files/5567396/a.npy.zip&gt;a.npy.zip&lt;/denchmark-link&gt;
+
+After the calculation of 2), 3) and 4), the output of 5) is always changing...
+		</comment>
+		<comment id='21' author='cookingbear' date='2020-11-20T01:34:01Z'>
+		&lt;denchmark-link:https://github.com/cookingbear&gt;@cookingbear&lt;/denchmark-link&gt;
+, it works well for me.
+I wonder if it's a conversion issue or not. Could you generate tflite model with recent nightly build?
+FYI, your a.npy is different with mine.
+		</comment>
+		<comment id='22' author='cookingbear' date='2020-11-20T02:06:41Z'>
+		the tf nightly version I used is tf-nightly 2.5.0.dev20201119, the converted tflite model is
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/files/5570814/model.tflite.zip&gt;model.tflite.zip&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='23' author='cookingbear' date='2020-11-20T02:42:04Z'>
+		Now I can reproduce it with your model. Let me dig more.
+		</comment>
+		<comment id='24' author='cookingbear' date='2020-11-20T02:50:44Z'>
+		Did you use tf-nightly 2.5.0.dev20201119 to create the FP16 model?
+		</comment>
+		<comment id='25' author='cookingbear' date='2020-11-20T03:13:14Z'>
+		
+Did you use tf-nightly 2.5.0.dev20201119 to create the FP16 model?
+
+I tested the tflite fp16 model using the code and the ckpt above with tf-nightly 2.5.0.dev20201119. It worked fine using the inputs above.
+		</comment>
+		<comment id='26' author='cookingbear' date='2020-11-20T04:29:35Z'>
+		&lt;denchmark-link:https://github.com/cookingbear&gt;@cookingbear&lt;/denchmark-link&gt;
+ , did you mean the problem is solved with tf-nightly 2.5.0.dev20201119?
+		</comment>
+		<comment id='27' author='cookingbear' date='2020-11-20T05:54:47Z'>
+		
+@cookingbear , did you mean the problem is solved with tf-nightly 2.5.0.dev20201119?
+
+The tflite model in fp16 format would be more stable using tf-nightly 2.5.0.dev20201119 and the cases above can be solved. but when I have more tests and find that the fp16 model using tf-nightly 2.5.0.dev20201119 would still show the similar issues.
+		</comment>
+		<comment id='28' author='cookingbear' date='2020-11-20T06:03:09Z'>
+		Hmm. If you can provide a way to reproduce it, I'll continue to investigate.
+		</comment>
+		<comment id='29' author='cookingbear' date='2020-11-20T06:21:54Z'>
+		
+Hmm. If you can provide a way to reproduce it, I'll continue to investigate.
+
+I'll try. but the tf-nightly 2.5.0.dev20201119 int8 model can still reproduce the issue using the cases above...
+		</comment>
+		<comment id='30' author='cookingbear' date='2020-11-20T07:05:54Z'>
+		Could you share the int8 model?
+		</comment>
+		<comment id='31' author='cookingbear' date='2020-11-20T07:07:46Z'>
+		
+the tf nightly version I used is tf-nightly 2.5.0.dev20201119, the converted tflite model is
+model.tflite.zip
+
+&lt;denchmark-link:https://github.com/terryheo&gt;@terryheo&lt;/denchmark-link&gt;
+ this is the int8 model
+		</comment>
+		<comment id='32' author='cookingbear' date='2020-11-20T07:11:20Z'>
+		Oh, I thought it was a fp16 model. Got it.
+		</comment>
+		<comment id='33' author='cookingbear' date='2020-11-27T06:18:49Z'>
+		
+Oh, I thought it was a fp16 model. Got it.
+
+so it is a conversion problem? how can I solve this?
+		</comment>
+		<comment id='34' author='cookingbear' date='2020-11-27T06:30:09Z'>
+		I could reproduce the issue with int8 hybrid quantized model.
+I'm still root-causing the issue to figure out culprit. I'll get back to you once I have an update.
+		</comment>
+		<comment id='35' author='cookingbear' date='2020-12-01T02:07:50Z'>
+		I've root caused the issue. Preparing a fix.
+		</comment>
+		<comment id='36' author='cookingbear' date='2020-12-04T01:21:37Z'>
+		Patch is merged. Nightly build tonight will have the fix.
+		</comment>
+		<comment id='37' author='cookingbear' date='2020-12-07T01:19:13Z'>
+		Let me close the issue. Please reopen if the issue persists.
+		</comment>
+		<comment id='38' author='cookingbear' date='2020-12-07T01:19:14Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/44520&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/44520&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,131 @@
+<bug id='751' author='Disgruntoad' open_date='2019-12-10T00:37:10Z' closed_time='2020-01-13T04:39:58Z'>
+	<summary>tfa GroupNorm Incorrectly Reshapes</summary>
+	<description>
+This bug report is in reference to the GroupNormalization layer implemented here: &lt;denchmark-link:https://github.com/tensorflow/addons/blob/v0.6.0/tensorflow_addons/layers/normalizations.py#L74-L100&gt;https://github.com/tensorflow/addons/blob/v0.6.0/tensorflow_addons/layers/normalizations.py#L74-L100&lt;/denchmark-link&gt;
+
+The issue is related to the following piece of code.
+&lt;denchmark-code&gt;def _reshape_into_groups(self, inputs, input_shape, tensor_input_shape):
+        group_shape = [tensor_input_shape[i] for i in range(len(input_shape))]
+        group_shape[self.axis] = input_shape[self.axis] // self.groups
+        group_shape.insert(1, self.groups)
+        group_shape = tf.stack(group_shape)
+        reshaped_inputs = tf.reshape(inputs, group_shape)
+        return reshaped_inputs, group_shape
+
+&lt;/denchmark-code&gt;
+
+self.axis would be the channels axis.
+The problem is when self.axis = -1 and the reshape goes from: [N, H, W, C] to [N, G, H, W, C//G] without performing the intermediate step of a transpose. The correct implementation should be:
+(1) Reshape from [N, H, W, C] to [N, H, W, G, C//G]
+(2) Transpose to generate [N, G, H, W, C//G]
+Ignoring the transpose leads to unexpected // incorrect behavior (mixing of channels and H/W dimensions) that may be difficult to debug.
+This bug could be resolved by either:
+(A) adding the transpose operation or
+(B) always reshaping to have groups adjacent to channels and then modifying the group_reduction_axes in _apply_normalization() to this new standard.
+I did not test which implementation would be more efficient on cpu or gpu.
+Here is some test code:
+&lt;denchmark-code&gt;import numpy as np
+import tensorflow as tf
+import tensorflow_addons as tfa
+tf.executing_eagerly()
+
+eps = 1E-3
+shp = [4,8,8,32] # [N, H, W, C]
+ng = 4 # number of groups
+# each channel has random mean and variance
+x = (np.random.rand(*shp) - np.random.rand(shp[-1])) * (np.random.rand(shp[-1])*5) 
+
+x_a = np.reshape(x, [shp[0], shp[1], shp[2], ng, shp[3]//ng]) # correct version
+mean_a = np.mean(x_a, axis=(1,2,4), keepdims=True)  
+var_a = np.var(x_a, axis=(1,2,4), keepdims=True)
+
+x_b = np.reshape(x, [shp[0], ng, shp[1], shp[2], shp[3]//ng])  # current tfa version
+mean_b = np.mean(x_b, axis=(2,3,4), keepdims=True)  
+var_b = np.var(x_b, axis=(2,3,4), keepdims=True)
+
+tfa_gn_fn = tfa.layers.GroupNormalization(axis=-1, groups=ng, epsilon=eps)
+tfa_gn = tfa_gn_fn(x).numpy()
+gamma = tfa_gn_fn.gamma.numpy()
+beta = tfa_gn_fn.beta.numpy()
+
+std_a = (x_a - mean_a) / np.sqrt(var_a + eps)
+std_b = (x_b - mean_b) / np.sqrt(var_b + eps)
+
+np_gn_a = tf.reshape(std_a, shp) * gamma + beta
+np_gn_b = tf.reshape(std_b, shp) * gamma + beta
+
+print(np.mean(np.abs(tfa_gn - np_gn_a)))
+print(np.mean(np.abs(tfa_gn - np_gn_b)))
+&lt;/denchmark-code&gt;
+
+A sample result would be something such as:
+&lt;denchmark-code&gt;0.2670085431804909
+4.0290002929794564e-08
+&lt;/denchmark-code&gt;
+
+This confirms the 2nd implementation is used and that the two implementations are not equivalent. It is simple to demonstrate that the 2nd implementation is incorrect. The purpose of GN is to "group" the channels, but this is not what is currently grouped. For instance:
+&lt;denchmark-code&gt;import numpy as np
+
+eps = 1E-3
+shp = [4,8,8,32] # [BS, H, W, C]
+ng = 4 # number of groups
+# each channel has random mean and variance
+x = (np.random.rand(*shp) - np.random.rand(shp[-1])) * (np.random.rand(shp[-1])*5) 
+
+x_a = np.reshape(x, [shp[0], shp[1], shp[2], ng, shp[3]//ng]) # correct version
+x_b = np.reshape(x, [shp[0], ng, shp[1], shp[2], shp[3]//ng])  # current tfa version
+
+print(x[3,4,4,19]) # Let's choose a random point to inspect
+print(x_a[3,4,4,2,3]) # 2 * 8 + 3 = 19
+print(x_b[3,2,4,4,3]) # expected location 
+print(x_b[3,2,2,2,3]) # transposed location
+&lt;/denchmark-code&gt;
+
+A sample result would be something such as:
+&lt;denchmark-code&gt;-0.8013022898433083
+-0.8013022898433083
+-0.030630469082052626
+-0.8013022898433083
+&lt;/denchmark-code&gt;
+
+The important thing to note is that with consistent indexing, x is equivalent to x_a, but x is not equivalent to x_b. This result shows the data has been effectively transposed by the reshape operation in tfa GroupNorm, which causes unexpected behavior. This is no longer a group normalization op over several channels, but instead an operation which normalizes over portions of HWC.
+	</description>
+	<comments>
+		<comment id='1' author='Disgruntoad' date='2019-12-10T14:41:30Z'>
+		Thanks for the detailed report &lt;denchmark-link:https://github.com/Disgruntoad&gt;@Disgruntoad&lt;/denchmark-link&gt;
+! Would you be interested in submitting a PR with appropriate test cases?
+		</comment>
+		<comment id='2' author='Disgruntoad' date='2019-12-11T01:11:59Z'>
+		&lt;denchmark-link:https://github.com/seanpmorgan&gt;@seanpmorgan&lt;/denchmark-link&gt;
+ Sure! I'm kinda a noob at PR though, so if there's a good set of guidelines, lmk.
+		</comment>
+		<comment id='3' author='Disgruntoad' date='2019-12-12T01:39:56Z'>
+		
+@seanpmorgan Sure! I'm kinda a noob at PR though, so if there's a good set of guidelines, lmk.
+
+Great! First you'll want to fork addons and create your own branch on the fork where you make changes. Here is a good guide: &lt;denchmark-link:http://blog.davidecoppola.com/2016/11/howto-contribute-to-open-source-project-on-github/&gt;http://blog.davidecoppola.com/2016/11/howto-contribute-to-open-source-project-on-github/&lt;/denchmark-link&gt;
+
+You'll want to fix the bug in &lt;denchmark-link:https://github.com/tensorflow/addons/blob/master/tensorflow_addons/layers/normalizations.py&gt;normalizations.py&lt;/denchmark-link&gt;
+ and add tests that explicitly describe/test the bug you're fixing to: &lt;denchmark-link:https://github.com/tensorflow/addons/blob/master/tensorflow_addons/layers/normalizations_test.py&gt;normalizations_test.py&lt;/denchmark-link&gt;
+
+The easiest way to run tests locally is to follow this steps to &lt;denchmark-link:https://github.com/tensorflow/addons/blob/master/CONTRIBUTING.md#locally-testing-cpu&gt;found here in the contributing doc&lt;/denchmark-link&gt;
+. Basically run the docker image and use bazel to run the tests. It will output typical python prints/logging while you debug
+You can run only the target required using:
+&lt;denchmark-code&gt;bazel test -c opt -k \
+--test_timeout 300,450,1200,3600 \
+--test_output=all \
+//tensorflow_addons/layers:normalizations_test
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='4' author='Disgruntoad' date='2019-12-31T21:36:26Z'>
+		&lt;denchmark-link:https://github.com/Disgruntoad&gt;@Disgruntoad&lt;/denchmark-link&gt;
+ Any update on this?
+		</comment>
+		<comment id='5' author='Disgruntoad' date='2020-01-13T00:27:37Z'>
+		&lt;denchmark-link:https://github.com/Squadrick&gt;@Squadrick&lt;/denchmark-link&gt;
+, It looks like someone already pushed a correction here.
+I tested functionality and it appears to work correctly. You should verify that it's included in whatever version you're using.
+		</comment>
+	</comments>
+</bug>

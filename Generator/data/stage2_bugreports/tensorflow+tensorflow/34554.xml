@@ -1,0 +1,125 @@
+<bug id='34554' author='cooijmanstim' open_date='2019-11-24T11:56:32Z' closed_time='2019-12-09T17:34:13Z'>
+	<summary>Forward-mode-by-double-backprop fails on tf.square ops</summary>
+	<description>
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): colab
+TensorFlow version (use command below): 1.15
+Python version: 3.x
+
+The double-backprop trick (&lt;denchmark-link:https://j-towns.github.io/2017/06/12/A-new-trick.html&gt;https://j-towns.github.io/2017/06/12/A-new-trick.html&lt;/denchmark-link&gt;
+) for computing jacobian-vector products (JVPs) fails when  ops are in the graph. Recall the double-backprop trick constructs an initial throwaway backward graph, which linearly depends on some dummy variables, and then backpropagates through this throwaway graph with respect to the dummy variables. The result should be constant wrt the dummy variables, and the throwaway graph should be disconnected from the final result.
+Below I've taken the example JVP code from &lt;denchmark-link:https://github.com/renmengye/tensorflow-forward-ad/issues/2#issue-234418055&gt;renmengye/tensorflow-forward-ad#2 (comment)&lt;/denchmark-link&gt;
+ and changed  to  to illustrate the failure. The code crashes with an  because the dummy placeholder created in  is not fed a value. The true underlying issue is that the dummy should have disappeared in the second call to  inside  (because  is linear in ). Presumably the cause is that the backward op for  somehow depends nonlinearly on the dummy variables.
+%tensorflow_version 1.x
+import numpy as np
+import numpy.random as npr
+import tensorflow as tf
+
+def fwd_gradients(ys, xs, d_xs):
+  """Forward-mode pushforward analogous to the pullback defined by tf.gradients.
+  With tf.gradients, grad_ys is the vector being pulled back, and here d_xs is
+  the vector being pushed forward."""
+  v = tf.placeholder(ys.dtype, shape=ys.get_shape(), name="dummy")
+  g = tf.gradients(ys, xs, grad_ys=v)
+  return tf.gradients(g, v, grad_ys=d_xs)
+
+A = tf.constant(npr.randn(5, 3), dtype=tf.float32)
+x = tf.placeholder(tf.float32, [1, 5])
+y = tf.square(tf.matmul(x, A))
+u = tf.placeholder(tf.float32, [1, 5])
+
+jvp = fwd_gradients(y, x, u)
+
+x_val = npr.randn(1, 5)
+u_val = npr.randn(1, 5)
+
+init_op = tf.initialize_all_variables()
+with tf.Session() as sess:
+  sess.run(init_op)
+  print(sess.run(jvp, feed_dict={x: x_val, u: u_val}))
+	</description>
+	<comments>
+		<comment id='1' author='cooijmanstim' date='2019-11-25T09:17:59Z'>
+		Could replicate the issue with TF 1.15.
+Please find the gist &lt;denchmark-link:https://colab.sandbox.google.com/gist/gadagashwini/4e94cfb813d5d912fddb371cfa67ef63/untitled272.ipynb&gt;here&lt;/denchmark-link&gt;
+. Thanks!
+		</comment>
+		<comment id='2' author='cooijmanstim' date='2019-12-09T17:34:13Z'>
+		This is expected if a bit ugly. Gradient functions can use tf.shape and similar operations on the will-be-pruned placeholders, and Session can't really tell in advance that the value itself isn't necessary since there's enough shape information.
+You can fill the tensor with NaNs to make sure its value isn't used:
+&lt;denchmark-code&gt;def fwd_gradients(ys, xs, d_xs):
+  """Forward-mode pushforward analogous to the pullback defined by tf.gradients.
+  With tf.gradients, grad_ys is the vector being pulled back, and here d_xs is
+  the vector being pushed forward."""
+  v = tf.fill(value=float('NaN'), dims=tf.shape(ys))
+  g = tf.gradients(ys, xs, grad_ys=v)
+  return tf.gradients(g, v, grad_ys=d_xs)
+&lt;/denchmark-code&gt;
+
+That works for me. But please do comment/reopen if you still think something's wrong.
+We do have a &lt;denchmark-link:https://www.tensorflow.org/versions/r2.1/api_docs/python/tf/autodiff/ForwardAccumulator&gt;new 2.x API for forward-mode autodiff&lt;/denchmark-link&gt;
+:
+&lt;denchmark-code&gt;import numpy as np
+import numpy.random as npr
+import tensorflow as tf
+
+A = tf.constant(npr.randn(5, 3), dtype=tf.float32)
+
+def jvp(x, u):
+  with tf.autodiff.ForwardAccumulator(x, u) as acc:
+    y = tf.square(tf.matmul(x, A))
+  return acc.jvp(y)
+
+x_val = tf.constant(npr.randn(1, 5), dtype=tf.float32)
+u_val = tf.constant(npr.randn(1, 5), dtype=tf.float32)
+print(jvp(x_val, u_val))
+&lt;/denchmark-code&gt;
+
+It's implemented with the same double-gradient trick, but runs in a tf.function so the pruning works when executed eagerly too. And of course you can wrap jvp in @tf.function if you don't want to execute it eagerly.
+		</comment>
+		<comment id='3' author='cooijmanstim' date='2019-12-09T17:34:15Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/34554&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/34554&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='4' author='cooijmanstim' date='2019-12-09T22:15:16Z'>
+		I know it's a fragile trick and it's sort of a miracle it works at all. The main reason for reporting this issue is because using x ** 2 instead of tf.square(x) works fine, so supposedly the fix would be simple. That said, after continuing to push on my problem I've found out that graphical black boxes like tf.function and presumably tf.while_loop also break this trick, so it's a dead end.
+I'm happy to see there's forward-mode in eager now! That was my only reason for sticking with graph mode.
+		</comment>
+		<comment id='5' author='cooijmanstim' date='2019-12-09T22:23:47Z'>
+		That is a bit of an odd difference between x**2 and tf.square(x) I agree. Likely because of the control dependency here: 
+
+
+tensorflow/tensorflow/python/ops/math_grad.py
+
+
+         Line 583
+      in
+      d1265d5
+
+
+
+
+
+
+ with ops.control_dependencies([grad]): 
+
+
+
+
+
+But like I say, even if we changed that gradient there will be others that run operations on the gradients to get their size and such. I don't think placeholders will work, but using NaNs should be pretty robust.
+		</comment>
+		<comment id='6' author='cooijmanstim' date='2019-12-09T22:47:08Z'>
+		Well, filling with NaNs gives me NaNs in the output (in my real graph, not in this MWE). Generally I could fill with any value such as ones to get the correct result. However this hides the fact that the intermediate graph is not thrown away. It is kept around and actually computed, which roughly doubles the time/space/graph complexity of the whole operation. Just a word of warning for people finding this thread in the future.
+		</comment>
+		<comment id='7' author='cooijmanstim' date='2019-12-09T22:56:04Z'>
+		Even if the original NaN tensor is referenced for a shape or control dependency, the first tf.gradient call can still be pruned out. I expect that would actually be fine, although inspecting the optimized graph would be the way to tell for sure.
+Having the NaN show up in the computation itself does sound bad. If you can isolate that I'd be interested. The MWE does seem to work fine.
+		</comment>
+	</comments>
+</bug>

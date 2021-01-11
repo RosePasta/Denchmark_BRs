@@ -1,0 +1,176 @@
+<bug id='28541' author='remydubois' open_date='2019-05-09T09:23:47Z' closed_time='2019-11-04T00:45:20Z'>
+	<summary>tf.data.Dataset.padded_batch does not actually pad data when working on multiple GPUs.</summary>
+	<description>
+&lt;denchmark-h:h3&gt;System information&lt;/denchmark-h&gt;
+
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow):
+Yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04):
+Ubuntu 16.04
+Mobile device (e.g. iPhone 8, Pixel 2, Samsung Galaxy) if the issue happens on mobile device:
+X
+TensorFlow installed from (source or binary):
+Binary
+TensorFlow version (use command below):
+v1.12.0-9492-g2c319fb415 2.0.0-alpha0
+Python version:
+3.6
+Bazel version (if compiling from source):
+X
+GCC/Compiler version (if compiling from source):
+X
+CUDA/cuDNN version:
+10.0
+GPU model and memory:
+Tesla K80 / 12GB RAM
+Exact command to reproduce:
+See test below
+
+&lt;denchmark-h:h3&gt;Describe the problem&lt;/denchmark-h&gt;
+
+The problem appears when one wants to use a multi-gpu-compiled model with variable-shaped data, fed from a tf.data pipeline.
+Batching data using padded_batch (compulsory here, since the data is of variable shape) does not seem to really pad the tensors comprised in a batch. Calling fitor predict after doing so raises:
+ValueError: Input tensor shapes do not match for distributed tensor inputs PerReplica.
+See below a MVCE:
+
+A python generator is used to generate tensors of variable shape: (4, 4, 1), then (5, 5, 1), then (4, 4, 1), then (5, 5, 1), etc...
+A tf.data Dataset is built using tf.data.Dataset.from_generator, including a consistency check.
+A dummy model is built using the tf.keras functional API and a tf.distribute.MirroredStrategy on several GPUS.
+
+&lt;denchmark-h:h3&gt;Source code / logs&lt;/denchmark-h&gt;
+
+MVCE:
+&lt;denchmark-code&gt;import tensorflow as tf
+import numpy as np
+
+
+def data_generator():
+    """
+    Creates a generator of variable_sized tensors.
+        tensor 1: (4, 4, 1)
+        tensor 2: (5, 5, 1)
+        tensor 3: (4, 4, 1)
+        tensor 4: (5, 5, 1)
+        ...
+    """
+    i = 0
+
+    while True:
+        size = (4 + i % 2, 4 + i % 2, 1)
+        x = tf.random.normal(shape=size)
+        yield x
+        i += 1
+
+
+def build_data_pipeline():
+    """
+    Builds a tf.data pipeline yielding variably-sized tensors.
+    """
+    dataset = tf.data.Dataset.from_generator(
+        generator=data_generator,
+        output_types=tf.float32,
+        output_shapes=[None, None, 1])
+
+    # Padded batch, should output (batch_size, 5, 5, 1) - shaped tensors.
+    dataset = dataset.padded_batch(
+        batch_size=2,
+        padded_shapes=(None, None, 1),
+        padding_values=0.)
+
+    # Juste making sure that the tf.data pipeline is as expected
+    it = iter(dataset)
+    batch_1 = next(it)  #~= tf.data.experimental.get_single_element(dataset)
+    batch_2 = next(it)  #~= tf.data.experimental.get_single_element(dataset)
+
+    np.testing.assert_allclose(batch_1.shape, batch_2.shape)
+    np.testing.assert_allclose(batch_1.shape, (2, 5, 5, 1))
+
+    return dataset
+
+
+def run_on_multi_gpus():
+    """
+    Building multi-gpu model using MirroredStrategy,
+    And trying to predict
+    """
+    strat = tf.distribute.MirroredStrategy()
+
+    with strat.scope():
+
+        i_ = tf.keras.layers.Input((None, None, 1))
+        model = tf.keras.models.Model(i_, i_)
+
+        model.compile(optimizer='adam',
+                      loss='binary_crossentropy')
+
+    dataset = build_data_pipeline()
+    model.predict(dataset, steps=1, verbose=1)
+
+
+if __name__ == '__main__':
+    run_on_multi_gpus()
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='remydubois' date='2019-05-20T21:46:30Z'>
+		&lt;denchmark-link:https://github.com/jvishnuvardhan&gt;@jvishnuvardhan&lt;/denchmark-link&gt;
+ the error is coming from TF distribution strategy, which I am not familiar with. Could you please re-assign this to someone from that team? Thank you.
+		</comment>
+		<comment id='2' author='remydubois' date='2019-06-05T20:53:40Z'>
+		Why do you think it's not padded if these statements pass:
+&lt;denchmark-code&gt;    np.testing.assert_allclose(batch_1.shape, batch_2.shape)
+    np.testing.assert_allclose(batch_1.shape, (2, 5, 5, 1))
+&lt;/denchmark-code&gt;
+
+Looks padded, doesn't it?  Since all of the batches are ..., 5,5,1.
+		</comment>
+		<comment id='3' author='remydubois' date='2019-06-07T07:40:55Z'>
+		Hi,
+I agree that the title is misleading:
+The issue here comes when using a padded_batch tf.data.dataset with a multi_gpu model, built using a MirroredStrategy.
+Doing so raises:
+ValueError: Input tensor shapes do not match for distributed tensor inputs PerReplica. This error prints along each sub-batch (one sub-batch per worker).
+Consequently, The MVCE above will print two tensors:
+
+one of shape (1, 4, 4, 1),
+the other of shape (1, 5, 5, 1)
+
+My issue here is that I can not train a Distributed model on varying-sized input.
+		</comment>
+		<comment id='4' author='remydubois' date='2019-07-26T18:24:53Z'>
+		Yes, it's an issue and we are currently working on fixing it.  Thanks for reporting.
+		</comment>
+		<comment id='5' author='remydubois' date='2019-07-29T18:01:20Z'>
+		FYI it should work if there were fully defined shapes instead of None in padded_batch.
+		</comment>
+		<comment id='6' author='remydubois' date='2019-07-31T12:07:33Z'>
+		&lt;denchmark-link:https://github.com/isaprykin&gt;@isaprykin&lt;/denchmark-link&gt;
+ thanks, good to know
+		</comment>
+		<comment id='7' author='remydubois' date='2019-07-31T22:06:58Z'>
+		Automatically closing this out since I understand it to be resolved, but please let me know if I'm mistaken.Thanks!
+		</comment>
+		<comment id='8' author='remydubois' date='2019-07-31T22:07:00Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=28541&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=28541&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='9' author='remydubois' date='2019-07-31T23:01:54Z'>
+		I don't think the issue is resolved yet, Igor simply suggested a workaround for now. The bug is still there and needs to be fixed.
+		</comment>
+		<comment id='10' author='remydubois' date='2019-11-04T00:45:20Z'>
+		I think this issue should now be fixed. Please re-open if not.
+		</comment>
+		<comment id='11' author='remydubois' date='2019-11-04T00:45:22Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/28541&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/28541&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

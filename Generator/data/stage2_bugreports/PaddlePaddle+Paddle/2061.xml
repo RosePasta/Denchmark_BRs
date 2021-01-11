@@ -1,0 +1,132 @@
+<bug id='2061' author='xinghai-sun' open_date='2017-05-08T13:53:40Z' closed_time='2017-06-02T03:30:31Z'>
+	<summary>Incorrect topological parsing with memory-layer referencing.</summary>
+	<description>
+It seems that PaddlePaddle V2 APIs only consider the explicit layer connection (by "input" argument) when parsing the network topology, neglect of the fact that the memory-layer referencing (by "name" argument of paddle.layer.memory) should also be considered as an implicitly connection. As a result, such a layer with its output only referenced by a memory layer and not explicitly connected to any final cost/output layer, will not be created at all during backward traversing the topological graph.
+Here is a simple example:
+&lt;denchmark-code&gt;import paddle.v2 as paddle
+
+def main():
+    hidden_size = 128
+    dict_size = 30000
+    paddle.init(use_gpu=False, trainer_count=1)
+
+    words = paddle.layer.data(
+        name="words",
+        type=paddle.data_type.integer_value_sequence(dict_size))
+    next_words = paddle.layer.data(
+        name='next_words',
+        type=paddle.data_type.integer_value_sequence(dict_size))
+
+    def recurrent_step(embedding):
+        last_memory = paddle.layer.memory(name="memory", size=hidden_size)
+        memory_update = paddle.layer.fc(
+            name="memory", input=[last_memory, embedding], size=hidden_size)
+        predict = paddle.layer.fc(
+            input=[embedding, last_memory],
+            size=dict_size,
+            act=paddle.activation.Softmax())
+        return predict
+
+    predict_seq = paddle.layer.recurrent_group(
+        step=recurrent_step,
+        input=[paddle.layer.embedding(input=words, size=hidden_size)])
+    cost = paddle.layer.classification_cost(
+        input=predict_seq, label=next_words)
+
+    parameters = paddle.parameters.create(cost)
+    optimizer = paddle.optimizer.Adam(learning_rate=5e-5)
+    trainer = paddle.trainer.SGD(
+        cost=cost, parameters=parameters, update_equation=optimizer)
+
+if __name__ == '__main__':
+    main()
+&lt;/denchmark-code&gt;
+
+With error:
+&lt;denchmark-code&gt;Traceback (most recent call last):
+  File "bug.py", line 39, in &lt;module&gt;
+    main()
+  File "bug.py", line 32, in main
+    parameters = paddle.parameters.create(cost)
+  File "/usr/local/lib/python2.7/site-packages/paddle/v2/parameters.py", line 19, in create
+    topology = Topology(layers)
+  File "/usr/local/lib/python2.7/site-packages/paddle/v2/topology.py", line 69, in __init__
+    layers, extra_layers=extra_layers)
+  File "/usr/local/lib/python2.7/site-packages/paddle/v2/layer.py", line 96, in parse_network
+    return __parse__(__real_func__)
+  File "/usr/local/lib/python2.7/site-packages/paddle/trainer_config_helpers/config_parser_utils.py", line 32, in parse_network_config
+    config = config_parser.parse_config(network_conf, config_arg_str)
+  File "/usr/local/lib/python2.7/site-packages/paddle/trainer/config_parser.py", line 3597, in parse_config
+    trainer_config()
+  File "/usr/local/lib/python2.7/site-packages/paddle/v2/layer.py", line 89, in __real_func__
+    real_output = [each.to_proto(context=context) for each in output_layers]
+  File "/usr/local/lib/python2.7/site-packages/paddle/v2/config_base.py", line 109, in to_proto
+    context=context)
+  File "/usr/local/lib/python2.7/site-packages/paddle/v2/config_base.py", line 116, in to_proto
+    ret_val = self.to_proto_impl(**kwargs)
+  File "/usr/local/lib/python2.7/site-packages/paddle/v2/layer.py", line 398, in to_proto_impl
+    RecurrentLayerGroupEnd(name=self.__recurrent_name__)
+  File "/usr/local/lib/python2.7/site-packages/paddle/trainer/config_parser.py", line 419, in RecurrentLayerGroupEnd
+    layer = g_layer_map[pair.layer_name]
+KeyError: u'memory@__recurrent_group_0__'
+&lt;/denchmark-code&gt;
+
+I think it is due to that the memory_update layer is not created at all, and then PaddlePaddle cannot find any layer matching the name "memory" in the created last_memory layer. The reason might be that the memory_update layer is not explicitly connected to the cost layer, misleading PaddlePaddle to ignore it when creating layers.
+However, it is actually connected (in a indirect or implicit manner) to the cost layer in the next time step through paddle.layer.memory component, and of-course, should never be ignored.
+I guess, any recurrent model with a cost layer depending on the previous-step memory rather than current-step memory (updated just now) will meet the same problem (because the current-step update memory layer will then have no connection to the cost layer within current time step).
+To prove it, I change only a single line of the code, making the cost layer depend on the current-step memory instead of the previous-step memory in original code, and then the model works just well.
+I change last_memory to memory_update as below (such that memory_update is explicitly connected to the final cost), and the code works just well.
+From
+&lt;denchmark-code&gt;        predict = paddle.layer.fc(
+            input=[embedding, last_memory],
+            size=dict_size,
+            act=paddle.activation.Softmax())
+&lt;/denchmark-code&gt;
+
+to
+&lt;denchmark-code&gt;        predict = paddle.layer.fc(
+            input=[embedding, memory_update],
+            size=dict_size,
+            act=paddle.activation.Softmax())
+&lt;/denchmark-code&gt;
+
+Neural Turing Machine model with "read first and write next" (not reverse) will also have such a problem. However, demos like vanilla LSTM/ GRU will not run into the problem since their cost or softmax output distribution depends LUCKILY on updated memory (hidden state, or cell state), instead of previous memory.
+Besides, such a problem didn't exist in V1 APIs.
+Would it be a bug? Could anyone help solve this issue?
+	</description>
+	<comments>
+		<comment id='1' author='xinghai-sun' date='2017-05-08T14:00:39Z'>
+		I also tried adding one line of code (as suggested by qingqing01 and  jacquesqiao):
+&lt;denchmark-code&gt;memory_last.append_child(memory_update, parent_names=[memory_last.name])
+&lt;/denchmark-code&gt;
+
+But still the same error.
+		</comment>
+		<comment id='2' author='xinghai-sun' date='2017-05-09T06:46:04Z'>
+		I encounter the same problem for scheduled sampling.
+During the training process, scheduled sampling needs to remember the predicted word of the last time step. I tried to use the memory layer to represent the predicted word in the recurrent group.
+&lt;denchmark-code&gt;    def gru_decoder_with_attention_train(enc_vec, enc_proj, true_word, true_token_flag):
+        generated_word_memory = paddle.layer.memory(
+            name='generated_word', size=target_dict_dim, boot_with_const_id=0)
+
+        # embedding and update the gru state (omit the code here)
+        ......
+
+        # calculate the softmax output
+        with paddle.layer.mixed(
+                size=target_dict_dim,
+                bias_attr=True,
+                act=paddle.activation.Softmax()) as out:
+            out += paddle.layer.full_matrix_projection(input=gru_step)
+
+        paddle.layer.max_id(input=out, name='generated_word')
+
+        return out
+&lt;/denchmark-code&gt;
+
+paddle.layer.max_id is only used to update the memory and not appears in the topological graph.
+The above code will encounter KeyError: u'generated_word@decoder_group'.
+In order to fix this problem, I tried to use the softmax output as the memory layer and then use max_id to extract the generated word. Since the softmax output is used for calculating the cost function, it will appear in the final topological graph. Such method works.
+		</comment>
+	</comments>
+</bug>

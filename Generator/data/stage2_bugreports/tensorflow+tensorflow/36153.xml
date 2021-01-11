@@ -1,0 +1,166 @@
+<bug id='36153' author='Flamefire' open_date='2020-01-23T10:15:49Z' closed_time='2020-08-06T17:26:58Z'>
+	<summary>MultiWorkerMirroredStrategy training does not work with multiple epochs</summary>
+	<description>
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): Minor adaption of https://www.tensorflow.org/tutorials/distribute/multi_worker_with_keras
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): RHEL 7.5
+TensorFlow installed from (source or binary): source
+TensorFlow version (use command below):2.1.0
+Python version: 3.7.4
+Bazel version (if compiling from source): 0.29.1
+GCC/Compiler version (if compiling from source): 8.3.0
+CUDA/cuDNN version: 10.1
+GPU model and memory: K80
+
+Describe the current behavior
+Executing training over multiple epochs and workers as per the example fails with "Empty training data" and
+
+WARNING:tensorflow:Your input ran out of data; interrupting training. Make sure that your dataset or generator can generate at least steps_per_epoch * epochs batches (in this case, 1407 batches). You may need to use the repeat() function when building your dataset.
+
+Describe the expected behavior
+Running training over multiple epochs automatically repeats the training data
+Code to reproduce the issue
+Pretty much the exact example code from the MultiWorkerDistributed tutorial:
+&lt;denchmark-code&gt;#!/usr/bin/env python
+
+import os
+import json
+import tensorflow_datasets as tfds
+import tensorflow as tf
+from slurm_utils import create_tf_config
+tfds.disable_progress_bar()
+
+BUFFER_SIZE = 10000
+BATCH_SIZE = 64
+
+
+def make_datasets_unbatched():
+    # Scaling MNIST data from (0, 255] to (0., 1.]
+    def scale(image, label):
+        image = tf.cast(image, tf.float32)
+        image /= 255
+        return image, label
+
+    datasets, info = tfds.load(name='mnist',
+                               with_info=True,
+                               as_supervised=True)
+
+    return datasets['train'].map(scale).cache().shuffle(BUFFER_SIZE)
+
+
+def build_and_compile_cnn_model():
+    model = tf.keras.Sequential([
+        tf.keras.layers.Conv2D(32,
+                               3,
+                               activation='relu',
+                               input_shape=(28, 28, 1)),
+        tf.keras.layers.MaxPooling2D(),
+        tf.keras.layers.Flatten(),
+        tf.keras.layers.Dense(64, activation='relu'),
+        tf.keras.layers.Dense(10, activation='softmax')
+    ])
+    model.compile(loss=tf.keras.losses.sparse_categorical_crossentropy,
+                  optimizer=tf.keras.optimizers.SGD(learning_rate=0.001),
+                  metrics=['accuracy'])
+    return model
+
+
+tfConfig = create_tf_config(gpus_per_task=2)
+print('Used Config: {}'.format(tfConfig))
+os.environ['TF_CONFIG'] = json.dumps(tfConfig)
+
+strategy = tf.distribute.experimental.MultiWorkerMirroredStrategy()
+print('Number of workers: {}\nParameter devices: {}\nWorkers: {}'.format(
+    strategy.num_replicas_in_sync, strategy.extended.parameter_devices,
+    strategy.extended.worker_devices))
+
+# Here the batch size scales up by number of workers since
+# `tf.data.Dataset.batch` expects the global batch size.
+GLOBAL_BATCH_SIZE = BATCH_SIZE * strategy.num_replicas_in_sync
+with strategy.scope():
+    # Creation of dataset, and model building/compiling need to be within
+    # `strategy.scope()`.
+    train_datasets = make_datasets_unbatched().batch(GLOBAL_BATCH_SIZE)
+    multi_worker_model = build_and_compile_cnn_model()
+
+multi_worker_model.fit(x=train_datasets, epochs=3)
+&lt;/denchmark-code&gt;
+
+Other info / logs
+The above create_tf_config creates the following config from SLURM environment: {'cluster': {'worker': ['taurusa9:8888']}, 'task': {'type': 'worker', 'index': 0, 'trial': 1}, 'job': None}
+Running with 1 epoch works without any other code changes
+	</description>
+	<comments>
+		<comment id='1' author='Flamefire' date='2020-02-06T16:52:13Z'>
+		I may have found the cause to this issue: After iterating over a  provided by  the iterator for that dataset is exhausted. There is some code here: &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/v2.1.0/tensorflow/python/keras/engine/data_adapter.py#L203-L208&gt;https://github.com/tensorflow/tensorflow/blob/v2.1.0/tensorflow/python/keras/engine/data_adapter.py#L203-L208&lt;/denchmark-link&gt;
+
+The size is always unknown because a DatasetAdapter is used. The steps_per_epoch is not None, because this is required for MultiWorkerMirroredStrategy. Hence the iterator is never recreated leading to the mentioned issue.
+I've seen that there were some changes, however &lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/6be131d0860559954c42685a87c63f16cebb2185&gt;6be131d&lt;/denchmark-link&gt;
+ does not fix the issue because  returns  leading to NOT recreating the iterator.
+Side note: Why is a  implemented in a way so it does not know its size? The information is often (always?) available. See e.g. &lt;denchmark-link:https://github.com/tensorflow/datasets/issues/1403&gt;tensorflow/datasets#1403&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='2' author='Flamefire' date='2020-02-25T07:45:23Z'>
+		I met up with the same problem. But in a little different scenario. I used the for loop as
+&lt;denchmark-code&gt;for epoch in range(FLAGS.epoch):
+        for train_data in train_dataset:
+           ...
+&lt;/denchmark-code&gt;
+
+I log on every train batch. But the train stops before the last step of the first epoch. I guess that dataset can't fetch from the second epoch to fill the shuffle queue.
+		</comment>
+		<comment id='3' author='Flamefire' date='2020-02-25T08:07:04Z'>
+		&lt;denchmark-link:https://github.com/372046933&gt;@372046933&lt;/denchmark-link&gt;
+ That is a different problem. The issue I describe is with the default training loop. Can you open another issue with a full example?
+
+But the train stops before the last step of the first epoch.
+
+In case you are using MultiWorkerMirroredStrategy: The docs explain that this can NOT handle the trailing batch and you need to use repeat or explicit step/batch counts.
+		</comment>
+		<comment id='4' author='Flamefire' date='2020-02-25T09:00:54Z'>
+		&lt;denchmark-link:https://github.com/Flamefire&gt;@Flamefire&lt;/denchmark-link&gt;
+  I was using custom training loop, i.e. there is no model.fit. Also, I just checked the failing point, it's far from the last batch. Anyway, it seems a different problem
+		</comment>
+		<comment id='5' author='Flamefire' date='2020-02-26T06:25:03Z'>
+		
+I met up with the same problem. But in a little different scenario. I used the for loop as
+for epoch in range(FLAGS.epoch):
+        for train_data in train_dataset:
+           ...
+
+I log on every train batch. But the train stops before the last step of the first epoch. I guess that dataset can't fetch from the second epoch to fill the shuffle queue.
+
+I logged  on every iteration, and found that the stopped position have smaller batch_size than  &lt;denchmark-link:https://github.com/Flamefire&gt;@Flamefire&lt;/denchmark-link&gt;
+ , Do you think this is a duplicate issue
+		</comment>
+		<comment id='6' author='Flamefire' date='2020-02-26T08:36:23Z'>
+		Your issue is different as I wrote in &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/36153#issuecomment-590736823&gt;#36153 (comment)&lt;/denchmark-link&gt;
+ because you use a custom training loop. Please open another issue after reading that comment again and verifying that you are NOT using your loop inside MultiWorkerMirroredStrategy scope which is documented not to work if the last batch is smaller than the others. In case of doubt open a new issue with ALL information instead of adding half-information to an existing issue as this makes it MUCH easier to reason about your problem.
+		</comment>
+		<comment id='7' author='Flamefire' date='2020-02-27T02:36:11Z'>
+		&lt;denchmark-link:https://github.com/Flamefire&gt;@Flamefire&lt;/denchmark-link&gt;
+ I have just opened an issue &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/37112&gt;#37112&lt;/denchmark-link&gt;
+ . Thanks for your help.
+		</comment>
+		<comment id='8' author='Flamefire' date='2020-06-08T06:44:28Z'>
+		This is a known issue that we are working on - MultiWorkerMirroredStrategy doesn't handle last partial batch correctly. To remedy the error, please pass steps_per_epoch argument (and use repeat in your dataset accordingly for multiple epochs). We've updated the tutorial with these details.
+&lt;denchmark-link:https://www.tensorflow.org/tutorials/distribute/multi_worker_with_keras#train_the_model_with_multiworkermirroredstrategy&gt;https://www.tensorflow.org/tutorials/distribute/multi_worker_with_keras#train_the_model_with_multiworkermirroredstrategy&lt;/denchmark-link&gt;
+
+We expect to have this fixed by TF 2.3
+		</comment>
+		<comment id='9' author='Flamefire' date='2020-08-06T17:26:58Z'>
+		Updating this thread as the  requirement with MWMS has been lifted and the tutorial has been updated again.
+For more info on distributed input, see this &lt;denchmark-link:https://www.tensorflow.org/tutorials/distribute/input#distributed_datasets&gt;guide.&lt;/denchmark-link&gt;
+
+I'll close the issue now, but feel free to reopen if something is still unanswered.
+		</comment>
+		<comment id='10' author='Flamefire' date='2020-08-06T17:27:00Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/36153&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/36153&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

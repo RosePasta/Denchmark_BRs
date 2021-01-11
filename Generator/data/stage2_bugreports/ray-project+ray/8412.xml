@@ -1,0 +1,139 @@
+<bug id='8412' author='Purpleslz' open_date='2020-05-12T06:46:54Z' closed_time='2020-06-05T16:31:03Z'>
+	<summary>[rllib] rllib not saving Tensorflow AdamOptimizer's momentum and accumulators</summary>
+	<description>
+&lt;denchmark-h:h3&gt;What is the problem?&lt;/denchmark-h&gt;
+
+Ray: 0.8.4
+Tensorflow: 1.14
+RLLib is using its own checkpoint saving API instead of  tensorflow's, and this API is not saving AdamOptimizer's momentum and accumulators.
+When using  AdamOptimizer, the momentum and accumulators (m, v, beta1_power, beta2_power &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/v1.14.0/tensorflow/python/training/adam.py#L118&gt;https://github.com/tensorflow/tensorflow/blob/v1.14.0/tensorflow/python/training/adam.py#L118&lt;/denchmark-link&gt;
+) is not saved.
+&lt;denchmark-h:h3&gt;Reproduction (REQUIRED)&lt;/denchmark-h&gt;
+
+Using official example which default optimizer is Adam: &lt;denchmark-link:https://github.com/ray-project/ray/blob/master/rllib/examples/custom_tf_policy.py&gt;https://github.com/ray-project/ray/blob/master/rllib/examples/custom_tf_policy.py&lt;/denchmark-link&gt;
+
+
+add checkpoint_freq=1 to tune.run's argument.
+Run example to save checkpoints.
+add restore=${checkpoint_path} to tune.run 's argument, restore from one checkpoint and rerun example.
+
+I checked from this line: &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/v1.14.0/tensorflow/python/training/optimizer.py#L1169&gt;https://github.com/tensorflow/tensorflow/blob/v1.14.0/tensorflow/python/training/optimizer.py#L1169&lt;/denchmark-link&gt;
+
+Tensorflow first creates these slot variables, then restore them. If there are no variables to restore, the deferred_restorations will be an empty list. These new created slot variables will be zero.
+	</description>
+	<comments>
+		<comment id='1' author='Purpleslz' date='2020-05-12T22:59:21Z'>
+		What's a good way of saving them? Now that we have deprecated modelv1, perhaps we can standardize on a Keras method? cc &lt;denchmark-link:https://github.com/sven1977&gt;@sven1977&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='2' author='Purpleslz' date='2020-05-13T03:43:37Z'>
+		
+What's a good way of saving them? Now that we have deprecated modelv1, perhaps we can standardize on a Keras method? cc @sven1977
+
+&lt;denchmark-link:https://github.com/ray-project/ray/blob/master/rllib/agents/trainer.py#L629&gt;Trainer's save method&lt;/denchmark-link&gt;
+ will only save &lt;denchmark-link:https://github.com/ray-project/ray/blob/master/rllib/policy/tf_policy.py#L229&gt;self._variables in tf policy class&lt;/denchmark-link&gt;
+ which will not contain optimizer's accumulators.
+I noticed we have implementations about export_checkpoint/export_model in policy, perhaps we should save model checkpoints and training checkpoints separately.
+		</comment>
+		<comment id='3' author='Purpleslz' date='2020-05-13T23:22:29Z'>
+		Hmm is the right thing to register those variables for saving as well? I think the optimizer variables used to be saved by TensorFlowVariables with ModelV1, so this is a regression with ModelV2, which only registers the model variables instead of walking the graph looking for them: &lt;denchmark-link:https://github.com/ray-project/ray/blob/master/rllib/policy/tf_policy.py#L230&gt;https://github.com/ray-project/ray/blob/master/rllib/policy/tf_policy.py#L230&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='4' author='Purpleslz' date='2020-05-14T12:52:01Z'>
+		Maybe you're right. The "export_checkpoint way" can support more frameworks (e.g. pytorch), torch_policy and tf_policy can use the same interface export_checkpoint and the implementation for tf&amp;pytorch is very simple.
+I think both ways are sufficient and reasonable to fix this issue, maybe "register optimizers' variable" is a better one. However, I'm not very familiar with tensorflow, I don't know how to do this.
+		</comment>
+		<comment id='5' author='Purpleslz' date='2020-05-18T07:56:02Z'>
+		&lt;denchmark-link:https://github.com/Purpleslz&gt;@Purpleslz&lt;/denchmark-link&gt;
+ Could you try this PR here and confirm whether this fixes your issue? I just made the ModelV2 branch behave the same as the ModelV1 one in terms of automatically collecting all vars in the tf-graph.
+		</comment>
+		<comment id='6' author='Purpleslz' date='2020-05-18T15:25:20Z'>
+		&lt;denchmark-link:https://github.com/ray-project/ray/pull/8480&gt;#8480&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='7' author='Purpleslz' date='2020-05-20T07:03:59Z'>
+		This PR &lt;denchmark-link:https://github.com/ray-project/ray/pull/8480&gt;#8480&lt;/denchmark-link&gt;
+ doesn't solve my problem. I'm not sure whether my verification method is correct：
+
+I checked the https://github.com/tensorflow/tensorflow/blob/v1.14.0/tensorflow/python/training/optimizer.py#L1169 this line, this line is restoring optimizers' variables. If there are no variables to restore, the deferred_restorations will be an empty list. After the PR, the list is still empty.
+I think the Adam optimizers' momentum variables will have Adam suffix, accumulators will have Beta suffix.  I print self._variables keys in https://github.com/ray-project/ray/blob/master/python/ray/experimental/tf_utils.py#L94, there is no such variables.
+
+		</comment>
+		<comment id='8' author='Purpleslz' date='2020-05-22T09:25:55Z'>
+		I don't actually think the problem is ModelV1/V2 related at all.
+In tf, optimizer variables are generated after initializing the global vars: self._sess.run(tf.global_variables_initializer()) and this is happening after we store a Model's vars (V1/V2 doesn't matter here) in self._variables, so the optimizer vars were never part of that list.
+When creating a checkpoint, only things in self._variables are stored as the Policy's state.
+Let's store the optimizer vars separately (I don't think they should be returned in Policy.get_weights()) and then do include them in the storing process (Policy.get_state()).
+		</comment>
+		<comment id='9' author='Purpleslz' date='2020-05-22T10:37:08Z'>
+		Can you try again? This is working now on my end:
+&lt;denchmark-code&gt;trainer.train(). # &lt;- e.g. DQN with an Adam optimizer
+chkpoint= trainer.save()
+...
+new_trainer = ...
+new_trainer.restore(chkpoint)
+p = new_trainer.get_policy()
+p._sess.run(p._optimizer._slots)
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='10' author='Purpleslz' date='2020-05-22T10:38:18Z'>
+		&lt;denchmark-link:https://github.com/Purpleslz&gt;@Purpleslz&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='11' author='Purpleslz' date='2020-05-23T02:24:37Z'>
+		Yeah, it makes sense to not include them in the policy get_weights, but only in trainer checkpoints.
+		</comment>
+		<comment id='12' author='Purpleslz' date='2020-05-23T12:38:09Z'>
+		
+Can you try again? This is working now on my end:
+trainer.train(). # &lt;- e.g. DQN with an Adam optimizer
+chkpoint= trainer.save()
+...
+new_trainer = ...
+new_trainer.restore(chkpoint)
+p = new_trainer.get_policy()
+p._sess.run(p._optimizer._slots)
+
+
+I am using ray repo in the master branch, and merged the &lt;denchmark-link:https://github.com/ray-project/ray/pull/8480&gt;#8840&lt;/denchmark-link&gt;
+.
+However, I got this error:
+&lt;denchmark-code&gt;  File "xxxxx/.pyenv/versions/anaconda3-5.0.1/envs/ray/lib/python3.6/site-packages/tensorflow/python/keras/optimizer_v2/optimizer_v2
+.py", line 532, in __getattribute__
+    return super(OptimizerV2, self).__getattribute__(name)
+AttributeError: 'Adam' object has no attribute 'compute_gradients'
+&lt;/denchmark-code&gt;
+
+I think the problem is in this line: 
+
+
+ray/rllib/policy/tf_policy.py
+
+
+         Line 721
+      in
+      497493d
+
+
+
+
+
+
+ return tf.keras.optimizers.Adam(learning_rate=self.cur_lr) 
+
+
+
+
+, when I changed this optimzier to tf.train.AdamOptimizer the code could run correctly.
+It seems that the optimizers' variables could be saved and restored, when will the pull request be merged?
+		</comment>
+		<comment id='13' author='Purpleslz' date='2020-06-05T16:31:03Z'>
+		This PR fixes (and tests) saving optimizer state for later restoring.
+&lt;denchmark-link:https://github.com/ray-project/ray/pull/8480&gt;#8480&lt;/denchmark-link&gt;
+
+Will be merged later today.
+Closing this issue.
+		</comment>
+	</comments>
+</bug>

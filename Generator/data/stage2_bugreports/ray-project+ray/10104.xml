@@ -1,0 +1,92 @@
+<bug id='10104' author='snmhaines' open_date='2020-08-13T22:43:03Z' closed_time='2020-09-02T18:41:34Z'>
+	<summary>Too many open files error</summary>
+	<description>
+I am trying to run a large cluster on EC2 (21 x c5.24xlarge for Ubuntu 18.04), using Ray 0.8.6  but experiencing this run-time error:-
+&lt;denchmark-code&gt;"COULD NOT CREATE A LOGGINGFILE .... Could not create logging file: Too may open files"  
+&lt;/denchmark-code&gt;
+
+This has recently been reported before (issues &lt;denchmark-link:https://github.com/ray-project/ray/issues/6583&gt;#6583&lt;/denchmark-link&gt;
+  and &lt;denchmark-link:https://github.com/ray-project/ray/issues/7169&gt;#7169&lt;/denchmark-link&gt;
+), but neither of the solutions used therein seem to work.  I increased  ulimit in the head_start_ray_commands from 65536 to 1000000, then 10000000.  I also tried 1000000 in the worker config as well - neither made any difference: i.e. the fault occurred at about the same time in any case.  I presume that 2^16 is a hard limit determined elsewhere.
+I also tried "sync_to_driver=False" in the head-node config, after Ray is started.  This did have a noticeable effect:  the error didn't occur, at least not until I aborted the test at 30 minutes, but the performance of the cluster was crippled  - estimate that it would have taken about 20 times as long to run the test.
+The test itself only involves opening and then closing one small text input file (local to each worker) on initialization, and I have run it with no problem on a cluster with a head-node and two workers.  I am guessing that the overload is being caused by the generation of all the log files on the head node, so I need a way of effectively stopping that.
+	</description>
+	<comments>
+		<comment id='1' author='snmhaines' date='2020-08-14T02:40:55Z'>
+		cc &lt;denchmark-link:https://github.com/wuisawesome&gt;@wuisawesome&lt;/denchmark-link&gt;
+ Any clue?
+		</comment>
+		<comment id='2' author='snmhaines' date='2020-08-14T02:47:01Z'>
+		&lt;denchmark-link:https://github.com/snmhaines&gt;@snmhaines&lt;/denchmark-link&gt;
+ thaanks for the report, some diagnostic data might be useful here.
+Can you get the output from find /tmp/ray/session_latest | wc -l, find /tmp/ray/session_latest/logs | wc -l, and find /tmp/ray/session_latest/sockets | wc -l?
+If either of those directories contains a very large (thousands) of files, most of those file names will follow a pattern which would be very useful.
+		</comment>
+		<comment id='3' author='snmhaines' date='2020-08-21T00:27:54Z'>
+		OK, I have managed mostly to reproduce this problem and am attaching all the info I can find:-
+&lt;denchmark-link:https://github.com/ray-project/ray/files/5106032/logs.zip&gt;logs.zip&lt;/denchmark-link&gt;
+
+This contains:-
+
+conf_east_c5.24xlarge.yaml: the config file
+AWS CloudTrail.doc: shows the initialization of the cluster on AWS
+Logs: The logs directory (the sockets one only contained two sockets - plasma_store and raylets - which cannot be copied).
+Ubuntu Terminal.doc: the terminal display including everything from the "ray up" command, to my keyboard interrupt of the application (Big_Data_Gen.py).   The latter starts to fail at "E0820 22:08:27.820545  8341  8456 task_manager.cc:304] 3 retries left for task fdee3a7f127d76beffffffff0100, attempting to resubmit."
+ray-timeline-2020-08-20_22-14-14.json:  I notice one important thing from this: it shows all 1008 cores initializing, but only about 100 of the tasks being run (the py application asks ray to run 1006 in parallel); also, these tasks do not start immediately.  I do not know whether this is actually what is happening, or just a failure of complete logging.
+
+What I have not found, so far, is the "COULD NOT CREATE A LOGGINGFILE" error message.
+		</comment>
+		<comment id='4' author='snmhaines' date='2020-08-24T01:50:31Z'>
+		I think that, as &lt;denchmark-link:https://github.com/richardliaw&gt;@richardliaw&lt;/denchmark-link&gt;
+ suggests, this problem should be re-classified as one produced by resource management for large clusters, because it seems that there may be multiple causes.
+I have found that the first is the installation of boto3 on worker nodes; as I was doing in the general setup section of the config' included above.  This works only up to about 480 CPUs ( i.e. "actual", for the 10 c5.24xlarge instances: head-node and 9 workers).  With boto3 only on the head-node, I can run up to 960 CPUs (20 instances) reasonably reliably.
+The increase to even just one task running on a 21st instance causes similar errors to situation recorded in the attached files above.  In one run with this number of tasks, I did encounter this glibc bug: "Assertion `listp-&gt;slotinfo[cnt].gen &lt;= GL(dl_tls_generation)' failed! &lt;denchmark-link:https://github.com/ray-project/ray/issues/2207&gt;#2207&lt;/denchmark-link&gt;
+ ", and in another there was: "OSError: [Errno 24] Too many open files: './Datout1.mat'".  However, neither of these was immediately repeatable.  Mostly, workers are timing out on handshaking and being closed down, with tasks that couldn't complete being reallocated to workers that have the capacity, and/or the autoscaler spinning up new instances to take their place.  All of which slows down the cluster considerably.
+For my purposes, I can work with 20 instances, so I am leaving this issue open for someone else to investigate who has better insight into the processes of cluster communications than I.
+P.S.
+One more piece of information: the simulation that is the task being parallelized is about 105 Mb when compiled and takes 730 sec to run.  A second version, that runs at a higher sample frequency, is 115 Mb and takes about 100 s longer; however it causes the cluster to start choking up at just over 672 cores.
+		</comment>
+		<comment id='5' author='snmhaines' date='2020-09-02T18:41:27Z'>
+		I think that I have got to the bottom of these problems now, so I will close the issue.
+The main one is that the "ulimit -n ..." command in the head_ and worker_start_ray_commands: sections do not work (presumably not the right environment). So the c5.24xlarge instances default to the soft limit for open files, which is only 1024.  The hard limit is 1048576, so I managed to change the soft limit to that by editing the limits.conf files in the common setup_commands, as follows:
+&lt;denchmark-code&gt;    - sudo chmod -R 777 /etc/security/*
+    - echo "*   soft  nofile  1048576" | tee -a /etc/security/limits.conf
+&lt;/denchmark-code&gt;
+
+This got rid of most of the errors (even though they did not necessarily report "too many open files").
+The remaining problem seems to have been the termination of spot instances due to lack of availability.  This produces messages such as:-
+&lt;denchmark-code&gt;E0902 18:16:43.617805  8397  8512 task_manager.cc:304] 3 retries left for task 383577a27f00f481ffffffff0100, attempting to resubmit.
+E0902 18:16:43.617892  8397  8512 core_worker.cc:415] Will resubmit task after a 5000ms delay: Type=NORMAL_TASK, Language=PYTHON, Resources: {CPU: 1, }, function_descriptor={type=PythonFunctionDescriptor, module_name=__main__, class_name=, function_name=test_loop, function_hash=7ad0dbfd66031441eeb2ab05740d85865bb7c016}, task_id=383577a27f00f481ffffffff0100, job_id=0100, num_args=4, num_returns=1
+2020-09-02 18:17:13,314	WARNING worker.py:1134 -- The node with node id 6213112ab29be6e36b57fc3b0ddaf1c6e046a630 has been marked dead because the detector has missed too many heartbeats from it.
+E0902 18:18:59.365111  8397  8512 direct_task_transport.cc:274] Retrying attempt to schedule task at remote node. Error: IOError: 14: Broken pipe
+E0902 18:18:59.365479  8397  8512 direct_task_transport.cc:274] Retrying attempt to schedule task at remote node. Error: IOError: 14: Broken pipe
+&lt;/denchmark-code&gt;
+
+I had assumed that spot instances with the maximum price at the default value (equal to the on-demand price) would not get terminated, but it appears that any spot instance can be terminated if an on-demand one is needed, regardless of the maximum price.  I will investigate how to choose different termination behaviour and/or reserved spot instances, but it would be useful if the reported error when the termination occurs was a bit less cryptic.
+		</comment>
+		<comment id='6' author='snmhaines' date='2020-12-23T19:57:53Z'>
+		
+I think that I have got to the bottom of these problems now, so I will close the issue.
+The main one is that the "ulimit -n ..." command in the head_ and worker_start_ray_commands: sections do not work (presumably not the right environment). So the c5.24xlarge instances default to the soft limit for open files, which is only 1024. The hard limit is 1048576, so I managed to change the soft limit to that by editing the limits.conf files in the common setup_commands, as follows:
+    - sudo chmod -R 777 /etc/security/*
+    - echo "*   soft  nofile  1048576" | tee -a /etc/security/limits.conf
+
+This got rid of most of the errors (even though they did not necessarily report "too many open files").
+The remaining problem seems to have been the termination of spot instances due to lack of availability. This produces messages such as:-
+E0902 18:16:43.617805  8397  8512 task_manager.cc:304] 3 retries left for task 383577a27f00f481ffffffff0100, attempting to resubmit.
+E0902 18:16:43.617892  8397  8512 core_worker.cc:415] Will resubmit task after a 5000ms delay: Type=NORMAL_TASK, Language=PYTHON, Resources: {CPU: 1, }, function_descriptor={type=PythonFunctionDescriptor, module_name=__main__, class_name=, function_name=test_loop, function_hash=7ad0dbfd66031441eeb2ab05740d85865bb7c016}, task_id=383577a27f00f481ffffffff0100, job_id=0100, num_args=4, num_returns=1
+2020-09-02 18:17:13,314	WARNING worker.py:1134 -- The node with node id 6213112ab29be6e36b57fc3b0ddaf1c6e046a630 has been marked dead because the detector has missed too many heartbeats from it.
+E0902 18:18:59.365111  8397  8512 direct_task_transport.cc:274] Retrying attempt to schedule task at remote node. Error: IOError: 14: Broken pipe
+E0902 18:18:59.365479  8397  8512 direct_task_transport.cc:274] Retrying attempt to schedule task at remote node. Error: IOError: 14: Broken pipe
+
+I had assumed that spot instances with the maximum price at the default value (equal to the on-demand price) would not get terminated, but it appears that any spot instance can be terminated if an on-demand one is needed, regardless of the maximum price. I will investigate how to choose different termination behaviour and/or reserved spot instances, but it would be useful if the reported error when the termination occurs was a bit less cryptic.
+
+&lt;denchmark-link:https://github.com/snmhaines&gt;@snmhaines&lt;/denchmark-link&gt;
+
+Thanks for the suggested solution. Any ideas of an alternative workaround when I can't have sudo access? Thanks in advance.
+		</comment>
+		<comment id='7' author='snmhaines' date='2020-12-24T05:25:40Z'>
+		I don't know what you are trying to do, but my advice would be that if you do not have the Linux super-user access rights, then you should find someone who has to configure the system for you.
+		</comment>
+	</comments>
+</bug>

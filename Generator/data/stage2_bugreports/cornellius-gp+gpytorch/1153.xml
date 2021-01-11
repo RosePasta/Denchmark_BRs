@@ -1,0 +1,361 @@
+<bug id='1153' author='foail' open_date='2020-05-19T01:06:08Z' closed_time='2020-06-08T19:11:44Z'>
+	<summary>[Bug] #1084 not solved with version 1.1.1</summary>
+	<description>
+&lt;denchmark-h:h1&gt;🐛 Bug&lt;/denchmark-h&gt;
+
+The same problem as stated in issue &lt;denchmark-link:https://github.com/cornellius-gp/gpytorch/issues/1084&gt;#1084&lt;/denchmark-link&gt;
+ occurs with the version 1.1.1. I am also trying to combine conv2d with deep kernel learning for a regression task. So I used a very similar approach as stated in issue &lt;denchmark-link:https://github.com/cornellius-gp/gpytorch/issues/1084&gt;#1084&lt;/denchmark-link&gt;
+. Although issue &lt;denchmark-link:https://github.com/cornellius-gp/gpytorch/issues/1084&gt;#1084&lt;/denchmark-link&gt;
+ is closed, I ran the same code in issue &lt;denchmark-link:https://github.com/cornellius-gp/gpytorch/issues/1084&gt;#1084&lt;/denchmark-link&gt;
+ and reproduced the same error "RuntimeError: Shapes are not broadcastable for mul operatio".
+&lt;denchmark-h:h2&gt;To reproduce&lt;/denchmark-h&gt;
+
+** Code snippet to reproduce **
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Mar 23 19:17:40 2020
+
+@author: denisilie94
+"""
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Mar 23 15:38:22 2020
+
+@author: denisilie94
+"""
+
+import os
+import tqdm
+import torch
+import gpytorch
+import numpy as np
+from matplotlib import pyplot as plt
+
+
+# Define a plotting function
+def ax_plot(f, ax, y_labels, title):
+    im = ax.imshow(y_labels)
+    ax.set_title(title)
+    f.colorbar(im)
+    
+
+# Load Olivetti faces database
+data = np.load('olivetti.npz')
+
+train_x = torch.Tensor(data['train_x'])
+train_x = train_x.reshape((train_x.shape[0], 1, train_x.shape[1], train_x.shape[2]))
+train_y = torch.Tensor(data['train_y'])
+
+
+test_x = torch.Tensor(data['test_x'])
+test_x = test_x.reshape((test_x.shape[0], 1, test_x.shape[1], test_x.shape[2]))
+test_y = torch.Tensor(data['test_y'])
+
+
+# Create dataset
+dataset    = torch.utils.data.TensorDataset(train_x, train_y)
+dataloader = torch.utils.data.DataLoader(dataset) 
+
+if torch.cuda.is_available():
+    train_x, train_y = train_x.cuda(), train_y.cuda()
+    
+    
+# Defining the DKL Feature Extractor
+data_dim = train_x.size(-1)
+
+class LargeFeatureExtractor(torch.nn.Sequential):           
+    def __init__(self):                                      
+        super(LargeFeatureExtractor, self).__init__()        
+        self.add_module('conv1', torch.nn.Conv2d(kernel_size=(5,5), stride=1, in_channels=1, out_channels=20))
+        self.add_module('pool1', torch.nn.MaxPool2d(kernel_size=(2, 2), stride=2))                  
+        self.add_module('conv2', torch.nn.Conv2d(kernel_size=(5,5), stride=1, in_channels=20, out_channels=50))     
+        self.add_module('pool2', torch.nn.MaxPool2d(kernel_size=(2, 2), stride=2))
+        self.add_module('flatt', torch.nn.Flatten())              
+        self.add_module('full3', torch.nn.Linear(800, 1000))
+        self.add_module('relu3', torch.nn.ReLU())
+        self.add_module('full4', torch.nn.Linear(1000, 500))                  
+        self.add_module('relu4', torch.nn.ReLU())
+        self.add_module('full5', torch.nn.Linear(500, 50))       
+        self.add_module('full6', torch.nn.Linear(50, 2))
+        
+feature_extractor = LargeFeatureExtractor()
+
+
+# Defining the DKL-GP Model
+class GPRegressionModel(gpytorch.models.ExactGP):
+        def __init__(self, train_x, train_y, likelihood):
+            super(GPRegressionModel, self).__init__(train_x, train_y, likelihood)
+            self.mean_module = gpytorch.means.ConstantMean()
+            self.covar_module = gpytorch.kernels.GridInterpolationKernel(
+                gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=1)),
+                num_dims=2, grid_size=100
+            )
+            self.feature_extractor = feature_extractor
+
+        def forward(self, x):
+            # We're first putting our data through a deep net (feature extractor)
+            # We're also scaling the features so that they're nice values
+            projected_x = self.feature_extractor(x)
+            projected_x = projected_x - projected_x.min(0)[0]
+            projected_x = 2 * (projected_x / projected_x.max(0)[0]) - 1
+        
+            mean_x = self.mean_module(projected_x)
+            covar_x = self.covar_module(projected_x)
+            return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+
+        
+
+likelihood = gpytorch.likelihoods.GaussianLikelihood()
+model = GPRegressionModel(train_x, train_y, likelihood)
+
+if torch.cuda.is_available():
+    model = model.cuda()
+    likelihood = likelihood.cuda()
+    
+# Training the model
+training_iterations = 1
+
+# Find optimal model hyperparameters
+model.train()
+likelihood.train()
+
+# Use the adam optimizer
+optimizer = torch.optim.Adam([
+    {'params': model.feature_extractor.parameters()},
+    {'params': model.covar_module.parameters()},
+    {'params': model.mean_module.parameters()},
+    {'params': model.likelihood.parameters()},
+], lr=0.01)
+
+# "Loss" for GPs - the marginal log likelihood
+mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
+
+def train():
+    iterator = tqdm.tqdm_notebook(range(training_iterations))
+    for i in iterator:
+        # Zero backprop gradients
+        optimizer.zero_grad()
+        # Get output from model
+        output = model(train_x)
+        # Calc loss and backprop derivatives
+        loss = -mll(output, train_y)
+        loss.backward()
+        iterator.set_postfix(loss=loss.item())
+        optimizer.step()
+        
+        # extract covariance matrix
+#        cov_mat = output.covariance_matrix.detach().numpy()
+        
+        # Plot our predictive means
+#        fig, observed_ax = plt.subplots(1, 1)
+#        ax_plot(fig, observed_ax, cov_mat, 'Covariance kernel matrix')
+#        fig.savefig('{}/{}_{}.png'.format(outputDir, i, outputDir))
+#        plt.close(fig)
+
+# define output folder
+if type(model.covar_module.base_kernel.base_kernel) is gpytorch.kernels.rbf_kernel.RBFKernel:
+    outputDir = 'RBFKernel'
+else:
+    outputDir = 'SpectralMixtureKernel'
+    
+# create output directory if needed    
+if not os.path.exists(outputDir):
+    os.mkdir(outputDir)
+        
+# train model
+train()
+
+
+# Making predictions
+model.eval()
+likelihood.eval()
+with torch.no_grad(), gpytorch.settings.use_toeplitz(False), gpytorch.settings.fast_pred_var():
+    preds = model(test_x)
+
+print('Test MAE: {}'.format(torch.mean(torch.abs(preds.mean - test_y))))
+** Stack trace/error message **
+&lt;denchmark-code&gt;---------------------------------------------------------------------------
+RuntimeError                              Traceback (most recent call last)
+&lt;ipython-input-22-f38243cc9371&gt; in &lt;module&gt;()
+      4 likelihood.eval()
+      5 with torch.no_grad(), gpytorch.settings.use_toeplitz(False), gpytorch.settings.fast_pred_var():
+----&gt; 6     preds = model(test_x)
+      7 
+      8 print('Test MAE: {}'.format(torch.mean(torch.abs(preds.mean - test_y))))
+
+1 frames
+/usr/local/lib/python3.6/dist-packages/gpytorch/models/exact_gp.py in __call__(self, *args, **kwargs)
+    306                     train_input = train_input.expand(*batch_shape, *train_input.shape[-2:])
+    307                 if batch_shape != input.shape[:-2]:
+--&gt; 308                     batch_shape = _mul_broadcast_shape(batch_shape, input.shape[:-2])
+    309                     train_input = train_input.expand(*batch_shape, *train_input.shape[-2:])
+    310                     input = input.expand(*batch_shape, *input.shape[-2:])
+
+/usr/local/lib/python3.6/dist-packages/gpytorch/utils/broadcasting.py in _mul_broadcast_shape(error_msg, *shapes)
+     18             if any(size != non_singleton_sizes[0] for size in non_singleton_sizes):
+     19                 if error_msg is None:
+---&gt; 20                     raise RuntimeError("Shapes are not broadcastable for mul operation")
+     21                 else:
+     22                     raise RuntimeError(error_msg)
+
+RuntimeError: Shapes are not broadcastable for mul operation
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h2&gt;System information&lt;/denchmark-h&gt;
+
+GPyTorch Version 1.1.1
+PyTorch Version 1.4.0
+Google Colab
+	</description>
+	<comments>
+		<comment id='1' author='foail' date='2020-05-19T04:59:10Z'>
+		Can you try replacing your kernel with ScaleKernel(GridInterpolationKernel(RBFKernel()))? (Rather than GridInterpolationKernel(ScaleKernel(RBFKernel())))
+		</comment>
+		<comment id='2' author='foail' date='2020-05-19T11:36:44Z'>
+		
+Can you try replacing your kernel with ScaleKernel(GridInterpolationKernel(RBFKernel()))? (Rather than GridInterpolationKernel(ScaleKernel(RBFKernel())))
+
+Thank you for your reply. I tried as you suggested. The training worked as before. However, the same error happened during the testing.
+&lt;denchmark-h:h3&gt;To reproduce the error:&lt;/denchmark-h&gt;
+
+&lt;denchmark-code&gt;class GPRegressionModel(gpytorch.models.ExactGP):
+        def __init__(self, train_x, train_y, likelihood):
+            super(GPRegressionModel, self).__init__(train_x, train_y, likelihood)
+            self.mean_module = gpytorch.means.ConstantMean()
+
+            self.covar_module = gpytorch.kernels.ScaleKernel( 
+                gpytorch.kernels.GridInterpolationKernel(gpytorch.kernels.RBFKernel(ard_num_dims=1), num_dims=2, grid_size=100)
+                
+            )
+            self.feature_extractor = feature_extractor
+
+        def forward(self, x):
+            # We're first putting our data through a deep net (feature extractor)
+            # We're also scaling the features so that they're nice values
+            projected_x = self.feature_extractor(x)
+            projected_x = projected_x - projected_x.min(0)[0]
+            projected_x = 2 * (projected_x / projected_x.max(0)[0]) - 1
+
+            mean_x = self.mean_module(projected_x)
+            covar_x = self.covar_module(projected_x)
+            return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h3&gt;Stack trace/error message&lt;/denchmark-h&gt;
+
+&lt;denchmark-code&gt;---------------------------------------------------------------------------
+RuntimeError                              Traceback (most recent call last)
+&lt;ipython-input-32-f38243cc9371&gt; in &lt;module&gt;()
+      4 likelihood.eval()
+      5 with torch.no_grad(), gpytorch.settings.use_toeplitz(False), gpytorch.settings.fast_pred_var():
+----&gt; 6     preds = model(test_x)
+      7 
+      8 print('Test MAE: {}'.format(torch.mean(torch.abs(preds.mean - test_y))))
+
+1 frames
+/usr/local/lib/python3.6/dist-packages/gpytorch/models/exact_gp.py in __call__(self, *args, **kwargs)
+    306                     train_input = train_input.expand(*batch_shape, *train_input.shape[-2:])
+    307                 if batch_shape != input.shape[:-2]:
+--&gt; 308                     batch_shape = _mul_broadcast_shape(batch_shape, input.shape[:-2])
+    309                     train_input = train_input.expand(*batch_shape, *train_input.shape[-2:])
+    310                     input = input.expand(*batch_shape, *input.shape[-2:])
+
+/usr/local/lib/python3.6/dist-packages/gpytorch/utils/broadcasting.py in _mul_broadcast_shape(error_msg, *shapes)
+     18             if any(size != non_singleton_sizes[0] for size in non_singleton_sizes):
+     19                 if error_msg is None:
+---&gt; 20                     raise RuntimeError("Shapes are not broadcastable for mul operation")
+     21                 else:
+     22                     raise RuntimeError(error_msg)
+
+RuntimeError: Shapes are not broadcastable for mul operation
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='3' author='foail' date='2020-05-19T12:56:36Z'>
+		Gotcha. We're pretty swamped for the next week or two but I'll try to take a look soon.
+		</comment>
+		<comment id='4' author='foail' date='2020-06-04T18:33:42Z'>
+		I am seeing the same issue and suspect it's due to the following lines in the exact_gp src:
+`
+def call(self, *args, **kwargs):
+&lt;denchmark-code&gt;    train_inputs = list(self.train_inputs) if self.train_inputs is not None else []
+
+    inputs = [i.unsqueeze(-1) if i.ndimension() == 1 else i for i in args]
+&lt;/denchmark-code&gt;
+
+`
+The example "KISSGP_Deep_Kernel_Regression_CUDA" has a input size of (Batch_n, n). When test_x is sent into model for prediction, sample shape is altered to (18, 1) from (18) due to the above "if i.ndimension() == 1" condition.
+My dataset x has the size (Batch_n, d, n), therefore when model is called for prediction, the test sample shape remains the same since it does not meet the "if i.ndimension() == 1".
+I am curious as to why test sample shape has to be modified while train sample shape does not, especially since in the posterior mode both test and train inputs are to be concatenated through:
+ full_inputs.append(torch.cat([train_input, input], dim=-2))
+		</comment>
+		<comment id='5' author='foail' date='2020-06-08T19:11:43Z'>
+		&lt;denchmark-link:https://github.com/foail&gt;@foail&lt;/denchmark-link&gt;
+ - the issue is that GPyTorch expects the input to be  (or ). What you should do is flatten your train/test_x, and un-flatten them in . &lt;denchmark-link:https://github.com/ac25737&gt;@ac25737&lt;/denchmark-link&gt;
+ this should solve your issue as well.
+		</comment>
+		<comment id='6' author='foail' date='2020-06-09T02:52:52Z'>
+		&lt;denchmark-link:https://github.com/gpleiss&gt;@gpleiss&lt;/denchmark-link&gt;
+  Could you further clarify the solution as to how input should be un-flattened in  in the following case where the same error is re-created?
+I altered the data size in "KISSGP_Deep_Kernel_Regression_CUDA" so that they are
+&lt;denchmark-code&gt;print(train_x.size(), test_x.size(), train_y.size(), test_y.size())
+torch.Size([13279, 1, 18]) torch.Size([3320, 1, 18]) torch.Size([13279]) torch.Size([3320])
+&lt;/denchmark-code&gt;
+
+And feature extractor was modified so that the extracted output still has the same shape as in the original notebook.
+&lt;denchmark-code&gt;class LargeFeatureExtractor(torch.nn.Sequential):           
+    def __init__(self):                                      
+        super(LargeFeatureExtractor, self).__init__()  
+        self.add_module('conv1', torch.nn.Conv1d(kernel_size=7, stride=1, in_channels=1, out_channels=30))
+        self.add_module('pool1', torch.nn.MaxPool1d(kernel_size=2, stride=2))
+        self.add_module('flatt', torch.nn.Flatten())
+        self.add_module('linear1', torch.nn.Linear(data_dim * 10, 1000))
+        self.add_module('relu1', torch.nn.ReLU())                  
+        self.add_module('linear2', torch.nn.Linear(1000, 500))     
+        self.add_module('relu2', torch.nn.ReLU())                  
+        self.add_module('linear3', torch.nn.Linear(500, 50))       
+        self.add_module('relu3', torch.nn.ReLU())                  
+        self.add_module('linear4', torch.nn.Linear(50, 2))  
+&lt;/denchmark-code&gt;
+
+extracted feature has size(2) for each sample
+&lt;denchmark-code&gt;feature_extractor(test_x).size()
+torch.Size([3320, 2])
+&lt;/denchmark-code&gt;
+
+When the rest of the notebook remains un-changed, model trains without issue, though throwing an issue during prediction:
+&lt;denchmark-code&gt;RuntimeError                              Traceback (most recent call last)
+&lt;ipython-input-20-4d8528462b74&gt; in &lt;module&gt;
+      2 likelihood.eval()
+      3 with torch.no_grad(), gpytorch.settings.use_toeplitz(False), gpytorch.settings.fast_pred_var():
+----&gt; 4     preds = model(test_x)
+
+c:\users\ac25737\appdata\local\continuum\miniconda3\envs\sagemaker\lib\site-packages\gpytorch\models\exact_gp.py in __call__(self, *args, **kwargs)
+    306                     train_input = train_input.expand(*batch_shape, *train_input.shape[-2:])
+    307                 if batch_shape != input.shape[:-2]:
+--&gt; 308                     batch_shape = _mul_broadcast_shape(batch_shape, input.shape[:-2])
+    309                     train_input = train_input.expand(*batch_shape, *train_input.shape[-2:])
+    310                     input = input.expand(*batch_shape, *input.shape[-2:])
+
+c:\users\ac25737\appdata\local\continuum\miniconda3\envs\sagemaker\lib\site-packages\gpytorch\utils\broadcasting.py in _mul_broadcast_shape(error_msg, *shapes)
+     18             if any(size != non_singleton_sizes[0] for size in non_singleton_sizes):
+     19                 if error_msg is None:
+---&gt; 20                     raise RuntimeError("Shapes are not broadcastable for mul operation")
+     21                 else:
+     22                     raise RuntimeError(error_msg)
+
+RuntimeError: Shapes are not broadcastable for mul operation```
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='7' author='foail' date='2020-06-09T13:34:44Z'>
+		train_x and test_x should be 13279 x 18 and 3320 x 18, respectively.
+		</comment>
+		<comment id='8' author='foail' date='2020-06-09T18:28:25Z'>
+		Thanks. It is clear now. It works after train/test input (batch, n, d) is first reshaped into (batch, n x d) before model and then reshaped back to (batch, n, d) before feature extractor.
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,118 @@
+<bug id='15518' author='Hong-Xiang' open_date='2017-12-20T09:47:28Z' closed_time='2017-12-20T19:39:15Z'>
+	<summary>Possible memory leak with tf.py_func() with distributed Tensorflow?</summary>
+	<description>
+When running Tensorflow as an distributed process to provide data with tf.data, it gradually consumes more and more memory, and finally consumes all memory of the system.
+Scripts to reproduce:
+We use a dummy dataset which produce [128, 28, 28, 1] tensors.
+Case1: Without distribute, which works fine, it will only consume 429Mb memory, no matter how many batches we run.
+Codes in test1.py:
+&lt;denchmark-code&gt;#test1.py
+import tensorflow as tf
+import numpy as np
+from tqdm import tqdm
+
+def dataset_generator():
+    while True:
+        yield np.random.uniform(size=[28, 28, 1]).astype(np.float32)
+dataset = tf.data.Dataset.from_generator(dataset_generator, tf.float32)
+dataset = dataset.batch(128)
+value = dataset.make_one_shot_iterator().get_next()
+
+sess = tf.Session()
+for _ in tqdm(range(100000), ascii=True):
+    sess.run(value)
+&lt;/denchmark-code&gt;
+
+Case: With distribute, it will consumes more and more memory while running more and more batches. It consumes 10+Gb with less than 1M batches. Use the following two commands in two processes to run the test2.py:
+&lt;denchmark-code&gt;CUDA_VISIBLE_DEVICES="" python test2.py dataset
+CUDA_VISIBLE_DEVICES="" python test2.py test
+&lt;/denchmark-code&gt;
+
+Codes in test2.py
+&lt;denchmark-code&gt;# test2.py
+import tensorflow as tf
+import numpy as np
+from tqdm import tqdm
+import sys
+def main(role):
+    def dataset_generator():
+        while True:
+            yield np.random.uniform(size=[28, 28, 1]).astype(np.float32)
+    cluster = tf.train.ClusterSpec({'dataset': ['localhost:2001'], 'test': ['localhost:2002']})
+    if role == 'dataset':
+        server = tf.train.Server(cluster, 'dataset', 0)
+    elif role == 'test':
+        server = tf.train.Server(cluster, 'test', 0)
+    else:
+        raise ValueError("Uknown role {}.".format(role))
+    with tf.device('/job:dataset/task:0')    :
+        dataset = tf.data.Dataset.from_generator(dataset_generator, tf.float32)
+        dataset = dataset.batch(128)
+        value = dataset.make_one_shot_iterator().get_next()
+    if role == 'dataset':
+        server.join()
+    elif role == 'test':
+        sess = tf.Session(target=server.target)
+        for _ in tqdm(range(100000000), ascii=True):
+            sess.run(value)
+            
+if __name__ == "__main__":
+    main(sys.argv[1])
+&lt;/denchmark-code&gt;
+
+Tensorflow: v1.4.0-rc1-11-g130a514 1.4.0
+OS: ubuntu mate 16.04.1
+Python: 3.6.1 (conda 4.3.30)
+	</description>
+	<comments>
+		<comment id='1' author='Hong-Xiang' date='2017-12-20T16:05:16Z'>
+		I think this is an issue in tf.py_func() (which Dataset.from_generator() uses internally). The following program exhibits the same memory leak:
+import tensorflow as tf
+import numpy as np
+from tqdm import tqdm
+import sys
+def main(role):
+    cluster = tf.train.ClusterSpec({'dataset': ['localhost:2001'],
+                                    'test': ['localhost:2002']})
+    if role == 'dataset':
+        server = tf.train.Server(cluster, 'dataset', 0)
+    elif role == 'test':
+        server = tf.train.Server(cluster, 'test', 0)
+    else:
+        raise ValueError("Uknown role {}.".format(role))
+
+    with tf.device('/job:dataset/task:0'):
+        result = tf.py_func(
+            lambda: np.random.uniform(size=[28, 28, 1]).astype(np.float32),
+            inp=[], Tout=tf.float32)
+
+    if role == 'dataset':
+        server.join()
+    elif role == 'test':
+        sess = tf.Session(target=server.target)
+        for _ in tqdm(range(100000000), ascii=True):
+            sess.run(result)
+            
+if __name__ == "__main__":
+    main(sys.argv[1])
+Note that the memory leak is in the  process (which executes the  op) and not the  process (which creates the session). Also note that this setup isn't intended to be supported, but I suppose the note in  &lt;denchmark-link:https://www.tensorflow.org/api_docs/python/tf/py_func&gt;the tf.py_func() docs&lt;/denchmark-link&gt;
+ could be read as allowing it:
+
+The operation must run in the same address space as the Python program that calls tf.py_func(). If you are using distributed TensorFlow, you must run a tf.train.Server in the same process as the program that calls tf.py_func() and you must pin the created operation to a device in that server (e.g. using with tf.device():).
+
+(In a sense, the program "gets lucky" because both processes call tf.py_func() in the same order, and so the same identifier is used for the registered Python function in each process.)
+I think the source of the leak is the "decref cache", which holds references to Python arrays that are passed without copying into the TensorFlow runtime, and can only be cleared when the GIL is held. The &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/810394550571c5feb333cb6da66afb4b20c3bd85/tensorflow/python/lib/core/ndarray_tensor_bridge.cc#L52&gt;ClearDecrefCache()&lt;/denchmark-link&gt;
+ function is only called in the session code (and some TF Eager code): for example at the &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/810394550571c5feb333cb6da66afb4b20c3bd85/tensorflow/python/client/tf_session_helper.cc#L88&gt;beginning&lt;/denchmark-link&gt;
+ and &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/810394550571c5feb333cb6da66afb4b20c3bd85/tensorflow/python/client/tf_session_helper.cc#L151&gt;end&lt;/denchmark-link&gt;
+ of a  call. Since the cache is filling up in  and it is only being cleared in , we see a memory leak in .
+I'll assign this to &lt;denchmark-link:https://github.com/alextp&gt;@alextp&lt;/denchmark-link&gt;
+, who added this mechanism, and might be able to suggest a fix or workaround.
+		</comment>
+		<comment id='2' author='Hong-Xiang' date='2017-12-20T17:37:50Z'>
+		It's easy to clear the decref cache while we hold the gil to call the py_func, so I'll add this and hopefully this bug will go away. Is tqdm necessary for this bug to happen or are you using it just for styling?
+		</comment>
+		<comment id='3' author='Hong-Xiang' date='2017-12-20T17:45:38Z'>
+		AFAICT it's just for styling!
+		</comment>
+	</comments>
+</bug>
