@@ -6,12 +6,15 @@
 
 2. JsonSet
    - final dataset 
+   - ./fulljson/ : Detailed dataset
+   - ./simplejson/ : Simplified datatset (recommend)
 
 3. Project_description.tsv
    - Project description
 
 4. Statisticx.xlsx
    - Detail statistics
+   - Data schema for dataset in JsonSet
 
 # Contributor
    - Misoo Kim (misoo12@skku.edu)
