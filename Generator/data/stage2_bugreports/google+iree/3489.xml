@@ -1,0 +1,81 @@
+<bug id='3489' author='benvanik' open_date='2020-10-15T17:23:14Z' closed_time='2020-10-16T23:43:57Z'>
+	<summary>Investigate out-of-tolerance keras:large_cifar10_internal_tests_ResNet50__tf__iree_vulkan</summary>
+	<description>
+After PR &lt;denchmark-link:https://github.com/google/iree/pull/3424&gt;#3424&lt;/denchmark-link&gt;
+  started having larger diffs (~0.1) than the previous max tolerance. LLVM passes with no tolerance change, so there may be something specific to the Vulkan HAL, swiftshader, or SPIR-V codegen. It'd be useful to narrow down where this is happening and see if we can get a test earlier in the pipeline for whichever area it falls under.
+Log:
+&lt;denchmark-link:https://source.cloud.google.com/results/invocations/c52975b6-bc8c-4aed-aa32-a544d7dcfc71/targets/iree%2Fgcp_ubuntu%2Fbazel%2Flinux%2Fx86-swiftshader%2Fintegrations%2Fpresubmit/log&gt;https://source.cloud.google.com/results/invocations/c52975b6-bc8c-4aed-aa32-a544d7dcfc71/targets/iree%2Fgcp_ubuntu%2Fbazel%2Flinux%2Fx86-swiftshader%2Fintegrations%2Fpresubmit/log&lt;/denchmark-link&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='benvanik' date='2020-10-16T14:26:44Z'>
+		This one is tricky. The output of second launch is wrong.
+VMLA
+&lt;denchmark-code&gt;=== Output for predict_ex_dispatch_1 ===
+1x16x16x64xf32=[[[-0.0248649 0.181895 -0.162422 ...
+&lt;/denchmark-code&gt;
+
+Vulkan
+&lt;denchmark-code&gt;=== Output for predict_ex_dispatch_1 ===
+1x16x16x64xf32=[[[-0.209309 -0.013611 -0.0699595 ...
+&lt;/denchmark-code&gt;
+
+I tried several ways but couldn't get the test case smaller.
+
+Only test on dispatch_1 (which is a convolution), the outputs are the same.
+Only test on dispatch_0 + dispatch_1, the outputs are the same.
+As (2), but use flow variable as one of input arguments (exactly as the same way as in the model), the outputs are the same.
+
+The dispatch_1 is:
+func @predict_ex_dispatch_1(%arg0: tensor&lt;1x38x38x3xf32&gt;, %arg1: tensor&lt;7x7x3x64xf32&gt;) -&gt; tensor&lt;1x16x16x64xf32&gt; attributes { iree.module.export }{
+  %0 = "mhlo.convolution"(%arg0, %arg1) {
+    batch_group_count = 1 : i64,
+    dimension_numbers = {input_batch_dimension = 0 : i64,
+                         input_feature_dimension = 3 : i64,
+                         input_spatial_dimensions = dense&lt;[1, 2]&gt; : tensor&lt;2xi64&gt;,
+                         kernel_input_feature_dimension = 2 : i64,
+                         kernel_output_feature_dimension = 3 : i64,
+                         kernel_spatial_dimensions = dense&lt;[0, 1]&gt; : tensor&lt;2xi64&gt;,
+                         output_batch_dimension = 0 : i64,
+                         output_feature_dimension = 3 : i64,
+                         output_spatial_dimensions = dense&lt;[1, 2]&gt; : tensor&lt;2xi64&gt;},
+    feature_group_count = 1 : i64,
+    padding = dense&lt;0&gt; : tensor&lt;2x2xi64&gt;,
+    rhs_dilation = dense&lt;1&gt; : tensor&lt;2xi64&gt;,
+    window_strides = dense&lt;2&gt; : tensor&lt;2xi64&gt;
+  } : (tensor&lt;1x38x38x3xf32&gt;, tensor&lt;7x7x3x64xf32&gt;) -&gt; tensor&lt;1x16x16x64xf32&gt;
+  return %0 : tensor&lt;1x16x16x64xf32&gt;
+}
+note: the results from vulkan and vmla are the same in this single case. They are all 1x16x16x64xf32=[[[-0.0248649 0.181895 -0.162422...
+		</comment>
+		<comment id='2' author='benvanik' date='2020-10-16T16:40:03Z'>
+		I suspect that maybe the constants are not handled well. This case and the case in &lt;denchmark-link:https://github.com/google/iree/issues/3507&gt;#3507&lt;/denchmark-link&gt;
+ are both taking constants as input arguments and resulting wrong output.
+I think the next step is to bisect on the commit chain &lt;denchmark-link:https://github.com/google/iree/pull/3424&gt;#3424&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='3' author='benvanik' date='2020-10-16T18:11:19Z'>
+		The root cause is this commit: &lt;denchmark-link:https://github.com/google/iree/commit/a8fcd48de752ac7c4e978bbdbfa2e3819c34abf5&gt;a8fcd48&lt;/denchmark-link&gt;
+
+It's passing at the previous one, &lt;denchmark-link:https://github.com/google/iree/commit/2dbe2fbd5a45dba5dd1a894951d9ab881a9d0999&gt;2dbe2fb&lt;/denchmark-link&gt;
+
+Same thing happens in MobileBert on vulkan.
+&lt;denchmark-link:https://github.com/benvanik&gt;@benvanik&lt;/denchmark-link&gt;
+ is this good enough for you to debug? I can try to get something more if needed.
+		</comment>
+		<comment id='4' author='benvanik' date='2020-10-16T20:16:33Z'>
+		Fantastic! I'm really glad I didn't squash that PR :P
+I'll work on bert to narrow things down (since I can test that without using python).
+		</comment>
+		<comment id='5' author='benvanik' date='2020-10-16T21:23:42Z'>
+		I think I found the issue! &lt;denchmark-link:https://github.com/google/iree/commit/a8fcd48de752ac7c4e978bbdbfa2e3819c34abf5&gt;a8fcd48&lt;/denchmark-link&gt;
+ introduced the first time we bound buffers with a non-zero offset. The Vulkan HAL today is dropping that offset on the floor and not using it, which then causes any constant besides the one at offset 0 to be wrong 
+		</comment>
+		<comment id='6' author='benvanik' date='2020-10-17T02:08:51Z'>
+		Cool, thanks for the quick fix!
+		</comment>
+		<comment id='7' author='benvanik' date='2020-10-17T02:28:17Z'>
+		Thanks for helping isolate the issue! It really helped!
+		</comment>
+	</comments>
+</bug>

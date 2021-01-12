@@ -1,0 +1,82 @@
+<bug id='4061' author='phoenix-meadowlark' open_date='2020-12-02T22:44:32Z' closed_time='2020-12-08T19:46:56Z'>
+	<summary>iree-xla-legalize-tf miscompiles tf.IsNan --&amp;gt; dense&amp;lt;false&amp;gt; with static shapes (and correctly compiles with dynamic shapes)</summary>
+	<description>
+iree-xla-legalize-tf miscompiles tf.IsNan -&gt; dense&lt;false&gt; when static shapes are provided. This means that tf.math.is_nan only passes when compiled with dynamic dims.
+&lt;denchmark-h:h3&gt;Minimal reproducer&lt;/denchmark-h&gt;
+
+&lt;denchmark-h:h4&gt;Static (failing)&lt;/denchmark-h&gt;
+
+// is_nan.mlir
+module {
+  func @"is_nan"(%arg0: tensor&lt;1xf32&gt;) -&gt; tensor&lt;1xi1&gt; {
+    %0 = "tf.IsNan"(%arg0) : (tensor&lt;1xf32&gt;) -&gt; tensor&lt;1xi1&gt;
+    return %0 : tensor&lt;1xi1&gt;
+  }
+}
+bazel run integrations/tensorflow/compiler:iree-tf-opt -- \
+  -iree-xla-legalize-tf \
+  is_nan.mlir
+module  {
+  func @is_nan(%arg0: tensor&lt;1xf32&gt;) -&gt; tensor&lt;1xi1&gt; {
+    %0 = mhlo.constant dense&lt;false&gt; : tensor&lt;1xi1&gt;
+    return %0 : tensor&lt;1xi1&gt;
+  }
+}
+&lt;denchmark-h:h4&gt;Dynamic (passing)&lt;/denchmark-h&gt;
+
+// is_nan_dynamic.mlir
+module {
+  func @"is_nan_dynamic"(%arg0: tensor&lt;?xf32&gt;) -&gt; tensor&lt;?xi1&gt; {
+    %0 = "tf.IsNan"(%arg0) : (tensor&lt;?xf32&gt;) -&gt; tensor&lt;?xi1&gt;
+    return %0 : tensor&lt;?xi1&gt;
+  }
+}
+bazel run integrations/tensorflow/compiler:iree-tf-opt -- \
+  -iree-xla-legalize-tf \
+  is_nan_dynamic.mlir
+module  {
+  func @is_nan_dynamic(%arg0: tensor&lt;?xf32&gt;) -&gt; tensor&lt;?xi1&gt; {
+    %0 = shape.shape_of %arg0 : tensor&lt;?xf32&gt; -&gt; tensor&lt;?xindex&gt;
+    %1 = shape.shape_of %arg0 : tensor&lt;?xf32&gt; -&gt; tensor&lt;?xindex&gt;
+    %2 = shape.cstr_broadcastable %0, %1 : tensor&lt;?xindex&gt;, tensor&lt;?xindex&gt;
+    %3 = shape.assuming %2 -&gt; (tensor&lt;?xi1&gt;) {
+      %4 = shape.shape_of %arg0 : tensor&lt;?xf32&gt; -&gt; tensor&lt;?xindex&gt;
+      %5 = shape.shape_of %arg0 : tensor&lt;?xf32&gt; -&gt; tensor&lt;?xindex&gt;
+      %6 = shape.broadcast %4, %5 : tensor&lt;?xindex&gt;, tensor&lt;?xindex&gt; -&gt; tensor&lt;?xindex&gt;
+      %7 = tensor_cast %6 : tensor&lt;?xindex&gt; to tensor&lt;1xindex&gt;
+      %8 = "mhlo.dynamic_broadcast_in_dim"(%arg0, %7) {broadcast_dimensions = dense&lt;0&gt; : tensor&lt;1xi64&gt;} : (tensor&lt;?xf32&gt;, tensor&lt;1xindex&gt;) -&gt; tensor&lt;?xf32&gt;
+      %9 = "mhlo.dynamic_broadcast_in_dim"(%arg0, %7) {broadcast_dimensions = dense&lt;0&gt; : tensor&lt;1xi64&gt;} : (tensor&lt;?xf32&gt;, tensor&lt;1xindex&gt;) -&gt; tensor&lt;?xf32&gt;
+      %10 = "mhlo.compare"(%8, %9) {comparison_direction = "NE"} : (tensor&lt;?xf32&gt;, tensor&lt;?xf32&gt;) -&gt; tensor&lt;?xi1&gt;
+      shape.assuming_yield %10 : tensor&lt;?xi1&gt;
+    }
+    return %3 : tensor&lt;?xi1&gt;
+  }
+}
+&lt;denchmark-h:h3&gt;Partial conversions in iree-xla-legalize-tf&lt;/denchmark-h&gt;
+
+func @is_nan(%arg0: tensor&lt;1xf32&gt;) -&gt; tensor&lt;1xi1&gt; {
+  %0 = "tf.IsNan"(%arg0) : (tensor&lt;1xf32&gt;) -&gt; tensor&lt;1xi1&gt;
+  return %0 : tensor&lt;1xi1&gt;
+}
+func @is_nan(%arg0: tensor&lt;1xf32&gt;) -&gt; tensor&lt;1xi1&gt; {
+  %0 = "tf.NotEqual"(%arg0, %arg0) {incompatible_shape_error = true} : (tensor&lt;1xf32&gt;, tensor&lt;1xf32&gt;) -&gt; tensor&lt;1xi1&gt;
+  return %0 : tensor&lt;1xi1&gt;
+}
+func @is_nan(%arg0: tensor&lt;1xf32&gt;) -&gt; tensor&lt;1xi1&gt; {
+  %0 = "mhlo.compare"(%arg0, %arg0) {comparison_direction = "NE"} : (tensor&lt;1xf32&gt;, tensor&lt;1xf32&gt;) -&gt; tensor&lt;1xi1&gt;
+  return %0 : tensor&lt;1xi1&gt;
+}
+func @is_nan(%arg0: tensor&lt;1xf32&gt;) -&gt; tensor&lt;1xi1&gt; {
+  %0 = mhlo.constant dense&lt;false&gt; : tensor&lt;1xi1&gt;
+  return %0 : tensor&lt;1xi1&gt;
+}
+It looks like comparison by SSA value in &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/master/tensorflow/compiler/mlir/hlo/lib/Dialect/mhlo/IR/hlo_ops.cc#L2773-L2779&gt;this folder&lt;/denchmark-link&gt;
+ violates IEEE float semantics for . Dynamic shapes would have also miscompiled if a CSE pass was ran before  halted.
+	</description>
+	<comments>
+		<comment id='1' author='phoenix-meadowlark' date='2020-12-04T00:07:19Z'>
+		Fixing this in &lt;denchmark-link:https://github.com/tensorflow/mlir-hlo&gt;https://github.com/tensorflow/mlir-hlo&lt;/denchmark-link&gt;
+.
+		</comment>
+	</comments>
+</bug>

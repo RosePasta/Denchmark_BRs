@@ -1,0 +1,132 @@
+<bug id='1247' author='Peilun-Li' open_date='2020-12-11T21:52:52Z' closed_time='2020-12-15T00:51:11Z'>
+	<summary>Scale to zero would make inferenceservice with long init time fail in creation</summary>
+	<description>
+/kind bug
+The actual issue we met is related with GPU node scaling:
+
+Deploy inferenceservice with GPU request and scale to zero enabled (minReplicas=0)
+GPU resource is fully occupied in current cluster thus a GPU node scale up is triggered, meanwhile the inferenceservice pod is in Pending status
+The node scale up takes time (&gt; 2min), however upon 2 min, scale to zero would be triggered and the inferenceservice pod will be deleted before ready.
+The inferenceservice would never be in ready status then even after GPU nodes scaled up, i.e., deployment failed.
+
+On the other hand, if we set minReplicas=1 of the deployment, the inferenceservice would be deployed successfully after GPU node scaled up.
+What steps did you take and what happened:
+[A clear and concise description of what the bug is.]
+To better reproduce the above issue, I create a custom docker which will take 3 min to initialize (to mimic the node scale up latency).
+&lt;denchmark-code&gt;# app.py
+import kfserving
+import time
+
+class KFServingSampleModel(kfserving.KFModel):
+    def __init__(self, name):
+        super().__init__(name)
+        self.ready = False
+
+    def load(self):
+        time.sleep(180)
+        self.ready = True
+
+    def predict(self, request):
+        return request
+
+if __name__ == "__main__":
+    model = KFServingSampleModel("kfserving-custom-model")
+    model.load()
+    kfserving.KFServer(workers=1).start([model])
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-code&gt;# Dockerfile (pushed to lplrobert/kfserving-long-init)
+FROM python:3.6-alpine
+
+WORKDIR /app
+
+COPY app.py /app
+
+RUN apk update
+RUN apk add make automake gcc g++ subversion python3-dev libffi-dev openssl-dev
+
+RUN pip install kfserving==0.4.0
+
+CMD ["python", "app.py"]
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-code&gt;# custom.yaml
+apiVersion: serving.kubeflow.org/v1alpha2
+kind: InferenceService
+metadata:
+  labels:
+    controller-tools.k8s.io: "1.0"
+  name: kfserving-custom-model
+spec:
+  default:
+    predictor:
+      minReplicas: 0 # this will fail in creation due to scale to zero after 2 min
+      # minReplicas: 1 # this won't fail
+      custom:
+        name: kfserving-custom-model
+        container:
+          image: lplrobert/kfserving-long-init
+&lt;/denchmark-code&gt;
+
+When applying the above yaml with minReplicas=0, things will eventually fail:
+
+Pod will be created and in running status with Ready 2/3
+When 2 min reaches, pod will be deleted due to scale to zero
+Inferenceservice will never be ready
+
+&lt;denchmark-code&gt;NAME                     URL   READY   DEFAULT TRAFFIC   CANARY TRAFFIC   AGE
+kfserving-custom-model         False                                      5m26s
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-code&gt;Conditions:
+    Last Transition Time:  2020-12-11T21:31:30Z
+    Message:               Configuration "kfserving-custom-model-predictor-default" is waiting for a Revision to become ready.
+    Reason:                RevisionMissing
+    Status:                Unknown
+    Type:                  DefaultPredictorReady
+    Last Transition Time:  2020-12-11T21:31:29Z
+    Message:               Failed to reconcile predictor
+    Reason:                PredictorHostnameUnknown
+    Status:                False
+    Type:                  Ready
+    Last Transition Time:  2020-12-11T21:31:29Z
+    Message:               Failed to reconcile predictor
+    Reason:                PredictorHostnameUnknown
+    Status:                False
+    Type:                  RoutesReady
+&lt;/denchmark-code&gt;
+
+As a comparison, if we apply the above yaml with minReplicas=1, deploy will succeed (inferenceservice will be ready after ~3 min)
+&lt;denchmark-code&gt;NAME                     URL                                                   READY   DEFAULT TRAFFIC   CANARY TRAFFIC   AGE
+kfserving-custom-model   http://kfserving-custom-model.namespace.example.com   True    100                                4m5s
+&lt;/denchmark-code&gt;
+
+Deploying with minReplicas=1 firs then patch/edit to minReplicas=0 wouldn't help with this issue either, cause patch/edit will create a new replicaset and pod, which then encounter the same issue.
+What did you expect to happen:
+Deployment should not be failing when scale to zero is enabled and model initialization takes a long time, i.e., we probably don't want the very first pod to be scaling to zero until it's ready or failed, rather than on a hard 2 min wait.
+Question for temporary mitigation: is there any place/config we can set/customize ourselves to increase the default 2 min wait time before scaling down to zero?
+Environment:
+
+Istio Version:
+Knative Version:
+KFServing Version: 0.4.0
+Kubeflow version:
+Kfdef:[k8s_istio/istio_dex/gcp_basic_auth/gcp_iap/aws/aws_cognito/ibm]
+Minikube version:
+Kubernetes version: (use kubectl version): 1.16+
+OS (e.g. from /etc/os-release):
+
+	</description>
+	<comments>
+		<comment id='1' author='Peilun-Li' date='2020-12-12T15:37:24Z'>
+		&lt;denchmark-link:https://github.com/Peilun-Li&gt;@Peilun-Li&lt;/denchmark-link&gt;
+ can you try this configuration to increase the timeout from 2min to 10min?
+kubectl patch cm config-deployment --patch '{"data":{"progressDeadline": "600s"}}' -n knative-serving
+		</comment>
+		<comment id='2' author='Peilun-Li' date='2020-12-15T00:51:11Z'>
+		&lt;denchmark-link:https://github.com/yuzisun&gt;@yuzisun&lt;/denchmark-link&gt;
+ Cool that works! Closing this one given it's already an issue of awareness (&lt;denchmark-link:https://github.com/knative/serving/issues/6201&gt;knative/serving#6201&lt;/denchmark-link&gt;
+). Thanks for the help!
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,163 @@
+<bug id='620' author='antalszava' open_date='2020-05-06T01:23:26Z' closed_time='2020-05-13T03:10:33Z'>
+	<summary>PassthruQNode decomposition error with default.tensor.tf</summary>
+	<description>
+&lt;denchmark-h:h4&gt;Issue description&lt;/denchmark-h&gt;
+
+
+
+Expected behavior:
+Operations not supported by a device (e.g. U3 given default.tensor.tf) get decomposed well within a PassthruQNode without any problems.
+
+
+Actual behavior:
+An error is raised due to a check that gets executed:
+
+
+import pennylane as qml
+import numpy as np
+import tensorflow as tf
+
+from pennylane.qnodes import PassthruQNode
+
+theta = 0.543
+phi = -0.234
+lam = 0.654
+p = [theta, phi, lam]
+
+dev = qml.device("default.tensor.tf", wires=1)
+
+def circuit(weights, w=None):
+    qml.U3(weights[0], weights[1], weights[2], wires=w)   # &lt;--- decomposition is required
+    return qml.expval(qml.PauliX(w))
+
+node = PassthruQNode(circuit, dev, interface="tf")
+
+params = tf.Variable(p, dtype=tf.float64)
+
+with tf.GradientTape() as tape:
+    tape.watch(params)
+    res = node(params, w=0)
+Produces:
+~/pennylane/pennylane/operation.py in __init__(self, wires, do_queue, *params)
+    328         if self.do_check_domain:
+    329             for p in params:
+--&gt; 330                 self.check_domain(p)
+    331         self.params = list(params)  #: list[Any]: parameters of the operator
+    332 
+
+~/pennylane/pennylane/operation.py in check_domain(self, p, flattened)
+    425             if not isinstance(p, numbers.Real):
+    426                 raise TypeError(
+--&gt; 427                     "{}: Real scalar parameter expected, got {}.".format(self.name, type(p))
+    428                 )
+    429 
+
+TypeError: Rot: Real scalar parameter expected, got &lt;class 'tensorflow.python.framework.ops.EagerTensor'&gt;.
+
+
+Reproduces how often:
+Each time a PassthruQNode is being used purely with TF using the default.tensor.tf device.
+
+
+System information: (post the output of import pennylane as qml; qml.about())
+
+
+Name: PennyLane
+Version: 0.9.0.dev0
+Summary: PennyLane is a Python quantum machine learning library by Xanadu Inc.
+Home-page: https://github.com/XanaduAI/pennylane
+Author: None
+Author-email: None
+License: Apache License 2.0
+Location: /pennylane
+Requires: numpy, scipy, networkx, autograd, toml, appdirs, semantic-version
+Required-by: 
+Platform info:           Linux-4.19.11-041911-generic-x86_64-with-debian-buster-sid
+Python version:          3.7.6
+Numpy version:           1.18.1
+Scipy version:           1.4.1
+Installed devices:
+- microsoft.QuantumSimulator (PennyLane-qsharp-0.6.0)
+- cirq.simulator (PennyLane-Cirq-0.8.0)
+- forest.numpy_wavefunction (PennyLane-Forest-0.8.0)
+- forest.qpu (PennyLane-Forest-0.8.0)
+- forest.qvm (PennyLane-Forest-0.8.0)
+- forest.wavefunction (PennyLane-Forest-0.8.0)
+- qiskit.aer (PennyLane-qiskit-0.9.0.dev0)
+- qiskit.basicaer (PennyLane-qiskit-0.9.0.dev0)
+- qiskit.ibmq (PennyLane-qiskit-0.9.0.dev0)
+- projectq.classical (PennyLane-PQ-0.7.0.dev0)
+- projectq.ibm (PennyLane-PQ-0.7.0.dev0)
+- projectq.simulator (PennyLane-PQ-0.7.0.dev0)
+- default.gaussian (PennyLane-0.9.0.dev0)
+- default.qubit (PennyLane-0.9.0.dev0)
+- default.tensor (PennyLane-0.9.0.dev0)
+- default.tensor.tf (PennyLane-0.9.0.dev0)
+- strawberryfields.fock (PennyLane-SF-0.9.0.dev0)
+- strawberryfields.gaussian (PennyLane-SF-0.9.0.dev0)
+&lt;denchmark-h:h4&gt;Additional information&lt;/denchmark-h&gt;
+
+Testing of the  differentiation method proposed in &lt;denchmark-link:https://github.com/PennyLaneAI/pennylane/pull/552&gt;#552&lt;/denchmark-link&gt;
+ will slightly change once this issue is resolved. This PR works with gate decomposition due to the error.
+	</description>
+	<comments>
+		<comment id='1' author='antalszava' date='2020-05-06T03:43:09Z'>
+		Good catch &lt;denchmark-link:https://github.com/antalszava&gt;@antalszava&lt;/denchmark-link&gt;
+! In the  class, we do some basic input validation of arguments. However, this won't work for PassthruQNodes, since they will no longer be using NumPy arrays/Python floats, but rather the default data structure for their target ML framework.
+In the PassthruQNode, operation validation is turned off explicitly within the construct method:
+def _construct(self, args, kwargs):
+    """Construct the quantum circuit graph by calling the quantum function.
+
+    Like :class:`.BaseQNode._construct`, but does not use Variables.
+    """
+    # temporary queues for operations and observables
+    self.queue = []  #: list[Operation]: applied operations
+    self.obs_queue = []  #: list[Observable]: applied observables
+
+    # set up the context for Operator entry
+    with self:
+        try:
+            # turn off domain checking since PassthruQNode qfuncs can take any class as input
+            pennylane.operation.Operator.do_check_domain = False
+            # generate the program queue by executing the quantum circuit function
+            res = self.func(*args, **kwargs)
+        finally:
+            pennylane.operation.Operator.do_check_domain = True
+My guess is that this seemingly doesn't propagate to decomposed operations, and it somehow gets turned on again?
+		</comment>
+		<comment id='2' author='antalszava' date='2020-05-06T13:40:16Z'>
+		I think I have found the cause. The operation decomposition is performed during the self._circuit_check method call. So this just needs to be moved to within the try: block:
+# set up the context for Operator entry
+with self:
+    try:
+        # turn off domain checking since PassthruQNode qfuncs can take any class as input
+        pennylane.operation.Operator.do_check_domain = False
+        # generate the program queue by executing the quantum circuit function
+        res = self.func(*args, **kwargs)
+        # check the validity of the circuit
+        self._check_circuit(res)
+    finally:
+        pennylane.operation.Operator.do_check_domain = True
+
+del self.queue
+del self.obs_queue
+		</comment>
+		<comment id='3' author='antalszava' date='2020-05-06T14:52:06Z'>
+		Applying this seems to result in another one for the same example:
+~/pennylane/pennylane/_queuing_context.py in append_operator(cls, operator)
+     72         """
+     73         for context in cls._active_contexts:
+---&gt; 74             context._append_operator(operator)  # pylint: disable=protected-access
+     75 
+     76     @abc.abstractmethod
+~/pennylane/pennylane/qnodes/base.py in _append_operator(self, operator)
+    329             if self.obs_queue:
+    330                 raise QuantumFunctionError(
+--&gt; 331                     "State preparations and gates must precede measured observables."
+    332                 )
+    333             self.queue.append(operator)
+QuantumFunctionError: State preparations and gates must precede measured observables.
+This does not arise when using the decomposition explicitly.
+		</comment>
+	</comments>
+</bug>

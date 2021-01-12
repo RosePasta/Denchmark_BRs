@@ -29,7 +29,7 @@ for framework in frameworks:
         # 1. Filtering the projects with at least 1,000 star each based on The Scent of Deep Learning Code: An Empirical Study, MSR'20
         num_stars = repo.stargazers_count
         num_forks = repo.forks_count
-        if num_stars < 1000:
+        if num_stars < 100:
             break
 
         # 2. Filtering no-issue projects
