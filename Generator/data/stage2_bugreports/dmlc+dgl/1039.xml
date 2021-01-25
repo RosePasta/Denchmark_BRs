@@ -1,0 +1,168 @@
+<bug id='1039' author='mjwen' open_date='2019-11-23T04:19:05Z' closed_time='2019-11-29T06:41:23Z'>
+	<summary>[Bug] memory leak in `DGLHeteroGraph.multi_update_all()`</summary>
+	<description>
+&lt;denchmark-h:h2&gt;🐛 Bug&lt;/denchmark-h&gt;
+
+DGLHeteroGraph.multi_update_all() seems to have cuda memory leak. As optimization proceeds, cuda memory accumulates and results in OOM error eventually. This seems to happen in some other functions as well, e.g. DGLHeteroGraph.update_all()
+&lt;denchmark-h:h2&gt;To Reproduce&lt;/denchmark-h&gt;
+
+import torch
+import torch.nn as nn
+import dgl
+from dgl import function as fn
+
+
+class MyModel(nn.Module):
+    def __init__(self, in_size, out_size):
+        super(MyModel, self).__init__()
+        self.layer = nn.Linear(in_size, out_size, bias=True)
+
+    def forward(self, g, feats):
+        g = g.local_var()
+
+        for nt, v in feats.items():
+            v = self.layer(v)
+            g.nodes[nt].data.update({"ft": v})
+
+        update_all_1(g)
+        updated_feats = {nt: g.nodes[nt].data["ft"] for nt in g.ntypes}
+
+        return updated_feats
+
+
+def create_data():
+    graphs = []
+    for i in range(3):
+        g = dgl.heterograph(
+            {
+                ("a", "a2b", "b"): [(0, 0)],
+                ("b", "b2a", "a"): [(0, 0)],
+                ("c", "c2a", "a"): [(0, 0)],
+                ("c", "c2b", "b"): [(0, 0)],
+            }
+        )
+        g.nodes["a"].data["feat"] = torch.rand(1, 10).cuda()
+        g.nodes["b"].data["feat"] = torch.rand(1, 10).cuda()
+        g.nodes["c"].data["feat"] = torch.rand(1, 10).cuda()
+        graphs.append(g)
+    return graphs
+
+
+def update_all_1(g):
+    etypes = ["b2a", "c2a"]
+    g.multi_update_all(
+        {et: (fn.copy_u("ft", "m"), fn.sum("m", "ft")) for et in etypes}, "sum"
+    )
+    etypes = ["a2b", "c2b"]
+    g.multi_update_all(
+        {et: (fn.copy_u("ft", "m"), fn.sum("m", "ft")) for et in etypes}, "sum"
+    )
+
+
+def update_all_2(g):
+    for et in g.canonical_etypes:
+        g.update_all(fn.copy_u("ft", "m"), fn.sum("m", "ft"), etype=et)
+
+
+def loss_1(pred):
+    # not use all elements of pred
+    pred = pred["a"]
+    return (pred.sum() - 0.0) ** 2
+
+
+def loss_2(pred):
+    # use all elements of pred
+    loss = 0
+    for k, v in pred.items():
+        loss += (v.sum() - 0.0) ** 2
+    return loss
+
+
+def stat_cuda(msg):
+    print(
+        "{}. allocated: {:.4f}M, max allocated: {:.4f}M, cached: {:.4f}M, "
+        "max cached: {:.4f}M".format(
+            msg,
+            torch.cuda.memory_allocated() / 1024 / 1024,
+            torch.cuda.max_memory_allocated() / 1024 / 1024,
+            torch.cuda.memory_cached() / 1024 / 1024,
+            torch.cuda.max_memory_cached() / 1024 / 1024,
+        )
+    )
+
+
+if __name__ == "__main__":
+
+    data = create_data()
+    model = MyModel(10, 5)
+    model.cuda()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+    for epoch in range(3):
+        for i, g in enumerate(data):
+            feats = {nt: g.nodes[nt].data["feat"] for nt in g.ntypes}
+
+            pred = model(g, feats)
+            loss = loss_1(pred)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        stat_cuda("epoch " + str(epoch))
+Steps to reproduce the behavior:
+
+
+Running the above code gives:
+epoch 0. allocated: 0.0151M, max allocated: 0.0405M, cached: 2.0000M, max cached: 2.0000M
+epoch 1. allocated: 0.0210M, max allocated: 0.0464M, cached: 2.0000M, max cached: 2.0000M
+epoch 2. allocated: 0.0269M, max allocated: 0.0522M, cached: 2.0000M, max cached: 2.0000M
+
+The allocated memory keeps increasing. I'd expect the allocated memory be around a   constant value. If I change loss_1() to loss_2() in the main optimization loop, we get
+epoch 0. allocated: 0.0103M, max allocated: 0.0376M, cached: 2.0000M, max cached: 2.0000M
+epoch 1. allocated: 0.0103M, max allocated: 0.0376M, cached: 2.0000M, max cached: 2.0000M
+epoch 2. allocated: 0.0103M, max allocated: 0.0376M, cached: 2.0000M, max cached: 2.0000M
+
+The difference is that I only use part of the node features to construct the loss in loss_1(), but use all the node features in loss_2().
+
+
+However, if I change to use update_all_2() instead of update_all_1() in MyModel.forward(), the allocated memory will increase no matter loss_1() or loss_2() is used. Seems strange to me. I haven't tested other built-in functions, but possibly some may have similar behavior.
+
+
+&lt;denchmark-h:h2&gt;Environment&lt;/denchmark-h&gt;
+
+
+DGL Version (e.g., 1.0): 0.4.1 (cuda9.0)
+Backend Library &amp; Version (e.g., PyTorch 0.4.1, MXNet/Gluon 1.3): PyTorch 1.3.1 (py3.7_cuda9.2.148_cudnn7.6.3_0)
+OS (e.g., Linux): Linux
+How you installed DGL (conda, pip, source): conda
+Build command you used (if compiling from source):
+Python version: 3.7.4
+CUDA/cuDNN version (if applicable):
+GPU models and configuration (e.g. V100): 1080Ti
+Any other relevant information:
+
+	</description>
+	<comments>
+		<comment id='1' author='mjwen' date='2019-11-23T13:04:40Z'>
+		When I am modifying GCMC to minibatch, I encountered same problem, but it is fixed by forcing Python GC with gc.collect().
+		</comment>
+		<comment id='2' author='mjwen' date='2019-11-25T05:48:15Z'>
+		&lt;denchmark-link:https://github.com/classicsong&gt;@classicsong&lt;/denchmark-link&gt;
+ Thanks for the info. I tried it, but  does not work in this case.
+		</comment>
+		<comment id='3' author='mjwen' date='2019-11-25T06:01:51Z'>
+		Your script is helpful for us to debug and I can reproduce the leak behavior. We might need some time to debug this. Thanks.
+		</comment>
+		<comment id='4' author='mjwen' date='2019-11-29T06:41:22Z'>
+		Should be fixed in &lt;denchmark-link:https://github.com/dmlc/dgl/pull/1060&gt;#1060&lt;/denchmark-link&gt;
+ .  Please feel free to reopen it if this is not the case.
+Running the provided snippet now yields the following:
+&lt;denchmark-code&gt;epoch 0. allocated: 0.0117M, max allocated: 0.0391M, cached: 2.0000M, max cached: 2.0000M
+epoch 1. allocated: 0.0117M, max allocated: 0.0391M, cached: 2.0000M, max cached: 2.0000M
+epoch 2. allocated: 0.0117M, max allocated: 0.0391M, cached: 2.0000M, max cached: 2.0000M
+&lt;/denchmark-code&gt;
+
+		</comment>
+	</comments>
+</bug>

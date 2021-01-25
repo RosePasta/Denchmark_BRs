@@ -1,0 +1,228 @@
+<bug id='40276' author='MilimaBwana' open_date='2020-06-08T12:58:10Z' closed_time='2021-01-22T01:37:24Z'>
+	<summary>TensorArray concat() throws _FallbackException</summary>
+	<description>
+Please make sure that this is a bug. As per our
+GitHub Policy,
+we only address code/doc bugs, performance issues, feature requests and
+build/installation issues on GitHub. tag:bug_template
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow): Yes
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Ubuntu 18.04
+Mobile device (e.g. iPhone 8, Pixel 2, Samsung Galaxy) if the issue happens on mobile device:
+TensorFlow installed from (source or binary): binary
+TensorFlow version (use command below): 2.2.0
+Python version: 3.7.5
+Bazel version (if compiling from source):
+GCC/Compiler version (if compiling from source):
+CUDA/cuDNN version: 10.1/ 7.6.5
+GPU model and memory:
+
+You can collect some of this information using our environment capture
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/tree/master/tools/tf_env_collect.sh&gt;script&lt;/denchmark-link&gt;
+
+You can also obtain the TensorFlow version with:
+
+TF 1.0: python -c "import tensorflow as tf; print(tf.GIT_VERSION, tf.VERSION)"
+TF 2.0: python -c "import tensorflow as tf; print(tf.version.GIT_VERSION, tf.version.VERSION)"
+
+Describe the current behavior
+
+For a image classification challenge, i need to save the predictions with the corresponding filenames to a json-file. In this example this is simply replaced by an manual added index, because fashion_mnist doesn't contain filenames.
+As the dataset is batched, at the end of the prediction, it is necessary to flatten the TensorArray via the concat()-Function after all samples in the testset have been processed.
+If i run this code without @tf.function by setting tf.config.experimental_run_functions_eagerly(True), the issue won't happen.
+If i run the code with the @tf.function annotator, the error below is thrown.
+Error occurs with tf-gpu 2.1.0 as well as with tf-gpu 2.2.0
+
+Describe the expected behavior
+The concat-Function should work like without the @tf.function annotator.
+Standalone code to reproduce the issue
+&lt;denchmark-link:https://github.com/MilimaBwana/Issues/blob/master/TFFunction_Issue.ipynb&gt;Link to colab notebook&lt;/denchmark-link&gt;
+
+import tensorflow as tf
+from pathlib import Path
+import json
+import keras
+import numpy as np
+import os
+
+
+class JSONLogger:
+
+    def __init__(self, model, directory):
+        self.model = model
+        self.directory = directory
+        Path(directory).mkdir(parents=True, exist_ok=True)
+
+        self.idx_list = tf.TensorArray(tf.int32, size=0, dynamic_size=True, clear_after_read=False)
+        self.predictions_list = tf.TensorArray(tf.int64, size=0, dynamic_size=True, clear_after_read=False)
+        self.index = 0
+
+    def on_batch_predict_end(self, indices, predictions):
+        self.idx_list = self.idx_list.write(self.index, indices)
+        self.predictions_list = self.predictions_list.write(self.index, predictions)
+        self.index += 1
+
+    def on_predict_end(self):
+        indices = self.idx_list.concat() # Error gets thrown here
+        predictions_list = self.predictions_list.concat()
+        helper_list = []
+
+        for index, prediction in zip(indices.numpy(),
+                                     predictions_list.numpy()):
+            tmp_dict = {'Index': str(index), 'Class': str(prediction)}
+            helper_list.append(tmp_dict)
+        
+        with open(self.directory + '/predictions.json', 'w') as file:
+            json.dump(helper_list, file)
+
+
+class fashion_model(tf.keras.Model):
+    def __init__(self):
+        super(fashion_model, self).__init__()
+        self.optimizer = tf.keras.optimizers.Adam(learning_rate=1e-4)
+        self.flatten = tf.keras.layers.Flatten(data_format='channels_last')
+        self.dense1 = tf.keras.layers.Dense(units=128, input_shape=(28 * 28,), activation='relu')
+        self.out_layer = tf.keras.layers.Dense(units=10)
+
+        self.loss_object = tf.keras.losses.SparseCategoricalCrossentropy(
+            from_logits=True,
+            reduction=tf.keras.losses.Reduction.SUM_OVER_BATCH_SIZE)
+
+        self.train_loss = tf.keras.metrics.Mean('train_loss')
+
+    def call(self, inputs, training=None, mask=None):
+        x = self.flatten(inputs)
+        x = self.dense1(x)
+        x = self.out_layer(x)
+        return x
+
+
+@tf.function
+def train_step(model, sample):
+    images, labels, _ = sample
+
+    with tf.GradientTape() as tape:
+        logits = model(images, training=True)
+        loss = model.loss_object(y_pred=logits, y_true=labels)
+
+    gradients = tape.gradient(loss, model.trainable_variables)
+    model.optimizer.apply_gradients(grads_and_vars=zip(gradients, model.trainable_variables))
+
+    model.train_loss(loss)
+
+
+@tf.function
+def predict_step(model, sample, logger):
+    images, labels, indices = sample
+    logits = model(images, training=False)
+    logger.on_batch_predict_end(indices, tf.argmax(logits, axis=-1))
+
+
+def tf_run(run_eagerly=False):
+    # pip install ..  only works on colab
+    !pip install tensorflow-gpu==2.2.0
+    print('TFVersion: ', tf.__version__)
+    print('Run eagerly', run_eagerly)
+    if run_eagerly:
+        tf.config.experimental_run_functions_eagerly(True)
+
+    fashion_mnist = keras.datasets.fashion_mnist
+
+    (train_images, train_labels), (test_images, test_labels) = fashion_mnist.load_data()
+
+    class_names = ['T-shirt/top', 'Trouser', 'Pullover', 'Dress', 'Coat',
+                   'Sandal', 'Shirt', 'Sneaker', 'Bag', 'Ankle boot']
+    train_idx = np.arange(len(train_labels), dtype=np.int32)
+    train_dataset = tf.data.Dataset.from_tensor_slices((train_images, train_labels, train_idx))
+    train_dataset.shuffle(5000)
+    train_dataset = train_dataset.batch(32, drop_remainder=True)
+
+    test_idx = np.arange(len(test_labels), dtype=np.int32)
+    test_dataset = tf.data.Dataset.from_tensor_slices((test_images, test_labels, test_idx))
+    test_dataset = test_dataset.batch(32, drop_remainder=True)
+    model = fashion_model()
+    logger = JSONLogger(model, os.getcwd())
+    print('Path', os.getcwd())
+
+    for epoch in range(1, 3):
+
+        for sample in train_dataset:
+            train_step(model, sample)
+
+        template = 'Epoch {}, Loss: {}'
+        print(template.format(epoch,
+                              model.train_loss.result()))
+
+        model.train_loss.reset_states()
+
+    for sample in test_dataset:
+        predict_step(model, sample, logger)
+
+    logger.on_predict_end()
+
+
+if __name__ == "__main__":
+    tf_run(False)
+Other info / logs Include any logs or source code that would be helpful to
+diagnose the problem. If including tracebacks, please include the full
+traceback. Large logs and files should be attached.
+_FallbackException                        Traceback (most recent call last)
+
+/usr/local/lib/python3.6/dist-packages/tensorflow/python/ops/gen_array_ops.py in identity(input, name)
+   3888         _ctx._context_handle, tld.device_name, "Identity", name,
+-&gt; 3889         tld.op_callbacks, input)
+   3890       return _result
+
+_FallbackException: This function does not handle the case of the path where all inputs are not already EagerTensors.
+
+
+During handling of the above exception, another exception occurred:
+
+TypeError                                 Traceback (most recent call last)
+
+12 frames
+
+/usr/local/lib/python3.6/dist-packages/tensorflow/python/eager/execute.py in quick_execute(op_name, num_outputs, inputs, attrs, ctx, name)
+     58     ctx.ensure_initialized()
+     59     tensors = pywrap_tfe.TFE_Py_Execute(ctx._handle, device_name, op_name,
+---&gt; 60                                         inputs, attrs, num_outputs)
+     61   except core._NotOkStatusException as e:
+     62     if name is not None:
+
+TypeError: An op outside of the function building code is being passed
+a "Graph" tensor. It is possible to have Graph tensors
+leak out of the function building context by including a
+tf.init_scope in your function building code.
+For example, the following function will fail:
+  @tf.function
+  def has_init_scope():
+    my_constant = tf.constant(1.)
+    with tf.init_scope():
+      added = my_constant * 2
+The graph tensor has name: sample_2:0
+	</description>
+	<comments>
+		<comment id='1' author='MilimaBwana' date='2020-06-09T05:47:29Z'>
+		I have tried in colab with TF version 2.2, nightly versions and was able to reproduce the issue.Please, find the gist &lt;denchmark-link:https://colab.research.google.com/gist/ravikyram/f2033c65dbfcc13578d16b17b68d52b2/untitled967.ipynb&gt;here&lt;/denchmark-link&gt;
+.Thanks!
+		</comment>
+		<comment id='2' author='MilimaBwana' date='2020-08-21T15:54:30Z'>
+		Hi &lt;denchmark-link:https://github.com/MilimaBwana&gt;@MilimaBwana&lt;/denchmark-link&gt;
+, this error has been reported before. There's no fix currently, but I can update this thread when a change has been made. Essentially the issue you're facing has to do with trying to pass in a TensorArray created outside in eager mode to a tf.function. This is currently unsupported due to somewhat inconsistent behavior of TensorArrays in graph and eager mode.
+		</comment>
+		<comment id='3' author='MilimaBwana' date='2021-01-15T01:03:29Z'>
+		This issue has been automatically marked as stale because it has not had recent activity. It will be closed if no further activity occurs. Thank you.
+		</comment>
+		<comment id='4' author='MilimaBwana' date='2021-01-22T01:37:23Z'>
+		Closing as stale. Please reopen if you'd like to work on this further.
+		</comment>
+		<comment id='5' author='MilimaBwana' date='2021-01-22T01:37:25Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/40276&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/40276&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

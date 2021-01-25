@@ -1,0 +1,334 @@
+<bug_data>
+<bug id='44278' author='jackd' open_date='2020-10-24T03:59:35Z' closed_time='2020-12-11T18:07:59Z'>
+ 	<summary>Unexpected `snapshot` behaviour with `flat_map` in tf-nightly</summary>
+ 	<description>
+ System information
+ 
+ Have I written custom code (as opposed to using a stock example script provided in TensorFlow): yes
+ OS Platform and Distribution (e.g., Linux Ubuntu 16.04): ubuntu 18.04
+ TensorFlow installed from (source or binary): binary (pip)
+ TensorFlow version (use command below): '2.4.0-dev20201023'
+ Python version: 3.7.7
+ 
+ Describe the current behavior
+ A dataset formed by flat_mapping multiple snapshotted datasets which have each been iterated over individually (thus producing files on disk) results in a dataset which seemingly does not use those files on disk. This is different to the behaviour of cache in tf-2.3 and tf-nightly and snapshot in tf-2.3
+ Describe the expected behavior
+ snapshot to work equivalently in 2.3 as tf-nightly, and similarly to cache.
+ 
+ Colab &lt;denchmark-link:https://colab.research.google.com/drive/13mXDdNKNg04MEDvFTwmQq0tAw8L0MY02?usp=sharing&gt;here&lt;/denchmark-link&gt;
+ .
+ import os
+ from tempfile import TemporaryDirectory
+ 
+ import numpy as np
+ import tensorflow as tf
+ 
+ 
+ def as_numpy(ds: tf.data.Dataset):
+     return np.array([x.numpy() for x in ds])
+ 
+ 
+ def get_data(
+     num_repeats=2,
+     snap=False,
+     preprocess_early=False,
+     preprocess_late=False,
+     del_rng=False,
+ ):
+     """
+     Get numpy results from a data pipeline.
+ 
+     The pipeline looks like:
+         1. range
+         2. add stateful random noise
+         3. create `num_repeats` `cache`d or `snapshot`ted versions
+         4. `flat_map` if num_repeats &gt; 1
+ 
+     Args:
+         num_repeats: number of duplicates created in step 3 above.
+         snap: use `snapshot` (otherwise use `cache`)
+         preprocess_early: if True, we iterate over individually cached / snapshotted
+             datasets prior to flat-mapping.
+         preprocess_late: if True, we iterate over the `flat_map`ped dataset
+         del_rng: if True, we delete the rng responsible for generating random noise in
+             step 2. This will cause an error if this map function is called again,
+             rather than using cached / snapshotted files on disk.
+ 
+     Returns:
+         Two iterations of the repeated dataset.
+     """
+     rng = tf.random.Generator.from_seed(0)
+     dataset = tf.data.Dataset.range(10).map(
+         lambda x: tf.cast(x, tf.float32) + rng.uniform(())
+     )
+     with TemporaryDirectory() as tmp_dir:
+         paths = [os.path.join(tmp_dir, f"repeat-{i}") for i in range(num_repeats)]
+         if snap:
+             datasets = [
+                 dataset.apply(tf.data.experimental.snapshot(path)) for path in paths
+             ]
+         else:
+             datasets = [dataset.cache(path) for path in paths]
+         if preprocess_early:
+             # iterate over datasets individually to force saving to file
+             for ds in datasets:
+                 as_numpy(ds)
+         if num_repeats == 1:
+             (dataset,) = datasets
+         else:
+             dataset = tf.data.Dataset.from_tensor_slices(datasets).flat_map(lambda x: x)
+         if preprocess_late:
+             # iterate over concatenated dataset to force saving to file
+             as_numpy(dataset)
+         if del_rng:
+             # this will cause an error is the original mapped dataset is called
+             del rng
+         return as_numpy(dataset), as_numpy(dataset)
+ 
+ 
+ class SnapshotTest(tf.test.TestCase):
+     def test_consistent(self):
+         base0, base1 = get_data()
+         np.testing.assert_equal(base0, base1)
+ 
+     def test_reproducible(self):
+         base0, _ = get_data()
+         s0, s1 = get_data()
+         np.testing.assert_equal(s0, s1)
+         np.testing.assert_equal(s0, base0)
+ 
+     def test_snapshot(self):
+         base0, _ = get_data()
+         s0, s1 = get_data(snap=True)
+         np.testing.assert_equal(s0, s1)
+         np.testing.assert_equal(s0, base0)
+ 
+     def test_preprocess_late(self):
+         base0, _ = get_data()
+         s0, s1 = get_data(snap=True, preprocess_late=True)
+         np.testing.assert_equal(s0, s1)
+         np.testing.assert_equal(s0, base0)
+ 
+     def test_preprocess_late_del_rng(self):
+         base0, _ = get_data()
+         s0, s1 = get_data(snap=True, preprocess_late=True, del_rng=True)
+         np.testing.assert_equal(s0, s1)
+         np.testing.assert_equal(s0, base0)
+ 
+     def test_preprocess_early(self):
+         base0, _ = get_data()
+         s0, s1 = get_data(snap=True, preprocess_early=True)
+         np.testing.assert_equal(s0, s1)
+         np.testing.assert_equal(s0, base0)
+ 
+     def test_preprocess_early_del_rng(self):
+         base0, _ = get_data()
+         s0, s1 = get_data(snap=True, preprocess_early=True, del_rng=True)
+         np.testing.assert_equal(s0, s1)
+         np.testing.assert_equal(s0, base0)
+ 
+     def test_preprocess_no_repeats(self):
+         # preprocess_early is equivalent to preprocess_late here
+         base0, _ = get_data(num_repeats=1)
+         s0, s1 = get_data(snap=True, preprocess_early=True, num_repeats=1)
+         np.testing.assert_equal(s0, s1)
+         np.testing.assert_equal(s0, base0)
+ 
+     def test_preprocess_del_rng_no_repeats(self):
+         # preprocess_early is equivalent to preprocess_late here
+         base0, _ = get_data(num_repeats=1)
+         s0, s1 = get_data(snap=True, preprocess_early=True, num_repeats=1, del_rng=True)
+         np.testing.assert_equal(s0, s1)
+         np.testing.assert_equal(s0, base0)
+ 
+ 
+ if __name__ == "__main__":
+     tf.test.main()
+ Other info / logs
+ Failed test output:
+ &lt;denchmark-code&gt;======================================================================
+ ERROR: test_preprocess_early_del_rng (__main__.SnapshotTest)
+ SnapshotTest.test_preprocess_early_del_rng
+ ----------------------------------------------------------------------
+ Traceback (most recent call last):
+   File "/home/jackd/anaconda3/envs/tf-nightly/lib/python3.7/site-packages/tensorflow/python/eager/context.py", line 2113, in execution_mode
+     yield
+   File "/home/jackd/anaconda3/envs/tf-nightly/lib/python3.7/site-packages/tensorflow/python/data/ops/iterator_ops.py", line 733, in _next_internal
+     output_shapes=self._flat_output_shapes)
+   File "/home/jackd/anaconda3/envs/tf-nightly/lib/python3.7/site-packages/tensorflow/python/ops/gen_dataset_ops.py", line 2579, in iterator_get_next
+     _ops.raise_from_not_ok_status(e, name)
+   File "/home/jackd/anaconda3/envs/tf-nightly/lib/python3.7/site-packages/tensorflow/python/framework/ops.py", line 6862, in raise_from_not_ok_status
+     six.raise_from(core._status_to_exception(e.code, message), None)
+   File "&lt;string&gt;", line 3, in raise_from
+ tensorflow.python.framework.errors_impl.NotFoundError: Resource localhost/_AnonymousVar6/N10tensorflow3VarE does not exist.
+ 	 [[{{node stateful_uniform/StatefulUniform}}]] [Op:IteratorGetNext]
+ 
+ During handling of the above exception, another exception occurred:
+ 
+ Traceback (most recent call last):
+   File "foob.py", line 107, in test_preprocess_early_del_rng
+     s0, s1 = get_data(snap=True, preprocess_early=True, del_rng=True)
+   File "foob.py", line 67, in get_data
+     return as_numpy(dataset), as_numpy(dataset)
+   File "foob.py", line 9, in as_numpy
+     return np.array([x.numpy() for x in ds])
+   File "foob.py", line 9, in &lt;listcomp&gt;
+     return np.array([x.numpy() for x in ds])
+   File "/home/jackd/anaconda3/envs/tf-nightly/lib/python3.7/site-packages/tensorflow/python/data/ops/iterator_ops.py", line 747, in __next__
+     return self._next_internal()
+   File "/home/jackd/anaconda3/envs/tf-nightly/lib/python3.7/site-packages/tensorflow/python/data/ops/iterator_ops.py", line 739, in _next_internal
+     return structure.from_compatible_tensor_list(self._element_spec, ret)
+   File "/home/jackd/anaconda3/envs/tf-nightly/lib/python3.7/contextlib.py", line 130, in __exit__
+     self.gen.throw(type, value, traceback)
+   File "/home/jackd/anaconda3/envs/tf-nightly/lib/python3.7/site-packages/tensorflow/python/eager/context.py", line 2116, in execution_mode
+     executor_new.wait()
+   File "/home/jackd/anaconda3/envs/tf-nightly/lib/python3.7/site-packages/tensorflow/python/eager/executor.py", line 69, in wait
+     pywrap_tfe.TFE_ExecutorWaitForAllPendingNodes(self._handle)
+ tensorflow.python.framework.errors_impl.NotFoundError: Resource localhost/_AnonymousVar6/N10tensorflow3VarE does not exist.
+ 	 [[{{node stateful_uniform/StatefulUniform}}]]
+ 
+ ======================================================================
+ FAIL: test_preprocess_early (__main__.SnapshotTest)
+ SnapshotTest.test_preprocess_early
+ ----------------------------------------------------------------------
+ Traceback (most recent call last):
+   File "foob.py", line 103, in test_preprocess_early
+     np.testing.assert_equal(s0, base0)
+   File "/home/jackd/anaconda3/envs/tf-nightly/lib/python3.7/site-packages/numpy/testing/_private/utils.py", line 342, in assert_equal
+     return assert_array_equal(actual, desired, err_msg, verbose)
+   File "/home/jackd/anaconda3/envs/tf-nightly/lib/python3.7/site-packages/numpy/testing/_private/utils.py", line 931, in assert_array_equal
+     verbose=verbose, header='Arrays are not equal')
+   File "/home/jackd/anaconda3/envs/tf-nightly/lib/python3.7/site-packages/numpy/testing/_private/utils.py", line 840, in assert_array_compare
+     raise AssertionError(msg)
+ AssertionError: 
+ Arrays are not equal
+ 
+ Mismatched elements: 20 / 20 (100%)
+ Max absolute difference: 0.90819454
+ Max relative difference: 1.9366292
+  x: array([0.91562 , 1.45509 , 2.253555, 3.829305, 4.681193, 5.65526 ,
+        6.401854, 7.514806, 8.184864, 9.174181, 0.130606, 1.063369,
+        2.513922, 3.190604, 4.433053, 5.044663, 6.653943, 7.007094,
+        8.878403, 9.046815], dtype=float32)
+  y: array([0.311793, 1.18098 , 2.761353, 3.138052, 4.027518, 5.460741,
+        6.235661, 7.175892, 8.786037, 9.549028, 0.860469, 1.631952,
+        2.669349, 3.255722, 4.884421, 5.066545, 6.267429, 7.34992 ,
+        8.16538 , 9.955009], dtype=float32)
+ 
+ ----------------------------------------------------------------------
+ Ran 10 tests in 0.849s
+ 
+ FAILED (failures=1, errors=1, skipped=1)
+ &lt;/denchmark-code&gt;
+ 
+ 	</description>
+ 	<comments>
+ 		<comment id='1' author='jackd' date='2020-10-27T12:24:41Z'>
+ 		&lt;denchmark-link:https://github.com/ymodak&gt;@ymodak&lt;/denchmark-link&gt;
+ 
+ I am able to replicate the issue reported,please find the &lt;denchmark-link:https://colab.research.google.com/gist/Saduf2019/919b0216f01d1b8d41444ee0f24b47f3/untitled453.ipynb&gt;gist here&lt;/denchmark-link&gt;
+ .
+ 		</comment>
+ 		<comment id='2' author='jackd' date='2020-10-30T20:14:21Z'>
+ 		Hi &lt;denchmark-link:https://github.com/jackd&gt;@jackd&lt;/denchmark-link&gt;
+ , thank you for the thorough testing and reproduction details! I dug into the issue and found a couple behaviors that combined to cause this issue:
+ 
+ Datasets passed through flat_map functions are not optimized before iterating over them.
+ This commit changed SnapshotDataset so that when the dataset is optimized, the dataset hash changes. This happens because the compression type gets changed/resolved from AUTO to SNAPPY, and compression type is included in the snapshot hash.
+ 
+ I'm preparing a fix that will address both issues by always computing snapshot hashes based on the structure of the dataset before optimization.
+ To work around the issue in the short term, you could change the way you implement preprocess_early to use flat_map, like so:
+ if preprocess_early:
+     # iterate over datasets individually to force saving to file
+     for ds in datasets:
+         as_numpy(tf.data.Dataset.from_tensors(ds).flat_map(lambda x: x))
+ 		</comment>
+ 		<comment id='3' author='jackd' date='2020-12-11T18:07:58Z'>
+ 		This should be fixed now, right?
+ Please reopen if that is not the case.
+ 		</comment>
+ 		<comment id='4' author='jackd' date='2020-12-11T18:08:01Z'>
+ 		Are you satisfied with the resolution of your issue?
+ &lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/44278&gt;Yes&lt;/denchmark-link&gt;
+ 
+ &lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/44278&gt;No&lt;/denchmark-link&gt;
+ 
+ 		</comment>
+ 	</comments>
+ </bug>
+<commit id='cbc7f31b7d6aac81158be084201d3b3e8e346907' author='Andrew Audibert' date='2020-11-03 11:59:47-08:00'>
+ 	<dmm_unit complexity='1.0' interfacing='0.7' size='0.6'></dmm_unit>
+ 	<modification change_type='MODIFY' old_name='tensorflow\core\kernels\data\experimental\snapshot_dataset_op.cc' new_name='tensorflow\core\kernels\data\experimental\snapshot_dataset_op.cc'>
+ 		<file_info nloc='1945' complexity='228' token_count='13615'></file_info>
+ 		<method name='tensorflow::data::experimental::SnapshotDatasetV2Op::Dataset::AsGraphDefInternal' parameters='ctx,b,output'>
+ 				<method_info nloc='50' complexity='1' token_count='358' nesting_level='3' start_line='350' end_line='415'></method_info>
+ 			<added_lines>377,378,379,380,381,382,408,409</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<method name='tensorflow::data::experimental::SnapshotDatasetV2Op::SnapshotDatasetV2Op' parameters='ctx'>
+ 				<method_info nloc='22' complexity='3' token_count='212' nesting_level='3' start_line='822' end_line='847'></method_info>
+ 			<added_lines>838,839,840,841</added_lines>
+ 			<deleted_lines>843,844,845,846,847</deleted_lines>
+ 		</method>
+ 		<method name='tensorflow::data::experimental::SnapshotDatasetV2Op::Dataset::Dataset' parameters='ctx,input,hash,path,compression,reader_prefix,writer_prefix,reader_func,shard_func'>
+ 				<method_info nloc='17' complexity='1' token_count='128' nesting_level='3' start_line='297' end_line='313'></method_info>
+ 			<added_lines>307</added_lines>
+ 			<deleted_lines>307,308</deleted_lines>
+ 		</method>
+ 		<method name='tensorflow::data::experimental::SnapshotDatasetV2Op::MakeDataset' parameters='ctx,input,output'>
+ 				<method_info nloc='34' complexity='3' token_count='245' nesting_level='3' start_line='849' end_line='887'></method_info>
+ 			<added_lines>854,855,856,857,858,859,860,861,862,863,864,865,866,867,868,869,870,871,872,873,885,886</added_lines>
+ 			<deleted_lines>849,850,851,852,853,854,855,856,868,869</deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines></added_lines>
+ 			<deleted_lines>848</deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='tensorflow\core\kernels\data\experimental\snapshot_dataset_op.h' new_name='tensorflow\core\kernels\data\experimental\snapshot_dataset_op.h'>
+ 		<file_info nloc='61' complexity='0' token_count='298'></file_info>
+ 		<modified_lines>
+ 			<added_lines>49,50,80,81</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='tensorflow\core\ops\experimental_dataset_ops.cc' new_name='tensorflow\core\ops\experimental_dataset_ops.cc'>
+ 		<file_info nloc='1017' complexity='0' token_count='6618'></file_info>
+ 		<modified_lines>
+ 			<added_lines>971,972</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='tensorflow\python\data\experimental\kernel_tests\snapshot_test.py' new_name='tensorflow\python\data\experimental\kernel_tests\snapshot_test.py'>
+ 		<file_info nloc='775' complexity='88' token_count='6142'></file_info>
+ 		<method name='testReadUsingFlatMap' parameters='self'>
+ 				<method_info nloc='11' complexity='1' token_count='100' nesting_level='1' start_line='360' end_line='370'></method_info>
+ 			<added_lines>360,361,362,363,364,365,366,367,368,369,370</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<method name='testReadOptimizableUsingFlatMap' parameters='self'>
+ 				<method_info nloc='13' complexity='1' token_count='120' nesting_level='1' start_line='373' end_line='386'></method_info>
+ 			<added_lines>373,374,375,376,377,378,379,380,381,382,383,384,385,386</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines>359,371,372,387</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='tensorflow\tools\api\golden\v1\tensorflow.raw_ops.pbtxt' new_name='tensorflow\tools\api\golden\v1\tensorflow.raw_ops.pbtxt'>
+ 		<file_info nloc='None' complexity='None' token_count='None'></file_info>
+ 		<modified_lines>
+ 			<added_lines>4125</added_lines>
+ 			<deleted_lines>4125</deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='tensorflow\tools\api\golden\v2\tensorflow.raw_ops.pbtxt' new_name='tensorflow\tools\api\golden\v2\tensorflow.raw_ops.pbtxt'>
+ 		<file_info nloc='None' complexity='None' token_count='None'></file_info>
+ 		<modified_lines>
+ 			<added_lines>4125</added_lines>
+ 			<deleted_lines>4125</deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ </commit>
+</bug_data>

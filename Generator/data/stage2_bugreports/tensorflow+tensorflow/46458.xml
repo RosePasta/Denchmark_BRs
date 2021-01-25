@@ -1,0 +1,341 @@
+<bug id='46458' author='emadboctorx' open_date='2021-01-15T16:19:53Z' closed_time='2021-01-16T15:56:06Z'>
+	<summary>TypeError: An op outside of the function building code is being passed</summary>
+	<description>
+Following the &lt;denchmark-link:https://www.tensorflow.org/tutorials/reinforcement_learning/actor_critic&gt;documentation&lt;/denchmark-link&gt;
+ I re-arranged functions into a class, I changed the model and made a few other modifications, however the code fails to work if  is enabled, otherwise it works perfectly fine. By commenting out line 97, the error is gone:
+&lt;denchmark-code&gt;self.model.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
+&lt;/denchmark-code&gt;
+
+Error
+&lt;denchmark-code&gt;Traceback (most recent call last):
+  File "/Users/emadboctor/Desktop/code/drl-algos/a2c.py", line 109, in &lt;module&gt;
+    agn.fit()
+  File "/Users/emadboctor/Desktop/code/drl-algos/a2c.py", line 103, in fit
+    self.train_step()
+  File "/usr/local/lib/python3.8/site-packages/tensorflow/python/eager/def_function.py", line 828, in __call__
+    result = self._call(*args, **kwds)
+  File "/usr/local/lib/python3.8/site-packages/tensorflow/python/eager/def_function.py", line 888, in _call
+    return self._stateless_fn(*args, **kwds)
+  File "/usr/local/lib/python3.8/site-packages/tensorflow/python/eager/function.py", line 2942, in __call__
+    return graph_function._call_flat(
+  File "/usr/local/lib/python3.8/site-packages/tensorflow/python/eager/function.py", line 1918, in _call_flat
+    return self._build_call_outputs(self._inference_function.call(
+  File "/usr/local/lib/python3.8/site-packages/tensorflow/python/eager/function.py", line 555, in call
+    outputs = execute.execute(
+  File "/usr/local/lib/python3.8/site-packages/tensorflow/python/eager/execute.py", line 75, in quick_execute
+    raise e
+  File "/usr/local/lib/python3.8/site-packages/tensorflow/python/eager/execute.py", line 59, in quick_execute
+    tensors = pywrap_tfe.TFE_Py_Execute(ctx._handle, device_name, op_name,
+TypeError: An op outside of the function building code is being passed
+a "Graph" tensor. It is possible to have Graph tensors
+leak out of the function building context by including a
+tf.init_scope in your function building code.
+For example, the following function will fail:
+  @tf.function
+  def has_init_scope():
+    my_constant = tf.constant(1.)
+    with tf.init_scope():
+      added = my_constant * 2
+The graph tensor has name: while:4
+&lt;/denchmark-code&gt;
+
+Code
+&lt;denchmark-code&gt;import gym
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.layers import Conv2D, Dense, Flatten, Input
+from tensorflow.keras.losses import Huber
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam
+
+
+class A2C:
+    def __init__(self, env, gamma=0.99, fc_units=512):
+        self.env = env
+        self.available_actions = env.action_space.n
+        self.model = self.create_model(fc_units)
+        self.state = tf.cast(self.env.reset(), tf.float32)
+        self.gamma = gamma
+        self.division_eps = np.finfo(np.float32).eps.item()
+        self.loss = Huber(reduction=tf.keras.losses.Reduction.SUM)
+
+    def create_model(self, fc_units):
+        x0 = Input(self.env.observation_space.shape)
+        x = Conv2D(32, 8, 4, activation='relu')(x0)
+        x = Conv2D(64, 4, 2, activation='relu')(x)
+        x = Conv2D(32, 3, 1, activation='relu')(x)
+        x = Flatten()(x)
+        x = Dense(fc_units, activation='relu')(x)
+        actor = Dense(self.available_actions)(x)
+        critic = Dense(1)(actor)
+        model = Model(x0, [actor, critic])
+        model.call = tf.function(model.call)
+        return model
+
+    def env_step(self, action):
+        state, reward, done, _ = self.env.step(action)
+        return (
+            state.astype(np.float32),
+            np.array(reward, np.int32),
+            np.array(done, np.int32),
+        )
+
+    def tf_env_step(self, action):
+        return tf.numpy_function(
+            self.env_step, [action], [tf.float32, tf.int32, tf.int32]
+        )
+
+    def get_returns(self, rewards, standardize=True):
+        n = tf.shape(rewards)[0]
+        returns = tf.TensorArray(dtype=tf.float32, size=n)
+        rewards = tf.cast(rewards[::-1], dtype=tf.float32)
+        discounted_sum = tf.constant(0.0)
+        discounted_sum_shape = discounted_sum.shape
+        for i in tf.range(n):
+            reward = rewards[i]
+            discounted_sum = reward + self.gamma * discounted_sum
+            discounted_sum.set_shape(discounted_sum_shape)
+            returns = returns.write(i, discounted_sum)
+        returns = returns.stack()[::-1]
+        if standardize:
+            returns = (returns - tf.math.reduce_mean(returns)) / (
+                tf.math.reduce_std(returns) + self.division_eps
+            )
+        return returns
+
+    def play_episode(self, max_steps=10000):
+        action_probs = tf.TensorArray(dtype=tf.float32, size=0, dynamic_size=True)
+        values = tf.TensorArray(dtype=tf.float32, size=0, dynamic_size=True)
+        rewards = tf.TensorArray(dtype=tf.int32, size=0, dynamic_size=True)
+        initial_shape = self.state.shape
+        for i in tf.range(max_steps):
+            actor_out, value = self.model(tf.expand_dims(self.state, 0))
+            action = tf.random.categorical(actor_out, 1)[0, 0]
+            action_prob = tf.nn.softmax(actor_out)
+            self.state, reward, done = self.tf_env_step(action)
+            self.state.set_shape(initial_shape)
+            action_probs = action_probs.write(i, action_prob[0, action])
+            values = values.write(i, tf.squeeze(value))
+            rewards = rewards.write(i, reward)
+            if tf.cast(done, tf.bool):
+                self.state = tf.cast(self.env.reset(), tf.float32)
+                break
+        return [item.stack() for item in [action_probs, values, rewards]]
+
+    def compute_loss(self, returns, values, action_probs):
+        advantage = returns - values
+        action_log_probs = tf.math.log(action_probs)
+        actor_loss = -tf.math.reduce_sum(action_log_probs * advantage)
+        critic_loss = self.loss(values, returns)
+        return actor_loss + critic_loss
+
+    @tf.function
+    def train_step(self):
+        with tf.GradientTape() as tape:
+            action_probs, values, rewards = self.play_episode()
+            returns = self.get_returns(rewards)
+            loss = self.compute_loss(returns, values, action_probs)
+        grads = tape.gradient(loss, self.model.trainable_variables)
+        self.model.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
+        episode_reward = tf.math.reduce_sum(rewards)
+        return episode_reward
+
+    def fit(self, learning_rate=7e-4):
+        self.model.compile(optimizer=Adam(learning_rate))
+        self.train_step()
+
+
+if __name__ == '__main__':
+    gym_env = gym.make('PongNoFrameskip-v4')
+    agn = A2C(gym_env)
+    agn.fit()
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='emadboctorx' date='2021-01-15T16:33:18Z'>
+		I have tried in colab with TF version 2.4, nightly version() and was able to reproduce the issue.Please, find the gist &lt;denchmark-link:https://colab.research.google.com/gist/ravikyram/0a2838dd44503c16dcb6cbb1a61af05a/untitled621.ipynb&gt;here&lt;/denchmark-link&gt;
+. Thanks!
+		</comment>
+		<comment id='2' author='emadboctorx' date='2021-01-16T15:56:06Z'>
+		I closed the issue upon coming up with the fix below:
+&lt;denchmark-code&gt;from collections import deque
+from time import perf_counter
+
+import gym
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.layers import Conv2D, Dense, Flatten, Input
+from tensorflow.keras.losses import Huber
+from tensorflow.keras.models import Model
+    
+
+class A2C:
+    def __init__(
+        self,
+        envs,
+        seed=None,
+        fc_units=512,
+        gamma=0.99,
+        reward_buffer_size=100,
+        max_episode_steps=10000,
+    ):
+        self.envs = envs
+        self.available_actions = envs[0].action_space.n
+        self.model = self.create_model(fc_units)
+        for env in self.envs:
+            env.seed(seed)
+        tf.random.set_seed(seed)
+        np.random.seed(seed)
+        self.total_rewards = deque(maxlen=reward_buffer_size)
+        self.mean_reward = -float('inf')
+        self.best_reward = -float('inf')
+        self.division_eps = np.finfo(np.float32).eps.item()
+        self.optimizer = tf.keras.optimizers.Adam(learning_rate=0.01)
+        self.gamma = gamma
+        self.steps = 0
+        self.games = 0
+        self.start_state = None
+        self.max_episode_steps = max_episode_steps
+
+    def create_model(self, fc_units):
+        x0 = Input(self.envs[0].observation_space.shape)
+        x = Conv2D(32, 8, 4, activation='relu')(x0)
+        x = Conv2D(64, 4, 2, activation='relu')(x)
+        x = Conv2D(32, 3, 1, activation='relu')(x)
+        x = Flatten()(x)
+        x = Dense(fc_units, activation='relu')(x)
+        actor = Dense(self.available_actions)(x)
+        critic = Dense(1)(actor)
+        model = Model(x0, [actor, critic])
+        model.call = tf.function(model.call)
+        return model
+
+    def env_step(self, action):
+        state, reward, done, _ = self.envs[0].step(action)
+        self.steps += 1
+        return (
+            state.astype(np.float32),
+            np.array(reward, np.int32),
+            np.array(done, np.int32),
+        )
+
+    def tf_env_step(self, action):
+        return tf.numpy_function(
+            self.env_step, [action], [tf.float32, tf.int32, tf.int32]
+        )
+
+    def play_episode(self):
+        action_probs = tf.TensorArray(dtype=tf.float32, size=0, dynamic_size=True)
+        values = tf.TensorArray(dtype=tf.float32, size=0, dynamic_size=True)
+        rewards = tf.TensorArray(dtype=tf.int32, size=0, dynamic_size=True)
+        initial_state_shape = self.start_state.shape
+        state = self.start_state
+        for t in tf.range(self.max_episode_steps):
+            state = tf.expand_dims(state, 0)
+            action_logits_t, value = self.model(state)
+            action = tf.random.categorical(action_logits_t, 1)[0, 0]
+            action_probs_t = tf.nn.softmax(action_logits_t)
+            values = values.write(t, tf.squeeze(value))
+            action_probs = action_probs.write(t, action_probs_t[0, action])
+            state, reward, done = self.tf_env_step(action)
+            state.set_shape(initial_state_shape)
+            rewards = rewards.write(t, reward)
+            if tf.cast(done, tf.bool):
+                break
+        return [item.stack() for item in [action_probs, values, rewards]]
+
+    def get_returns(self, rewards, gamma, standardize=True):
+        n = tf.shape(rewards)[0]
+        returns = tf.TensorArray(dtype=tf.float32, size=n)
+        rewards = tf.cast(rewards[::-1], dtype=tf.float32)
+        discounted_sum = tf.constant(0.0)
+        discounted_sum_shape = discounted_sum.shape
+        for i in tf.range(n):
+            reward = rewards[i]
+            discounted_sum = reward + gamma * discounted_sum
+            discounted_sum.set_shape(discounted_sum_shape)
+            returns = returns.write(i, discounted_sum)
+        returns = returns.stack()[::-1]
+        if standardize:
+            returns = (returns - tf.math.reduce_mean(returns)) / (
+                tf.math.reduce_std(returns) + self.division_eps
+            )
+        return returns
+
+    @staticmethod
+    def compute_loss(action_probs, values, returns):
+        advantage = returns - values
+        action_log_probs = tf.math.log(action_probs)
+        actor_loss = -tf.math.reduce_sum(action_log_probs * advantage)
+        critic_loss = Huber(reduction=tf.keras.losses.Reduction.SUM)(values, returns)
+        return actor_loss + critic_loss
+
+    @tf.function
+    def train_step(
+        self,
+    ):
+        with tf.GradientTape() as tape:
+            action_probs, values, rewards = self.play_episode()
+            returns = self.get_returns(rewards, self.gamma)
+            action_probs, values, returns = [
+                tf.expand_dims(x, 1) for x in [action_probs, values, returns]
+            ]
+            loss = self.compute_loss(action_probs, values, returns)
+        grads = tape.gradient(loss, self.model.trainable_variables)
+        self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
+        return tf.math.reduce_sum(rewards)
+
+    def fit(self, target_reward):
+        display_titles = (
+            'frame',
+            'games',
+            'speed',
+            'mean reward',
+            'best reward',
+            'episode reward',
+        )
+        while True:
+            start_steps = self.steps
+            t0 = perf_counter()
+            self.start_state = tf.constant(self.envs[0].reset(), dtype=tf.float32)
+            episode_reward = int(self.train_step())
+            self.games += 1
+            self.total_rewards.append(episode_reward)
+            self.mean_reward = np.around(np.mean(self.total_rewards), 2)
+            self.best_reward = max(episode_reward, self.best_reward)
+            speed = (self.steps - start_steps) // (perf_counter() - t0)
+            display_values = (
+                self.steps,
+                self.games,
+                f'{speed} steps/s',
+                self.mean_reward,
+                self.best_reward,
+                episode_reward,
+            )
+            display = (
+                f'{title}: {value}'
+                for title, value in zip(display_titles, display_values)
+            )
+            print(', '.join(display))
+            if self.mean_reward &gt;= target_reward:
+                break
+        print(f'\nSolved in {self.steps} steps.')
+
+
+if __name__ == '__main__':
+    en = gym.make('PongNoFrameskip-v4')
+    a2c = A2C([en], reward_buffer_size=10)
+    a2c.fit(18)
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='3' author='emadboctorx' date='2021-01-16T15:56:08Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/46458&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/46458&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

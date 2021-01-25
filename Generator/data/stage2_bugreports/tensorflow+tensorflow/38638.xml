@@ -1,0 +1,152 @@
+<bug id='38638' author='bigcola317' open_date='2020-04-17T12:00:44Z' closed_time='2021-01-21T22:02:14Z'>
+	<summary>Dilated convolution pass not working on standard TCN model</summary>
+	<description>
+System information
+
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Linux Ubuntu 18.04
+TensorFlow installed from (source or binary): source
+TensorFlow version (or github SHA if from source): 17dfa4e
+
+Command used to run the converter or code if you’re using the Python API
+If possible, please share a link to Colab/Jupyter/any notebook.
+&lt;denchmark-code&gt;# Copy and paste here the exact command (in Python)
+model = load_model(model_path, custom_objects={'TCN': TCN})
+converter = tf.lite.TFLiteConverter.from_keras_model(model)
+converter.experimental_new_converter = True
+converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS]
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-code&gt;# Copy and paste here the exact command (tf_tfl_translate command-line utility)
+tf_tfl_translate  --tf-input-arrays=input_1 --tf-input-shapes=1,784,1 --tf-output-arrays=dense/BiasAdd --print-function-result-mapping -o=$HOME/Desktop/converted.tflite --emit-builtin-tflite-ops ~/smnist.pb
+&lt;/denchmark-code&gt;
+
+The output from the converter invocation
+&lt;denchmark-code&gt;# Copy and paste the output here. (tf_tfl_translate output)
+'main' inputs:
+	name: 'input_1' buffer: 0
+'main' outputs:
+	name: 'dense/BiasAdd' buffer: 271 loc("dense/BiasAdd")
+&lt;/denchmark-code&gt;
+
+
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/files/4492741/smnist.zip&gt;smnist.zip&lt;/denchmark-link&gt;
+ contains the model in both .h5 and .pb format, and the converted Flatbuffers.
+
+I'm converting the Keras-TCN model from &lt;denchmark-link:https://github.com/philipperemy/keras-tcn&gt;https://github.com/philipperemy/keras-tcn&lt;/denchmark-link&gt;
+ to TF Lite.
+Method 1:
+I convert the Keras model (.h5) to a TF Lite Flatbuffer via the Python API as above. The conversion is successful, inference with the model has the correct accuracy, but I want to get rid of the SpaceToBatchNd and BatchToSpaceNd nodes resulting from the Conv1D ops present in the model. Commit &lt;denchmark-link:https://github.com/tensorflow/tensorflow/commit/f54bb6f5578b931d79884302768996ba1073f685&gt;f54bb6f&lt;/denchmark-link&gt;
+ claims to do so solving issue &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/29509&gt;#29509&lt;/denchmark-link&gt;
+. However this does not happen to be so in my converted model, which I attach.
+Method 2:
+To investigate further, I built the tf_tfl_translate tool from source and invoked it with the command above on a GraphDef (.pb) of the model. Conversions happen to be successful but again the STB and BTS ops are still present in the TF Lite Flatbuffer. The sequence of ops in the GraphDef seems to comply to the sequences specified in &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/master/tensorflow/compiler/mlir/lite/transforms/dilated_conv.h&gt;https://github.com/tensorflow/tensorflow/blob/master/tensorflow/compiler/mlir/lite/transforms/dilated_conv.h&lt;/denchmark-link&gt;
+.
+However, this time the ExpandDims and Squeeze ops are correctly converted to Reshape operations, as specified here &lt;denchmark-link:https://github.com/tensorflow/tensorflow/blob/master/tensorflow/compiler/mlir/lite/transforms/optimize_patterns.td&gt;https://github.com/tensorflow/tensorflow/blob/master/tensorflow/compiler/mlir/lite/transforms/optimize_patterns.td&lt;/denchmark-link&gt;
+, whereas this would not happen with the method above, and although I would like to avoid this being done on my final Flatbuffer.
+	</description>
+	<comments>
+		<comment id='1' author='bigcola317' date='2020-04-21T00:04:14Z'>
+		Hi,
+The current dilated conv rewriting pass only supports Conv2D:
+
+
+
+tensorflow/tensorflow/compiler/mlir/lite/transforms/prepare_tf.cc
+
+
+         Line 629
+      in
+      b422faa
+
+
+
+
+
+
+ patterns.insert&lt;ConvertTFDilatedConvOp&lt;TF::Conv2DOp&gt;, 
+
+
+
+
+
+If your model contains Conv1D, unfortunately that's not supported now.
+		</comment>
+		<comment id='2' author='bigcola317' date='2020-04-21T07:53:06Z'>
+		Thank you for your interest,
+But actually the model presents exactly a Conv2D op, as the Conv1D is converted to an ExpandDims -&gt; Conv2D -&gt; Squeeze sequence. So in the frozen graph there is exactly a SpaceToBatchND -&gt; Expand -&gt; Conv2D -&gt; Squeeze -&gt; BatchToSpaceND -&gt; BiasAdd sequence which this comment states is supported
+
+
+
+tensorflow/tensorflow/compiler/mlir/lite/transforms/dilated_conv.h
+
+
+         Line 50
+      in
+      adbacb4
+
+
+
+
+
+
+ //   SpaceToBatchND -&gt; Expand -&gt; Conv2D -&gt; Squeeze -&gt; BatchToSpaceND -&gt; BiasAdd 
+
+
+
+
+
+The same comment cites Wavenet as a use case for this sequence, which is very similar to my model.
+		</comment>
+		<comment id='3' author='bigcola317' date='2020-04-22T22:19:51Z'>
+		I took a look at your graph. And I think the pattern doesn't get matched because this line:
+
+
+
+tensorflow/tensorflow/compiler/mlir/lite/transforms/dilated_conv.h
+
+
+         Line 284
+      in
+      adbacb4
+
+
+
+
+
+
+ if (stb_bs_attr.getNumElements() &lt; 2) return {}; 
+
+
+
+
+
+For example, tensor name: tcn/residual_block_1_1/conv1D_1/SpaceToBatchND/block_shape only has 1 element '2', so the pattern got rejected since it's less than 2 elements.
+Could you change your model code where you specify the block_shape argument for the SpaceToBatchND op? Assuming you want to apply dilation rate 2 on both the height and width, you can just pass in [2, 2] in this case.
+		</comment>
+		<comment id='4' author='bigcola317' date='2020-04-23T06:39:06Z'>
+		Thank you.
+The problem is that I didn't create the ExpandDims -&gt; Conv2D -&gt; Squeeze sequence explicitly, so I don't have direct access to them. I have dilated Conv1D layers in my model which are handled by TensorFlow this way. The complexity that TF introduces to handle Conv1D is actually quite surprising. So I think that the conversion should take care of supporting dilated Conv1D as it does dilated Conv2D. I could extend it myself in a pull request if that could help.
+		</comment>
+		<comment id='5' author='bigcola317' date='2020-04-23T16:45:40Z'>
+		I see. I think the TF high level python API just rewrite the dilated conv into SpaceToBatch -&gt; Conv -&gt; BatchToSpace automatically. If you could help extend this pass by supporting Conv1D that will be great. Thanks!
+		</comment>
+		<comment id='6' author='bigcola317' date='2020-07-07T08:03:47Z'>
+		Hi &lt;denchmark-link:https://github.com/haozha111&gt;@haozha111&lt;/denchmark-link&gt;
+,
+Unfortunately I cannot make it to work on this, is there a chance someone could solve this?
+I kind of depend on it, but if this weren't possible I'd go with an ugly custom pass in my hardware delegates for turnaround time reasons.
+I would be available to support with more information on how to reproduce the issue, etc.
+		</comment>
+		<comment id='7' author='bigcola317' date='2020-07-09T17:33:57Z'>
+		Hi,
+I wouldn't have much time working on support for dilated conv1d. Do you mind either file a github issue or write the custom pass on your own? I believe the work should be  very similar with the current 2d case with little modifications.
+		</comment>
+		<comment id='8' author='bigcola317' date='2021-01-21T22:02:16Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/38638&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/38638&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

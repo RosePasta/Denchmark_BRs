@@ -1,0 +1,231 @@
+<bug id='45914' author='GooseXP' open_date='2020-12-21T22:18:34Z' closed_time='2021-01-11T11:39:49Z'>
+	<summary>TF 2.4 shows shape mismatch where 2.3.1 did not</summary>
+	<description>
+Please make sure that this is a bug. As per our
+GitHub Policy,
+we only address code/doc bugs, performance issues, feature requests and
+build/installation issues on GitHub. tag:bug_template
+System information
+
+Have I written custom code (as opposed to using a stock example script provided in TensorFlow):No
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Ubuntu 16.04
+Mobile device (e.g. iPhone 8, Pixel 2, Samsung Galaxy) if the issue happens on mobile device:No
+TensorFlow installed from (source or binary):binary
+TensorFlow version (use command below):2.4
+Python version:3.7
+Bazel version (if compiling from source):
+GCC/Compiler version (if compiling from source):
+CUDA/cuDNN version:
+GPU model and memory:
+
+You can collect some of this information using our environment capture
+&lt;denchmark-link:https://github.com/tensorflow/tensorflow/tree/master/tools/tf_env_collect.sh&gt;script&lt;/denchmark-link&gt;
+
+You can also obtain the TensorFlow version with:
+
+TF 1.0: python -c "import tensorflow as tf; print(tf.GIT_VERSION, tf.VERSION)"
+TF 2.0: python -c "import tensorflow as tf; print(tf.version.GIT_VERSION, tf.version.VERSION)"
+
+i_model = Model([obs1.input, obs2.input], x, name='icm_inverse_model') returns a shape mismatch under the current version of tensorflow.
+No mismatch should be given as was the case in version 2.3.1 unless I am missing somthing...
+&lt;denchmark-code&gt;from keras.layers import Input, Concatenate, GRU, Dense, Reshape
+from keras.optimizers import Adam
+from keras.backend import clear_session
+from pathlib import Path
+from subprocess import Popen, PIPE, STDOUT, TimeoutExpired
+import numpy as np
+import tensorflow as tf
+from rl.agents import SARSAAgent
+from rl.policy import BoltzmannQPolicy
+import os
+
+cmd = 'echo Hello World!'
+env_reward = 0
+length_penalty = .25
+learning_reward = 10
+
+hidden_layers = 4
+layer_neurons = 128
+learning_rate = 0.001
+nb_actions = 96
+
+tf.get_logger().setLevel('ERROR')
+
+done = False
+cmd_in = True
+obs_last = None
+initialize = True
+
+while True:
+    if cmd_in:
+        proc = Popen(cmd, shell=True, stdin=PIPE, stdout=PIPE, stderr=STDOUT, close_fds=True)
+        try:
+            stdout = proc.communicate(timeout=1)[0].decode()
+            exitcode = proc.returncode
+        except TimeoutExpired:
+            proc.kill()
+            stdout = proc.communicate()[0].decode()
+            exitcode = proc.returncode
+        nnin = ''.join(char for char in stdout if char.isprintable())
+        filename = Path('mem.txt')
+        filename.touch(exist_ok=True)
+        if not nnin:
+            nnin = 'Done!'
+            stdout = nnin
+        if exitcode == 0:
+            done = True
+            with open('mem.txt', 'r+') as mem:
+                for line in stdout.splitlines():
+                    if line + '\n' not in mem:
+                        mem.write(line + '\n')
+                        env_reward += learning_reward
+        cmd = ''
+        print('\n')
+        print(stdout)
+        print('# ', end='', flush=True)
+    else:
+        nnin = cmd
+        print(nnin[-1], end='', flush=True)
+        env_reward -= length_penalty
+    idxs = (np.frombuffer(nnin.encode(), dtype=np.uint8) - 32) / 100 
+    env = tf.reshape(idxs, idxs.shape + (1,))
+    shape = env.shape
+
+
+    def build_actor_model(shape, nb_actions):
+        model = Sequential()
+        model.add(Reshape(shape[1::], input_shape=shape))
+        for layer in range(hidden_layers):
+            model.add(GRU(layer_neurons, name='GRU' + str(layer), return_sequences=True))
+        model.add(GRU(layer_neurons, name='GRU' + str(hidden_layers)))
+        model.add(Dense(nb_actions, name='output', activation='softmax'))
+        return model
+
+
+    def build_main(shape, name_prefix='main.'):
+        inputs = Input(shape=shape)
+        x = inputs
+        for layer in range(hidden_layers):
+            x = GRU(layer_neurons, name=name_prefix + ('GRU' + str(layer)), return_sequences=True)(x)
+        x = GRU(layer_neurons, name=name_prefix + ('GRU' + str(hidden_layers)))(x)
+        model = Model(inputs, x, name=name_prefix + 'main')
+        return model
+
+
+    def build_inverse_model(obs1, obs2, nb_actions):
+        x = Concatenate()([obs1.output, obs2.output])
+        x = Dense(nb_actions, name='icm_i.output', activation='sigmoid')(x)
+        i_model = Model([obs1.input, obs2.input], x, name='icm_inverse_model')
+        return i_model
+
+
+    def build_forward_model(obs1, nb_actions):
+        act1 = Input(shape=nb_actions)
+        x = Concatenate()([obs1.output, act1])
+        output_shape = obs1.output_shape[1]
+        x = Dense(output_shape, name='icm_f.output', activation='linear')(x)
+        f_model = Model([obs1.input, act1], x, name='icm_forward_model')
+        return f_model
+
+
+    inv_weights_fname = '{}_inv_weights.h5f'.format("SMB")
+    fwd_weights_fname = '{}_fwd_weights.h5f'.format("SMB")
+    agent_weights_fname = '{}_agent_weights.h5f'.format("SMB")
+
+    main = build_main(shape)
+    main2 = build_main(shape, name_prefix='main2.')
+    inverse_model = build_inverse_model(main, main2, nb_actions)
+    inverse_model.compile(Adam(learning_rate), loss='mse', metrics=['mse'])
+    forward_model = build_forward_model(main, nb_actions)
+    forward_model.compile(Adam(learning_rate), loss='mse', metrics=['mse'])
+    model = build_actor_model((1,) + shape, nb_actions)
+    policy = BoltzmannQPolicy()
+    agent = SARSAAgent(model=model, nb_actions=nb_actions, policy=policy)
+    agent.compile(Adam(learning_rate), metrics=['mae'])
+    agent.reset_states()
+
+    if initialize:
+        if os.path.isfile(inv_weights_fname):
+            inverse_model.load_weights(inv_weights_fname)
+        if os.path.isfile(fwd_weights_fname):
+            forward_model.load_weights(fwd_weights_fname)
+        if os.path.isfile(agent_weights_fname):
+            agent.load_weights(agent_weights_fname)
+        initialize = False
+    agent.training = True
+
+    obs_now = env
+    if obs_last is None:
+        obs_last = obs_now
+    action = agent.forward(obs_now)
+    icm_action = np.zeros(nb_actions)
+    icm_action[action] = 1
+    inv_loss = inverse_model.train_on_batch([np.expand_dims(obs_last, 0), np.expand_dims(obs_now, 0)],
+                                            [np.expand_dims(icm_action, 0)])
+    features_now = main.predict(np.expand_dims(obs_now, 0))
+    fwd_loss = forward_model.train_on_batch([np.expand_dims(obs_last, 0), np.expand_dims(icm_action, 0)],
+                                            [features_now])
+    obs_last = obs_now
+    r_intr = (fwd_loss[0] ** 0.5) / 100
+    reward = r_intr + env_reward
+    agent.backward(reward, done)
+    clear_session()
+    done = False
+
+    enc_ascii = action + 32
+    if enc_ascii != 127:
+        cmd += chr(enc_ascii)
+        cmd_in = False
+        continue
+    cmd_in = True
+    inverse_model.save_weights(inv_weights_fname, overwrite=True)
+    forward_model.save_weights(fwd_weights_fname, overwrite=True)
+    agent.save_weights(agent_weights_fname, overwrite=True)```
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='GooseXP' date='2020-12-22T05:13:18Z'>
+		Hi I am new to the Open source community &amp; I would like to contribute, but i'm not able to understand where or how to start.
+Can anyone pls help me out with this.
+		</comment>
+		<comment id='2' author='GooseXP' date='2020-12-22T07:40:58Z'>
+		&lt;denchmark-link:https://github.com/MaruthiKo&gt;@MaruthiKo&lt;/denchmark-link&gt;
+ hello,
+If you are new to open source then this is definitely not the repo you would contribute.
+Start with some small repo, explore issues with good first issue tags.
+		</comment>
+		<comment id='3' author='GooseXP' date='2020-12-22T11:37:27Z'>
+		Was able to reproduce the issue with &lt;denchmark-link:https://colab.research.google.com/gist/amahendrakar/3253281273502be86c8135a345009a17/45914.ipynb&gt;TF v2.4&lt;/denchmark-link&gt;
+ and &lt;denchmark-link:https://colab.research.google.com/gist/amahendrakar/9efb46c1fce066ad7a9fb1a47de9558d/45914-tf-nightly.ipynb&gt;TF-nightly&lt;/denchmark-link&gt;
+.
+However with &lt;denchmark-link:https://colab.research.google.com/gist/amahendrakar/f0052d4fa4f99c4d771a9e4e07244696/45914-2-3.ipynb&gt;TF v2.3&lt;/denchmark-link&gt;
+, I did not face any errors. Please check the linked gist for reference. Thanks!
+		</comment>
+		<comment id='4' author='GooseXP' date='2020-12-22T16:01:21Z'>
+		Checked changelog and I was able to get the model working by passing the input_spec = None parameter to the forward and inverse model, but this still seams to be a bizarre behavior.
+		</comment>
+		<comment id='5' author='GooseXP' date='2021-01-07T20:45:25Z'>
+		This is most likely intended. TF 2.4 started enforcing shape assumptions checking, causing layers that were called on incorrectly shaped inputs to fail with a clear error message. If the model was working previously, it was by accident, likely thanks to broadcasting.
+What's the error message?
+		</comment>
+		<comment id='6' author='GooseXP' date='2021-01-11T08:08:22Z'>
+		&lt;denchmark-link:https://github.com/GooseXP&gt;@GooseXP&lt;/denchmark-link&gt;
+,
+Can you please respond to &lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues/45914#issuecomment-756373652&gt;@fchollet's message&lt;/denchmark-link&gt;
+? Thanks!
+		</comment>
+		<comment id='7' author='GooseXP' date='2021-01-11T11:39:49Z'>
+		&lt;denchmark-link:https://github.com/rmothukuru&gt;@rmothukuru&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/fchollet&gt;@fchollet&lt;/denchmark-link&gt;
+ Thank you both for your help but as stated previously I checked the changelog and resolved the issue.
+		</comment>
+		<comment id='8' author='GooseXP' date='2021-01-11T11:39:50Z'>
+		Are you satisfied with the resolution of your issue?
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=Yes&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/45914&gt;Yes&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://docs.google.com/forms/d/e/1FAIpQLSfaP12TRhd9xSxjXZjcZFNXPGk4kc1-qMdv3gc6bEP90vY1ew/viewform?entry.85265664=No&amp;entry.2137816233=https://github.com/tensorflow/tensorflow/issues/45914&gt;No&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

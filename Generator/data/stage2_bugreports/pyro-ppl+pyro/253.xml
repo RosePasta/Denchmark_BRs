@@ -1,0 +1,149 @@
+<bug id='253' author='fritzo' open_date='2017-10-12T17:34:21Z' closed_time='2017-10-18T15:05:20Z'>
+	<summary>Incorrect batching in Categorical.sample(one_hot=False)</summary>
+	<description>
+See also &lt;denchmark-link:https://github.com/pyro-ppl/pyro/issues/231&gt;#231&lt;/denchmark-link&gt;
+, &lt;denchmark-link:https://github.com/pyro-ppl/pyro/issues/153&gt;#153&lt;/denchmark-link&gt;
+
+This is blocking SS-VAE from properly handling discrete latent variables. (we can work around)
+&lt;denchmark-h:h2&gt;Actual Behavior&lt;/denchmark-h&gt;
+
+print(dist.categorical(Variable(torch.Tensor([0.5, 0.5])), one_hot=False).size())
+print(dist.categorical(Variable(torch.Tensor([[0.5, 0.5]])), one_hot=False).size())
+print(dist.categorical(Variable(torch.Tensor([[[0.5, 0.5]]])), one_hot=False).size())
+
+# torch.Size([1, 1])
+# torch.Size([1, 1])
+# torch.Size([1, 1])
+&lt;denchmark-h:h2&gt;Expected Behavior&lt;/denchmark-h&gt;
+
+Categorical(one_hot=False) should behave like Bernoulli:
+print(dist.bernoulli(Variable(torch.Tensor([0.5]))).size())
+print(dist.bernoulli(Variable(torch.Tensor([[0.5]]))).size())
+print(dist.bernoulli(Variable(torch.Tensor([[[0.5]]]))).size())
+
+# torch.Size([1])
+# torch.Size([1, 1])
+# torch.Size([1, 1, 1])
+	</description>
+	<comments>
+		<comment id='1' author='fritzo' date='2017-10-12T17:54:20Z'>
+		It seems support() has the expected behavior, but it is not consistent with sample(). I think we are doing some forced shape coercion in sample(). Working on a fix for this.
+		</comment>
+		<comment id='2' author='fritzo' date='2017-10-12T17:55:00Z'>
+		Thanks for looking into it!
+		</comment>
+		<comment id='3' author='fritzo' date='2017-10-12T18:37:04Z'>
+		Also, here's a failing test for .batch_log_pdf().size():
+def test_batch_log_pdf_size():
+        p = pyro.param("p", Variable(torch.Tensor([[0.05], [0.15]])))
+        ps = pyro.param("ps", Variable(torch.Tensor([[0.1, 0.2, 0.3, 0.4],
+                                                     [0.4, 0.3, 0.2, 0.1]])))
+        x = pyro.sample("x", dist.Bernoulli(p))
+        y = pyro.sample("y", dist.Categorical(ps, one_hot=False))
+        assert x.size() == (2, 1)
+        assert y.size() == (2, 1)
+
+        assert dist.Bernoulli(p).batch_log_pdf(y).size() == (2,)
+        assert dist.Categorical(ps, one_hot=False).batch_log_pdf(y).size() == (2,)
+
+#E       assert torch.Size([2, 1]) == (2,)
+#E         Left contains more items, first extra item: 1L
+#E         Full diff:
+#E         - torch.Size([2, 1])
+#E         + (2,)
+		</comment>
+		<comment id='4' author='fritzo' date='2017-10-12T20:56:32Z'>
+		We are using the pyTorch's torch.multinomial internally, which itself allows only 1D or 2D parameter values. We are coercing all parameter values into a 2D matrix, for the same reason, I think.
+&lt;denchmark-code&gt;In [190]: torch.multinomial(torch.Tensor([0.5]), 1, replacement=True).size()
+Out[190]: torch.Size([1])
+
+In [191]: torch.multinomial(torch.Tensor([[0.5]]), 1, replacement=True).size()
+Out[191]: torch.Size([1, 1])
+
+In [192]: torch.multinomial(torch.Tensor([[[0.5]]]), 1, replacement=True).size()
+Out[192]: torch.Size([1, 1])
+&lt;/denchmark-code&gt;
+
+I was earlier thinking of allowing for arbitrary batch dimensions where the last dimension indicates the distribution's shape (if needed. e.g. for categorical it will has size K=number of categories). I think it will be simpler to have all distributions be either vectorized (with batch dimension being 0, with the following dimensions having the distribution parameters) or non-vectorized where the batch dimension is missing. If we provide any parameter values that do not have the right dimensions, we should throw an error. e.g. dist.bernoulli(Variable(torch.Tensor([[[0.5]]])) would throw an error in that case. What do you think?
+		</comment>
+		<comment id='5' author='fritzo' date='2017-10-12T21:08:32Z'>
+		Nice sleuthing!
+
+have all distributions be either vectorized ... or non-vectorized
+
+Hmm that seems very restrictive to me. It sounds like MATLAB   As a Bayesian modeler, I'd really like to be able use arbitrary tensors. And we already have indication that multiple batch dimensions are needed for nested-summing in  &lt;denchmark-link:https://github.com/pyro-ppl/pyro/pull/206&gt;#206&lt;/denchmark-link&gt;
+ and for the  &lt;denchmark-link:https://github.com/pyro-ppl/pyro/pull/227&gt;#227&lt;/denchmark-link&gt;
+ .
+I'm in favor of wrapping pytorch.multinomial with the right .view() calls so that we can indeed support arbitrary batch dimension. Let's chat.
+		</comment>
+		<comment id='6' author='fritzo' date='2017-10-12T21:14:31Z'>
+		
+It sounds like MATLAB 😟 As a Bayesian modeler
+
+Haha..sure, let me try to get the categorical working with multiple dimensions, do it for the other discrete distributions and get a better sense of what needs to be done for the other distributions. If we can have a good consistent support for this, that'll be another reason for separating out the distributions library as stand-alone.
+		</comment>
+		<comment id='7' author='fritzo' date='2017-10-12T21:16:22Z'>
+		yes besides a few exceptions, distributions assume a shape of (batch_size, param_size) where params are a 1D tensor. if params are 2d, then the first dimension is the batch_size. perhaps an important question is if the torch multinomial sampler does the right thing given a higher dimensional tensor? scipy samplers are very strict in this respect, im pretty sure most of them will error or do the wrong thing given vectorized params
+		</comment>
+		<comment id='8' author='fritzo' date='2017-10-12T21:25:01Z'>
+		
+the torch multinomial sampler does the right thing given a higher dimensional tensor?
+
+It doesn't. You are right that both of them are quite restrictive and either give the wrong results or error out. It should be relatively straight-forward to get this working for tensors though, or at least, appears that way to me. :)
+		</comment>
+		<comment id='9' author='fritzo' date='2017-10-13T01:18:11Z'>
+		I am getting some dimensional inconsistency between sample() and support() in the non-vectorized case. categorical.sample([0.1, 0.6, 0.3]) currently returns a tensor of size 1x1. Support would, however, return torch.Tensor([0, 1, 2]). When iterated, each element will be a simple primitive like 1L, and will not have the same dimensionality as sample() which is a tensor.
+I suppose we do want to return only tensors, so I am changing the behavior of support. So, categorical.support([0.1, 0.6, 0.3]) would return torch.Tensor[[0], [1], [2]] instead, and categorical.support([[0.1, 0.6, 0.3]] should return torch.Tensor[[[0]], [[1]], [[2]]] to make them consistent with sample(). I am going with this, but let me know if you have any thoughts on this.
+		</comment>
+		<comment id='10' author='fritzo' date='2017-10-13T01:19:33Z'>
+		Times like this make me remember haskell :)
+		</comment>
+		<comment id='11' author='fritzo' date='2017-10-13T20:21:51Z'>
+		Just a correction to the test above:
+        assert dist.Categorical(ps, one_hot=False).batch_log_pdf(y).size() == (2,)
+would actually return (2, 1), for the same reason mentioned above. Some sample tests along the lines.
+@pytest.mark.parametrize('p, expected_size',
+                          [
+                              ([0.1, 0.2, 0.3, 0.4], (1, )),
+                              ([[0.1, 0.2, 0.3, 0.4]], (1, 1)),
+                              ([[0.1, 0.2, 0.3, 0.4],
+                                [0.4, 0.3, 0.2, 0.1]], (2, 1))
+                          ])
+def test_random(p, expected_size):
+    p = Variable(torch.Tensor(p))
+    sample = dist.categorical.sample(p, one_hot=False)
+    assert sample.size() == expected_size
+    batch_log_pdf = dist.categorical.batch_log_pdf(sample, ps=p, one_hot=False)
+    assert batch_log_pdf.size() == expected_size
+Let me know if this is not what you are expecting.
+		</comment>
+		<comment id='12' author='fritzo' date='2017-10-18T13:57:06Z'>
+		&lt;denchmark-link:https://github.com/neerajprad&gt;@neerajprad&lt;/denchmark-link&gt;
+ We really do want
+assert dist.Categorical(ps, one_hot=False).batch_log_pdf(y).size() == (2,)
+Here is the desired behavior, where DiagNormal and Bernoulli currently do behave correctly.
+def test_diag_normal_batch_log_pdf_shape():
+    mu = ng_zeros(3, 2)
+    sigma = ng_ones(3, 2)
+    x = ng_zeros(3, 2)
+    assert dist.DiagNormal(mu, sigma).batch_log_pdf(x).size() == (3,)
+
+def test_bernoulli_batch_log_pdf_shape():
+    ps = ng_ones(3, 2)
+    x = ng_ones(3, 2)
+    dist.Bernoulli(ps).batch_log_pdf(x).size() == (3,)
+
+@pytest.mark.xfail
+def test_categorical_batch_log_pdf_shape():
+    ps = ng_ones(3, 2, 4) / 4
+    x = ng_ones(3, 2)
+    dist.Categorical(ps, one_hot=False).batch_log_pdf(x).size() == (3,)
+See &lt;denchmark-link:https://github.com/pyro-ppl/pyro/pull/276&gt;#276&lt;/denchmark-link&gt;
+ for clarification.
+		</comment>
+		<comment id='13' author='fritzo' date='2017-10-18T15:05:20Z'>
+		Moving  issues to &lt;denchmark-link:https://github.com/pyro-ppl/pyro/issues/278&gt;#278&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

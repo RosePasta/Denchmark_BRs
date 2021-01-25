@@ -1,0 +1,400 @@
+<bug id='2814' author='dangpzanco' open_date='2020-08-04T04:51:51Z' closed_time='2020-12-24T23:01:42Z'>
+	<summary>LR finder broken 2: not sure why (and other tiny bugs)</summary>
+	<description>
+&lt;denchmark-h:h2&gt;🐛 Bug&lt;/denchmark-h&gt;
+
+LR finder doesn't seem to work. The model doesn't train when trainer.lr_find(model) is running (the loss metric oscillates around its initial value). When looking at the figure from lr_finder.plot(), I suspected the learning rate wasn't being changed somehow, but internally it does. So I rebuilt a custom LR finder to check if it wasn't the rest of my code. It seems lr_find is broken, but I'm not sure why, since the implementation is kinda complex for me to debug. People might get wrong results if they don't check lr_finder.plot() before using lr_find.suggestion().
+&lt;denchmark-h:h3&gt;To Reproduce&lt;/denchmark-h&gt;
+
+Steps to reproduce the behavior:
+
+Clone this test repository
+Run the corresponding script (run.bat or run.sh)
+Compare plot results for LR finder and a custom LR finder (lr_finder.png and custom_lr_finder.png)
+
+Edit: I made a new branch called lr_bug, so please refer to that code instead
+&lt;denchmark-h:h4&gt;Code sample&lt;/denchmark-h&gt;
+
+The sample code is available &lt;denchmark-link:https://github.com/dangpzanco/pl_resnet_cifar10&gt;on this repo&lt;/denchmark-link&gt;
+. It trains &lt;denchmark-link:https://github.com/akamaster/pytorch_resnet_cifar10&gt;ResNet-s on CIFAR10&lt;/denchmark-link&gt;
+ with 10% of the train/val set for 10  with initial  and .
+Following is a stripped-down version of it:
+# -----------------------------
+# 3 FIND INITIAL LEARNING RATE
+# -----------------------------
+
+# Run learning rate finder
+lr_finder = trainer.lr_find(
+    model,
+    num_training=hparams.epochs*model.batches_per_epoch,
+    min_lr=hparams.learning_rate,
+    mode='exponential')
+
+# Plot
+import matplotlib.pyplot as plt
+fig = lr_finder.plot(suggest=True)
+fig.tight_layout()
+fig.savefig('lr_finder.png', dpi=300, format='png')
+
+# Pick point based on plot, or get suggestion
+new_lr = lr_finder.suggestion()
+
+# -------------------------------------
+# 4 FIND INITIAL LEARNING RATE (CUSTOM)
+# -------------------------------------
+
+# the scheduler is already configured as a LR sweeper
+trainer.fit(model)
+
+# get metrics from a custom CSV logger callback
+metrics = trainer.callbacks[1].batch_metrics
+loss = metrics['loss'].values
+
+# Same as lr_finder.suggestion(), but with a moving average filter
+index, lrs, loss = lr_suggestion(metrics, model.batches_per_epoch)
+custom_lr = lrs[index]
+
+# Plot
+import matplotlib.pyplot as plt
+fig, ax = plt.subplots()
+ax.plot(metrics['lr'], metrics['loss'], ':', label='Per Batch')
+ax.plot(lrs, loss, label='Filtered ("Per Epoch")')
+ax.plot(lrs[index], loss[index], 'ro', label='Suggestion')
+ax.set_xscale('log')
+ax.set_xlabel('Learning Rate')
+ax.set_ylabel('Loss')
+ax.legend()
+fig.tight_layout()
+fig.savefig('custom_lr_finder.png', dpi=300, format='png')
+The "custom" learning rate finder is supposed to replicate lr_finder, it's just the same scheduler (lr_finder._ExponentialLR) and a custom CSV logger callback which logs lr collected from inside the training loop:
+def training_step(self, batch, batch_idx):
+    # forward pass
+    x, y = batch
+    y_hat = self.forward(x)
+
+    # calculate loss
+    loss_val = self.loss(y_hat, y)
+
+    # acc
+    acc = ...
+
+    # lr
+    lr = self.trainer.lr_schedulers[0]['scheduler']._last_lr[0]
+
+    tqdm_dict = {'acc': acc, 'lr': lr}
+    output = OrderedDict({
+        'loss': loss_val,
+        'progress_bar': tqdm_dict,
+        'log': tqdm_dict
+    })
+
+    # can also return just a scalar instead of a dict (return loss_val)
+    return output
+
+def configure_optimizers(self):
+        optimizer = optim.SGD(self.parameters(),
+                              self.hparams.learning_rate,
+                              momentum=self.hparams.momentum,
+                              weight_decay=self.hparams.weight_decay)
+
+        customlr = _ExponentialLR
+        # customlr = _LinearLR
+        clr = customlr(
+            optimizer,
+            end_lr=1,
+            num_iter=self.hparams.epochs*self.batches_per_epoch,
+            last_epoch=-1
+        )
+        scheduler = dict(scheduler=clr,
+                         interval='step')
+
+        return [optimizer], [scheduler]
+When calculating the learning rate suggestion, a moving average filter was applied (with size batches_per_epoch). This prevents amplifying the noise with np.gradient() and getting wrong results from a "lucky batch". scipy.signal.filtfilt is necessary to avoid a delay in the loss array. I removed the line with  loss = loss[np.isfinite(loss)] for simplicity (and because of a potential bug when loss contains NaNs).
+def lr_suggestion(metrics, filter_size=100, skip_begin=10, skip_end=1):
+    loss = metrics['loss'].values
+    lrs = metrics['lr'].values
+	
+    # if loss has any NaN values, lrs.size != loss.size,
+    # which would result in the wrong index for lrs
+    # this code assumes there's no NaNs in loss
+    # loss = loss[np.isfinite(loss)]
+    
+    # Moving average before calculating the "gradient"
+    from scipy import signal
+    coef = np.ones(filter_size) / filter_size
+    loss = signal.filtfilt(coef, 1, loss)
+
+    index = np.gradient(loss[skip_begin:-skip_end]).argmin() + skip_begin
+
+    return index, lrs, loss
+&lt;denchmark-h:h3&gt;Expected behavior&lt;/denchmark-h&gt;
+
+&lt;denchmark-h:h5&gt;LR finder plot results (not expected):&lt;/denchmark-h&gt;
+
+&lt;denchmark-link:https://github.com/dangpzanco/pl_resnet_cifar10/blob/e1f45365a3c29c0e49ee8162d50be80c7985b467/lr_finder.png?raw=true&gt;&lt;/denchmark-link&gt;
+
+&lt;denchmark-h:h5&gt;Custom LR finder (blue line is the expected behavior):&lt;/denchmark-h&gt;
+
+&lt;denchmark-h:h3&gt;Environment&lt;/denchmark-h&gt;
+
+
+CUDA:
+- GPU:
+- GeForce GTX 950M
+- available:         True
+- version:           10.2
+Packages:
+- numpy:             1.19.1
+- pyTorch_debug:     False
+- pyTorch_version:   1.6.0
+- pytorch-lightning: 0.8.5
+- tensorboard:       2.2.1
+- tqdm:              4.47.0
+System:
+- OS:                Windows
+- architecture:
+- 64bit
+- WindowsPE
+- processor:         Intel64 Family 6 Model 142 Stepping 9, GenuineIntel
+- python:            3.7.7
+- version:           10.0.19041
+
+&lt;denchmark-h:h3&gt;Additional context&lt;/denchmark-h&gt;
+
+PS: When debugging this problem, I noticed that  only supports  and  as an interval, not logging the lr when . The &lt;denchmark-link:https://github.com/dangpzanco/pl_resnet_cifar10/blob/e1f45365a3c29c0e49ee8162d50be80c7985b467/lr_logger.py&gt;sample code&lt;/denchmark-link&gt;
+ has a simple fix which changes 2 lines of code (&lt;denchmark-link:https://github.com/PyTorchLightning/pytorch-lightning/blob/0.8.5/pytorch_lightning/callbacks/lr_logger.py#L68&gt;L68&lt;/denchmark-link&gt;
+ and &lt;denchmark-link:https://github.com/PyTorchLightning/pytorch-lightning/blob/0.8.5/pytorch_lightning/callbacks/lr_logger.py#L82&gt;L82&lt;/denchmark-link&gt;
+) to  and , respectively.
+	</description>
+	<comments>
+		<comment id='1' author='dangpzanco' date='2020-08-04T09:25:04Z'>
+		&lt;denchmark-link:https://github.com/SkafteNicki&gt;@SkafteNicki&lt;/denchmark-link&gt;
+ this seems to be broken at a different level here in comparison to &lt;denchmark-link:https://github.com/PyTorchLightning/pytorch-lightning/issues/1983&gt;#1983&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='2' author='dangpzanco' date='2020-08-04T09:39:29Z'>
+		I am not sure what is going on here. I really do not understand why your training after running the learning rate finder is oscillating, since the value proposed by the learning rate finder is not that far off your custom lr finder.
+		</comment>
+		<comment id='3' author='dangpzanco' date='2020-08-04T15:15:16Z'>
+		
+I am not sure what is going on here. I really do not understand why your training after running the learning rate finder is oscillating, since the value proposed by the learning rate finder is not that far off your custom lr finder.
+
+Hmm, I'm not sure what you mean with "your training after running the learning rate finder is oscillating". I am training after using the learning rate finder (LRF) only to compare the built-in LRF with a custom one (which is partially implemented with (trainer.fit(model)), but only the built-in LRF is oscillating (notice the loss never decreases below 3).
+The fact that both LRF finders' suggestions are similar values has to do with the initial learning rate: the built-in LRF apparently has a bias towards it (?). It just occurred to me that maybe lr_finder is not updating the model's parameters after each batch. This would explain the oscillation.
+Please refer to the "LR range test" on the &lt;denchmark-link:https://arxiv.org/abs/1506.01186&gt;paper&lt;/denchmark-link&gt;
+'s section 3.3.
+To better illustrate the problem, I did a re-run with learning_rate=1e-8, please take a look at the following results.
+&lt;denchmark-code&gt;Suggestions:
+lr_finder: 1.6812837894983076e-08
+custom_lr_finder: 0.00017626003261754576
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h5&gt;LR finder plot results (not expected):&lt;/denchmark-h&gt;
+
+&lt;denchmark-link:https://github.com/dangpzanco/pl_resnet_cifar10/blob/8eecc322180f8a0e749ac69e7feea6e3dc18bdc3/lr_finder.png?raw=true&gt;&lt;/denchmark-link&gt;
+
+&lt;denchmark-h:h5&gt;Custom LR finder (blue line is the expected behavior):&lt;/denchmark-h&gt;
+
+&lt;denchmark-link:https://github.com/dangpzanco/pl_resnet_cifar10/blob/8eecc322180f8a0e749ac69e7feea6e3dc18bdc3/custom_lr_finder.png?raw=true&gt;&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='4' author='dangpzanco' date='2020-08-05T04:11:46Z'>
+		&lt;denchmark-h:h5&gt;update on this issue:&lt;/denchmark-h&gt;
+
+Maybe the problem has to do with the way lr_finder changes model.configure_optimizers(). I tried refactoring my custom learning rate finder (LRF) in a way that makes it easy for a potential user (without changing their arbitrary model's definition). This proved too difficult, since an apparently sane code is actually broken in two distinct, but similar, places. See the pseudo-code:
+class LRFinder():
+
+    def __init__(self, hparams, model_class, end_lr=1, mode='exponential'):
+        super(LRFinder, self).__init__()
+        self.hparams = hparams
+        self.model_class = model_class  # this is LightningModel's constructor
+        self.end_lr = end_lr
+        self.mode = mode
+
+        self.setup_hparams()
+        self.setup_model()
+        self.metrics = None
+        
+        self.lr_sweeper = _LinearLR or _ExponentialLR
+        self.setup_optimizers()
+
+        self.trainer = Trainer(...)
+
+    def setup_model(self):
+        # a copy of the model to avoid updating the original model's parameters
+        self.model = self.model_class(self.hparams)
+
+        # inject a lr log in the training_step (this logs just fine, but...)
+        def log_lr_decorator(training_step):
+            def wrapper(*args):
+                output = training_step(*args)
+                lr = self.trainer.lr_schedulers[0]['scheduler']._last_lr[0]
+                output['log']['lr'] = lr
+                return output
+            return wrapper
+
+        # THIS BREAKS THE CODE (the model never updates its parameters)
+        self.model.training_step = log_lr_decorator(self.model.training_step)
+
+    def setup_optimizers(self):
+        # get the model's optimizer and drop its scheduler
+        optimizers, _ = self.model.configure_optimizers()
+        optimizer = optimizers[0]
+        args = dict(...)
+
+        # lr_sweeper is eith _LinearLR or _ExponentialLR
+        scheduler = dict(scheduler=self.lr_sweeper(**args), interval='step')
+
+        # inject a scheduler, but keep the original optimizer, unless...
+        def configure_optimizers():
+            return [optimizer], [scheduler]
+
+        # THIS BREAKS THE CODE (the model never updates its parameters)
+        self.model.configure_optimizers = configure_optimizers
+If a custom LRF implements either of those broken lines of code, the final results are a lot similar to the lr_finder's:
+&lt;denchmark-link:https://camo.githubusercontent.com/269bca2acf89245aa5830a41123bf861870723099958055bbd94490eacb98449/68747470733a2f2f692e696d6775722e636f6d2f6e567a447841312e706e67&gt;&lt;/denchmark-link&gt;
+
+The final solution I'm using is to log the learning_rate inside model.training_step(), have extra hparams.scheduler options inside model.configure_optimizers() and add max_lr to hparams inside the LRFinder.
+class LightningModel(pl.LightningModule):
+
+    def training_step(self, batch, batch_idx):
+        # forward pass
+        x, y = batch
+        y_hat = self.forward(x)
+
+        # calculate loss
+        loss_val = self.loss(y_hat, y)
+
+        # acc
+        labels_hat = torch.argmax(y_hat, dim=1)
+        acc = torch.sum(y == labels_hat).item() / y.shape[0]
+        acc = torch.tensor(acc)
+
+        # lr
+        lr = self.trainer.lr_schedulers[0]['scheduler']._last_lr[0]
+
+        tqdm_dict = {'acc': acc, 'lr': lr}
+        output = OrderedDict({
+            'loss': loss_val,
+            'progress_bar': tqdm_dict,
+            'log': tqdm_dict
+        })
+
+        return output
+    
+    def configure_optimizers(self):
+        if self.hparams.optimizer == 'sgd':
+            optimizer = optim.SGD(...)
+        elif self.hparams.optimizer == 'adam':
+            optimizer = optim.Adam(...)
+
+        if self.hparams.scheduler == 'clr':
+            clr = optim.lr_scheduler.CyclicLR(...)
+            scheduler = dict(scheduler=clr, interval='step')
+        elif self.hparams.scheduler == 'sweep_lin':
+            sweep = _LinearLR(...self.hparams.max_lr...)
+            scheduler = dict(scheduler=sweep, interval='step')
+        elif self.hparams.scheduler == 'sweep_exp':
+            sweep = _ExponentialLR(...self.hparams.max_lr...)
+            scheduler = dict(scheduler=sweep, interval='step')
+        else:
+            scheduler = optim.lr_scheduler.MultiStepLR(...)
+
+        return [optimizer], [scheduler]
+If you want, you can test it on its &lt;denchmark-link:https://github.com/dangpzanco/pl_resnet_cifar10/tree/034bccfc3b7f812402c3e3c70cbe9fea0c7120c3&gt;repo&lt;/denchmark-link&gt;
+ (I left the broken code commented out on , so it's easy to debug it)
+		</comment>
+		<comment id='5' author='dangpzanco' date='2020-08-05T06:28:03Z'>
+		&lt;denchmark-link:https://github.com/dangpzanco&gt;@dangpzanco&lt;/denchmark-link&gt;
+ thanks for looking more into this. I guess that there have been a change at some point to lightning that made this line , because I am pretty sure that it used to work. We should probably have had a test that captured that. I will look more into this when I have time.
+		</comment>
+		<comment id='6' author='dangpzanco' date='2020-08-05T17:51:50Z'>
+		&lt;denchmark-h:h3&gt;IMPORTANT: Please update the documentation with a warning about this feature&lt;/denchmark-h&gt;
+
+It took too much time to make sure this wasn't a mistake on my part, and I feel like people probably won't notice it's broken if used in a production setting. The only way to check is looking at the lr_finder.plot(), but even then the problem might not be clear. Since this is a "stable" feature, it's expected to be working out of the box. I think this makes it necessary to warn users while the breaking bug is not fixed.
+PS: You can find one of the possible "breaking lines" in &lt;denchmark-link:https://github.com/PyTorchLightning/pytorch-lightning/blob/b01ad75700c9cc2848edfb310ad24ceb9b06aacf/pytorch_lightning/trainer/lr_finder.py#L181&gt;pytorch_lightning/trainer/lr_finder.py#L181&lt;/denchmark-link&gt;
+.
+		</comment>
+		<comment id='7' author='dangpzanco' date='2020-08-06T07:53:35Z'>
+		&lt;denchmark-link:https://github.com/dangpzanco&gt;@dangpzanco&lt;/denchmark-link&gt;
+ I am not sure that the feature is completely broken, at least if I run the build in learning rate finder on a simple mnist case I get the following image, which is what I would expect to get:
+&lt;denchmark-link:https://user-images.githubusercontent.com/24896311/89505944-a3d17400-d7ca-11ea-977b-e96a684be1a6.png&gt;&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='8' author='dangpzanco' date='2020-08-07T01:10:53Z'>
+		MNIST is the simplest use case possible, I think. Did you test with other examples?
+		</comment>
+		<comment id='9' author='dangpzanco' date='2020-08-07T09:22:30Z'>
+		Yes, it is a simple use case, but this indicates that the network is clearly training, thus that cannot be the error. I will have to do more checks to find out the root of this.
+		</comment>
+		<comment id='10' author='dangpzanco' date='2020-08-25T06:24:47Z'>
+		Hi,
+For me lr_find works with a custom U-Net implementation. But I can't disable the early_stop_threshold option, even by setting it to None.
+Let me know if I should open another issue for this behavior.
+		</comment>
+		<comment id='11' author='dangpzanco' date='2020-09-22T20:55:18Z'>
+		&lt;denchmark-link:https://github.com/tibuch&gt;@tibuch&lt;/denchmark-link&gt;
+ please open a different issue.
+&lt;denchmark-link:https://github.com/SkafteNicki&gt;@SkafteNicki&lt;/denchmark-link&gt;
+ can this one be closed?
+		</comment>
+		<comment id='12' author='dangpzanco' date='2020-09-22T21:48:47Z'>
+		&lt;denchmark-link:https://github.com/edenlightning&gt;@edenlightning&lt;/denchmark-link&gt;
+ I think this issue isn't solved yet. I didn't have time to do any further testing (I think I've done enough), but there's clearly a problem with the LR finder. Even if it works on other examples (like a simple MNIST or U-Net), ResNet on CIFAR-10 should be a trivial setting for the LR finder (it's one of the experiments on the cyclical lr paper).
+		</comment>
+		<comment id='13' author='dangpzanco' date='2020-09-23T05:58:39Z'>
+		&lt;denchmark-link:https://github.com/edenlightning&gt;@edenlightning&lt;/denchmark-link&gt;
+ lets keep it open for now.
+I have not been able to pin-point the exact issue of the problem described (I tried multiple things). We have examples that work and examples that don't work, which makes it harder to be certain what it is the error exactly is.
+		</comment>
+		<comment id='14' author='dangpzanco' date='2020-10-06T11:26:54Z'>
+		Okay, I looked into this once more. Here is the bare minimum script required to train a resnet model on cifar10:
+&lt;denchmark-code&gt;import torch
+import pytorch_lightning as pl
+from torchvision.models import resnet50
+from torchvision.datasets import CIFAR10
+from torchvision.transforms import ToTensor
+
+dataset = CIFAR10(root='datasets', train=True, download=False, transform=ToTensor())
+
+class MyModel(pl.LightningModule):
+    def __init__(self, backbone):
+        super().__init__()
+        backbone.fc = torch.nn.Linear(2048, 10, bias=True)
+        self.backbone = backbone
+        self.learning_rate = 1e-3
+        self.loss_f = torch.nn.CrossEntropyLoss()
+
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+        ypred = self.backbone(x)
+        loss = self.loss_f(ypred, y)
+        return loss
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.backbone.parameters(), lr=self.learning_rate)
+
+model = MyModel(resnet50())
+train_dataloader = torch.utils.data.DataLoader(dataset, batch_size=128)
+
+trainer = pl.Trainer(gpus=1, accumulate_grad_batches=5)
+lrfinder = trainer.tuner.lr_find(model,
+                                 train_dataloader,
+                                 min_lr=1e-5,
+                                 max_lr=1.0,
+                                 mode='exponential',
+                                 num_training=100)
+lrfinder.plot(show=True)
+&lt;/denchmark-code&gt;
+
+the last line produces this plot:
+&lt;denchmark-link:https://user-images.githubusercontent.com/24896311/95195666-2b416080-07d7-11eb-9dca-7741b2fc0f8a.png&gt;&lt;/denchmark-link&gt;
+
+which is around what I would expect (decreases until a certain point, then increases).
+I think that there is enough evidence right now to say that the learning rate finder is not broken. The issue here must be do to some corner edge combination that I have not been able to figure out yet.
+		</comment>
+		<comment id='15' author='dangpzanco' date='2020-12-17T21:12:28Z'>
+		This issue has been automatically marked as stale because it hasn't had any recent activity. This issue will be closed in 7 days if no further activity occurs. Thank you for your contributions, Pytorch Lightning Team!
+		</comment>
+	</comments>
+</bug>

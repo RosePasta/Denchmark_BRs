@@ -1,0 +1,295 @@
+<bug_data>
+<bug id='25833' author='Wizaron' open_date='2019-09-08T13:19:17Z' closed_time='2019-10-27T13:00:40Z'>
+ 	<summary>CUDNN implementation of CTCLoss does not handle gradients from subsequent operations</summary>
+ 	<description>
+ &lt;denchmark-h:h2&gt;🐛 Bug&lt;/denchmark-h&gt;
+ 
+ CUDNN implementation of CTCLoss does not handle gradients from subsequent operations.
+ &lt;denchmark-h:h2&gt;To Reproduce&lt;/denchmark-h&gt;
+ 
+ &lt;denchmark-code&gt;import torch
+ 
+ class Architecture(torch.nn.Module):
+ 
+     def __init__(self, n_features, n_classes):
+         super(Architecture, self).__init__()
+ 
+         self.n_features = n_features
+         self.n_classes = n_classes
+ 
+         self.cls = torch.nn.Linear(self.n_features, self.n_classes)
+ 
+     def forward(self, x):
+         ts, bs = x.shape[:2]
+ 
+         x = x.view(ts * bs, self.n_features)
+         x = self.cls(x).view(ts, bs, self.n_classes)
+         x = torch.nn.functional.log_softmax(x, dim=-1)
+         return x
+ 
+ BATCH_SIZE = 2
+ GT_LENGTH = 3
+ N_TIMESTEPS = GT_LENGTH * 2
+ N_FEATURES = 5
+ N_CLASSES = 4
+ 
+ def get_model():
+     arch = Architecture(N_FEATURES, N_CLASSES)
+     arch.train()
+ 
+     return arch
+ 
+ def get_data():
+     # Data
+     features = torch.normal(mean=torch.zeros((N_TIMESTEPS, BATCH_SIZE, N_FEATURES), dtype=torch.float32))
+     pred_lengths = N_TIMESTEPS * torch.ones((BATCH_SIZE,), dtype=torch.int32)
+ 
+     targets = torch.randint(1, N_CLASSES, size=(BATCH_SIZE * GT_LENGTH,), dtype=torch.int32)
+     target_lengths = GT_LENGTH * torch.ones((BATCH_SIZE,), dtype=torch.int32)
+ 
+     return features, pred_lengths, targets, target_lengths
+ 
+ def cast_data(features, pred_lengths, targets, target_lengths, device, dtype):
+     features = features.to(device)
+     pred_lengths = pred_lengths.to(dtype)
+     targets = targets.to(dtype).to(device)
+     target_lengths = target_lengths.to(dtype)
+ 
+     if dtype == torch.int32:
+         targets = targets.to(torch.device("cpu"))
+ 
+     return features, pred_lengths, targets, target_lengths
+ 
+ def run(model, data, device, dtype, loss_mult=1.0):
+     if device == torch.device("cpu"):
+         print("\n# CTC CPU     : device {} - dtype {} - mul {}".format(device, dtype, loss_mult))
+     elif device == torch.device("cuda") and dtype == torch.int32:
+         print("\n# CTC CUDNN   : device {} - dtype {} - mul {}".format(device, dtype, loss_mult))
+     elif device == torch.device("cuda") and dtype == torch.long:
+         print("\n# CTC REGULAR : device {} - dtype {} - mul {}".format(device, dtype, loss_mult))
+ 
+     model = model.to(device)
+     features, pred_lengths, targets, target_lengths = cast_data(*data, device, dtype)
+     preds = model(features)
+ 
+     # Loss
+     loss = torch.nn.functional.ctc_loss(preds, targets, pred_lengths, target_lengths)
+ 
+     loss = loss_mult * loss
+ 
+     print('LOSS : ', loss)
+ 
+     model.zero_grad()
+     loss.backward()
+ 
+     for param in model.parameters():
+         print('GRAD : ', param.grad.abs().mean())
+ 
+     model.zero_grad()
+ 
+ data = get_data()
+ model = get_model()
+ 
+ print("----- CPU -----")
+ run(model, data, torch.device("cpu"), torch.int32)
+ run(model, data, torch.device("cpu"), torch.long)
+ run(model, data, torch.device("cpu"), torch.int32, 0.0)
+ run(model, data, torch.device("cpu"), torch.long, 0.0)
+ 
+ print("\n----- GPU -----")
+ run(model, data, torch.device("cuda"), torch.int32)
+ run(model, data, torch.device("cuda"), torch.long)
+ run(model, data, torch.device("cuda"), torch.int32, 0.0)
+ run(model, data, torch.device("cuda"), torch.long, 0.0)
+ &lt;/denchmark-code&gt;
+ 
+ &lt;denchmark-h:h2&gt;Expected behavior&lt;/denchmark-h&gt;
+ 
+ We expect the gradients to be zeroed out when we multiply the loss by zero, which is not the case for cudnn implementation of ctcloss.
+ We can see that, from the following output, gradients are not affected by mul when we are using cudnn implementation.
+ &lt;denchmark-code&gt;----- CPU -----
+ 
+ # CTC CPU     : device cpu - dtype torch.int32 - mul 1.0
+ LOSS :  tensor(1.5330, grad_fn=&lt;MulBackward0&gt;)
+ GRAD :  tensor(0.0887)
+ GRAD :  tensor(0.1541)
+ 
+ # CTC CPU     : device cpu - dtype torch.int64 - mul 1.0
+ LOSS :  tensor(1.5330, grad_fn=&lt;MulBackward0&gt;)
+ GRAD :  tensor(0.0887)
+ GRAD :  tensor(0.1541)
+ 
+ # CTC CPU     : device cpu - dtype torch.int32 - mul 0.0
+ LOSS :  tensor(0., grad_fn=&lt;MulBackward0&gt;)
+ GRAD :  tensor(0.)
+ GRAD :  tensor(0.)
+ 
+ # CTC CPU     : device cpu - dtype torch.int64 - mul 0.0
+ LOSS :  tensor(0., grad_fn=&lt;MulBackward0&gt;)
+ GRAD :  tensor(0.)
+ GRAD :  tensor(0.)
+ 
+ ----- GPU -----
+ 
+ # CTC CUDNN   : device cuda - dtype torch.int32 - mul 1.0
+ LOSS :  tensor(1.5330, device='cuda:0', grad_fn=&lt;MulBackward0&gt;)
+ GRAD :  tensor(4.4561, device='cuda:0')
+ GRAD :  tensor(6.0174, device='cuda:0')
+ 
+ # CTC REGULAR : device cuda - dtype torch.int64 - mul 1.0
+ LOSS :  tensor(1.5330, device='cuda:0', grad_fn=&lt;MulBackward0&gt;)
+ GRAD :  tensor(0.0887, device='cuda:0')
+ GRAD :  tensor(0.1541, device='cuda:0')
+ 
+ # CTC CUDNN   : device cuda - dtype torch.int32 - mul 0.0
+ LOSS :  tensor(0., device='cuda:0', grad_fn=&lt;MulBackward0&gt;)
+ GRAD :  tensor(4.4561, device='cuda:0')
+ GRAD :  tensor(6.0174, device='cuda:0')
+ 
+ # CTC REGULAR : device cuda - dtype torch.int64 - mul 0.0
+ LOSS :  tensor(0., device='cuda:0', grad_fn=&lt;MulBackward0&gt;)
+ GRAD :  tensor(0., device='cuda:0')
+ GRAD :  tensor(0., device='cuda:0')
+ &lt;/denchmark-code&gt;
+ 
+ &lt;denchmark-h:h2&gt;Environment&lt;/denchmark-h&gt;
+ 
+ PyTorch version: 1.2.0
+ Is debug build: No
+ CUDA used to build PyTorch: 9.2.148
+ OS: Ubuntu 16.04.6 LTS
+ GCC version: (Ubuntu 5.4.0-6ubuntu1~16.04.11) 5.4.0 20160609
+ CMake version: version 3.5.1
+ Python version: 3.6
+ Is CUDA available: Yes
+ CUDA runtime version: Could not collect
+ GPU models and configuration: GPU 0: GeForce GTX 980M
+ Nvidia driver version: 418.40.04
+ cuDNN version: Probably one of the following:
+ /usr/lib/x86_64-linux-gnu/libcudnn.so.7.5.0
+ /usr/local/cuda-9.2/targets/x86_64-linux/lib/libcudnn.so.7.6.1
+ Versions of relevant libraries:
+ [pip] numpy==1.15.4
+ [pip] torch==1.2.0
+ [pip] torchgeometry==0.1.2rc1
+ [pip] torchvision==0.4.0a0+9232c4a
+ [conda] blas                      1.0                         mkl
+ [conda] mkl                       2019.1                      144
+ [conda] mkl_fft                   1.0.6            py36hd81dba3_0
+ [conda] mkl_random                1.0.2            py36hd81dba3_0
+ [conda] pytorch                   1.2.0           py3.6_cuda9.2.148_cudnn7.6.2_0    pytorch
+ [conda] torchvision               0.4.0                 py36_cu92    pytorch
+ 	</description>
+ 	<comments>
+ 		<comment id='1' author='Wizaron' date='2019-09-09T21:44:45Z'>
+ 		cc &lt;denchmark-link:https://github.com/t-vi&gt;@t-vi&lt;/denchmark-link&gt;
+ 
+ If cudnn is trashing some buffers I'm not sure if there's much we can do about this :(
+ 		</comment>
+ 		<comment id='2' author='Wizaron' date='2019-09-10T04:44:21Z'>
+ 		&lt;denchmark-link:https://github.com/pytorch/pytorch/blob/master/tools/autograd/derivatives.yaml#L1388&gt;https://github.com/pytorch/pytorch/blob/master/tools/autograd/derivatives.yaml#L1388&lt;/denchmark-link&gt;
+ 
+ seems like we need to multiply grad_out there.
+ 		</comment>
+ 		<comment id='3' author='Wizaron' date='2019-10-27T13:00:40Z'>
+ 		Fixed by: Use grad_out for cudnn CTC loss &lt;denchmark-link:https://github.com/pytorch/pytorch/pull/27039&gt;#27039&lt;/denchmark-link&gt;
+ 
+ Thank you for reporting!
+ 		</comment>
+ 	</comments>
+ </bug>
+<commit id='f461184505149560803855f3a40d9e0e54c64826' author='Thomas Viehmann' date='2019-10-15 11:36:37-07:00'>
+ 	<dmm_unit complexity='0.8051948051948052' interfacing='0.2597402597402597' size='0.3246753246753247'></dmm_unit>
+ 	<modification change_type='MODIFY' old_name='aten\src\ATen\cudnn\Descriptors.h' new_name='aten\src\ATen\cudnn\Descriptors.h'>
+ 		<file_info nloc='199' complexity='33' token_count='1215'></file_info>
+ 		<method name='at::native::AT_CUDA_APICTCLossDescriptor::setEx' parameters='datatype,normMode,gradMode'>
+ 				<method_info nloc='7' complexity='1' token_count='29' nesting_level='3' start_line='264' end_line='270'></method_info>
+ 			<added_lines>264,265,266,267,268,269,270</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines>263,271</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='aten\src\ATen\native\LossCTC.cpp' new_name='aten\src\ATen\native\LossCTC.cpp'>
+ 		<file_info nloc='295' complexity='55' token_count='3015'></file_info>
+ 		<method name='at::native::ctc_loss' parameters='log_probs,targets,input_lengths,target_lengths,BLANK,reduction,zero_infinity'>
+ 				<method_info nloc='9' complexity='1' token_count='171' nesting_level='2' start_line='377' end_line='386'></method_info>
+ 			<added_lines>381,382</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<method name='at::native::ctc_loss' parameters='log_probs,targets,input_lengths,target_lengths,BLANK,reduction,zero_infinity'>
+ 				<method_info nloc='29' complexity='6' token_count='254' nesting_level='2' start_line='341' end_line='374'></method_info>
+ 			<added_lines>343,344,345,353,354,355,356,357,358,359,360,361</added_lines>
+ 			<deleted_lines>342,343,345,346,347,348,349,350,351,352,353,354,355,356,357,358,359,360,361,362,363,371</deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines></added_lines>
+ 			<deleted_lines>391,392</deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='aten\src\ATen\native\cudnn\LossCTC.cpp' new_name='aten\src\ATen\native\cudnn\LossCTC.cpp'>
+ 		<file_info nloc='103' complexity='13' token_count='762'></file_info>
+ 		<method name='at::native::_use_cudnn_ctc_loss' parameters='log_probs,targets,input_lengths,target_lengths,BLANK'>
+ 				<method_info nloc='8' complexity='1' token_count='26' nesting_level='2' start_line='15' end_line='22'></method_info>
+ 			<added_lines>15,16,17,18,19,20,21,22</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<method name='at::native::_cudnn_ctc_loss' parameters='log_probs_t,targets_t,input_lengths_,target_lengths_,BLANK,deterministic,zero_infinity'>
+ 				<method_info nloc='56' complexity='2' token_count='459' nesting_level='2' start_line='70' end_line='139'></method_info>
+ 			<added_lines>101,102,103,104,105,106,107,109,110,111,112,113,114,115,116,117,118,119,124,125,126,127,128,129,130,131,132,133,134,135,136,137</added_lines>
+ 			<deleted_lines>71,73,74,75,76,82,83,84,85,86</deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines>9,23,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68</added_lines>
+ 			<deleted_lines>9,10,32,33,34,65,66,67,68,69</deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='aten\src\ATen\native\native_functions.yaml' new_name='aten\src\ATen\native\native_functions.yaml'>
+ 		<file_info nloc='None' complexity='None' token_count='None'></file_info>
+ 		<modified_lines>
+ 			<added_lines>97,98,99,100,101,102</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='test\test_autograd.py' new_name='test\test_autograd.py'>
+ 		<file_info nloc='2992' complexity='543' token_count='30340'></file_info>
+ 		<method name='test_ctc_loss_cudnn' parameters='self,device'>
+ 				<method_info nloc='20' complexity='1' token_count='236' nesting_level='1' start_line='3738' end_line='3758'></method_info>
+ 			<added_lines>3738,3739,3740,3741,3742,3743,3744,3745,3746,3747,3748,3749,3750,3751,3752,3753,3754,3755,3756,3757,3758</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines>43,3735,3736,3737,3759</added_lines>
+ 			<deleted_lines>43</deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='test\test_nn.py' new_name='test\test_nn.py'>
+ 		<file_info nloc='7862' complexity='1257' token_count='88877'></file_info>
+ 		<modified_lines>
+ 			<added_lines>8952</added_lines>
+ 			<deleted_lines>8952</deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='tools\autograd\derivatives.yaml' new_name='tools\autograd\derivatives.yaml'>
+ 		<file_info nloc='None' complexity='None' token_count='None'></file_info>
+ 		<modified_lines>
+ 			<added_lines>1385</added_lines>
+ 			<deleted_lines>1385</deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='tools\autograd\templates\Functions.cpp' new_name='tools\autograd\templates\Functions.cpp'>
+ 		<file_info nloc='1530' complexity='351' token_count='14975'></file_info>
+ 		<method name='torch::autograd::generated::_cudnn_ctc_loss_backward' parameters='grad_out,loss,raw_grad,zero_infinity'>
+ 				<method_info nloc='10' complexity='2' token_count='95' nesting_level='4' start_line='2456' end_line='2465'></method_info>
+ 			<added_lines>2456,2457,2458,2459,2460,2461,2462,2463,2464,2465</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines></added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ </commit>
+</bug_data>

@@ -1,0 +1,500 @@
+<bug id='2940' author='brandenkmurray' open_date='2020-08-13T00:04:52Z' closed_time='2020-08-14T01:51:06Z'>
+	<summary>2-GPU `ddp` -- hparams are static for GPU1 when training in a k-fold loop</summary>
+	<description>
+&lt;denchmark-h:h2&gt;🐛 Bug&lt;/denchmark-h&gt;
+
+When training a k-fold CV loop using 2 GPUs with ddp, the models on GPU0 will correctly change folds each iteration, but GPU0 is always given fold 0 i.e. the hparams are static.
+&lt;denchmark-h:h3&gt;To Reproduce&lt;/denchmark-h&gt;
+
+Colab is here (but you'll need multiple GPUs to reproduce: &lt;denchmark-link:https://colab.research.google.com/drive/1xr_JPDhf5UmHYUfmhZSrwQDanQbKYBcD?usp=sharing&gt;https://colab.research.google.com/drive/1xr_JPDhf5UmHYUfmhZSrwQDanQbKYBcD?usp=sharing&lt;/denchmark-link&gt;
+
+I've copied the output below. During the TrainSystem init I print out the fold and hparams. Notice that the for each iteration the first GPU gets the correct fold, but the second GPU is always using fold=0.
+&lt;denchmark-code&gt;import os
+import sys
+import gc
+
+import cv2
+import numpy as np
+import pandas as pd
+import pickle as pkl
+from argparse import ArgumentParser
+import argparse
+from tqdm import tqdm
+from PIL import Image
+Image.MAX_IMAGE_PIXELS = 1000000000000
+
+from torch import nn
+from torch.utils.data import Dataset, DataLoader, RandomSampler
+import torch.nn.functional as F
+from torchvision import transforms
+from torchvision.transforms import functional as TF
+from torchvision.datasets import MNIST
+import torch
+
+import pytorch_lightning as pl
+from pytorch_lightning import Trainer
+from pytorch_lightning.callbacks import EarlyStopping
+#from pytorch_lightning.logging import TensorBoardLogger, TestTubeLogger
+from pytorch_lightning.loggers import  TestTubeLogger, TensorBoardLogger
+from efficientnet_pytorch import EfficientNet
+
+IMG_HEIGHT = 300
+IMG_WIDTH = 300
+
+def parse_args(args):
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--backbone",
+                        help="Backbone to use",
+                        type=str,
+                        default="efficientnet-b4")
+    parser.add_argument("--backbone_weights",
+                        type=str,
+                        default="imagenet")
+    parser.add_argument("--batch_size",
+                        help="Batch size",
+                        type=int,
+                        default=12)
+    parser.add_argument("--acc_grad",
+                        help="Accumulate gradient for acc_grad epochs",
+                        type=int,
+                        default=4)
+    parser.add_argument("--gpus",
+                        help="GPUs to use. Either an int or comma-separated list e.g. '0,1,2'",
+                        type=int,
+                        default=1)
+    parser.add_argument("--num_workers",
+                        help="Number of workers to use in DataLoader.",
+                        type=int,
+                        default=8)    
+
+    args = parser.parse_args(args)
+    return(args)
+
+
+def accuracy(output, target, topk=(1,)):
+    """Computes the accuracy over the k top predictions for the specified values of k"""
+    with torch.no_grad():
+        maxk = max(topk)
+        batch_size = target.size(0)
+
+        _, pred = output.topk(maxk, 1, True, True)
+        pred = pred.t()
+        correct = pred.eq(target.view(1, -1).expand_as(pred))
+
+        res = []
+        for k in topk:
+            correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
+            res.append(correct_k.mul_(100.0 / batch_size))
+        return res
+
+
+class TrainSystem(pl.LightningModule):
+
+    def __init__(self, hparams, test_data=None):
+        super(TrainSystem, self).__init__()
+
+        self.hparams = hparams
+        print(f'Fold: {self.hparams.fold}')
+        print(self.hparams)
+        self.model = EfficientNet.from_pretrained(self.hparams.backbone, advprop=False, num_classes=self.hparams.n_classes)
+        self.model = self.model.float()
+
+    def forward(self, x):
+        out = self.model(x)
+        return out
+
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+        out = self.forward(x)
+        if isinstance(out, dict):
+            out = out['out']
+        celoss = nn.CrossEntropyLoss()
+        loss = celoss(out, y)
+        tensorboard_logs = {'train_loss': loss}
+        return {'loss': loss, 'log': tensorboard_logs}
+
+    def validation_step(self, batch, batch_idx):
+        x, y = batch
+        out = self.forward(x)
+        if isinstance(out, dict):
+            out = out['out']
+        celoss = nn.CrossEntropyLoss()
+        loss = celoss(out, y)
+        out_max = torch.argmax(out, dim=1)
+#         if batch_idx % 10 == 0:
+#             print('out: ', out)
+#             print("out_max: ", out_max)
+#             print("y: ", y)
+        acc = accuracy(out, y)[0]
+        return {'val_loss': loss,
+               'val_acc': acc}
+
+    def validation_end(self, outputs):
+        avg_loss = torch.stack([x['val_loss'] for x in outputs]).mean()
+        avg_acc = torch.stack([x['val_acc'] for x in outputs]).mean()
+        print(avg_acc)
+        tensorboard_logs = {'val_loss': avg_loss,
+                           'val_acc': avg_acc}
+        return {'avg_val_loss': avg_loss, 
+                'avg_val_acc': avg_acc,
+                'log': tensorboard_logs}
+            
+    def test_step(self, batch, batch_idx):
+        # OPTIONAL
+        x, y = batch
+        out = self.forward(x)
+        if isinstance(out, dict):
+            out = out['out']
+        celoss = nn.CrossEntropyLoss()
+        loss = celoss(out, y)
+        out_max = torch.argmax(out, dim=1)
+#         if batch_idx % 10 == 0:
+#             print('out: ', out)
+#             print("out_max: ", out_max)
+#             print("y: ", y)
+        acc = accuracy(out, y)[0]
+        return {'test_loss': loss,
+               'test_acc': acc}
+
+    def test_end(self, outputs):
+        # OPTIONAL
+        avg_loss = torch.stack([x['test_loss'] for x in outputs]).mean()
+        avg_acc = torch.stack([x['test_acc'] for x in outputs]).mean()
+        print(avg_acc)
+        tensorboard_logs = {'test_loss': avg_loss,
+                           'test_acc': avg_acc}
+        return {'avg_test_loss': avg_loss, 
+                'avg_test_acc': avg_acc,
+                'log': tensorboard_logs}
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
+
+    def train_dataloader(self):
+        # REQUIRED
+        return DataLoader(MNIST(os.getcwd(), train=True, download=True, transform=transforms.Compose([transforms.Resize((IMG_WIDTH, IMG_HEIGHT)), transforms.Grayscale(3), transforms.ToTensor()])), batch_size=self.hparams.batch_size, num_workers=self.hparams.num_workers, shuffle=True, pin_memory=True, drop_last=True)
+
+    def val_dataloader(self):
+        # OPTIONAL
+        return DataLoader(MNIST(os.getcwd(), train=True, download=True, transform=transforms.Compose([transforms.Resize((IMG_WIDTH, IMG_HEIGHT)),transforms.Grayscale(3), transforms.ToTensor()])), batch_size=self.hparams.batch_size, num_workers=self.hparams.num_workers, shuffle=False, pin_memory=True, drop_last=True)
+
+    def test_dataloader(self):
+        # OPTIONAL
+        return DataLoader(MNIST(os.getcwd(), train=False, download=True, transform=transforms.Compose([transforms.Resize((IMG_WIDTH, IMG_HEIGHT)),transforms.Grayscale(3), transforms.ToTensor()])), batch_size=self.hparams.batch_size, num_workers=self.hparams.num_workers, shuffle=False, pin_memory=True, drop_last=False)
+
+
+
+args = ['--backbone', 'efficientnet-b0','--batch_size','24','--acc_grad','1','--gpus','2']
+args = parse_args(args)
+print(args)
+    
+out_dir = f"./saved/chk/classifier_{args.backbone}"
+for fold in range(5):
+  hparams = argparse.Namespace(**{'fold': fold, 
+                                  'backbone': args.backbone,
+                                      'encoder_weights': args.backbone_weights,
+                                      'lr': 0.0001,
+                                      'resize': (IMG_WIDTH, IMG_HEIGHT),
+                                      'n_classes': 10,
+                                      'batch_size': args.batch_size,
+                                      'num_workers': args.num_workers})
+
+  logger = TestTubeLogger(
+                          save_dir=out_dir,
+                          name='lightning_logs'
+                      )
+
+
+  trainer = Trainer(logger=logger,
+                            #default_save_path=out_dir,
+                            accumulate_grad_batches=args.acc_grad,
+                            #early_stop_callback=early_stop_callback,
+                            #use_amp=False,
+                            #amp_level=32,
+                            gpus=args.gpus,
+                            max_steps=20,
+                            max_epochs=1,
+                            distributed_backend='ddp') 
+
+  model = TrainSystem(hparams)
+
+  trainer.fit(model)
+        
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-code&gt;Namespace(acc_grad=1, backbone='efficientnet-b0', backbone_weights='imagenet', batch_size=24, gpus=2, num_workers=8)
+GPU available: True, used: True
+TPU available: False, using: 0 TPU cores
+CUDA_VISIBLE_DEVICES: [0,1]
+Fold: 0
+"backbone":        efficientnet-b0
+"batch_size":      24
+"encoder_weights": imagenet
+"fold":            0
+"lr":              0.0001
+"n_classes":       10
+"num_workers":     8
+"resize":          (300, 300)
+Loaded pretrained weights for efficientnet-b0
+Namespace(acc_grad=1, backbone='efficientnet-b0', backbone_weights='imagenet', batch_size=24, gpus=2, num_workers=8)
+Fold: 0
+"backbone":        efficientnet-b0
+"batch_size":      24
+"encoder_weights": imagenet
+"fold":            0
+"lr":              0.0001
+"n_classes":       10
+"num_workers":     8
+"resize":          (300, 300)
+Loaded pretrained weights for efficientnet-b0
+initializing ddp: GLOBAL_RANK: 1, MEMBER: 2/2
+initializing ddp: GLOBAL_RANK: 0, MEMBER: 1/2
+----------------------------------------------------------------------------------------------------
+distributed_backend=ddp
+All DDP processes registered. Starting ddp with 2 processes
+----------------------------------------------------------------------------------------------------
+
+  | Name  | Type         | Params
+---------------------------------------
+0 | model | EfficientNet | 4 M   
+Validation sanity check: 100%|████████████████████████████████████████████████████████████████████████████████████████████████| 1/1.0 [00:01&lt;00:00,  1.03s/it]tensor(12.5000, device='cuda:0')
+tensor(8.3333, device='cuda:1')                                                                                                                               
+Epoch 1:   1%|▋                                                                                        | 20/2500 [00:09&lt;20:02,  2.06it/s, loss=2.097, v_num=8]
+GPU available: True, used: True
+TPU available: False, using: 0 TPU cores
+Using environment variable NODE_RANK for node rank (0).
+CUDA_VISIBLE_DEVICES: [0,1]
+Fold: 1
+"backbone":        efficientnet-b0
+"batch_size":      24
+"encoder_weights": imagenet
+"fold":            1
+"lr":              0.0001
+"n_classes":       10
+"num_workers":     8
+"resize":          (300, 300)
+Loaded pretrained weights for efficientnet-b0
+
+Fold: 0
+"backbone":        efficientnet-b0
+"batch_size":      24
+"encoder_weights": imagenet
+"fold":            0
+"lr":              0.0001
+"n_classes":       10
+"num_workers":     8
+"resize":          (300, 300)
+Loaded pretrained weights for efficientnet-b0
+initializing ddp: GLOBAL_RANK: 1, MEMBER: 2/2
+initializing ddp: GLOBAL_RANK: 0, MEMBER: 1/2
+----------------------------------------------------------------------------------------------------
+distributed_backend=ddp
+All DDP processes registered. Starting ddp with 2 processes
+----------------------------------------------------------------------------------------------------
+
+  | Name  | Type         | Params
+---------------------------------------
+0 | model | EfficientNet | 4 M   
+Validation sanity check: 100%|████████████████████████████████████████████████████████████████████████████████████████████████| 1/1.0 [00:00&lt;00:00,  1.68it/s]tensor(8.3333, device='cuda:0')
+tensor(4.1667, device='cuda:1')                                                                                                                               
+Epoch 1:   1%|▋                                                                                        | 20/2500 [00:09&lt;20:11,  2.05it/s, loss=2.137, v_num=9]
+GPU available: True, used: True
+TPU available: False, using: 0 TPU cores
+Using environment variable NODE_RANK for node rank (0).
+CUDA_VISIBLE_DEVICES: [0,1]
+Fold: 2
+"backbone":        efficientnet-b0
+"batch_size":      24
+"encoder_weights": imagenet
+"fold":            2
+"lr":              0.0001
+"n_classes":       10
+"num_workers":     8
+"resize":          (300, 300)
+Loaded pretrained weights for efficientnet-b0
+
+Namespace(acc_grad=1, backbone='efficientnet-b0', backbone_weights='imagenet', batch_size=24, gpus=2, num_workers=8)
+Fold: 0
+"backbone":        efficientnet-b0
+"batch_size":      24
+"encoder_weights": imagenet
+"fold":            0
+"lr":              0.0001
+"n_classes":       10
+"num_workers":     8
+"resize":          (300, 300)
+Loaded pretrained weights for efficientnet-b0
+initializing ddp: GLOBAL_RANK: 1, MEMBER: 2/2
+initializing ddp: GLOBAL_RANK: 0, MEMBER: 1/2
+----------------------------------------------------------------------------------------------------
+distributed_backend=ddp
+All DDP processes registered. Starting ddp with 2 processes
+----------------------------------------------------------------------------------------------------
+
+  | Name  | Type         | Params
+---------------------------------------
+0 | model | EfficientNet | 4 M   
+Validation sanity check: 100%|████████████████████████████████████████████████████████████████████████████████████████████████| 1/1.0 [00:00&lt;00:00,  1.66it/s]tensor(0., device='cuda:0')
+tensor(4.1667, device='cuda:1')                                                                                                                               
+Epoch 1:   1%|▋                                                                                       | 20/2500 [00:09&lt;20:02,  2.06it/s, loss=2.129, v_num=10]
+GPU available: True, used: True
+TPU available: False, using: 0 TPU cores
+Using environment variable NODE_RANK for node rank (0).
+CUDA_VISIBLE_DEVICES: [0,1]
+Fold: 3
+"backbone":        efficientnet-b0
+"batch_size":      24
+"encoder_weights": imagenet
+"fold":            3
+"lr":              0.0001
+"n_classes":       10
+"num_workers":     8
+"resize":          (300, 300)
+Loaded pretrained weights for efficientnet-b0
+
+initializing ddp: GLOBAL_RANK: 0, MEMBER: 1/2
+Namespace(acc_grad=1, backbone='efficientnet-b0', backbone_weights='imagenet', batch_size=24, gpus=2, num_workers=8)
+Fold: 0
+"backbone":        efficientnet-b0
+"batch_size":      24
+"encoder_weights": imagenet
+"fold":            0
+"lr":              0.0001
+"n_classes":       10
+"num_workers":     8
+"resize":          (300, 300)
+Loaded pretrained weights for efficientnet-b0
+initializing ddp: GLOBAL_RANK: 1, MEMBER: 2/2
+----------------------------------------------------------------------------------------------------
+distributed_backend=ddp
+All DDP processes registered. Starting ddp with 2 processes
+----------------------------------------------------------------------------------------------------
+
+  | Name  | Type         | Params
+---------------------------------------
+0 | model | EfficientNet | 4 M   
+Validation sanity check: 100%|████████████████████████████████████████████████████████████████████████████████████████████████| 1/1.0 [00:00&lt;00:00,  1.99it/s]tensor(8.3333, device='cuda:0')
+tensor(8.3333, device='cuda:1')                                                                                                                               
+Epoch 1:   1%|▋                                                                                       | 20/2500 [00:09&lt;19:46,  2.09it/s, loss=2.139, v_num=11]
+GPU available: True, used: True
+TPU available: False, using: 0 TPU cores
+Using environment variable NODE_RANK for node rank (0).
+CUDA_VISIBLE_DEVICES: [0,1]
+Fold: 4
+"backbone":        efficientnet-b0
+"batch_size":      24
+"encoder_weights": imagenet
+"fold":            4
+"lr":              0.0001
+"n_classes":       10
+"num_workers":     8
+"resize":          (300, 300)
+Loaded pretrained weights for efficientnet-b0
+
+Namespace(acc_grad=1, backbone='efficientnet-b0', backbone_weights='imagenet', batch_size=24, gpus=2, num_workers=8)
+Fold: 0
+"backbone":        efficientnet-b0
+"batch_size":      24
+"encoder_weights": imagenet
+"fold":            0
+"lr":              0.0001
+"n_classes":       10
+"num_workers":     8
+"resize":          (300, 300)
+Loaded pretrained weights for efficientnet-b0
+initializing ddp: GLOBAL_RANK: 1, MEMBER: 2/2
+initializing ddp: GLOBAL_RANK: 0, MEMBER: 1/2
+----------------------------------------------------------------------------------------------------
+distributed_backend=ddp
+All DDP processes registered. Starting ddp with 2 processes
+----------------------------------------------------------------------------------------------------
+
+  | Name  | Type         | Params
+---------------------------------------
+0 | model | EfficientNet | 4 M   
+Validation sanity check: 100%|████████████████████████████████████████████████████████████████████████████████████████████████| 1/1.0 [00:00&lt;00:00,  1.45it/s]tensor(8.3333, device='cuda:0')
+tensor(12.5000, device='cuda:1')                                                                                                                              
+Epoch 1:   1%|▋                                                                                       | 20/2500 [00:09&lt;20:02,  2.06it/s, loss=2.145, v_num=12]
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h3&gt;Expected behavior&lt;/denchmark-h&gt;
+
+I expect both GPUs to get the same fold.
+&lt;denchmark-h:h3&gt;Environment&lt;/denchmark-h&gt;
+
+
+PyTorch Version (e.g., 1.0): 1.4
+OS (e.g., Linux): Ubuntu 18.04
+How you installed PyTorch (conda, pip, source): conda
+Build command you used (if compiling from source):
+Python version: 3.7.6
+CUDA/cuDNN version: 11.0
+GPU models and configuration: 2x1080ti
+Any other relevant information: pytorch-lightning 0.9.0rc12
+
+&lt;denchmark-h:h3&gt;Additional context&lt;/denchmark-h&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='brandenkmurray' date='2020-08-13T02:27:41Z'>
+		In your real script, are you wrapping code from args = ['...'] on down in a main? i.e.
+if __name__ == '__main__':
+    # your code here
+    args = ['--backbone', 'efficientnet-b0','--batch_size','24','--acc_grad','1','--gpus','2']
+    args = parse_args(args)
+    ...
+Just a sanity check...its noted in docs that you have to do that when doing multi-gpu runs.
+		</comment>
+		<comment id='2' author='brandenkmurray' date='2020-08-13T03:06:50Z'>
+		&lt;denchmark-link:https://github.com/nateraw&gt;@nateraw&lt;/denchmark-link&gt;
+ In the real script I have everything in a function called  which is then called under  like so:
+&lt;denchmark-code&gt;def main():
+    args = ['--backbone', 'efficientnet-b0','--batch_size','24','--acc_grad','1','--gpus','2']
+    args = parse_args(args)
+    print(args)
+    
+    out_dir = f"./saved/chk/classifier_{args.backbone}"
+    for fold in range(5):
+        hparams = argparse.Namespace(**{'fold': fold, 
+                                      'backbone': args.backbone,
+                                      'encoder_weights': args.backbone_weights,
+                                      'lr': 0.0001,
+                                      'resize': (IMG_WIDTH, IMG_HEIGHT),
+                                      'n_classes': 10,
+                                      'batch_size': args.batch_size,
+                                      'num_workers': args.num_workers})
+        logger = TestTubeLogger(
+                          save_dir=out_dir,
+                          name='lightning_logs'
+                      )
+
+
+      trainer = Trainer(logger=logger,
+                            #default_save_path=out_dir,
+                            accumulate_grad_batches=args.acc_grad,
+                            #early_stop_callback=early_stop_callback,
+                            #use_amp=False,
+                            #amp_level=32,
+                            gpus=args.gpus,
+                            max_steps=20,
+                            max_epochs=1,
+                            distributed_backend='ddp') 
+
+      model = TrainSystem(hparams)
+
+      trainer.fit(model)
+
+if __name__ == "__main__":
+    main()
+&lt;/denchmark-code&gt;
+
+However, doing it both like this and the way you've shown still gives the same result.
+		</comment>
+		<comment id='3' author='brandenkmurray' date='2020-08-14T01:51:06Z'>
+		unfortunately, the way ddp works you can't use it this way. You can use ddp_spawn instead.
+ddp calls the script again... and your script in turn calls 5 other scripts lol. So, for this use case, this won't work.
+		</comment>
+	</comments>
+</bug>

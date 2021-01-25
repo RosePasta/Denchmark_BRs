@@ -6,11 +6,16 @@ import calendar
 from urllib.request import urlopen
 from bs4 import BeautifulSoup
 
-frameworks = ['tensorflow','keras','cntk','caffe','caffe2','torch','pytorch','mxnet','chainer','theano','deeplearning4j','dl4j','paddlepaddle','deep-learning','deep-neural-network']
+frameworks = ['tensorflow','keras','cntk','caffe','caffe2','torch','pytorch','mxnet','chainer','theano','deeplearning4j','dl4j','paddlepaddle','paddle']
+
+# https://machinelearningmastery.com/a-tour-of-machine-learning-algorithms/
+frameworks += ['deep-learning','deep-neural-network','deep-reinforcement-learning','deep-q-learing','convolution-neural-network','recurrent-neural-network','deep-belief-network','long-short-term-memory-networks','deep-boltzmann-machine']
+frameworks += ['dnn','drl','dql','cnn','rnn','dbn','lstm','dbm']
+
 
 # Based on https://madnight.github.io/githut/#/pull_requests/2020/3 
 # Selecting the programming languages in Top-10
-target_languages  = ["C++", "C", "Python", "Java", "C#", "Go"]
+target_languages  = ["javascript","python","java","go","c++","ruby","typescript","php","c#","c"]
 
 date_criteria = datetime.datetime(2020, 1, 1)
 

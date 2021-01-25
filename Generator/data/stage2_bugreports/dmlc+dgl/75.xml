@@ -1,0 +1,116 @@
+<bug id='75' author='BarclayII' open_date='2018-10-11T05:47:10Z' closed_time='2018-12-24T02:35:50Z'>
+	<summary>[BUG] Consecutive sends without recv</summary>
+	<description>
+Here's the test I was running on cpp branch.
+def test_send_twice():
+    g = DGLGraph()
+    g.add_nodes(2)
+    g.add_edge(0, 1)
+    def _message_a(src, edge):
+        return {'a': src['a']}
+    def _message_b(src, edge):
+        return {'b': src['b']}
+    def _reduce(node, msgs):
+        return {'a': msgs['a'].sum(1), 'b': msgs['b'].sum(1)}
+
+    old_a = th.randn(2, 5)
+    old_b = th.randn(2, 5)
+    g.set_n_repr({'a': old_a, 'b': old_b})
+
+    g.send(0, 1, _message_a)
+    g.send(0, 1, _message_b)
+    g.recv([1], _reduce)
+
+    new_repr = g.get_n_repr()
+
+    assert th.allclose(new_repr['a'][1], old_a[0])
+    assert th.allclose(new_repr['b'][1], old_b[0])
+First, if I do two consecutive sends with different message keys, DGLGraph throws a KeyError: 'b' regardless of whether we are sending on the same node pairs/edges.
+The next issue is that we are adding edges into a "message graph" during sends.  This does not make a lot of sense on multigraphs if we allow sending between the same node pairs twice without recv, which will leave us with two edges in the message graph.  Actually, in the test case above, I stepped into the _batch_recv method and found that the degree is 2 in the degree bucketing procedure.
+So do we want to allow (1) consecutive sends without recv, and (2) consecutive sends between the same node pairs without recv?
+If we were to allow both, I guess ultimately we would want to have the message graph represented as an edge subgraph, or somehow maintain a set of "already-added-edges" in the message graph.
+Thoughts?
+	</description>
+	<comments>
+		<comment id='1' author='BarclayII' date='2018-10-11T15:38:52Z'>
+		The issue is because we didn't check whether the edges have been triggered or not. I think it's a good time to think about the case thoroughly (suppose we still want to keep the send/recv flexibility here):
+
+If the given edges have been triggered before, we should use update_rows instead of append to save the messages.
+If the given edges are new, use append. If the messages are of different keys, pad zero for other edges.
+If the given edges are partly new, split the edges into two sets and treat them differently as above.
+
+Do we need more APIs?
+I guess the has_edges API is sufficient to implement the above logic.
+Efficiency?
+Not efficient at all. However, I think flexibility is more important for these cases. Note that, if user calls send_and_recv, the messages are transient and thus shall not go through all the message graph shenanigans. This is what @ylfdq1118 is working on right now.
+Multigraph?
+Maybe user should use edge id as the argument to send? In such case, the message graph will also be a multigraph. Will this cause problem?
+		</comment>
+		<comment id='2' author='BarclayII' date='2018-10-11T17:53:35Z'>
+		My main argument is that since we are supporting multigraphs, we either need to represent the message graph as a subgraph of the original graph, or check whether an edge is already in the message graph before addition (by maintaining a Python set of triggered edges); we could no longer just add_edges into the message graphs as it is right now.
+I don't think has_edges() by itself is appropriate for this purpose because it only asks whether an edge is connecting two nodes.
+		</comment>
+		<comment id='3' author='BarclayII' date='2018-10-11T17:55:58Z'>
+		How do you plan to maintain the storage? The good thing about the current design is that the message frame is always appending.
+		</comment>
+		<comment id='4' author='BarclayII' date='2018-10-11T19:45:14Z'>
+		I guess we can still keep the current design of appending to message frames; all we need is to keep track of which edge IDs we have triggered.  We call add_edges only for those edges that are not triggered.  This can essentially combine with what we will do on message frames:
+
+For the edges triggered before, call update_rows
+For others, add_edges and append.
+
+I expect that using edge subgraphs as message graphs will involve lots of overhauling so I don't recommend it for now.
+Also,
+
+
+If the given edges are new, use append. If the messages are of different keys, pad zero for other edges.
+
+
+I'm confused of this.  Why do we want to pad zeros?  And I think that this is not even necessarily correct.  What if we are reducing by max and the messages are negative?
+		</comment>
+		<comment id='5' author='BarclayII' date='2018-10-13T20:40:36Z'>
+		My two cents: if we still want to have the flexibility of allowing multiple sends on different keys, it is very likely that we need separate message graphs for each key.
+For example:
+
+The test code above will have a message graph for key a with edge (0, 1), and another message graph for key b with edge (0, 1).
+If we are running g.send(0, 2, _message_b) instead, then message graph a should have edge (0, 1) but message graph b instead should have (0, 2).  If we are recv'ing on 0, the msgs argument should be a dictionary with a from (0, 1) and b from (0, 2).
+
+		</comment>
+		<comment id='6' author='BarclayII' date='2018-10-13T22:00:15Z'>
+		Bring &lt;denchmark-link:https://github.com/GaiYu0&gt;@GaiYu0&lt;/denchmark-link&gt;
+ into the loop. This is the issue we've discussed before. The problem is the in-message-degree will be different for different message keys (if we don't pad the missing messages). Quan's solution is to extend the API to let user tell us which message key is required. Since this is a corner case, I am afraid that this might slow down the common case due to extra check and overhead.
+		</comment>
+		<comment id='7' author='BarclayII' date='2018-10-13T22:01:32Z'>
+		Another related question here is how should we support degree-padding other than degree-bucketing? I remembered this is how JTNN people write their codes. Is this correct &lt;denchmark-link:https://github.com/BarclayII&gt;@BarclayII&lt;/denchmark-link&gt;
+ ?
+		</comment>
+		<comment id='8' author='BarclayII' date='2018-10-13T22:25:45Z'>
+		
+Bring @GaiYu0 into the loop. This is the issue we've discussed before. The problem is the in-message-degree will be different for different message keys (if we don't pad the missing messages). Quan's solution is to extend the API to let user tell us which message key is required. Since this is a corner case, I am afraid that this might slow down the common case due to extra check and overhead.
+
+I wasn't thinking of extending the API of any sorts.  I prototyped my solution in cpp-multisend branch and you can see the diff.  Duplicate edges are not handled yet there and I believe more optimization is needed.  But you can see that the user interface there is not changed whatsoever.
+
+Another related question here is how should we support degree-padding other than degree-bucketing? I remembered this is how JTNN people write their codes. Is this correct @BarclayII ?
+
+For degree padding:
+
+I think it only works if we are using builtin reducers like sum or max.  For different reducers we also need to pad different values (0 for sum, -inf for max).
+I would imagine that we have another general scheduler at the same level as degree_bucketing, except that the reduce function is called only once with padded messages.
+We can figure out the maximum in-degree and pad the list of incoming messages [(in_degree[i], ...) for i in range(N)] to a tensor (N, max(in_degree), ...).
+We can allow the users to select which strategy they with to use during reduce (degree_bucketing or degree_padding).  Maybe we can add an argument preferred_scheduler in recv() and other calls involving reducers?
+
+		</comment>
+		<comment id='9' author='BarclayII' date='2018-10-13T22:40:54Z'>
+		Oh I see. I misunderstood your solution. Can we simplify it to forbid user to have misaligned message fields in multiple sends? I'm afraid maintaining one message graph for one message field is very costly.
+		</comment>
+		<comment id='10' author='BarclayII' date='2018-10-13T22:42:14Z'>
+		I think forbidding this is fair as user can call send on field a first, recv it and then call send on field b, and we are no problem with that.
+		</comment>
+		<comment id='11' author='BarclayII' date='2018-10-14T00:43:55Z'>
+		Do we want to prevent users from sending messages on duplicate edges as well?
+		</comment>
+		<comment id='12' author='BarclayII' date='2018-10-14T01:34:23Z'>
+		I would put it as a low priority if it's very fussy to implement. I will write it down in the task list.
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,197 @@
+<bug id='833' author='cbockman' open_date='2018-05-24T01:28:40Z' closed_time='2018-05-24T20:49:43Z'>
+	<summary>Extremely poor performance w/ large embedding matrices (sort of fixed, but plz see inside)</summary>
+	<description>
+Hi,
+We have a t2t fork and recently went to the effort to pull our fork basically up-to-date with core repo master.
+We then saw the run-time performance of our models plummet from, e.g., 30 steps/s ==&gt; 1 step/s.
+After much teeth gnashing, we tracked it down to an unfortunate interaction between a large (word) embedding matrix on the CPU and this update:
+&lt;denchmark-code&gt;  def compute_gradients(self, loss, var_list=None, **kwargs):  # pylint: disable=arguments-differ
+    gradients = self._opt.compute_gradients(loss, var_list, **kwargs)
+    def cast_grad(g, v):
+      if v is None or g is None:
+        return (g, v)
+      return (tf.cast(g, v.dtype), v)
+    gradients = [cast_grad(g, v) for g, v in gradients]
+    return gradients
+&lt;/denchmark-code&gt;
+
+Specifically, the version we were on was just
+&lt;denchmark-code&gt;  def compute_gradients(self, loss, var_list=None, **kwargs):  # pylint: disable=arguments-differ
+    return self._opt.compute_gradients(loss, var_list, **kwargs)
+&lt;/denchmark-code&gt;
+
+Given the code in block &lt;denchmark-link:https://github.com/tensorflow/tensor2tensor/pull/1&gt;#1&lt;/denchmark-link&gt;
+, what is happening makes sense.
+The queries, then:
+
+
+What is that new block of code used for?  E.g., is it some support peculiar to TPUs?  Are we safe to just (internally) comment it out and use the "old" version?  (Presumably, there is a very good reason this was changed!)
+
+
+We've run into a couple of small other places that have to be handled very carefully to support word embeddings (at least if pinned on the CPU) (e.g., weight decay needs to be set to zero).
+
+
+If it is safe to, in some circumstances, revert to the old compute_gradients code, is there any appetite for an internal flag (hparams.support_large_embeddings, or something like that--I'd need to put a little thought into where exactly this should live) that conditions the code paths appropriately?
+If this is something of interest, then would happily push a PR, to converge how we apparently need to manage things internally with t2t master.
+	</description>
+	<comments>
+		<comment id='1' author='cbockman' date='2018-05-24T01:57:46Z'>
+		Wow, that's unfortunate. Glad you were able to track down the change that degraded your performance. I believe a simple if v.dtype == g.dtype: return (g, v) would avoid the cast and the performance hit. I'll have that out shortly.
+Please share other places in the code that do not play nicely with large embedding variables. I think we should try to have it supported out of the box without an additional hparam (unless necessity dictates otherwise).
+And how large of an embedding variable are we talking about here?
+		</comment>
+		<comment id='2' author='cbockman' date='2018-05-24T02:20:39Z'>
+		Thanks for the (very) quick response!
+
+And how large of an embedding variable are we talking about here?
+
+Even just GloVe 6B 300d (&lt;denchmark-link:https://nlp.stanford.edu/projects/glove/&gt;https://nlp.stanford.edu/projects/glove/&lt;/denchmark-link&gt;
+) makes things very sad.
+
+I believe a simple if v.dtype == g.dtype: return (g, v) would avoid the cast and the performance hit.
+
+I think we can try this fix now--kind of surprising that tf.cast doesn't deal nicely with this case already?  Unless there are weird cases where tf.cast's x.dtype == dtype but that you'd still want to force a cast...
+
+Please share other places in the code that do not play nicely with large embedding variables. I think we should try to have it supported out of the box without an additional hparam (unless necessity dictates otherwise).
+
+Main other place we ran into pain was weight_decay != 0 (
+
+
+tensor2tensor/tensor2tensor/layers/common_hparams.py
+
+
+         Line 67
+      in
+      6a7ef7f
+
+
+
+
+
+
+ weight_decay=1e-6, 
+
+
+
+
+, which we inherited from as our starting point) crazily degrades things.  (Again, for understandable reasons, but took a bunch of hunting of course to id this as the culprit...)
+Our internal "fix" is just to throw a (loud) warning if our internal embed_words modality is used, while this value is non-zero.
+Otherwise, the pains of getting embeddings working mostly revolve around t2t and Estimator idiosyncrasies related to making sure that the embeddings aren't repeatedly loaded, etc.
+Have actually been meaning to get our word embedding modality up as a PR, but it is unfortunately a little hacky right now and dependent on various internal implementation details (we backend to GCS, for speed we pre-build the embeddings into a tensorflow model elsewhere and then load that model, etc.).  A publicly-shared word embedding modality probably deserves a bunch of more generalized code (inc. loading code) to support drop-in GloVe, etc...can see why you guys don't provide one right now.  :)
+		</comment>
+		<comment id='3' author='cbockman' date='2018-05-24T02:41:37Z'>
+		Just tried the suggested fix and it does not make the problem go away. So possibly the cast is necessary, but omitting it causes tensorflow to be smarter about not changing the gradients update to be non-sparse? It is not at all clear to me what is going on there.
+		</comment>
+		<comment id='4' author='cbockman' date='2018-05-24T02:56:39Z'>
+		That’s very odd since with that check it should be functionally equivalent
+to how the code was before. Could you print out the dtypes and see if there
+is a mismatch? If there is no mismatch, then what’s different from how the
+code was before?
+&lt;denchmark-link:#&gt;…&lt;/denchmark-link&gt;
+
+
+On Wed, May 23, 2018 at 7:41 PM epurdyf ***@***.***&gt; wrote:
+ Just tried the suggested fix and it does not make the problem go away. So
+ possibly the cast is necessary, but omitting it causes tensorflow to be
+ smarter about not changing the gradients update to be non-sparse? It is not
+ at all clear to me what is going on there.
+
+ —
+ You are receiving this because you commented.
+ Reply to this email directly, view it on GitHub
+ &lt;#833 (comment)&gt;,
+ or mute the thread
+ &lt;https://github.com/notifications/unsubscribe-auth/ABEGW5EWWlA7mUoxPUwC1zt92oU34lG1ks5t1h3jgaJpZM4ULbGj&gt;
+ .
+
+
+
+		</comment>
+		<comment id='5' author='cbockman' date='2018-05-24T03:38:24Z'>
+		Thanks &lt;denchmark-link:https://github.com/rsepassi&gt;@rsepassi&lt;/denchmark-link&gt;
+ , we'll try it first thing tomorrow and let you know.
+		</comment>
+		<comment id='6' author='cbockman' date='2018-05-24T17:16:21Z'>
+		Ahhhhhhh. In our case the values have dtype 'float32_ref' and the gradients have type 'float32':
+compute_gradients &lt;dtype: 'float32_ref'&gt; &lt;dtype: 'float32'&gt;
+Note that we found it to be much more efficient to pin the embeddings-related stuff to the CPU, which might be related to this.
+		</comment>
+		<comment id='7' author='cbockman' date='2018-05-24T17:19:39Z'>
+		Hm, this stack overflow question seems to imply that this is the expected behavior in general: &lt;denchmark-link:https://stackoverflow.com/questions/37958706/in-tensorflow-what-is-the-difference-between-a-tensor-that-has-a-type-ending-in&gt;https://stackoverflow.com/questions/37958706/in-tensorflow-what-is-the-difference-between-a-tensor-that-has-a-type-ending-in&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='8' author='cbockman' date='2018-05-24T17:24:09Z'>
+		Yes, the slowdown is almost certainly coming from copies, so pinning to cpu
+makes sense. Thanks for the ref find. I’ll see if I can do something about
+that.
+&lt;denchmark-link:#&gt;…&lt;/denchmark-link&gt;
+
+
+On Thu, May 24, 2018 at 10:19 AM epurdyf ***@***.***&gt; wrote:
+ Hm, this stack overflow question seems to imply that this is the expected
+ behavior in general:
+ https://stackoverflow.com/questions/37958706/in-tensorflow-what-is-the-difference-between-a-tensor-that-has-a-type-ending-in
+
+ —
+ You are receiving this because you were mentioned.
+ Reply to this email directly, view it on GitHub
+ &lt;#833 (comment)&gt;,
+ or mute the thread
+ &lt;https://github.com/notifications/unsubscribe-auth/ABEGWzBgDi1X4vZc5b8B-nKCiUxIB1-iks5t1uutgaJpZM4ULbGj&gt;
+ .
+
+
+
+		</comment>
+		<comment id='9' author='cbockman' date='2018-05-24T17:24:27Z'>
+		For context, we build the embeddings using the design pattern outlined by mrry in &lt;denchmark-link:https://stackoverflow.com/questions/35687678/using-a-pre-trained-word-embedding-word2vec-or-glove-in-tensorflow&gt;https://stackoverflow.com/questions/35687678/using-a-pre-trained-word-embedding-word2vec-or-glove-in-tensorflow&lt;/denchmark-link&gt;
+ answer &lt;denchmark-link:https://github.com/tensorflow/tensor2tensor/pull/1&gt;#1&lt;/denchmark-link&gt;
+ option &lt;denchmark-link:https://github.com/tensorflow/tensor2tensor/issues/2&gt;#2&lt;/denchmark-link&gt;
+, save it off, and then--within t2t--do option &lt;denchmark-link:https://github.com/tensorflow/tensor2tensor/issues/3&gt;#3&lt;/denchmark-link&gt;
+ to load it up.
+Thus, we initially build our embeddings with
+embeddings = tf.Variable(...)
+which seems to trigger this issue.
+		</comment>
+		<comment id='10' author='cbockman' date='2018-05-24T17:27:40Z'>
+		Nice, that does seem like a good pattern.
+
+The fix for the cast:
+if v.dtype.base_dtype == g.dtype.base_dtype
+&lt;denchmark-link:#&gt;…&lt;/denchmark-link&gt;
+
+
+On Thu, May 24, 2018 at 10:24 AM cbockman ***@***.***&gt; wrote:
+ For context, we build the embeddings using the design pattern outlined by
+ mrry in
+ https://stackoverflow.com/questions/35687678/using-a-pre-trained-word-embedding-word2vec-or-glove-in-tensorflow
+ answer #1 &lt;#1&gt; option #2
+ &lt;#2&gt;, save it off, and
+ then--within t2t--do option #3
+ &lt;#3&gt; to load it up.
+
+ —
+ You are receiving this because you were mentioned.
+ Reply to this email directly, view it on GitHub
+ &lt;#833 (comment)&gt;,
+ or mute the thread
+ &lt;https://github.com/notifications/unsubscribe-auth/ABEGW83p6QJJlHDSFYQOBH6Gs8THjWmZks5t1uzQgaJpZM4ULbGj&gt;
+ .
+
+
+
+		</comment>
+		<comment id='11' author='cbockman' date='2018-05-24T19:47:23Z'>
+		OK, that does fix everything! Thank you so much!
+		</comment>
+		<comment id='12' author='cbockman' date='2018-05-24T20:49:43Z'>
+		Great. Please do think about cleaning up your code and submitting a PR to handle general pretrained embeddings.
+		</comment>
+		<comment id='13' author='cbockman' date='2018-08-07T02:36:31Z'>
+		&lt;denchmark-link:https://github.com/rsepassi&gt;@rsepassi&lt;/denchmark-link&gt;
+ FYI this seems to be back; we're debugging &amp; will share soln if(!)/when we surface, but am flagging in case anything jumps to mind.
+Our last known good state was on our own fork, after applying your suggested fix (&lt;denchmark-link:https://github.com/tensorflow/tensor2tensor/commit/abb03b120cd2b0b1dddec2e5aaa69e687ec2893b&gt;abb03b1&lt;/denchmark-link&gt;
+).
+		</comment>
+	</comments>
+</bug>

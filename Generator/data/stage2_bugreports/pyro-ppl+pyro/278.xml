@@ -1,0 +1,89 @@
+<bug id='278' author='fritzo' open_date='2017-10-18T15:05:01Z' closed_time='2017-10-21T21:16:35Z'>
+	<summary>Fix batch_log_pdf and sample shapes for all distributions</summary>
+	<description>
+Here is the desired behavior, where DiagNormal and Bernoulli currently do behave correctly.
+def test_diag_normal_batch_log_pdf_shape():
+    mu = ng_zeros(3, 2)
+    sigma = ng_ones(3, 2)
+    x = ng_zeros(3, 2)
+    assert dist.DiagNormal(mu, sigma).batch_log_pdf(x).size() == (3,)
+
+def test_bernoulli_batch_log_pdf_shape():
+    ps = ng_ones(3, 2)
+    x = ng_ones(3, 2)
+    dist.Bernoulli(ps).batch_log_pdf(x).size() == (3,)
+
+@pytest.mark.xfail
+def test_categorical_batch_log_pdf_shape():
+    ps = ng_ones(3, 2, 4) / 4
+    x = ng_ones(3, 2)
+    dist.Categorical(ps, one_hot=False).batch_log_pdf(x).size() == (3,)
+See &lt;denchmark-link:https://github.com/pyro-ppl/pyro/pull/276&gt;#276&lt;/denchmark-link&gt;
+ for clarification.
+	</description>
+	<comments>
+		<comment id='1' author='fritzo' date='2017-10-18T18:11:28Z'>
+		The tests for all the three distributions are not the same. Let me first check my understanding of the desired behavior on a simple example first. The two tests below pass, but I would guess that according to the issue posted, the second one is not desired behavior and should return tensors of size (1, ) and not (1, 1). Correct me if I am mistaken.
+&lt;denchmark-code&gt;# e.g. 1: desired == actual
+def test_categorical_batch_log_pdf_shape():
+    ps = Variable(torch.Tensor([0.25, 0.25, 0.25, 0.25]))
+    x = Variable(torch.Tensor([1]))
+    y = Variable(torch.LongTensor([0, 0, 1, 0]))
+    assert dist.Categorical(ps, one_hot=False).batch_log_pdf(x).size() == (1, )
+    assert dist.Categorical(ps, one_hot=True).batch_log_pdf(y).size() == (1, )
+
+# e.g. 2 : desired != actual
+def test_categorical_batch_log_pdf_shape_1():
+    ps = Variable(torch.Tensor([[0.25, 0.25, 0.25, 0.25]]))
+    x = Variable(torch.Tensor([[1]]))
+    y = Variable(torch.LongTensor([[0, 0, 1, 0]]))
+    assert dist.Categorical(ps, one_hot=False).batch_log_pdf(x).size() == (1, 1) # desired (1, )
+    assert dist.Categorical(ps, one_hot=True).batch_log_pdf(y).size() == (1, 1) # desired (1, )
+&lt;/denchmark-code&gt;
+
+PS: I think that the behavior of Diagnormal and Bernoulli is fine when we are limited to batching on the leftmost dimension, but will lead to buggy behavior with arbitrary batch dimensions. Or perhaps, I'm complicating the issue. :)
+		</comment>
+		<comment id='2' author='fritzo' date='2017-10-18T18:39:25Z'>
+		First thanks for the clarifying example and for working through all these changes in specification.
+As I currently understand, your first examples have empty batch shape, so .batch_log_pdf should morally return a zero-dimensional tensor but returns a 1-diml tensor because Pytorch does not have 0-diml tensors. Maybe it's fine to always tack on an extra dim of size one on the right, to work around pytorch limitations. If that's your reasoning for Categorical, then we should follow that in other distributions as well, so that batch_log_pdf can broadcast correctly. (sorry in case you've already explained this to me and ive misunderstood or forgotten).
+Do you think we should rename this issue to fix all distributions other than categorical? (this may explain my enum-batch test failures)
+		</comment>
+		<comment id='3' author='fritzo' date='2017-10-18T18:53:21Z'>
+		
+Maybe it's fine to always tack on an extra dim of size one on the right, to work around pytorch limitations.
+
+That is exactly the reason. :) You are right that the non-vectorized case should actually return a 0 dim tensor, but since we can't do that, it is lifted to a dim 1 tensor. Once we do that, this means that we will have to tack on this additional dimension for all batches. This is also not just for some type niceness, it is really hard to have consistent scoring, sampling and support without doing this and not putting in hackiness in the code. I ran into a bunch of issues for categorical due to this.
+I would suggest that we do this for all the distributions. However, I'm not sure if this is something we should try to undertake before launch. I did not realize that the other distributions are not handling the batch dimension this way, otherwise I would have mentioned it. The other alternative is to remove the last two PRs for categorical to support arbitrary batch dimensions, so that all the distributions are consistent in their treatment of batch dimension. We will lose support for arbitrary batching in categorical in that case (not sure if we still need it before launch). There may also be some hacky way we can make it consistent with the other distributions, but I would like to finalize on a set of test examples before putting in any hacks that might lead to unexpected behavior. Let me know your thoughts.
+		</comment>
+		<comment id='4' author='fritzo' date='2017-10-18T18:57:29Z'>
+		Also I think it makes sense to consider also the next dimension:
+ps = [
+    [
+        [0.1, 0.2, 0.2, 0.5],
+        [0.2, 0.2, 0.2, 0.4],
+    ],
+    [
+        [0.1, 0.2, 0.2, 0.5],
+        [0.2, 0.2, 0.2, 0.4],
+    ],
+    [
+        [0.1, 0.2, 0.2, 0.5],
+        [0.2, 0.2, 0.2, 0.4],
+    ],
+]
+for which .batch_log_pdf should return something of shape either (3,) as i has originally understood this issue, or (3,1) if we use the no-dim-0-workaround. Specifically the dim of size 2 is not a batch dim, but is rather an event dim, and thus should be summed out in batch_log_pdf. (i've only recently understood this under-documented desired behavior).
+UPDATE: this behavior is punted until after launch
+		</comment>
+		<comment id='5' author='fritzo' date='2017-10-18T19:03:57Z'>
+		
+for which .batch_log_pdf should return something of shape either (3,) as i has originally understood this issue, or (3,1)
+
+In that case, we will need to specify what is the event dim, right? Otherwise, I'm not sure how would we distinguish a batch dimension from an event dimension. Also, do we need a separate event dim for categorical. Can't we think of it as just another RV and have the user handle it appropriately?
+EDIT - Discussed in person; we will need to explicitly specify the event shape in this case.
+		</comment>
+		<comment id='6' author='fritzo' date='2017-10-19T01:17:36Z'>
+		Discussed with &lt;denchmark-link:https://github.com/fritzo&gt;@fritzo&lt;/denchmark-link&gt;
+ in person. We will change the behavior for all distributions such that the sample and batch log pdf shape is .
+		</comment>
+	</comments>
+</bug>

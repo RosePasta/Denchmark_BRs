@@ -1,0 +1,192 @@
+<bug id='40' author='YutingZhang' open_date='2019-03-12T00:11:09Z' closed_time='2019-09-25T14:08:59Z'>
+	<summary>Not working with multiple processes</summary>
+	<description>
+When calling MobulaOP in a subprocess, it gets stuck.
+Environment: lastest mxnet nightly build and Python 3.6.5
+An example code modified from dynamic_import_op.py to replicate this error.
+from concurrent import futures
+
+import sys
+import mxnet as mx
+
+def foo():
+    import mobula
+    # Import Custom Operator Dynamically
+    mobula.op.load('./AdditionOP')
+    AdditionOP = mobula.op.AdditionOP
+
+    a = mx.nd.array([1, 2, 3])
+    b = mx.nd.array([4, 5, 6])
+
+    a.attach_grad()
+    b.attach_grad()
+
+    with mx.autograd.record():
+        c = AdditionOP(a, b)
+
+    dc = mx.nd.array([7, 8, 9])
+    c.backward(dc)
+
+    assert ((a + b).asnumpy() == c.asnumpy()).all()
+    assert (a.grad.asnumpy() == dc.asnumpy()).all()
+    assert (b.grad.asnumpy() == dc.asnumpy()).all()
+
+    print('Okay :-)')
+    print('a + b = c \n {} + {} = {}'.format(a.asnumpy(), b.asnumpy(), c.asnumpy()))
+
+def main():
+    ex = futures.ProcessPoolExecutor(1)
+    r = ex.submit(foo)
+    r.result()
+
+if __name__ == "__main__":
+    main()
+	</description>
+	<comments>
+		<comment id='1' author='YutingZhang' date='2019-03-12T00:17:08Z'>
+		Thanks for your report!
+I will check it.
+		</comment>
+		<comment id='2' author='YutingZhang' date='2019-03-12T00:21:47Z'>
+		Thanks!
+FYI, If you move import mxnet as mx into foo(), the bug can disappear. But this is generally not doable because mxnet is usually imported in the main process. It may related to how mxnet works with subprocesses.
+		</comment>
+		<comment id='3' author='YutingZhang' date='2019-03-12T00:28:02Z'>
+		moving import mobula and mobula.op.load('./AdditionOP') outside foo() may work, since MobulaOP will register operator into MXNet when mobula.op.load('./AdditionOP') is called.
+I will add a check to avoid duplicated register.
+		</comment>
+		<comment id='4' author='YutingZhang' date='2019-03-12T00:32:19Z'>
+		I tried that, but it does not work. Example code:
+from concurrent import futures
+
+import sys
+import mxnet as mx
+
+import mobula
+# Import Custom Operator Dynamically
+mobula.op.load('./AdditionOP')
+
+def foo():
+
+    AdditionOP = mobula.op.AdditionOP
+
+    a = mx.nd.array([1, 2, 3])
+    b = mx.nd.array([4, 5, 6])
+
+    a.attach_grad()
+    b.attach_grad()
+
+    with mx.autograd.record():
+        c = AdditionOP(a, b)
+
+    dc = mx.nd.array([7, 8, 9])
+    c.backward(dc)
+
+    assert ((a + b).asnumpy() == c.asnumpy()).all()
+    assert (a.grad.asnumpy() == dc.asnumpy()).all()
+    assert (b.grad.asnumpy() == dc.asnumpy()).all()
+
+    print('Okay :-)')
+    print('a + b = c \n {} + {} = {}'.format(a.asnumpy(), b.asnumpy(), c.asnumpy()))
+
+def main():
+    ex = futures.ProcessPoolExecutor(1)
+    r = ex.submit(foo)
+    r.result()
+
+if __name__ == "__main__":
+    main()
+		</comment>
+		<comment id='5' author='YutingZhang' date='2019-03-12T01:04:37Z'>
+		&lt;denchmark-link:https://github.com/YutingZhang&gt;@YutingZhang&lt;/denchmark-link&gt;
+
+Hi! I found the bug is not related to MobulaOP.
+It seems that MXNet triggers the bug.
+from concurrent import futures
+
+import mxnet as mx
+import sys
+from mobula.testing import assert_almost_equal
+sys.path.append('../../')  # Add MobulaOP Path
+
+class AdditionOP(mx.operator.CustomOp):
+    def __init__(self):
+        super(AdditionOP, self).__init__()
+    def forward(self, is_train, req, in_data, out_data, aux):
+        out_data[0][:] = in_data[0] + in_data[1]
+    def backward(self, req, out_grad, in_data, out_data, in_grad, aux):
+        in_grad[0][:] = out_grad[0]
+        in_grad[1][:] = out_grad[0]
+
+@mx.operator.register("AdditionOP")
+class AdditionOPProp(mx.operator.CustomOpProp):
+    def __init__(self):
+        super(AdditionOPProp, self).__init__()
+    def list_arguments(self):
+        return ['a', 'b']
+    def list_outputs(self):
+        return ['output']
+    def infer_shape(self, in_shape):
+        return in_shape, [in_shape[0]]
+    def create_operator(self, ctx, shapes, dtypes):
+        return AdditionOP()
+
+def foo():
+    a = mx.nd.array([1, 2, 3])
+    b = mx.nd.array([4, 5, 6])
+
+    a.attach_grad()
+    b.attach_grad()
+
+    print("REC")
+    with mx.autograd.record():
+        c = mx.nd.Custom(a, b, op_type='AdditionOP')
+
+    dc = mx.nd.array([7, 8, 9])
+    c.backward(dc)
+
+    assert_almost_equal(a + b, c)
+    assert_almost_equal(a.grad, dc)
+    assert_almost_equal(b.grad, dc)
+
+    print('Okay :-)')
+    print('a + b = c \n {} + {} = {}'.format(a.asnumpy(), b.asnumpy(), c.asnumpy()))
+
+def main():
+    ex = futures.ProcessPoolExecutor(1)
+    r = ex.submit(foo)
+    r.result()
+
+if __name__ == '__main__':
+    main()
+		</comment>
+		<comment id='6' author='YutingZhang' date='2019-03-12T01:42:10Z'>
+		So mx.nd.Custom is the actual problem ... MxNet just has lots of bugs when running in subprocess ...
+		</comment>
+		<comment id='7' author='YutingZhang' date='2019-03-12T01:56:49Z'>
+		Yes.
+		</comment>
+		<comment id='8' author='YutingZhang' date='2019-03-13T00:47:49Z'>
+		&lt;denchmark-link:https://github.com/wkcn&gt;@wkcn&lt;/denchmark-link&gt;
+ Send you an email to your live.cn email :)
+		</comment>
+		<comment id='9' author='YutingZhang' date='2019-03-13T01:12:37Z'>
+		Mail received. Thank you! : )
+		</comment>
+		<comment id='10' author='YutingZhang' date='2019-08-12T12:50:53Z'>
+		Hi &lt;denchmark-link:https://github.com/YutingZhang&gt;@YutingZhang&lt;/denchmark-link&gt;
+ , the two testcases you gave have been passed in the latest MXNet and MobulaOP : )
+		</comment>
+		<comment id='11' author='YutingZhang' date='2019-08-13T17:02:32Z'>
+		&lt;denchmark-link:https://github.com/wkcn&gt;@wkcn&lt;/denchmark-link&gt;
+ Thanks a lot! Did you work around the problem in MobulaOP? Or is it due to MxNet's update on CustomOP (you also contributed to this)?
+		</comment>
+		<comment id='12' author='YutingZhang' date='2019-08-13T22:29:15Z'>
+		&lt;denchmark-link:https://github.com/YutingZhang&gt;@YutingZhang&lt;/denchmark-link&gt;
+ It is due to MXNet’s update, and other contributors fixed it.
+		</comment>
+		<comment id='13' author='YutingZhang' date='2019-09-25T14:08:58Z'>
+		Close it since the problem has been addressed. : )
+		</comment>
+	</comments>
+</bug>

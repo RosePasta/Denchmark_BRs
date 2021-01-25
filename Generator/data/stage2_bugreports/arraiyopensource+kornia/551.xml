@@ -1,0 +1,345 @@
+<bug id='551' author='hal-314' open_date='2020-05-01T13:06:58Z' closed_time='2020-10-15T09:02:18Z'>
+	<summary>Assign different alphas to every class in Focal Loss</summary>
+	<description>
+Hi
+First of all, great work with kornia! Currently, focal loss (FL) is implemented for multiclass tasks. However, its alpha parameter is shared between all classes when the original paper defines FL for binary tasks as: FL(pt)=−αt(1−pt)γlog(pt). See &lt;denchmark-link:https://arxiv.org/abs/1708.02002&gt;https://arxiv.org/abs/1708.02002&lt;/denchmark-link&gt;
+ and &lt;denchmark-link:https://github.com/kornia/kornia/issues/493&gt;#493&lt;/denchmark-link&gt;
+ .
+I modified the current FL code to support different alphas for every class (see below). The only relevant change is:
+&lt;denchmark-code&gt;# Instead of using a constant, we change to a tensor of size (N, C, *) and rename alpha to alphas
+alphas = torch.tensor(alphas, dtype=input.dtype, device=input.device).view(1, -1, *[1]*(input.ndim-2))      
+&lt;/denchmark-code&gt;
+
+Here is the whole code (I haven't changed docs):
+&lt;denchmark-code&gt;from typing import Optional, List  # &lt;-Change:  Add List
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from kornia.utils import one_hot
+
+
+# based on:
+# https://github.com/zhezh/focalloss/blob/master/focalloss.py
+
+def focal_loss(
+        input: torch.Tensor,
+        target: torch.Tensor,
+        alphas: Optional[List[float]], # &lt;-Change:  rename to alphas and to a list of floats
+        gamma: float = 2.0,
+        reduction: str = 'none',
+        eps: float = 1e-8) -&gt; torch.Tensor:
+    r"""Function that computes Focal loss.
+
+    See :class:`~kornia.losses.FocalLoss` for details.
+    """
+    if not torch.is_tensor(input):
+        raise TypeError("Input type is not a torch.Tensor. Got {}"
+                        .format(type(input)))
+
+    if not len(input.shape) &gt;= 2:
+        raise ValueError("Invalid input shape, we expect BxCx*. Got: {}"
+                         .format(input.shape))
+ 
+    if input.size(0) != target.size(0):
+        raise ValueError('Expected input batch_size ({}) to match target batch_size ({}).'
+                         .format(input.size(0), target.size(0)))
+
+    n = input.size(0)
+    out_size = (n,) + input.size()[2:]
+    if target.size()[1:] != input.size()[2:]:
+        raise ValueError('Expected target size {}, got {}'.format(
+            out_size, target.size()))
+
+    if not input.device == target.device:
+        raise ValueError(
+            "input and target must be in the same device. Got: {} and {}" .format(
+                input.device, target.device))
+
+    ### New addition ###
+    alphas = torch.tensor(alphas, dtype=input.dtype, device=input.device).view(1, -1, *[1]*(input.ndim-2))      
+    if alphas.size(1) != input.size(1):
+        raise ValueError("Invalid alphas shape. we expect{} alpha values. Got: {}"
+                         .format(input.size(1), alphas.size(1)))
+
+    # Normalize alphas to sum up 1
+    alphas.div_(alphas.sum())
+
+    # Original code:
+
+    # compute softmax over the classes axis
+    input_soft: torch.Tensor = F.softmax(input, dim=1) + eps
+
+    # create the labels one hot tensor
+    target_one_hot: torch.Tensor = one_hot(
+        target, num_classes=input.shape[1],
+        device=input.device, dtype=input.dtype)
+
+    # compute the actual focal loss
+    weight = torch.pow(-input_soft + 1., gamma)
+
+    focal = -alphas * weight * torch.log(input_soft) # &lt;-Change:  alpha -&gt; alphas
+    loss_tmp = torch.sum(target_one_hot * focal, dim=1)
+
+    if reduction == 'none':
+        loss = loss_tmp
+    elif reduction == 'mean':
+        loss = torch.mean(loss_tmp)
+    elif reduction == 'sum':
+        loss = torch.sum(loss_tmp)
+    else:
+        raise NotImplementedError("Invalid reduction mode: {}"
+                                  .format(reduction))
+    return loss
+
+
+
+class FocalLoss(nn.Module):
+    r"""Criterion that computes Focal loss.
+
+    According to [1], the Focal loss is computed as follows:
+
+    .. math::
+
+        \text{FL}(p_t) = -\alpha_t (1 - p_t)^{\gamma} \, \text{log}(p_t)
+
+    where:
+       - :math:`p_t` is the model's estimated probability for each class.
+
+
+    Arguments:
+        alpha (float): Weighting factor :math:`\alpha \in [0, 1]`.
+        gamma (float): Focusing parameter :math:`\gamma &gt;= 0`.
+        reduction (str, optional): Specifies the reduction to apply to the
+         output: ‘none’ | ‘mean’ | ‘sum’. ‘none’: no reduction will be applied,
+         ‘mean’: the sum of the output will be divided by the number of elements
+         in the output, ‘sum’: the output will be summed. Default: ‘none’.
+
+    Shape:
+        - Input: :math:`(N, C, *)` where C = number of classes.
+        - Target: :math:`(N, *)` where each value is
+          :math:`0 ≤ targets[i] ≤ C−1`.
+
+    Examples:
+        &gt;&gt;&gt; N = 5  # num_classes
+        &gt;&gt;&gt; kwargs = {"alpha": 0.5, "gamma": 2.0, "reduction": 'mean'}
+        &gt;&gt;&gt; loss = kornia.losses.FocalLoss(**kwargs)
+        &gt;&gt;&gt; input = torch.randn(1, N, 3, 5, requires_grad=True)
+        &gt;&gt;&gt; target = torch.empty(1, 3, 5, dtype=torch.long).random_(N)
+        &gt;&gt;&gt; output = loss(input, target)
+        &gt;&gt;&gt; output.backward()
+
+    References:
+        [1] https://arxiv.org/abs/1708.02002
+    """
+
+    def __init__(self, alphas: Optional[List[float]], gamma: float = 2.0, # &lt;- Change:  alpha to alphas
+                 reduction: str = 'none') -&gt; None:
+        super(FocalLoss, self).__init__()
+        self.alphas: Optional[List[float]] = alphas # &lt;- Change:  alpha to alphas
+        self.gamma: float = gamma
+        self.reduction: str = reduction
+        self.eps: float = 1e-6
+
+    def forward(  # type: ignore
+            self,
+            input: torch.Tensor,
+            target: torch.Tensor) -&gt; torch.Tensor:
+        return focal_loss(input, target, self.alphas, self.gamma, self.reduction, self.eps) # &lt;- Change:  alpha to alphas
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='hal-314' date='2020-06-04T15:21:47Z'>
+		I think this is an important issue as the current implementation of alpha has no effect (if it is not set to 0) as far as I can tell. A possible extension of this suggestion could be to use alpha, if only a single number is passed, as weighting factor for class 0 (which is often the background class) and weigh all other classes equally (1-alpha)/num_classes
+		</comment>
+		<comment id='2' author='hal-314' date='2020-06-26T06:46:43Z'>
+		I think there already a couple of opened issues around this loss. If any of you can come with the "correct" implementation, feel free to open a PR to improve it. /cc &lt;denchmark-link:https://github.com/ducha-aiki&gt;@ducha-aiki&lt;/denchmark-link&gt;
+ did some tweaks at some point, maybe he has some intuitions as well
+		</comment>
+		<comment id='3' author='hal-314' date='2020-10-08T08:24:35Z'>
+		This issue has been automatically marked as stale because it has not had recent activity. It will be closed if no further activity occurs. Thank you for your contributions, and happy coding day 😎
+		</comment>
+		<comment id='4' author='hal-314' date='2020-10-19T10:55:05Z'>
+		&lt;denchmark-link:https://github.com/iimog&gt;@iimog&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/hal-314&gt;@hal-314&lt;/denchmark-link&gt;
+ can you guys verify is this issue it's still relevant. Feel free to open again, otherwise let's keep it closed.
+		</comment>
+		<comment id='5' author='hal-314' date='2020-10-19T11:22:22Z'>
+		I can confirm that the issue with fixed alpha still exists. &lt;denchmark-link:https://github.com/kornia/kornia/pull/699&gt;#699&lt;/denchmark-link&gt;
+ solves this problem for the binary case. It is not straightforward to do this for the multi class case. I'm okay with keeping this closed. If I need focal loss with different alphas I'm currently using: &lt;denchmark-link:https://docs.monai.io/en/latest/losses.html#focalloss&gt;https://docs.monai.io/en/latest/losses.html#focalloss&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='6' author='hal-314' date='2020-10-19T11:45:38Z'>
+		&lt;denchmark-link:https://github.com/iimog&gt;@iimog&lt;/denchmark-link&gt;
+ great, thanks for pointing out. I'll open open a ticket to support multi class. I guess not only medical imaging needs this.
+		</comment>
+		<comment id='7' author='hal-314' date='2020-10-19T11:55:25Z'>
+		My pleasure! I think so, too. Thanks for your great work.
+		</comment>
+		<comment id='8' author='hal-314' date='2020-10-22T09:59:40Z'>
+		Hi, I have written a FocalLoss implementation built upon my previous implementation. I think it mainly follows Kornia losses style and supports binary, multiclass and multilabel classification.
+I believe its correct. The main difference with Monai impl is that I used pytorch builtin loss functions instead of doing it manually.
+from typing import Optional, List, Union
+
+import torch
+from torch import nn
+from torch.nn import functional as F
+
+# Binary implementation based on https://amaarora.github.io/2020/06/29/FocalLoss.html
+# See this discussion https://www.kaggle.com/c/siim-isic-melanoma-classification/discussion/162035#904086
+# Multiclass and multilabel generalization based on that code.
+
+def focal_loss(input, target, fl_type: str, alphas, gamma, reduction):
+    if fl_type not in ['binary', 'multiclass', 'multilabel']:
+        raise ValueError(f"fl_type should be binary, multiclass or multilabel instead of {fl_type}.")
+        
+    # Checks (mainly copied from kornia.losses.focal_loss)
+    ndims, shape_msg = (1, 'B (batch_size)') if fl_type == 'binary' else (2, 'BxC') 
+    if input.ndim != ndims:
+        raise ValueError(f"Invalid input shape, we expect {shape_msg}. Got: {input.shape}.")
+        
+    ndims, shape_msg = (2, 'BxC') if fl_type == 'multilabel' else (1, 'B (batch_size)') 
+    if target.ndim != ndims:
+        raise ValueError(f"Invalid target shape, we expect {shape_msg}. Got: {target.shape}.")
+    
+    if fl_type == 'multiclass':
+        if input.shape[0] != target.shape[0]:
+            raise ValueError(f'Expected input batch_size ({input.shape[0]}) to match target batch_size ({target.shape[0]}).')
+            
+        if target.max() &gt;= input.shape[1]:
+            raise ValueError(f"There are more target classes ({target.max()+1}) than the number of classes predicted ({input.shape[1]})")            
+    else:
+        if input.shape != target.shape:
+            raise ValueError(f"Expected input shape ({input.shape}) to match target shape ({target.shape}).")      
+        
+    
+    if not input.device == target.device:
+        raise ValueError(
+            "input and target must be in the same device. Got: {} and {}" .format(
+                input.device, target.device))
+        
+    if gamma &lt; 1:
+        raise RuntimeError('Backpropagation problems. See EfficientDet Rwightman focal loss implementation')
+        
+    # Create at check alpha values
+    # Create an alphas tensor. Remember to move it to the same device and to have the same dtype that the inputs
+    if fl_type == 'binary' and (not isinstance(alphas, torch.Tensor) or alpha.ndim == 0): 
+        if not 0 &lt; alphas &lt; 1: 
+            raise ValueError(f"Alpha must be between 0 and 1 and it's {alphas}.")
+        alphas = torch.tensor([alphas, 1-alphas], dtype=input.dtype, device=input.device) # [0, 1] labels weights
+    elif isinstance(alphas, (tuple, list)): 
+        alphas = torch.tensor(alphas, dtype=input.dtype, device=input.device)
+    elif isinstance(alphas, torch.Tensor): 
+        alphas = alphas.type_as(input).to(input.device)
+    else:
+        raise RuntimeError(f"Incorrect alphas type: {type(alphas)}. Alphas values {alphas}")
+    
+    expect_n_alphas = 2 if fl_type == 'binary' else input.shape[1]
+    if alphas.shape[0] != expect_n_alphas:
+        raise ValueError(f"Invalid alphas shape. we expect {expect_n_alphas} alpha values. Got: {alphas.shape[0]}.")
+    
+    # Normalize alphas to sum up 1
+    alphas.div_(alphas.sum())
+    
+    # Non weighted version of Focal Loss computation:
+    if fl_type == 'multiclass':
+        target = target.long() # Targets needs to be long
+        base_loss = F.cross_entropy(input, target, reduction='none')
+    else: # Target can't be long
+        base_loss = F.binary_cross_entropy_with_logits(input, target, reduction='none')
+        
+    target = target.type(torch.long)
+    at = alphas.gather(0, target.data.view(-1))
+    if fl_type == 'multilabel': # Reshape 
+        at = at.view(-1, len(alphas))
+        
+    pt = torch.exp(-base_loss)
+    focal_loss = at*(1-pt)** gamma * base_loss
+        
+    if reduction == 'none': return focal_loss
+    elif reduction == 'mean': return focal_loss.mean()
+    elif reduction == 'sum': return focal_loss.sum()
+    else: raise NotImplementedError("Invalid reduction mode: {}".format(reduction))      
+        
+class FocalLoss(nn.Module):
+    """    
+    Focal loss that support binary, multiclass or multilabel classification. See [Focal Loss for Dense Object Detection](https://arxiv.org/abs/1708.02002).
+    This implementation is a non weighted version of Focal Loss in contrast of some implementations. See
+    this [kaggle post](https://www.kaggle.com/c/siim-isic-melanoma-classification/discussion/162035#904086).
+
+    According to the paper, the Focal Loss for binary case is computed as follows:
+    .. math::
+        \text{FL}(p_t) = -\alpha_t (1 - p_t)^{\gamma} \, \text{log}(p_t)
+        
+    where:
+       - :math:`p_t` is the model's estimated probability for each class.
+    
+    The `input` is expected to contain raw, unnormalized scores for each class. `input` has to be a one hot encoded Tensor of size 
+    either :math:`(minibatch, C)` for multilabel or multiclass classification or :math:`(minibatch, )` for binary classification. 
+    
+    The `target` is expected to contain raw, unnormalized scores for each class. `target` has to be a one hot encoded Tensor of size 
+    either :math:`(minibatch, C)` for multilabel classification or :math:`(minibatch, )` for binary or multiclass classification. 
+    
+    Args:
+        alphas (float, list, tuple, Tensor): the `alpha` value for each class. It weights the losses of each class. When `fl_type`
+            is 'binary', it could be a float. In this case, it's transformed to :math:`alphas = (alphas, 1 - alphas)` where the
+            first position is for the negative class and the second the positive. Note: alpha values are normalized to sum up 1.
+        gamma (float): gamma exponent of the focal loss. Typically, between 0.25 and 4.
+        reduction (string, optional): Specifies the reduction to apply to the output:
+            ``'none'`` | ``'mean'`` | ``'sum'``. ``'none'``: no reduction will be applied,
+            ``'mean'``: the sum of the output will be divided by the number of
+            elements in the output, ``'sum'``: the output will be summed.
+            
+    
+    :math:`(minibatch, C, d_1, d_2, ..., d_K)`
+    
+    Note: the implementation is based on [this post](https://amaarora.github.io/2020/06/29/FocalLoss.html).
+    
+    """
+    def __init__(self, fl_type: str, alphas: Union[float, List[float]], gamma: float = 2.0, reduction: str = 'mean') -&gt; None:
+        super(FocalLoss, self).__init__()
+        self.fl_type = fl_type
+        self.alphas = alphas #torch.tensor(alphas)        
+        self.gamma = gamma
+        self.reduction = reduction
+    
+    def forward(self, input, target):
+        return focal_loss(input, target, fl_type=self.fl_type, alphas=self.alphas, gamma=self.gamma, reduction=self.reduction)        
+You can test it:
+# Binary
+input = torch.randn(10, requires_grad=True)
+target = torch.empty(10).random_(2)
+print(FocalLoss('binary', alphas=.25, reduction='none')(input, target))
+
+# Multiclass classification
+input_mc = torch.randn((10,3), requires_grad=True)
+target_mc = torch.empty(10).random_(3)
+print(FocalLoss('multiclass', alphas=[1, 1, 1], reduction='none')(input_mc, target_mc))
+
+# Multilabel classification
+input_ml = torch.randn((10,4), requires_grad=True)
+target_ml = torch.empty((10,4)).random_(2)
+print(FocalLoss('multilabel', alphas=[1.3, 2, 3, 1], reduction='none')(input_ml, target_ml))
+		</comment>
+		<comment id='9' author='hal-314' date='2020-10-22T10:04:31Z'>
+		&lt;denchmark-link:https://github.com/hal-314&gt;@hal-314&lt;/denchmark-link&gt;
+ could you send a PR with the fixes ?
+		</comment>
+		<comment id='10' author='hal-314' date='2020-10-22T11:31:47Z'>
+		&lt;denchmark-link:https://github.com/edgarriba&gt;@edgarriba&lt;/denchmark-link&gt;
+ I'll try to do it next week when I'll have some free time.
+Regarding backwards compatibility, ¿do I need to keep it? If yes, can I change alpha  to alphas as it make more sense?
+class FocalLoss(alpha: float, gamma: float = 2.0, reduction: str = 'none') &lt;- Current FocalLoss
+class FocalLoss(alphas: float, gamma: float = 2.0, reduction: str = 'none', type='binary') &lt;- Proposed in the future PR to keep backward compatibility.
+class FocalLoss(type: str, alphas: float, gamma: float = 2.0, reduction: str = 'none') &lt;- I think that type should be the first argument but it breaks current user code.
+Do you prefer expose three focal losses (BinaryFocalLoss, MultiClassLocalLoss and MultilabelFocalLoss) to users while they call to the same _focal_loss function instead of one FocalLoss class?
+		</comment>
+		<comment id='11' author='hal-314' date='2020-10-23T08:04:49Z'>
+		&lt;denchmark-link:https://github.com/hal-314&gt;@hal-314&lt;/denchmark-link&gt;
+ that sound good. Let continue this conversation in &lt;denchmark-link:https://github.com/kornia/kornia/issues/722&gt;#722&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,199 @@
+<bug id='25833' author='Wizaron' open_date='2019-09-08T13:19:17Z' closed_time='2019-10-27T13:00:40Z'>
+	<summary>CUDNN implementation of CTCLoss does not handle gradients from subsequent operations</summary>
+	<description>
+&lt;denchmark-h:h2&gt;🐛 Bug&lt;/denchmark-h&gt;
+
+CUDNN implementation of CTCLoss does not handle gradients from subsequent operations.
+&lt;denchmark-h:h2&gt;To Reproduce&lt;/denchmark-h&gt;
+
+&lt;denchmark-code&gt;import torch
+
+class Architecture(torch.nn.Module):
+
+    def __init__(self, n_features, n_classes):
+        super(Architecture, self).__init__()
+
+        self.n_features = n_features
+        self.n_classes = n_classes
+
+        self.cls = torch.nn.Linear(self.n_features, self.n_classes)
+
+    def forward(self, x):
+        ts, bs = x.shape[:2]
+
+        x = x.view(ts * bs, self.n_features)
+        x = self.cls(x).view(ts, bs, self.n_classes)
+        x = torch.nn.functional.log_softmax(x, dim=-1)
+        return x
+
+BATCH_SIZE = 2
+GT_LENGTH = 3
+N_TIMESTEPS = GT_LENGTH * 2
+N_FEATURES = 5
+N_CLASSES = 4
+
+def get_model():
+    arch = Architecture(N_FEATURES, N_CLASSES)
+    arch.train()
+
+    return arch
+
+def get_data():
+    # Data
+    features = torch.normal(mean=torch.zeros((N_TIMESTEPS, BATCH_SIZE, N_FEATURES), dtype=torch.float32))
+    pred_lengths = N_TIMESTEPS * torch.ones((BATCH_SIZE,), dtype=torch.int32)
+
+    targets = torch.randint(1, N_CLASSES, size=(BATCH_SIZE * GT_LENGTH,), dtype=torch.int32)
+    target_lengths = GT_LENGTH * torch.ones((BATCH_SIZE,), dtype=torch.int32)
+
+    return features, pred_lengths, targets, target_lengths
+
+def cast_data(features, pred_lengths, targets, target_lengths, device, dtype):
+    features = features.to(device)
+    pred_lengths = pred_lengths.to(dtype)
+    targets = targets.to(dtype).to(device)
+    target_lengths = target_lengths.to(dtype)
+
+    if dtype == torch.int32:
+        targets = targets.to(torch.device("cpu"))
+
+    return features, pred_lengths, targets, target_lengths
+
+def run(model, data, device, dtype, loss_mult=1.0):
+    if device == torch.device("cpu"):
+        print("\n# CTC CPU     : device {} - dtype {} - mul {}".format(device, dtype, loss_mult))
+    elif device == torch.device("cuda") and dtype == torch.int32:
+        print("\n# CTC CUDNN   : device {} - dtype {} - mul {}".format(device, dtype, loss_mult))
+    elif device == torch.device("cuda") and dtype == torch.long:
+        print("\n# CTC REGULAR : device {} - dtype {} - mul {}".format(device, dtype, loss_mult))
+
+    model = model.to(device)
+    features, pred_lengths, targets, target_lengths = cast_data(*data, device, dtype)
+    preds = model(features)
+
+    # Loss
+    loss = torch.nn.functional.ctc_loss(preds, targets, pred_lengths, target_lengths)
+
+    loss = loss_mult * loss
+
+    print('LOSS : ', loss)
+
+    model.zero_grad()
+    loss.backward()
+
+    for param in model.parameters():
+        print('GRAD : ', param.grad.abs().mean())
+
+    model.zero_grad()
+
+data = get_data()
+model = get_model()
+
+print("----- CPU -----")
+run(model, data, torch.device("cpu"), torch.int32)
+run(model, data, torch.device("cpu"), torch.long)
+run(model, data, torch.device("cpu"), torch.int32, 0.0)
+run(model, data, torch.device("cpu"), torch.long, 0.0)
+
+print("\n----- GPU -----")
+run(model, data, torch.device("cuda"), torch.int32)
+run(model, data, torch.device("cuda"), torch.long)
+run(model, data, torch.device("cuda"), torch.int32, 0.0)
+run(model, data, torch.device("cuda"), torch.long, 0.0)
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h2&gt;Expected behavior&lt;/denchmark-h&gt;
+
+We expect the gradients to be zeroed out when we multiply the loss by zero, which is not the case for cudnn implementation of ctcloss.
+We can see that, from the following output, gradients are not affected by mul when we are using cudnn implementation.
+&lt;denchmark-code&gt;----- CPU -----
+
+# CTC CPU     : device cpu - dtype torch.int32 - mul 1.0
+LOSS :  tensor(1.5330, grad_fn=&lt;MulBackward0&gt;)
+GRAD :  tensor(0.0887)
+GRAD :  tensor(0.1541)
+
+# CTC CPU     : device cpu - dtype torch.int64 - mul 1.0
+LOSS :  tensor(1.5330, grad_fn=&lt;MulBackward0&gt;)
+GRAD :  tensor(0.0887)
+GRAD :  tensor(0.1541)
+
+# CTC CPU     : device cpu - dtype torch.int32 - mul 0.0
+LOSS :  tensor(0., grad_fn=&lt;MulBackward0&gt;)
+GRAD :  tensor(0.)
+GRAD :  tensor(0.)
+
+# CTC CPU     : device cpu - dtype torch.int64 - mul 0.0
+LOSS :  tensor(0., grad_fn=&lt;MulBackward0&gt;)
+GRAD :  tensor(0.)
+GRAD :  tensor(0.)
+
+----- GPU -----
+
+# CTC CUDNN   : device cuda - dtype torch.int32 - mul 1.0
+LOSS :  tensor(1.5330, device='cuda:0', grad_fn=&lt;MulBackward0&gt;)
+GRAD :  tensor(4.4561, device='cuda:0')
+GRAD :  tensor(6.0174, device='cuda:0')
+
+# CTC REGULAR : device cuda - dtype torch.int64 - mul 1.0
+LOSS :  tensor(1.5330, device='cuda:0', grad_fn=&lt;MulBackward0&gt;)
+GRAD :  tensor(0.0887, device='cuda:0')
+GRAD :  tensor(0.1541, device='cuda:0')
+
+# CTC CUDNN   : device cuda - dtype torch.int32 - mul 0.0
+LOSS :  tensor(0., device='cuda:0', grad_fn=&lt;MulBackward0&gt;)
+GRAD :  tensor(4.4561, device='cuda:0')
+GRAD :  tensor(6.0174, device='cuda:0')
+
+# CTC REGULAR : device cuda - dtype torch.int64 - mul 0.0
+LOSS :  tensor(0., device='cuda:0', grad_fn=&lt;MulBackward0&gt;)
+GRAD :  tensor(0., device='cuda:0')
+GRAD :  tensor(0., device='cuda:0')
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h2&gt;Environment&lt;/denchmark-h&gt;
+
+PyTorch version: 1.2.0
+Is debug build: No
+CUDA used to build PyTorch: 9.2.148
+OS: Ubuntu 16.04.6 LTS
+GCC version: (Ubuntu 5.4.0-6ubuntu1~16.04.11) 5.4.0 20160609
+CMake version: version 3.5.1
+Python version: 3.6
+Is CUDA available: Yes
+CUDA runtime version: Could not collect
+GPU models and configuration: GPU 0: GeForce GTX 980M
+Nvidia driver version: 418.40.04
+cuDNN version: Probably one of the following:
+/usr/lib/x86_64-linux-gnu/libcudnn.so.7.5.0
+/usr/local/cuda-9.2/targets/x86_64-linux/lib/libcudnn.so.7.6.1
+Versions of relevant libraries:
+[pip] numpy==1.15.4
+[pip] torch==1.2.0
+[pip] torchgeometry==0.1.2rc1
+[pip] torchvision==0.4.0a0+9232c4a
+[conda] blas                      1.0                         mkl
+[conda] mkl                       2019.1                      144
+[conda] mkl_fft                   1.0.6            py36hd81dba3_0
+[conda] mkl_random                1.0.2            py36hd81dba3_0
+[conda] pytorch                   1.2.0           py3.6_cuda9.2.148_cudnn7.6.2_0    pytorch
+[conda] torchvision               0.4.0                 py36_cu92    pytorch
+	</description>
+	<comments>
+		<comment id='1' author='Wizaron' date='2019-09-09T21:44:45Z'>
+		cc &lt;denchmark-link:https://github.com/t-vi&gt;@t-vi&lt;/denchmark-link&gt;
+
+If cudnn is trashing some buffers I'm not sure if there's much we can do about this :(
+		</comment>
+		<comment id='2' author='Wizaron' date='2019-09-10T04:44:21Z'>
+		&lt;denchmark-link:https://github.com/pytorch/pytorch/blob/master/tools/autograd/derivatives.yaml#L1388&gt;https://github.com/pytorch/pytorch/blob/master/tools/autograd/derivatives.yaml#L1388&lt;/denchmark-link&gt;
+
+seems like we need to multiply grad_out there.
+		</comment>
+		<comment id='3' author='Wizaron' date='2019-10-27T13:00:40Z'>
+		Fixed by: Use grad_out for cudnn CTC loss &lt;denchmark-link:https://github.com/pytorch/pytorch/pull/27039&gt;#27039&lt;/denchmark-link&gt;
+
+Thank you for reporting!
+		</comment>
+	</comments>
+</bug>

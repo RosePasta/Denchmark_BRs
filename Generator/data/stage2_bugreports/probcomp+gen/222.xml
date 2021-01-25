@@ -1,0 +1,193 @@
+<bug id='222' author='bzinberg' open_date='2020-03-31T17:45:39Z' closed_time='2020-06-20T19:58:00Z'>
+	<summary>Tilde syntax `x ~ foo` looks for `@trace` in the caller's namespace</summary>
+	<description>
+Example:
+Gen.@gen function f()
+  x ~ Gen.normal(0, 1)
+end
+# ERROR: LoadError: UndefVarError: @trace not defined
+I think this is a bug in the macro escaping.
+	</description>
+	<comments>
+		<comment id='1' author='bzinberg' date='2020-03-31T17:52:08Z'>
+		oh jk, it's actually that the @trace macro is being called incorrectly.  Or maybe both?  Sending fix
+		</comment>
+		<comment id='2' author='bzinberg' date='2020-03-31T17:52:57Z'>
+		Yeah I think &lt;denchmark-link:https://github.com/probcomp/Gen/blob/964d8a96205de6bb13e69f13eec7eaff7906c952/src/dsl/dsl.jl#L73&gt;this is the function&lt;/denchmark-link&gt;
+ that needs to be fixed by prefixing each  with 
+function desugar_tildes(expr)
+    MacroTools.postwalk(expr) do e
+        if MacroTools.@capture(e, {*} ~ rhs_)
+            :(@trace($rhs))
+        elseif MacroTools.@capture(e, {addr_} ~ rhs_)
+            :(@trace($rhs, $(addr)))
+        elseif MacroTools.@capture(e, lhs_ ~ rhs_)
+            addr_expr = address_from_expression(lhs)
+            :($lhs = @trace($rhs, $(addr_expr)))
+        else
+            e
+        end
+    end
+end
+		</comment>
+		<comment id='3' author='bzinberg' date='2020-03-31T17:55:42Z'>
+		&lt;denchmark-link:https://github.com/ztangent&gt;@ztangent&lt;/denchmark-link&gt;
+, see &lt;denchmark-link:https://github.com/probcomp/Gen.jl/pull/223&gt;#223&lt;/denchmark-link&gt;
+ 
+I think what should be happening is that trace (as a function on ASTs) should be called at macro expansion time, from within Gen's internals.  Instead, the desugarer was punting the @traceing to the caller, which actually worked if the caller happened to have @trace in their namespace, but was not the intended logic.
+		</comment>
+		<comment id='4' author='bzinberg' date='2020-03-31T17:58:54Z'>
+		Hm, a unit test is now failing probably due to &lt;denchmark-link:https://github.com/probcomp/Gen.jl/pull/223&gt;#223&lt;/denchmark-link&gt;
+ not doing some escaping that it should be doing.  I'll try to figure it out :)
+		</comment>
+		<comment id='5' author='bzinberg' date='2020-03-31T18:21:34Z'>
+		As mentioned in &lt;denchmark-link:https://github.com/probcomp/Gen.jl/pull/223&gt;#223&lt;/denchmark-link&gt;
+, I think there needs to be some care to make sure the fix for this works with the DML and the SML. The fix I suggested in my comment above (i.e. prefixing  by ) should work for the DML, but it most likely will not work with the SML because the SML parser tries to match  expressions, and so will fail to match .
+In fact, even without tilde syntax, I think if you do import Gen instead of using Gen, the SML will fail for the following function (when it should work):
+Gen.@gen function f()
+  x = Gen.@trace(Gen.normal(0, 1), :x)
+end
+but work for the following function (when it should fail):
+Gen.@gen function f()
+  x = @trace(Gen.normal(0, 1), :x)
+end
+i.e. the SML doesn't obey the standard scoping rules.
+		</comment>
+		<comment id='6' author='bzinberg' date='2020-03-31T18:27:17Z'>
+		I think probably the most principled way (in terms of consistency with standard Julia scoping rules) to fix this is to:
+
+Add the Gen. prefix to @trace in the desugar_tildes function -- this should ensure the DML always works.
+Pass the calling __module__ from the the @gen macro all the way down to the various SML parsing functions, so that can selectively match either @trace, Gen.@trace, or both, depending on whether @trace exists in the calling __module__.
+Do the above for @param in the SML as well.
+
+		</comment>
+		<comment id='7' author='bzinberg' date='2020-03-31T18:38:53Z'>
+		&lt;denchmark-link:https://github.com/bzinberg&gt;@bzinberg&lt;/denchmark-link&gt;
+, good catch, and &lt;denchmark-link:https://github.com/ztangent&gt;@ztangent&lt;/denchmark-link&gt;
+, good analysis!
+I think what we're running up against is that it doesn't make a whole lot of sense that @trace is a macro in the static DSL, because it is never actually macroexpanded -- instead, it's syntax that the @gen macro explicitly looks for.
+Long-term, I wonder if it makes sense to phase out @trace from the static DSL (because it never actually resolves to a Julia binding) and just have the ~ syntax. (Implementation-wise, ~ could replace with Gen.@trace, and static DSL could look for Gen.@trace.) I think that @trace still plays an important role in the dynamic DSL, ensuring that the @trace calls in nested generative function definitions are properly resolved.
+		</comment>
+		<comment id='8' author='bzinberg' date='2020-03-31T18:48:21Z'>
+		
+I think probably the most principled way (in terms of consistency with standard Julia scoping rules) to fix this is to:
+
+
+Add the Gen. prefix to @trace in the desugar_tildes function -- this should ensure the DML always works.
+
+
+Pass the calling __module__ from the the @gen macro all the way down to the various SML parsing functions, so that can selectively match either @trace, Gen.@trace, or both, depending on whether @trace exists in the calling __module__.
+
+
+Do the above for @param in the SML as well.
+
+
+
+&lt;denchmark-link:https://github.com/ztangent&gt;@ztangent&lt;/denchmark-link&gt;
+, definitely not an expert but my thoughts are:
+I think 1. assumes the caller has a module called Gen in their namespace, which I think is not necessary.
+For 2., [Edit: whoops, I misread it.]
+I don't think there is a principled reason to assume that the caller has the @trace macro, or the Gen module, available under some specific name.
+I currently believe the most principled solution (for the dynamic DSL) is:
+&lt;denchmark-link:https://github.com/probcomp/Gen/blob/09a86c01042a6f449059d2d96b1f08b920b29564/src/dsl/dsl.jl#L73-L90&gt;https://github.com/probcomp/Gen/blob/09a86c01042a6f449059d2d96b1f08b920b29564/src/dsl/dsl.jl#L73-L90&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='9' author='bzinberg' date='2020-03-31T18:51:04Z'>
+		
+I think 1. assumes the caller has a module called Gen in their namespace, which I think is not necessary.
+
+I think in Julia, you can’t import something without getting its name?
+		</comment>
+		<comment id='10' author='bzinberg' date='2020-03-31T18:53:00Z'>
+		
+
+I think 1. assumes the caller has a module called Gen in their namespace, which I think is not necessary.
+
+I think in Julia, you can’t import something without getting its name?
+
+What if the user imports a package Foo that depends on Gen?  My understanding is that Foo.Gen will exist for them but Gen will not.
+		</comment>
+		<comment id='11' author='bzinberg' date='2020-03-31T19:59:25Z'>
+		&lt;denchmark-link:https://github.com/bzinberg&gt;@bzinberg&lt;/denchmark-link&gt;
+ that solution looks like it should work for the DML, but I think it'll still break support for the tilde syntax in the SML :/
+		</comment>
+		<comment id='12' author='bzinberg' date='2020-03-31T20:10:27Z'>
+		Hmm yeah... I think similar to what &lt;denchmark-link:https://github.com/alex-lew&gt;@alex-lew&lt;/denchmark-link&gt;
+ suggested in &lt;denchmark-link:https://github.com/probcomp/Gen.jl/issues/222#issuecomment-606801429&gt;#222 (comment)&lt;/denchmark-link&gt;
+, it might make sense to replace  with tilde syntax completely in the static modelling language.  I think the  syntax is misleading, because it makes it look like  is a macro but it's not -- it's a keyword that is specific to the modelling language, and has semantics similar to  in the DML (which is a macro).  The complaint I have with this pun is that  in the SML cannot be referred to by a qualified name like  (and in fact is not imported from anywhere, it's syntax) -- it has to be referred to by exactly the expression .
+		</comment>
+		<comment id='13' author='bzinberg' date='2020-03-31T20:13:21Z'>
+		Yeah I agree that the issue is with the SML, but removing support for  would be a breaking change for a lot of existing code (including some of my own). I think this warrants a longer discussion with &lt;denchmark-link:https://github.com/marcoct&gt;@marcoct&lt;/denchmark-link&gt;
+?
+		</comment>
+		<comment id='14' author='bzinberg' date='2020-03-31T20:15:41Z'>
+		&lt;denchmark-link:https://github.com/ztangent&gt;@ztangent&lt;/denchmark-link&gt;
+ yes, I definitely did not mean to imply an overly hasty migration strategy -- or even a commitment to do the migration at all.  I'm considering us to be at the stage of coming to consensus about what the ideal long-term resolution is, independent of whether or how much time we can afford to invest in moving toward that ideal.
+		</comment>
+		<comment id='15' author='bzinberg' date='2020-03-31T20:20:22Z'>
+		Here's a possible alternative that preserves @trace support in the SML. Since @trace macroexpands to either a traceat call or a splice call (see below), we could make the SML parser match those expressions instead. This would also nicely allow it catch and throw errors on any splice call, since splicing is currently not supported by the SML. (With the SML refactor, splicing is already caught at parse time, but only by checking that @trace calls don't have a supplied address).
+&lt;denchmark-link:https://github.com/probcomp/Gen/blob/09a86c01042a6f449059d2d96b1f08b920b29564/src/dynamic/dynamic.jl#L63-L79&gt;https://github.com/probcomp/Gen/blob/09a86c01042a6f449059d2d96b1f08b920b29564/src/dynamic/dynamic.jl#L63-L79&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='16' author='bzinberg' date='2020-03-31T21:28:50Z'>
+		&lt;denchmark-link:https://github.com/ztangent&gt;@ztangent&lt;/denchmark-link&gt;
+ nice!  This is orthogonal to the fix in the DML, right?
+		</comment>
+		<comment id='17' author='bzinberg' date='2020-03-31T21:43:29Z'>
+		&lt;denchmark-link:https://github.com/bzinberg&gt;@bzinberg&lt;/denchmark-link&gt;
+ You mean orthogonal to the fix you've already made for the DML? Well, it would rely on the macroexpansion being done in desugar_tildes, so not exactly orthogonal. It would also require macroexpanding any direct  calls (and ideally  calls too) in the static function body, before passing the function body to .
+		</comment>
+		<comment id='18' author='bzinberg' date='2020-04-02T17:35:48Z'>
+		&lt;denchmark-link:https://github.com/ztangent&gt;@ztangent&lt;/denchmark-link&gt;
+, do you think this is a reasonable complete fix?:
+
+Change @trace as in #223, so that macro expansion works regardless of what names exist in the caller's scope.
+Make the changes you suggested in #222 (comment), and document them as: "In the SML, traceat and splice are keywords; in the DML, they are functions."
+Change make_static_gen_function as you suggested in #222 (comment)
+
+		</comment>
+		<comment id='19' author='bzinberg' date='2020-04-02T18:59:54Z'>
+		I think that should work, yup! Happy to review any of the changes made to
+the static parser. Also, if this is going to happen, I suggest reorganizing
+the code so that `@param` and `@trace` are defined in dsl.jl, since they will
+now be shared by both the static and dynamic modeling languages.
+
+(edited to remove my email etc from edit history.)
+		</comment>
+		<comment id='20' author='bzinberg' date='2020-04-02T19:02:22Z'>
+		Hmm, I just realized that splice is also defined in Base if I'm
+not mistaken... And in general users would need to make sure they don't
+define their own traceat and splice functions when using the static
+modeling language.
+
+Edit: `Base.splice!` is defined, but `Base.splice` is not.
+		</comment>
+		<comment id='21' author='bzinberg' date='2020-04-07T00:52:39Z'>
+		
+in general users would need to make sure they don't define their own traceat and splice functions when using the static modeling language.
+
+That's the case for any reserved word, right?  I think users expect that (like in Python you can't say def = 7).  Adding reserved words of some sort to the SML sounds reasonable to me, since they really are part of the syntax.
+		</comment>
+		<comment id='22' author='bzinberg' date='2020-04-07T00:55:07Z'>
+		&lt;denchmark-link:https://github.com/ztangent&gt;@ztangent&lt;/denchmark-link&gt;
+
+
+I think that should work, yup!
+
+Great 👍
+
+Happy to review any of the changes made to the static parser.
+
+Would you be up for implementing these changes?  You could push commits to &lt;denchmark-link:https://github.com/probcomp/Gen.jl/pull/223&gt;#223&lt;/denchmark-link&gt;
+ so that we have one combined fix and then we can review it together.
+		</comment>
+		<comment id='23' author='bzinberg' date='2020-04-07T00:57:19Z'>
+		BTW, to your point about reserved words, yeah, I think it would be a good idea to use something less high-frequency-word than splice as the reserved word -- perhaps something like Gen_splice.
+		</comment>
+		<comment id='24' author='bzinberg' date='2020-04-07T02:59:46Z'>
+		&lt;denchmark-link:https://github.com/bzinberg&gt;@bzinberg&lt;/denchmark-link&gt;
+ yeah, or maybe , in keeping with !
+And yeah, I can make those changes -- but it may have to wait till next week when I'm a little less busy!
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,163 @@
+<bug id='4614' author='edenlightning' open_date='2020-11-11T00:10:44Z' closed_time='2020-12-04T19:58:27Z'>
+	<summary>Memory leak using AMP and transformers</summary>
+	<description>
+Context can be found here: &lt;denchmark-link:https://github.com/huggingface/transformers/issues/8403&gt;huggingface/transformers#8403&lt;/denchmark-link&gt;
+
+10x memory consumption increase with native amp on PL
+I'm running under debugger pt15+apex side by side with pt16+native amp, &lt;denchmark-link:https://github.com/huggingface/transformers/issues/8403&gt;huggingface/transformers#8403&lt;/denchmark-link&gt;
+
+and found the first issue of objects not being freed
+I ruled out GradScaler I think there is a huge memory leak somewhere.
+Typically this happens due to circular references, but I don't know PL codebase... so asking for help.
+Oh, and I ruled out transformers  - the HF trainer using the same model code doesn't have this issue.
+	</description>
+	<comments>
+		<comment id='1' author='edenlightning' date='2020-11-11T00:43:33Z'>
+		So the first place where it fails to clear cuda cache when running with native amp is here: &lt;denchmark-link:https://github.com/PyTorchLightning/pytorch-lightning/blob/master/pytorch_lightning/trainer/connectors/checkpoint_connector.py#L62&gt;https://github.com/PyTorchLightning/pytorch-lightning/blob/master/pytorch_lightning/trainer/connectors/checkpoint_connector.py#L62&lt;/denchmark-link&gt;
+ (with apex it clears about 1/3rd of preallocated gpu ram at this point). The trace is:
+&lt;denchmark-code&gt;restore_weights, checkpoint_connector.py:64
+setup_training, training_loop.py:174
+train, gpu_accelerator.py:51
+fit, trainer.py:444
+generic_train, lightning_base.py:398
+main, finetune.py:413
+&lt;module&gt;, finetune.py:446
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='2' author='edenlightning' date='2020-11-11T03:42:32Z'>
+		OK, this one I sorted out not to be the culprit as I initially thought it was.
+The problem with native amp is that PL doesn't cast to fp16 until much later in the game, hence the discrepancy. If for the sake of debug I force .half() here:
+&lt;denchmark-code&gt;    def restore_weights(self, model: LightningModule):
+[...]
+        model.half()
+        import gc
+        gc.collect()
+        # clear cache before restore
+        if self.trainer.on_gpu:
+            torch.cuda.empty_cache()
+&lt;/denchmark-code&gt;
+
+the cache gets emptied - identically to when apex amp is used - the model sizes on gpu are identical at this point. The reduced size is about the size of model - model.half() (symbolically) .
+So this wasn't it. back to the drawing board.
+		</comment>
+		<comment id='3' author='edenlightning' date='2020-11-11T05:04:53Z'>
+		I don't think autocast is doing anything, despite the forward calls being made through it:
+&lt;denchmark-code&gt;        if self.trainer.amp_backend == AMPType.NATIVE:
+            with torch.cuda.amp.autocast():
+                output = self.__validation_step(args)
+&lt;/denchmark-code&gt;
+
+If I look at the forward()s intermediary data with apex, they are of dtype float16, but with native amp they are float32
+apex (see lower right corner)
+&lt;denchmark-link:https://user-images.githubusercontent.com/10676103/98770962-366c4b00-2398-11eb-9289-388b4c1b25d9.png&gt;&lt;/denchmark-link&gt;
+
+native (see lower right corner)
+&lt;denchmark-link:https://user-images.githubusercontent.com/10676103/98770976-4126e000-2398-11eb-9d15-0e07807554ae.png&gt;&lt;/denchmark-link&gt;
+
+edit: well here the x  surely had to do with only the dtype of model weights - wasn't really the right place to take the snapshot.
+Also the model dtype is float32 with native amp. I'm new to autocast so I'm not sure if it's a bug or it's so by design - should the model weights be converted to float16 at some point or do they remain intact at float32 through the whole training and the casting happening behind the scenes during forward calls keeping the model intact? This doesn't seem to be optimal since the model then takes much more space than if it were half()ed.
+		</comment>
+		<comment id='4' author='edenlightning' date='2020-11-11T05:54:59Z'>
+		Reading more on autocast - it doesn't just autocast any operation, but only a select list of pytorch ops
+&lt;denchmark-link:https://pytorch.org/docs/stable/amp.html#ops-that-can-autocast-to-float16&gt;https://pytorch.org/docs/stable/amp.html#ops-that-can-autocast-to-float16&lt;/denchmark-link&gt;
+
+
+matmul, addbmm, addmm, addmv, addr, baddbmm, bmm, chain_matmul, conv1d, conv2d, conv3d, conv_transpose1d, conv_transpose2d, conv_transpose3d, GRUCell, linear, LSTMCell, matmul, mm, mv, prelu, RNNCell
+
+So I was checking initially in the wrong parts of the forward() - where these have been used.
+So I rechecked again with forward() that contained some Linear layers - same thing, the weights of linear remain float32 and the result from nn.Linear.forward() is still float32.
+		</comment>
+		<comment id='5' author='edenlightning' date='2020-11-11T06:25:00Z'>
+		OK, so I did find a few lines of code where it did  to  &lt;denchmark-link:https://github.com/huggingface/transformers/blob/eb3bd73ce35bfef56eeb722d697f2d39a06a8f8d/src/transformers/modeling_bart.py#L472&gt;here&lt;/denchmark-link&gt;
+, only very briefly and then it went back to  - Layers like dropout and activation cast it right back into .
+So I have verified that autocast "works" too, albeit very differently from apex, where both, the model weights and the intermediary data are float16 most of the time. If I go through the same forward() with apex, x is float16 through and through.
+Is this how autocast supposed to work? It appears so different from apex. Does it mean that all those operations not listed in the previous comment don't benefit from fp16 and have the same speed as fp32? Surely, at least it takes less space on gpu.
+So far, unless I understand it incorrectly or perhaps it's used incorrectly, native amp is much worse than apex gpu memory requirements-wise.
+		</comment>
+		<comment id='6' author='edenlightning' date='2020-11-11T11:07:38Z'>
+		
+So I have verified that autocast "works" too, albeit very differently from apex, where both, the model weights and the intermediary data are float16 most of the time.
+
+apex/amp has different opt_levels, where the native amp implementation would be similar to opt_level='O1' in apex.
+
+Does it mean that all those operations not listed in the previous comment don't benefit from fp16 and have the same speed as fp32? Surely, at least it takes less space on gpu.
+
+While one could reduce the memory footprint using FP16 in all operations, your training might blow up, as FP16 values can easily over/underflow. Automatic mixed-precision is designed to use FP32 where necessary, and FP16 where possible.
+You can still use model.half() and use pure FP16.
+Cross-posting from the huggingface repo:
+&lt;denchmark-link:https://github.com/huggingface/transformers/issues/8403#issuecomment-725356909&gt;huggingface/transformers#8403 (comment)&lt;/denchmark-link&gt;
+
+
+After some more debugging it seems that the autocast cache is blowing up.
+As a workaround you can add torch.clear_autocast_cache() in BartForConditionalGeneration.forward, which might slow down your code but should at least work.
+Based on @stas00 's debugging it seems that PL is interacting with native AMP in a way that the cache is increasing.
+
+		</comment>
+		<comment id='7' author='edenlightning' date='2020-11-11T17:10:43Z'>
+		Thank you for your answers, &lt;denchmark-link:https://github.com/ptrblck&gt;@ptrblck&lt;/denchmark-link&gt;
+!
+I suppose the only way to really know which  amp/level would be most beneficial is to write a memory/speed benchmark.
+		</comment>
+		<comment id='8' author='edenlightning' date='2020-11-11T18:17:39Z'>
+		cross-posting... &lt;denchmark-link:https://github.com/huggingface/transformers/issues/8403#issuecomment-725579899&gt;huggingface/transformers#8403 (comment)&lt;/denchmark-link&gt;
+
+
+Don't think this is a trainer issue, I've been able to replicate this OOM crash putting autocast directly into the forward call, wrapping the code found here with torch.cuda.amp.autocast:
+https://github.com/huggingface/transformers/blob/master/src/transformers/modeling_bart.py#L419
+and turning off --fp16. Haven't been able to investigate further into why memory isn't being freed in this block!
+
+		</comment>
+		<comment id='9' author='edenlightning' date='2020-11-11T18:39:05Z'>
+		Please let's use &lt;denchmark-link:https://github.com/huggingface/transformers/issues/8403&gt;huggingface/transformers#8403&lt;/denchmark-link&gt;
+ for tracking the native amp issue, so that it's in one place.
+		</comment>
+		<comment id='10' author='edenlightning' date='2020-11-11T18:48:48Z'>
+		I found another unrelated strange huge gpu memory requirement in PL. It happens during save_checkpoint - As I'm stepping through it with debugger I observe the gpu memory growing from 2GB (training was complete) to 5GB.
+It's very difficult to debug PL due to dozens of indirections :( here is the stack trace (in v1.0.6)
+&lt;denchmark-code&gt;dump_checkpoint, checkpoint_connector.py:337
+save_checkpoint, checkpoint_connector.py:389
+save_checkpoint, properties.py:207
+_save_model, model_checkpoint.py:333
+_update_best_and_save, model_checkpoint.py:583
+_save_top_k_checkpoints, model_checkpoint.py:534
+save_checkpoint, model_checkpoint.py:232
+on_validation_end, model_checkpoint.py:186
+on_validation_end, callback_hook.py:177
+call_hook, trainer.py:833
+on_evaluation_end, evaluation_loop.py:109
+run_evaluation, trainer.py:620
+run_training_epoch, training_loop.py:589
+train, trainer.py:493
+train_or_test, accelerator.py:74
+train, gpu_accelerator.py:63
+fit, trainer.py:444
+generic_train, lightning_base.py:398
+main, finetune.py:413
+&lt;module&gt;, finetune.py:446
+&lt;/denchmark-code&gt;
+
+So the gpu ram is growing through dump_checkpoint to about 1GB, and then jumps by another 2GB at:
+&lt;denchmark-code&gt;        # give the model a chance to dump a few things
+        model.on_save_checkpoint(checkpoint)
+&lt;/denchmark-code&gt;
+
+Would this be something that can be done on CPU? This is a checkpoint saving - shouldn't need more gpu RAM here in theory.
+Ideally this function should need 0 extra gpu ram. Otherwise one may have a successful training but the program would OOM at the end of it during checkpoint saving which is not best. or if it's intermediary saving then it's definitely a problem.
+		</comment>
+		<comment id='11' author='edenlightning' date='2020-12-04T19:58:27Z'>
+		Update: This has been fixed in PyTorch: &lt;denchmark-link:https://github.com/pytorch/pytorch/pull/48696&gt;pytorch/pytorch#48696&lt;/denchmark-link&gt;
+ more info here: &lt;denchmark-link:https://github.com/pytorch/pytorch/issues/48049#issuecomment-736701769&gt;pytorch/pytorch#48049 (comment)&lt;/denchmark-link&gt;
+
+This will be fixed for Pytorch 1.8 and can be closed as this isn't to do with PL :)
+		</comment>
+		<comment id='12' author='edenlightning' date='2020-12-04T20:01:35Z'>
+		Thank you, &lt;denchmark-link:https://github.com/SeanNaren&gt;@SeanNaren&lt;/denchmark-link&gt;
+!
+		</comment>
+		<comment id='13' author='edenlightning' date='2020-12-04T20:05:11Z'>
+		Thank you &lt;denchmark-link:https://github.com/stas00&gt;@stas00&lt;/denchmark-link&gt;
+ for chasing this up, I think you got a pretty big bug resolved!
+		</comment>
+	</comments>
+</bug>

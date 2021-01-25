@@ -1,0 +1,123 @@
+<bug id='1096' author='ryanwongsa' open_date='2020-06-02T19:54:15Z' closed_time='2020-06-04T20:25:34Z'>
+	<summary>Training on TPU with threading</summary>
+	<description>
+&lt;denchmark-h:h2&gt;❓ Questions/Help/Support&lt;/denchmark-h&gt;
+
+Currently I am trying to train multiple folds of my dataset on each TPU core using threading but ignite has issues where the one thread either takes preference over others or causes my training to crash.
+I created two simple versions to show an ignite version of MNIST on multiple folds vs a regular pytorch version as an example
+
+Ignite TPU multi-fold
+Pytorch TPU multi-fold
+
+The pure Pytorch version doesn't seem to have any issues but ignite version seems inconsistent. I think it how the metrics work on multiple threads. So was wondering if there is any easy way to solve this issue?
+	</description>
+	<comments>
+		<comment id='1' author='ryanwongsa' date='2020-06-02T20:42:57Z'>
+		&lt;denchmark-link:https://github.com/ryanwongsa&gt;@ryanwongsa&lt;/denchmark-link&gt;
+ thank you for this excellent usecase !! I suspect some issues with some unwanted syncs. Thank you again for the codes, we will have a look on it !!
+		</comment>
+		<comment id='2' author='ryanwongsa' date='2020-06-02T22:35:07Z'>
+		&lt;denchmark-link:https://github.com/ryanwongsa&gt;@ryanwongsa&lt;/denchmark-link&gt;
+ let me investigate the issue. Since yesterday we merged a huge part of dist config handling which should normally work on GPUs and TPUs.
+Looking the code in details, the codes are not exactly the same:
+
+in ignite version we should not use num_workers=1 and pin_memory=True with XLA.
+our implementation of create_supervised_evaluator unfortunately does not do barrier=True. =&gt; we should fix that, probably.
+in pytorch code, they do not add loss.item() for performances issue (I presume).
+
+However, with all those updates, I constantly now experience desynchronization of threads which leads to crashes of jupyter kernel. I need to investigate what happens.
+Maybe there is an issue with our ProgressBar and RunningAverage.
+I replaced the first by tqdm directly and removed logging the loss.
+Here is my version: &lt;denchmark-link:https://colab.research.google.com/gist/vfdev-5/d6bce745a4a70195630725008a1be7f3/ignite_on_tpus.ipynb#scrollTo=6LwB-prr4Bbt&gt;https://colab.research.google.com/gist/vfdev-5/d6bce745a4a70195630725008a1be7f3/ignite_on_tpus.ipynb#scrollTo=6LwB-prr4Bbt&lt;/denchmark-link&gt;
+
+PS: There is no synchornization for gradient or metrics computation, right ? So, seems like, all threads are training their own model's copy and have no idea of the presence of others...
+For example, xm.optimizer_step internally does reduce_gradients if
+torch_xla._XLAC._xla_get_replication_devices_count() &gt; 1, but inside main_fold  this value is 0.
+&lt;denchmark-link:https://github.com/pytorch/xla/blob/a53987acc382460c7ab9a3afb7f1a21a18dbba45/torch_xla/core/xla_model.py#L555&gt;https://github.com/pytorch/xla/blob/a53987acc382460c7ab9a3afb7f1a21a18dbba45/torch_xla/core/xla_model.py#L555&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='3' author='ryanwongsa' date='2020-06-02T23:23:24Z'>
+		&lt;denchmark-link:https://github.com/vfdev-5&gt;@vfdev-5&lt;/denchmark-link&gt;
+ thanks for your feedback, I tried running your version and set the metrics for the evaluator to be an empty dictionary and commented out the printing of the metrics and it seems to run without crashing. So I think the main issue is that there is some sort of synchronisation for metric computation even when the trainers are independent.
+		</comment>
+		<comment id='4' author='ryanwongsa' date='2020-06-02T23:31:55Z'>
+		&lt;denchmark-link:https://github.com/ryanwongsa&gt;@ryanwongsa&lt;/denchmark-link&gt;
+ well, let me check that. Thanks for pointing out about metrics' sync for XLA. We need to verify it. Naively, I would say it tries to  with world size = 1, so nothing special... but as we have more than one device used maybe there are some interferences...
+PS: I was wondering why not to use xmp.spawn for a similar task ? This will properly define working group and metrics will be correctly reduced (I hope my tests are not wrong :)
+		</comment>
+		<comment id='5' author='ryanwongsa' date='2020-06-02T23:50:16Z'>
+		&lt;denchmark-link:https://github.com/vfdev-5&gt;@vfdev-5&lt;/denchmark-link&gt;
+ Just incase it is of any use, I am pretty sure I was experiencing this issue before the changes from PR &lt;denchmark-link:https://github.com/pytorch/ignite/pull/1042&gt;#1042&lt;/denchmark-link&gt;
+ was merged so it might be a general sync issue that might affect GPUs too but I haven’t tried it.
+Also it is weird that the metrics in the evaluator is causing the kernel to crash as it crashes during the training process, so it might be an initialisation issue (maybe?).
+As for the xmp.spawn, I could be wrong but I though the spawn was for when you want to train one model on all cores. In my case I wanted to train 5 fold cross validation simultaneously with 1 fold for each TPU core.
+		</comment>
+		<comment id='6' author='ryanwongsa' date='2020-06-02T23:57:20Z'>
+		
+As for the xmp.spawn, I could be wrong but I though the spawn was for when you want to train one model on all cores. In my case I wanted to train 5 fold cross validation simultaneously with 1 fold for each TPU core.
+
+OK, I understand your use-case. Yes, that's correct about xmp.spawn and one model on all cores.
+
+@vfdev-5 Just incase it is of any use, I am pretty sure I was experiencing this issue before the changes from PR #1042 was merged so it might be a general sync issue that might affect GPUs too but I haven’t tried it.
+
+Thanks ! Need to dig into that. Normally, with GPUs if no initialized native torch processing group, we should not do anything to sync ... But, again, let me investigate it.
+
+Also it is weird that the metrics in the evaluator is causing the kernel to crash as it crashes during the training process, so it might be an initialisation issue (maybe?).
+
+Yeah, I remarked that too. On metrics creation we check current world size...
+		</comment>
+		<comment id='7' author='ryanwongsa' date='2020-06-03T00:20:45Z'>
+		I think I got the problem which is here :
+
+
+
+ignite/ignite/distributed/comp_models/xla.py
+
+
+        Lines 31 to 33
+      in
+      2d30d1d
+
+
+
+
+
+
+ def create_from_context() -&gt; Optional["_XlaDistModel"]: 
+
+
+
+ if not has_xla_support: 
+
+
+
+ return None 
+
+
+
+
+
+We create a XLA distributed computation model just if we have xla support. And when we setup it
+we compute various params like nprocs per node etc by using all_reduce which should cause crashing at some point ...
+If I hack the condition as has_xla_support and xm.xrt_world_size() &gt; 1, seems like it can compute without crashing...
+But definitely, there is a bug in the code.
+		</comment>
+		<comment id='8' author='ryanwongsa' date='2020-06-03T07:35:27Z'>
+		Thanks, I tried that change on my project and it works.
+		</comment>
+		<comment id='9' author='ryanwongsa' date='2020-06-03T09:12:29Z'>
+		I think k-fold is a scenario that we have to improve with distributed feature.
+		</comment>
+		<comment id='10' author='ryanwongsa' date='2020-06-04T20:30:10Z'>
+		&lt;denchmark-link:https://github.com/ryanwongsa&gt;@ryanwongsa&lt;/denchmark-link&gt;
+ I just merged a PR that should fix this issue. You can try it with this Colab:
+&lt;denchmark-link:https://colab.research.google.com/gist/vfdev-5/d6bce745a4a70195630725008a1be7f3/ignite_on_tpus.ipynb&gt;https://colab.research.google.com/gist/vfdev-5/d6bce745a4a70195630725008a1be7f3/ignite_on_tpus.ipynb&lt;/denchmark-link&gt;
+
+Note: concerning the threading, please see the comment from xla devs : &lt;denchmark-link:https://github.com/pytorch/xla/issues/2171#issuecomment-639065832&gt;pytorch/xla#2171 (comment)&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='11' author='ryanwongsa' date='2020-06-04T21:02:58Z'>
+		Nice, thanks for the quick fix and update regarding the threading.
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,499 @@
+<bug id='1056' author='achigeor' open_date='2020-05-20T14:25:54Z' closed_time='2020-06-23T21:59:58Z'>
+	<summary>TrainsSaver doesn't respect Checkpoint's n_saved</summary>
+	<description>
+&lt;denchmark-h:h2&gt;🐛 Bug description&lt;/denchmark-h&gt;
+
+As the title says, it seems that TrainsSaver bypasses the Checkpoint n_saved parameter. That means that all models are saved and never updated / deleted.
+Consider this simple example:
+&lt;denchmark-code&gt;        task.phases['train'].add_event_handler(
+            Events.EPOCH_COMPLETED(every=1),
+            Checkpoint(to_save, TrainsSaver(output_uri=output_uri), 'epoch', n_saved=1,
+                       global_step_transform=global_step_from_engine(task.phases['train'])))
+&lt;/denchmark-code&gt;
+
+The above saves every checkpoint. You end-up with
+&lt;denchmark-code&gt;epoch_checkpoint_1.pt
+epoch_checkpoint_2.pt
+epoch_checkpoint_3.pt
+...
+&lt;/denchmark-code&gt;
+
+Now if we do, the same with DiskSaver:
+&lt;denchmark-code&gt;        task.phases['train'].add_event_handler(
+            Events.EPOCH_COMPLETED(every=1),
+            Checkpoint(to_save, DiskSaver(dirname=dirname), 'epoch', n_saved=1,
+                       global_step_transform=global_step_from_engine(task.phases['train'])))
+&lt;/denchmark-code&gt;
+
+We get only:
+&lt;denchmark-code&gt;epoch_checkpoint_3.pt
+&lt;/denchmark-code&gt;
+
+as expected.
+Same behaviour if we save only best models using score_function, i.e. TrainsSaver saves every best model.
+&lt;denchmark-h:h2&gt;Environment&lt;/denchmark-h&gt;
+
+
+PyTorch Version: 1.3.1
+Ignite Version: 0.4.0.dev20200519  (EDIT: update to latest nightly, issue still exists)
+OS: Linux
+How you installed Ignite: pip nightly
+Python version: 3.6
+Any other relevant information: trains version: 0.14.3
+
+	</description>
+	<comments>
+		<comment id='1' author='achigeor' date='2020-05-20T14:32:15Z'>
+		Thanks for the report &lt;denchmark-link:https://github.com/achigeor&gt;@achigeor&lt;/denchmark-link&gt;
+ ! Let us reproduce the issue and have deeper look on where is the problem.
+cc &lt;denchmark-link:https://github.com/jkhenning&gt;@jkhenning&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='2' author='achigeor' date='2020-05-20T21:04:42Z'>
+		Checked the number of temporary saved checkpoints and only one remains in temp folder. Probably, the problem is that we need to explicitly remove them from Trains' storage: override
+remove method
+
+
+
+ignite/ignite/handlers/checkpoint.py
+
+
+        Lines 370 to 372
+      in
+      0452e41
+
+
+
+
+
+
+ def remove(self, filename: str) -&gt; None: 
+
+
+
+ path = os.path.join(self.dirname, filename) 
+
+
+
+ os.remove(path) 
+
+
+
+
+
+&lt;denchmark-link:https://github.com/jkhenning&gt;@jkhenning&lt;/denchmark-link&gt;
+ do you have an API to remove stored artifact ?
+		</comment>
+		<comment id='3' author='achigeor' date='2020-05-20T21:19:19Z'>
+		Hi &lt;denchmark-link:https://github.com/achigeor&gt;@achigeor&lt;/denchmark-link&gt;
+ ,
+When you say you see:
+&lt;denchmark-code&gt;epoch_checkpoint_1.pt
+epoch_checkpoint_2.pt
+epoch_checkpoint_3.pt
+...
+&lt;/denchmark-code&gt;
+
+Do you mean you see them in the Trains UI models page, or somewhere else? As &lt;denchmark-link:https://github.com/vfdev-5&gt;@vfdev-5&lt;/denchmark-link&gt;
+ said, I believe these files will not be present in the  folder (or the temp folder used if  is not provided)
+		</comment>
+		<comment id='4' author='achigeor' date='2020-05-21T10:00:24Z'>
+		Hey &lt;denchmark-link:https://github.com/jkhenning&gt;@jkhenning&lt;/denchmark-link&gt;
+,
+I mean I see them in the directory I pass as output_uri. E.g. if you pass output_uri="checkpoints",  you will see these checkpoints in checkpoints/trains_project_name/trains_task_name.task_id/models/:
+&lt;denchmark-code&gt;|   +-- &lt;project-name&gt;
+|       +-- &lt;task-name&gt;.&lt;task-Id&gt;
+|           +-- models
+|               +-- &lt;epoch_checkpoint_1.pt&gt;
+|               +-- &lt;epoch_checkpoint_2.pt&gt;
+|               +-- &lt;epoch_checkpoint_3.pt&gt;
+&lt;/denchmark-code&gt;
+
+In the Trains UI, you would only see the last model model saved in artifacts/Output Model, i.e task_name-epoch_checkpoint_3.pt.
+EDIT: I also checked the temp folder. It indeed only keeps the last one. However, the problem is that trains uploads all the checkpoints in the output_uri location defined - in this case a local directory.
+Following is a fully reproducible example, based on the mnist example:
+&lt;denchmark-code&gt;from argparse import ArgumentParser
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+from torch.optim import SGD
+from torch.utils.data import DataLoader
+from torchvision.datasets import MNIST
+from torchvision.transforms import Compose, ToTensor
+
+from ignite.contrib.handlers.trains_logger import *
+from ignite.engine import Events, create_supervised_trainer
+from ignite.handlers import Checkpoint, DiskSaver
+
+LOG_INTERVAL = 10
+
+
+class Net(nn.Module):
+    def __init__(self):
+        super(Net, self).__init__()
+        self.conv1 = nn.Conv2d(1, 10, kernel_size=5)
+        self.conv2 = nn.Conv2d(10, 20, kernel_size=5)
+        self.conv2_drop = nn.Dropout2d()
+        self.fc1 = nn.Linear(320, 50)
+        self.fc2 = nn.Linear(50, 10)
+
+    def forward(self, x):
+        x = F.relu(F.max_pool2d(self.conv1(x), 2))
+        x = F.relu(F.max_pool2d(self.conv2_drop(self.conv2(x)), 2))
+        x = x.view(-1, 320)
+        x = F.relu(self.fc1(x))
+        x = F.dropout(x, training=self.training)
+        x = self.fc2(x)
+        return F.log_softmax(x, dim=-1)
+
+
+def get_data_loaders(train_batch_size):
+    data_transform = Compose([ToTensor()])
+
+    train_loader = DataLoader(
+        MNIST(download=True, root=".", transform=data_transform, train=True), batch_size=train_batch_size, shuffle=True
+    )
+
+    return train_loader
+
+
+def run(train_batch_size, epochs, lr=0.01):
+    train_loader = get_data_loaders(train_batch_size)
+    model = Net()
+    device = "cpu"
+
+    if torch.cuda.is_available():
+        device = "cuda"
+
+    model.to(device)  # Move model before creating optimizer
+    optimizer = SGD(model.parameters(), lr=lr)
+    criterion = nn.CrossEntropyLoss()
+    trainer = create_supervised_trainer(model, optimizer, criterion, device=device)
+
+    TrainsLogger(project_name="trains-ignite", task_name="test-checkpoints")
+
+    handler = Checkpoint(
+        {"model": model},
+        TrainsSaver(output_uri="test_checkpoints"),
+        # DiskSaver(dirname="test_checkpoints", require_empty=False),
+        n_saved=1,
+        filename_prefix="epoch",
+        global_step_transform=global_step_from_engine(trainer),
+    )
+
+    trainer.add_event_handler(Events.EPOCH_COMPLETED, handler)
+    trainer.run(train_loader, max_epochs=epochs)
+
+
+if __name__ == "__main__":
+    parser = ArgumentParser()
+    parser.add_argument("--batch_size", type=int, default=32, help="input batch size for training (default: 64)")
+    parser.add_argument("--epochs", type=int, default=3, help="number of epochs to train (default: 10)")
+
+    args = parser.parse_args()
+
+    run(args.batch_size, args.epochs)
+&lt;/denchmark-code&gt;
+
+I just removed the unnecessary stuff, focusing on the checkpoints.
+You can comment  TrainsSaver or DiskSaver out, here:
+&lt;denchmark-code&gt;    handler = Checkpoint(
+        {"model": model},
+        TrainsSaver(output_uri="test_checkpoints"),
+        # DiskSaver(dirname="test_checkpoints", require_empty=False),
+        n_saved=1,
+        filename_prefix="epoch",
+        global_step_transform=global_step_from_engine(trainer),
+    )
+&lt;/denchmark-code&gt;
+
+Let me know if that helps. I just run the above and reproduced the behaviour I explained on the first message.
+		</comment>
+		<comment id='5' author='achigeor' date='2020-05-21T11:43:15Z'>
+		Hey &lt;denchmark-link:https://github.com/achigeor&gt;@achigeor&lt;/denchmark-link&gt;
+
+I see what you mean, and you're quite correct about Trains "uploading" the model files to the output_uri which in this case is a folder.
+The thing is, output_uri is also (most commonly) used to represent remote storage services, like an S3 bucket, in which cases supporting a delete action might add additional constraints (requiring the credentials to allow these permissions) or introduce a considerable amount of risk (automated processes with delete permission for buckets containing "production" grade data) - for us, the compromise there was to take into account the relatively low cost of cloud storage and forego support for delete in this case.
+An approach we did take in other cases, which is much more conservative, is reusing resource names, so if for example you'd like no more than the 3 last checkpoints to be stored, we can cycle through uploaded checkpoint file names, and upload as follows:
+&lt;denchmark-code&gt;epoch_checkpoint_1.pt
+epoch_checkpoint_2.pt
+epoch_checkpoint_3.pt
+epoch_checkpoint_1.pt
+epoch_checkpoint_2.pt
+...
+&lt;/denchmark-code&gt;
+
+As you can see, checkpoint 4 will simply overwrite old checkpoint 1 (and checkpoint 5 will override checkpoint 2), and assuming you're listing the files in modified order (or viewing through the Trains UI) - you still get the last 3 checkpoints, in the correct order (luckily, write access also mean overwrite access :)
+This can be easily implemented in this case in the TrainsSaver itself (with a little help from Trains).
+What do you say?
+		</comment>
+		<comment id='6' author='achigeor' date='2020-05-21T12:54:38Z'>
+		
+An approach we did take in other cases, which is much more conservative, is reusing resource names, so if for example you'd like no more than the 3 last checkpoints to be stored, we can cycle through uploaded checkpoint file names
+
+&lt;denchmark-link:https://github.com/jkhenning&gt;@jkhenning&lt;/denchmark-link&gt;
+ maybe this approach is not suitable for  or best model file  where  indicates training epoch and  best validation score. We can not cycle on those values, otherwise they do not make sense...
+About output_uri and dirname args of TrainSaver shouldn't we limit to only one provided possible (in case of when output_uri is a local storage) ?
+If I understand correctly in case of &lt;denchmark-link:https://github.com/achigeor&gt;@achigeor&lt;/denchmark-link&gt;
+ the checkpoints are stored twice: at temp  and  at  local storage ?
+		</comment>
+		<comment id='7' author='achigeor' date='2020-05-21T13:19:03Z'>
+		&lt;denchmark-link:https://github.com/vfdev-5&gt;@vfdev-5&lt;/denchmark-link&gt;
+ if I may chime in.
+We are using the filename as a way to add meta-data on the model weight itself.
+Maybe the best usage for TrainsLogger would be to store that meta-data as a comment on the model, this way it is also searchable? (we could also use the model name in the Trains system and store the meta-data there)
+Another option is using the model configuration entry (that can store anything, and add the meta-data there) &lt;denchmark-link:https://demoapp.trains.allegro.ai/projects/*/models/13432e3f49dd456ca87f963a59ad501e/network?order=created&amp;filter=framework:PyTorch&gt;see example&lt;/denchmark-link&gt;
+
+This removes the need to preserve the exact "filename" in the system, as the way to look for it would be to go to the Trains UI and search for the Model with specific score or checkpoint. Obviously you can also get it from a previously executed Task, including meta-data.
+What do think?
+p.s.
+We are thinking on adding a more specific key/value to the model object, so one could add more diverse information.
+		</comment>
+		<comment id='8' author='achigeor' date='2020-05-21T13:21:53Z'>
+		Hey &lt;denchmark-link:https://github.com/vfdev-5&gt;@vfdev-5&lt;/denchmark-link&gt;
+
+Well, I agree it makes little sense to store twice, however I'm not sure detecting when output_uri is local and  when not is a good approach (from experience, likely to break on edge-cases).
+I would say we should instruct users to use  for local storage, and  for remote storage, but this means users who'd like to test their code with  before switching to a remote storage will still see the same side-effects &lt;denchmark-link:https://github.com/achigeor&gt;@achigeor&lt;/denchmark-link&gt;
+ noticed...
+		</comment>
+		<comment id='9' author='achigeor' date='2020-05-21T13:51:32Z'>
+		&lt;denchmark-link:https://github.com/bmartinn&gt;@bmartinn&lt;/denchmark-link&gt;
+ thanks for the idea ! If I understand correctly your suggestions is to :
+
+pick filename which is need to be stored, e.g. epoch_checkpoint_1.pt and setup some meta-data
+save checkpoint on Trains system with another name that we can rewrite in a cycle manner as proposed by @jkhenning
+=&gt; on Trains UI we have a good number of stored artifacts and their meta-data contain the name we intendeded to store ?
+
+&lt;denchmark-link:https://github.com/jkhenning&gt;@jkhenning&lt;/denchmark-link&gt;
+, could you please detail why we need both arguments actually ? Sorry, I become a bit lost with how it work with Trains...
+Naively, can't we keep one argument, e.g. ?
+		</comment>
+		<comment id='10' author='achigeor' date='2020-05-21T18:38:31Z'>
+		&lt;denchmark-link:https://github.com/vfdev-5&gt;@vfdev-5&lt;/denchmark-link&gt;
+ yes exactly!
+a minor detail though:
+
+on Trains UI we have a good number of stored artifacts and their meta-data contain the name we intended to store ?
+
+Trains separates artifacts from Models. Basically artifacts you store once, and are tied with an experiment, where as  Models you store multiple times (e.g. snapshots) and have their own entity. This means we can easily track models between experiments. Unfortunately Artifacts already received the meta-data feature, and Models are still missing it, but I'm hoping it is coming soon ;)
+To the point, models have names that are unrelated to the experiment that created them, (kind of like Artifacts). We can basically use these names as the meta-data. Notice that a user can always choose to rename a model, even after the experiment is completed, with no effect on the actual stored file. This gives you the possibility of renaming your model (in the UI) from "best_model_val_score=&lt;0.XYZ&gt;.pt" to "this is the chosen one! score 0.999.pt"
+		</comment>
+		<comment id='11' author='achigeor' date='2020-05-21T20:44:28Z'>
+		Hi all,
+What's not clear to me regarding  is what &lt;denchmark-link:https://github.com/jkhenning&gt;@jkhenning&lt;/denchmark-link&gt;
+ mentioned about remote saving. We will indeed use S3 to save our models and artifacts - we're now finalizing integrating Trains in our workflow and were using a local dir as  for testing.
+But from my understanding, trains would behave the same regardless, i.e, what I'm experiencing locally will still happen if I store in S3. Is there a mechanism that I miss that makes this behaviour relevant only for local storing?
+To give some perspective, my goal is to store a checkpoint every N epochs keeping the last K (as kind of a "backup") as well as the best model(s). With DiskSaver this is straightforward to do.
+One solution could be to name the models  and  as &lt;denchmark-link:https://github.com/jkhenning&gt;@jkhenning&lt;/denchmark-link&gt;
+ suggested, but this won't work as &lt;denchmark-link:https://github.com/vfdev-5&gt;@vfdev-5&lt;/denchmark-link&gt;
+ pointed out, since afaik ignite adds a relevant suffix under the hood and no option to disable it yourself (please &lt;denchmark-link:https://github.com/vfdev-5&gt;@vfdev-5&lt;/denchmark-link&gt;
+ correct me if I'm wrong on this one). If this can work, it's fine for my usecase.
+Regarding trains and output models I like the idea of adding metadata to them, especially since it will allow to programmatically query based on them (instead of having to do torch.load() to read from the checkpoint dictionary).
+		</comment>
+		<comment id='12' author='achigeor' date='2020-05-21T20:58:29Z'>
+		
+One solution could be to name the models checkpoint and best_model as @jkhenning suggested, but this won't work as @vfdev-5 pointed out, since afaik ignite adds a relevant suffix under the hood and no option to disable it yourself (please @vfdev-5 correct me if I'm wrong on this one). If this can work, it's fine for my usecase.
+
+&lt;denchmark-link:https://github.com/achigeor&gt;@achigeor&lt;/denchmark-link&gt;
+ you are right, there is no easy way to store checkpoints without suffix. Maybe we can create a feature request for that inside . However, meta-data (e.g. epoch index or score) may be missing in the  file.
+		</comment>
+		<comment id='13' author='achigeor' date='2020-05-21T21:16:00Z'>
+		Hey &lt;denchmark-link:https://github.com/achigeor&gt;@achigeor&lt;/denchmark-link&gt;
+
+
+But from my understanding, trains would behave the same regardless, i.e, what I'm experiencing locally will still happen if I store in S3. Is there a mechanism that I miss that makes this behaviour relevant only for local storing?
+
+You're absolutely right - that was my point, that Trains currently handles remote and local storage locations exactly the same, without using any delete-like feature.
+&lt;denchmark-link:https://github.com/vfdev-5&gt;@vfdev-5&lt;/denchmark-link&gt;
+
+
+@jkhenning, could you please detail why we need both arguments actually ? Sorry, I become a bit lost with how it work with Trains...
+Naively, can't we keep one argument, e.g. output_uri?
+
+Well, the original intent of keeping dirnamewas to keep part of the DiskSaver interface since we need a local storage where checkpoint are stored prior to being uploaded anyway (if you remember, we create a temp dir in case dirname was not provided). I agree this represents some kind of duplication since output_uri (which is essential since it allows the user to provide a remote storage for Trains to use) also supports local storage.
+So I guess the actual original intent was "Use dirname for local storage and output_uri for remote storage. If you don't use dirname, we'll use a temp dir instead" - but maybe that was not reflected very well in the documentation, and it's possible it's too complicated and we should just decide we'll drop dirname altogether and always use a temp dir...
+		</comment>
+		<comment id='14' author='achigeor' date='2020-05-21T21:38:50Z'>
+		
+Hey @achigeor
+
+But from my understanding, trains would behave the same regardless, i.e, what I'm experiencing locally will still happen if I store in S3. Is there a mechanism that I miss that makes this behaviour relevant only for local storing?
+
+You're absolutely right - that was my point, that Trains currently handles remote and local storage locations exactly the same, without using any delete-like feature.
+
+Thanks got it now! I have this followup question then:
+Is there a specific reason that uploading happens while the task is running? What I see happening now is:
+
+Checkpoint with TrainsSaver writes to /tmp or dirname, respecting n_saved param
+TrainsSaver, through trains task's output_uri uploads the model from /tmp to output_uri everytime a model is saved in the previous step
+
+Would it be possible to instead upload the contents of the /tmp directory after the task is finished? This way you upload only once, instead of everytime you save a model while the training task is running.
+		</comment>
+		<comment id='15' author='achigeor' date='2020-05-21T21:43:28Z'>
+		
+Would it be possible to instead upload the contents of the /tmp directory after the task is finished?
+
+&lt;denchmark-link:https://github.com/achigeor&gt;@achigeor&lt;/denchmark-link&gt;
+ this can be possible, but we should keep in mind that we can loose everything if script crashes before the  and we didn't catch that.
+		</comment>
+		<comment id='16' author='achigeor' date='2020-05-21T22:24:03Z'>
+		From what I understand, &lt;denchmark-link:https://github.com/pytorch/ignite/blob/master/ignite/handlers/checkpoint.py#L68&gt;Checkpoint&lt;/denchmark-link&gt;
+ is doing the filename creation, and it seems that "" is a hard-coded separator.
+In case output_uri is  passed, we could parse the filename, extract the filename_prefix/name and use that as the base filename for upload, or we can use a hard-coded fixed name.
+This way if output_uri is not passed, the behavior is consistent with DiskSaver (as is already the case now), and if output_uri is passed, the Checkpoint filename (e.g. {filename_prefix}_{name}_{global_step}_{score_name}={score}.{ext}) will be used as the Trains Model name (i.e. in the UI), making it intuitive to look for.
+What do you guys think?
+		</comment>
+		<comment id='17' author='achigeor' date='2020-05-21T23:27:49Z'>
+		
+In case output_uri is passed, we could parse the filename, extract the filename_prefix/name and use that as the base filename for upload, or we can use a hard-coded fixed name.
+
+Well, both approaches are not ideal, but between parsing and hard-coded fixed name, IMO, hard-coded fixed name probably better... especially if in UI full correct filename is used.
+		</comment>
+		<comment id='18' author='achigeor' date='2020-05-22T21:12:55Z'>
+		&lt;denchmark-link:https://github.com/vfdev-5&gt;@vfdev-5&lt;/denchmark-link&gt;
+ I agree, I think hard-coded is probably safer, but we should have a way to differentiate between two models being stored, for example GAN training. We brings me back to parsing...
+How about we inherit Checkpoint, that way we know what's the prefix and can easily make those decisions. What do you think?
+		</comment>
+		<comment id='19' author='achigeor' date='2020-05-22T21:42:58Z'>
+		I was also thinking about if we can pass more info to save_handler in addition to object_to_save and filename:
+
+
+
+ignite/ignite/handlers/checkpoint.py
+
+
+         Line 21
+      in
+      c012166
+
+
+
+
+
+
+ def __call__(self, checkpoint: Mapping, filename: str) -&gt; None: 
+
+
+
+
+
+For example, we can opt to pass some meta-info about the checkpoint to save:
+class BaseSaveHandler(metaclass=ABCMeta):
+    """Base class for save handlers"""
+
+    @abstractmethod
+    def __call__(self, checkpoint: Mapping, filename: str, metadata=None) -&gt; None:
+        pass
+and in metadata we can pass prefix, name and all scores which compose the filename.
+This certainly requires minor API change for DiskSaver and other savers. However, we recently introduced BaseSaveHandler as base class for savers, so we still can change thing now...
+		</comment>
+		<comment id='20' author='achigeor' date='2020-05-22T22:04:57Z'>
+		&lt;denchmark-link:https://github.com/vfdev-5&gt;@vfdev-5&lt;/denchmark-link&gt;
+ I like it! I think it makes a lot of sense. That means the DiskSaver can gain more insight into the model being stored (so for example, if the model score is lower then the previous, it can only store it locally and choose to skip the upload).
+		</comment>
+		<comment id='21' author='achigeor' date='2020-05-22T22:12:23Z'>
+		Yes, for a cloud disk savers or other more complex savers where we can set some metadata it can be helpful and avoid parsing the filename :)
+
+so for example, if the model score is lower then the previous, it can only store it locally and choose to skip the upload
+
+Normally, it is the role of Checkpoint with score function etc.
+So, let us create a FR for that.
+		</comment>
+		<comment id='22' author='achigeor' date='2020-05-23T13:32:44Z'>
+		&lt;denchmark-link:https://github.com/bmartinn&gt;@bmartinn&lt;/denchmark-link&gt;
+ PR with metadata is landed. So, you may try to incorporate it into  and give a feedback on that....
+		</comment>
+		<comment id='23' author='achigeor' date='2020-05-23T19:50:47Z'>
+		Thanks &lt;denchmark-link:https://github.com/vfdev-5&gt;@vfdev-5&lt;/denchmark-link&gt;
+ ! kudos for the quick PR!
+We will add it into  (probably needs to add a bit of support in  as well)
+I'll update here once the PR is ready
+		</comment>
+		<comment id='24' author='achigeor' date='2020-05-23T21:13:14Z'>
+		&lt;denchmark-link:https://github.com/vfdev-5&gt;@vfdev-5&lt;/denchmark-link&gt;
+ Great idea, and  for pushing things so quickly - once we'll add the required support in trains I'll open a PR 
+		</comment>
+		<comment id='25' author='achigeor' date='2020-06-04T21:30:29Z'>
+		&lt;denchmark-link:https://github.com/bmartinn&gt;@bmartinn&lt;/denchmark-link&gt;
+ as 0.15.0 is out from your side, what can be done here to fix this issue ?
+		</comment>
+		<comment id='26' author='achigeor' date='2020-06-04T21:33:35Z'>
+		&lt;denchmark-link:https://github.com/jkhenning&gt;@jkhenning&lt;/denchmark-link&gt;
+ could you help with a PR fix?
+		</comment>
+		<comment id='27' author='achigeor' date='2020-06-04T21:35:16Z'>
+		&lt;denchmark-link:https://github.com/bmartinn&gt;@bmartinn&lt;/denchmark-link&gt;
+, &lt;denchmark-link:https://github.com/vfdev-5&gt;@vfdev-5&lt;/denchmark-link&gt;
+ I'll get on it :)
+		</comment>
+		<comment id='28' author='achigeor' date='2020-06-05T22:31:58Z'>
+		Hi &lt;denchmark-link:https://github.com/vfdev-5&gt;@vfdev-5&lt;/denchmark-link&gt;
+,
+I've pushed a draft into my fork, branch  (see &lt;denchmark-link:https://github.com/jkhenning/ignite/tree/fix_trains_checkpoint_n_saved&gt;here&lt;/denchmark-link&gt;
+) - I'd appreciate your input.
+Basically, I changed the TrainsSaver behavior to use the new Trains pre/post registration/upload callbacks, which always uses the filename as passed to the saver (which removed the need to have a special case for atomic mode).
+However, in order to preserve the n_saved behavior which keeps the n checkpoints with the highest priority, the logic inside the pre-save callback had to be aware of the n_saved value stored in the checkpoint, as well as the list of saved files and their priorities - this is required in order for the callback to know which previously registered/uploaded file must be overwritten. Even though I could have achieved that by inheriting the Checkpoint class, it seems a bit too much - I was wondering if you think we can simply expose these values in the Checkpoint's interface (for read, obviously, not write), or whether you have a better idea :)
+		</comment>
+		<comment id='29' author='achigeor' date='2020-06-05T22:55:19Z'>
+		&lt;denchmark-link:https://github.com/jkhenning&gt;@jkhenning&lt;/denchmark-link&gt;
+ thanks for working on that !
+Could you please confirm me that overriding  method can not help for that ?
+For example,  receives checkpoints with the filenames and metadata:
+&lt;denchmark-code&gt;T1 : save: training_checkpoint_100.pt meta1
+---
+T2 : save: training_checkpoint_200.pt meta2
+---
+T3 : save: training_checkpoint_300.pt meta3
+---
+T4 : save: training_checkpoint_400.pt meta4
+T4 : remove: training_checkpoint_100.pt
+---
+T5 : save: training_checkpoint_500.pt meta5
+T5 : remove: training_checkpoint_200.pt
+---
+...
+&lt;/denchmark-code&gt;
+
+if you store somewhere a mapping between training_checkpoint_X.pt and the name you save n checkpoints to store on server, maybe it could be possible to override remove: training_checkpoint_X.pt and perform necessary action ?
+What do you think ?
+PS: I tried to reach out you on allegro slack to talk about this in more fluent way.
+		</comment>
+		<comment id='30' author='achigeor' date='2020-06-05T23:33:23Z'>
+		I think the reason remove might not be enough, is that it will basically be too late.
+In other words if n_saved equals to 5, the first time the TrainsLogger will see a remove called will be after the 6th model was created, so essentially although you wanted the "last" 5 models, TrainsLogger will store the "last" 6.
+&lt;denchmark-link:https://github.com/vfdev-5&gt;@vfdev-5&lt;/denchmark-link&gt;
+ makes sense ?
+		</comment>
+		<comment id='31' author='achigeor' date='2020-06-10T21:39:02Z'>
+		&lt;denchmark-link:https://github.com/vfdev-5&gt;@vfdev-5&lt;/denchmark-link&gt;
+ I've updated my fork's branch to match the changes we made in Trains to support this feature - we plan to release an RC after this weekend, at which point I'll open a PR :)
+		</comment>
+		<comment id='32' author='achigeor' date='2020-06-10T21:54:11Z'>
+		&lt;denchmark-link:https://github.com/jkhenning&gt;@jkhenning&lt;/denchmark-link&gt;
+ thanks for the update ! It can work for us. We have released our v0.4.0 RC and meanwhile will work on remaining tasks.
+Yes, I saw the modification in your branch. So, it remains only the switch of save/remove order if we would like to have n_saved instead of n_saved+1 checkpoints.
+cc &lt;denchmark-link:https://github.com/erip&gt;@erip&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='33' author='achigeor' date='2020-06-11T08:34:32Z'>
+		Hi &lt;denchmark-link:https://github.com/vfdev-5&gt;@vfdev-5&lt;/denchmark-link&gt;
+
+
+So, it remains only the switch of save/remove order if we would like to have n_saved instead of n_saved+1 checkpoints.
+
+Indeed :)
+		</comment>
+		<comment id='34' author='achigeor' date='2020-06-12T21:41:53Z'>
+		
+Hi @vfdev-5
+
+So, it remains only the switch of save/remove order if we would like to have n_saved instead of n_saved+1 checkpoints.
+
+Indeed :)
+
+&lt;denchmark-link:https://github.com/jkhenning&gt;@jkhenning&lt;/denchmark-link&gt;
+ done !
+		</comment>
+	</comments>
+</bug>

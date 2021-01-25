@@ -1,0 +1,127 @@
+<bug id='4909' author='simonm3' open_date='2020-11-30T11:54:46Z' closed_time='2020-12-29T09:06:28Z'>
+	<summary>metrics fail if inputs are on gpu</summary>
+	<description>
+The metrics precision and recall fail if inputs are on gpu.
+&lt;denchmark-code&gt;&gt;&gt;&gt; from pytorch_lightning.metrics import Precision
+&gt;&gt;&gt; target = torch.tensor([0, 1, 2, 0, 1, 2]).cuda()
+&gt;&gt;&gt; preds = torch.tensor([0, 2, 1, 0, 0, 1]).cuda()
+&gt;&gt;&gt; precision = Precision(num_classes=3)
+&gt;&gt;&gt; precision(preds, target)
+tensor(0.3333)
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-code&gt;RuntimeError                              Traceback (most recent call last)
+&lt;ipython-input-39-834a61ec6e2d&gt; in &lt;module&gt;
+      3 preds = torch.tensor([0, 2, 1, 0, 0, 1]).cuda()
+      4 precision = Precision(num_classes=3)
+----&gt; 5 precision(preds, target)
+      6 tensor(0.3333)
+
+/anaconda/envs/azureml_py36/lib/python3.6/site-packages/torch/nn/modules/module.py in _call_impl(self, *input, **kwargs)
+    725             result = self._slow_forward(*input, **kwargs)
+    726         else:
+--&gt; 727             result = self.forward(*input, **kwargs)
+    728         for hook in itertools.chain(
+    729                 _global_forward_hooks.values(),
+
+/anaconda/envs/azureml_py36/lib/python3.6/site-packages/pytorch_lightning/metrics/metric.py in forward(self, *args, **kwargs)
+    154         # add current step
+    155         with torch.no_grad():
+--&gt; 156             self.update(*args, **kwargs)
+    157         self._forward_cache = None
+    158 
+
+/anaconda/envs/azureml_py36/lib/python3.6/site-packages/pytorch_lightning/metrics/metric.py in wrapped_func(*args, **kwargs)
+    200         def wrapped_func(*args, **kwargs):
+    201             self._computed = None
+--&gt; 202             return update(*args, **kwargs)
+    203         return wrapped_func
+    204 
+
+/anaconda/envs/azureml_py36/lib/python3.6/site-packages/pytorch_lightning/metrics/classification/precision_recall.py in update(self, preds, target)
+    130 
+    131         # multiply because we are counting (1, 1) pair for true positives
+--&gt; 132         self.true_positives += torch.sum(preds * target, dim=1)
+    133         self.predicted_positives += torch.sum(preds, dim=1)
+    134 
+
+RuntimeError: Expected all tensors to be on the same device, but found at least two devices, cuda:0 and cpu!
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='simonm3' date='2020-11-30T12:23:54Z'>
+		&lt;denchmark-link:https://github.com/teddykoker&gt;@teddykoker&lt;/denchmark-link&gt;
+ mind have a look?
+		</comment>
+		<comment id='2' author='simonm3' date='2020-11-30T15:21:46Z'>
+		We could move the metrics to GPUS if both provided arguments are on GPUs.
+		</comment>
+		<comment id='3' author='simonm3' date='2020-11-30T15:27:27Z'>
+		Metrics are subclass of nn.Module and their states behave similar to the parameters and buffers of other modules. Therefore, calling precision.cuda() before evaluating the metric should solve your problem.
+		</comment>
+		<comment id='4' author='simonm3' date='2020-11-30T17:36:15Z'>
+		It is cleaner to be able to use the same code on cpu or gpu without having multiple places where you have to test and convert.
+		</comment>
+		<comment id='5' author='simonm3' date='2020-11-30T23:21:49Z'>
+		
+It is cleaner to be able to use the same code on cpu or gpu without having multiple places where you have to test and convert.
+
+I agree here, this would be very useful, basically follow the agnostic philosophy as Trainer does...
+cc: &lt;denchmark-link:https://github.com/orgs/PyTorchLightning/teams/core-contributors&gt;@PyTorchLightning/core-contributors&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='6' author='simonm3' date='2020-12-01T02:55:37Z'>
+		Shouldn't this be moved to gpu automatically inside a pl module though? I'll give it a test shortly...
+		</comment>
+		<comment id='7' author='simonm3' date='2020-12-01T15:59:36Z'>
+		If the metric is initialized inside a LightningModule or a nn.Module it will automatically be moved to the correct device, whenever the .to(...) is called. However, if used outside a model the user would need to transfer the metric to the correct device. This is completely inline with other pytorch modules, that also needs to be moved to correct device by the user (take torch.nn.Conv2d for example).
+		</comment>
+		<comment id='8' author='simonm3' date='2020-12-01T20:56:56Z'>
+		Not sure what you mean by inside a model. I have:
+&lt;denchmark-code&gt;class Module(pl.LightningModule):
+    def __init__(self):
+        super().__init__()
+        model = resnet18(pretrained=True)
+        self.metrics = dict(precision=Precision())
+        self.loss = partial(F.cross_entropy, weight=torch.tensor([0.1, 0.9]))
+&lt;/denchmark-code&gt;
+
+In training_step and validation_step I call self.loss and each of the self.metrics. precision(y,ypred) fails if ypred and y are both gpu. so I have to force them to cpu.
+The loss also fails unless I explicitly change the above to weight=torch.tensor([0.1, 0.9]).cuda(). Everything else seems to detect whether it is running on cpu or gpu.
+		</comment>
+		<comment id='9' author='simonm3' date='2020-12-01T21:08:51Z'>
+		Then the problem has to with how pytorch register child modules. Essentially, anything put inside a list or dict will not be registered correctly. Instead you should be using nn.ModuleList and nn.ModuleDict. Addtionally, you can use the module version of the loss, and the weight should also automatically transferred to the correct device. This version of your code should work:
+class Module(pl.LightningModule):
+    def __init__(self):
+        super().__init__()
+        model = resnet18(pretrained=True)
+        self.metrics = torch.nn.ModuleDict({'precision' : Precision()})
+        self.loss = torch.nn.CrossEntropyLoss(weight=torch.tensor([0.1, 0.9]))
+		</comment>
+		<comment id='10' author='simonm3' date='2020-12-02T00:21:05Z'>
+		Yep I've had no issues using metrics inside pl modules. This seems like an intended behavior?
+		</comment>
+		<comment id='11' author='simonm3' date='2020-12-02T03:38:50Z'>
+		agree with &lt;denchmark-link:https://github.com/SkafteNicki&gt;@SkafteNicki&lt;/denchmark-link&gt;
+ this is most likely the reason. that's a silly mistake every pytorch user encounters at least once in their life xD
+one just has to know this :)
+		</comment>
+		<comment id='12' author='simonm3' date='2020-12-11T21:31:00Z'>
+		&lt;denchmark-link:https://github.com/SkafteNicki&gt;@SkafteNicki&lt;/denchmark-link&gt;
+ would you mind adding a warning or explanation in our docs?
+		</comment>
+		<comment id='13' author='simonm3' date='2020-12-11T21:36:14Z'>
+		
+agree with @SkafteNicki this is most likely the reason. that's a silly mistake every pytorch user encounters at least once in their life xD
+one just has to know this :)
+
+well, I as a user would appreciate simple experimenting with some automatic moving and do not need to care about it...
+would it be a problem to add a check if both inputs are on the same device already move the class itself there too?
+		</comment>
+		<comment id='14' author='simonm3' date='2020-12-14T14:30:37Z'>
+		&lt;denchmark-link:https://github.com/Borda&gt;@Borda&lt;/denchmark-link&gt;
+ it would probably not be a problem implementing that the metric states gets moved to the same device as the input (maybe still warn the user)
+		</comment>
+	</comments>
+</bug>

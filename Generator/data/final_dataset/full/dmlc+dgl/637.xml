@@ -1,0 +1,409 @@
+<bug_data>
+<bug id='637' author='yangysc' open_date='2019-06-10T12:59:30Z' closed_time='2019-06-11T02:07:23Z'>
+ 	<summary>The GPU usage keep growing as the training is going, if graph is passed into the model every time</summary>
+ 	<description>
+ &lt;denchmark-h:h2&gt;🐛 Bug&lt;/denchmark-h&gt;
+ 
+ Hello, I'm using the GAT model from the dgl library. But I made a small modification, since my input graph is changing all the time, so I do not store a graph in the model (I commented the code self.g=g), instead that I treat the graph and feature tensor as the input to the model every time.  Then the problem occured: the GPU usage is keeping growing as the training is going.
+ &lt;denchmark-code&gt;Processes:                                                           GPU Memory   
+  GPU  PID         Type   Process name                                Usage   
+ 
+    0     19583      C   ...noone/anaconda3/envs/tf_test/bin/python   697MiB
+    0     19731      C   ...noone/anaconda3/envs/tf_test/bin/python  1159MiB 
+    0     19583      C   ...noone/anaconda3/envs/tf_test/bin/python  1459MiB 
+    0     19731      C   ...noone/anaconda3/envs/tf_test/bin/python  1929MiB 
+    0     19731      C   ...noone/anaconda3/envs/tf_test/bin/python  2297MiB
+    0     19731      C   ...noone/anaconda3/envs/tf_test/bin/python  6023MiB
+ &lt;/denchmark-code&gt;
+ 
+ Is this because some data still exist in the GPU memory, and begin to accumulate whenever I call the model like probs = net(graph, feature)?  If this is true, what information should I delete when the model is called?
+ Thanks in advance!
+ &lt;denchmark-h:h2&gt;To Reproduce&lt;/denchmark-h&gt;
+ 
+ Steps to reproduce the behavior:
+ 
+ 
+ Install the latest dgl.
+ 
+ 
+ Download the files I uploaded  in here.
+ 
+ 
+ Run the following command to train
+ python3 train.py --dataset=cora --gpu=0 --epochs=20000
+ 
+ 
+ Watch the GPU usage every 3 seconds.
+ watch -n 3 nvidia-smi
+ 
+ 
+ # gat model
+ """
+ Graph Attention Networks in DGL using SPMV optimization.
+ References
+ ----------
+ Paper: https://arxiv.org/abs/1710.10903
+ Author's code: https://github.com/PetarV-/GAT
+ Pytorch implementation: https://github.com/Diego999/pyGAT
+ """
+ 
+ import torch
+ import torch.nn as nn
+ import dgl.function as fn
+ from dgl.nn.pytorch import edge_softmax
+ 
+ class GraphAttention(nn.Module):
+     def __init__(self,
+                  in_dim,
+                  out_dim,
+                  num_heads,
+                  feat_drop,
+                  attn_drop,
+                  alpha,
+                  residual=False):
+         super(GraphAttention, self).__init__()
+         # self.g = g
+         self.num_heads = num_heads
+         self.fc = nn.Linear(in_dim, num_heads * out_dim, bias=False)
+         if feat_drop:
+             self.feat_drop = nn.Dropout(feat_drop)
+         else:
+             self.feat_drop = lambda x : x
+         if attn_drop:
+             self.attn_drop = nn.Dropout(attn_drop)
+         else:
+             self.attn_drop = lambda x : x
+         self.attn_l = nn.Parameter(torch.Tensor(size=(1, num_heads, out_dim)))
+         self.attn_r = nn.Parameter(torch.Tensor(size=(1, num_heads, out_dim)))
+         nn.init.xavier_normal_(self.fc.weight.data, gain=1.414)
+         nn.init.xavier_normal_(self.attn_l.data, gain=1.414)
+         nn.init.xavier_normal_(self.attn_r.data, gain=1.414)
+         self.leaky_relu = nn.LeakyReLU(alpha)
+         self.softmax = edge_softmax
+         self.residual = residual
+         if residual:
+             if in_dim != out_dim:
+                 self.res_fc = nn.Linear(in_dim, num_heads * out_dim, bias=False)
+                 nn.init.xavier_normal_(self.res_fc.weight.data, gain=1.414)
+             else:
+                 self.res_fc = None
+ 
+     def forward(self, g, inputs):
+         # prepare
+         h = self.feat_drop(inputs)  # NxD
+         ft = self.fc(h).reshape((h.shape[0], self.num_heads, -1))  # NxHxD'
+         a1 = (ft * self.attn_l).sum(dim=-1).unsqueeze(-1) # N x H x 1
+         a2 = (ft * self.attn_r).sum(dim=-1).unsqueeze(-1) # N x H x 1
+         g.ndata.update({'ft' : ft, 'a1' : a1, 'a2' : a2})
+         # 1. compute edge attention
+         g.apply_edges(self.edge_attention)
+         # 2. compute softmax
+         self.edge_softmax(g)
+         # 3. compute the aggregated node features scaled by the dropped,
+         # unnormalized attention values.
+         g.update_all(fn.src_mul_edge('ft', 'a_drop', 'ft'), fn.sum('ft', 'ft'))
+         ret = g.ndata['ft']
+         # 4. residual
+         if self.residual:
+             if self.res_fc is not None:
+                 resval = self.res_fc(h).reshape((h.shape[0], self.num_heads, -1))  # NxHxD'
+             else:
+                 resval = torch.unsqueeze(h, 1)  # Nx1xD'
+             ret = resval + ret
+         return ret
+ 
+     def edge_attention(self, edges):
+         # an edge UDF to compute unnormalized attention values from src and dst
+         a = self.leaky_relu(edges.src['a1'] + edges.dst['a2'])
+         return {'a' : a}
+ 
+     def edge_softmax(self, g):
+         attention = self.softmax(g, g.edata.pop('a'))
+         # Dropout attention scores and save them
+         g.edata['a_drop'] = self.attn_drop(attention)
+ 
+ class GAT(nn.Module):
+     def __init__(self,
+                  num_layers,
+                  in_dim,
+                  num_hidden,
+                  num_classes,
+                  heads,
+                  activation,
+                  feat_drop,
+                  attn_drop,
+                  alpha,
+                  residual):
+         super(GAT, self).__init__()
+         # self.g = g
+         self.num_layers = num_layers
+         self.gat_layers = nn.ModuleList()
+         self.activation = activation
+         # input projection (no residual)
+         self.gat_layers.append(GraphAttention(
+             in_dim, num_hidden, heads[0], feat_drop, attn_drop, alpha, False))
+         # hidden layers
+         for l in range(1, num_layers):
+             # due to multi-head, the in_dim = num_hidden * num_heads
+             self.gat_layers.append(GraphAttention(
+                 num_hidden * heads[l-1], num_hidden, heads[l],
+                 feat_drop, attn_drop, alpha, residual))
+         # output projection
+         self.gat_layers.append(GraphAttention(
+             num_hidden * heads[-2], num_classes, heads[-1],
+             feat_drop, attn_drop, alpha, residual))
+ 
+     def forward(self, g, inputs):
+         h = inputs
+         for l in range(self.num_layers):
+             h = self.gat_layers[l](g, h).flatten(1)
+             h = self.activation(h)
+         # output projection
+         logits = self.gat_layers[-1](g, h).mean(1)
+         return logits
+ # train.py
+ """
+ Graph Attention Networks in DGL using SPMV optimization.
+ Multiple heads are also batched together for faster training.
+ Compared with the original paper, this code does not implement
+ early stopping.
+ References
+ ----------
+ Paper: https://arxiv.org/abs/1710.10903
+ Author's code: https://github.com/PetarV-/GAT
+ Pytorch implementation: https://github.com/Diego999/pyGAT
+ """
+ 
+ import argparse
+ import numpy as np
+ import time
+ import torch
+ import torch.nn.functional as F
+ from dgl import DGLGraph
+ from dgl.data import register_data_args, load_data
+ from gat import GAT
+ 
+ def accuracy(logits, labels):
+     _, indices = torch.max(logits, dim=1)
+     correct = torch.sum(indices == labels)
+     return correct.item() * 1.0 / len(labels)
+ 
+ def evaluate(model, g, features, labels, mask):
+     model.eval()
+     with torch.no_grad():
+         logits = model(g, features)
+         logits = logits[mask]
+         labels = labels[mask]
+         return accuracy(logits, labels)
+ 
+ def main(args):
+     # load and preprocess dataset
+     data = load_data(args)
+     features = torch.FloatTensor(data.features)
+     labels = torch.LongTensor(data.labels)
+     train_mask = torch.ByteTensor(data.train_mask)
+     val_mask = torch.ByteTensor(data.val_mask)
+     test_mask = torch.ByteTensor(data.test_mask)
+     num_feats = features.shape[1]
+     n_classes = data.num_labels
+     n_edges = data.graph.number_of_edges()
+     print("""----Data statistics------'
+       #Edges %d
+       #Classes %d
+       #Train samples %d
+       #Val samples %d
+       #Test samples %d""" %
+           (n_edges, n_classes,
+            train_mask.sum().item(),
+            val_mask.sum().item(),
+            test_mask.sum().item()))
+ 
+     if args.gpu &lt; 0:
+         cuda = False
+     else:
+         cuda = True
+         torch.cuda.set_device(args.gpu)
+         features = features.cuda()
+         labels = labels.cuda()
+         train_mask = train_mask.cuda()
+         val_mask = val_mask.cuda()
+         test_mask = test_mask.cuda()
+ 
+     g = data.graph
+     # add self loop
+     g.remove_edges_from(g.selfloop_edges())
+     g = DGLGraph(g)
+     g.add_edges(g.nodes(), g.nodes())
+     n_edges = g.number_of_edges()
+     # create model
+     heads = ([args.num_heads] * args.num_layers) + [args.num_out_heads]
+     model = GAT(
+                 args.num_layers,
+                 num_feats,
+                 args.num_hidden,
+                 n_classes,
+                 heads,
+                 F.elu,
+                 args.in_drop,
+                 args.attn_drop,
+                 args.alpha,
+                 args.residual)
+     print(model)
+     if cuda:
+         model.cuda()
+     loss_fcn = torch.nn.CrossEntropyLoss()
+ 
+     # use optimizer
+     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+ 
+     # initialize graph
+     dur = []
+     for epoch in range(args.epochs):
+         model.train()
+         if epoch &gt;= 3:
+             t0 = time.time()
+         # forward
+         logits = model(g, features)
+         loss = loss_fcn(logits[train_mask], labels[train_mask])
+ 
+         optimizer.zero_grad()
+         loss.backward()
+         optimizer.step()
+ 
+         if epoch &gt;= 3:
+             dur.append(time.time() - t0)
+ 
+         train_acc = accuracy(logits[train_mask], labels[train_mask])
+ 
+         if args.fastmode:
+             val_acc = accuracy(logits[val_mask], labels[val_mask])
+         else:
+             val_acc = evaluate(model, g, features, labels, val_mask)
+ 
+         print("Epoch {:05d} | Time(s) {:.4f} | Loss {:.4f} | TrainAcc {:.4f} |"
+               " ValAcc {:.4f} | ETputs(KTEPS) {:.2f}".
+               format(epoch, np.mean(dur), loss.item(), train_acc,
+                      val_acc, n_edges / np.mean(dur) / 1000))
+ 
+     print()
+     acc = evaluate(model, g, features, labels, test_mask)
+     print("Test Accuracy {:.4f}".format(acc))
+ 
+ if __name__ == '__main__':
+ 
+     parser = argparse.ArgumentParser(description='GAT')
+     register_data_args(parser)
+     # parser.add_argument("--dataset", type=str, default='cora',
+     #                     help="The input dataset. Can be cora, citeseer, pubmed, syn(synthetic dataset) or reddit")
+     parser.add_argument("--gpu", type=int, default=0,
+                         help="which GPU to use. Set -1 to use CPU.")
+     parser.add_argument("--epochs", type=int, default=20000,
+                         help="number of training epochs")
+     parser.add_argument("--num-heads", type=int, default=8,
+                         help="number of hidden attention heads")
+     parser.add_argument("--num-out-heads", type=int, default=1,
+                         help="number of output attention heads")
+     parser.add_argument("--num-layers", type=int, default=1,
+                         help="number of hidden layers")
+     parser.add_argument("--num-hidden", type=int, default=8,
+                         help="number of hidden units")
+     parser.add_argument("--residual", action="store_true", default=False,
+                         help="use residual connection")
+     parser.add_argument("--in-drop", type=float, default=.6,
+                         help="input feature dropout")
+     parser.add_argument("--attn-drop", type=float, default=.6,
+                         help="attention dropout")
+     parser.add_argument("--lr", type=float, default=0.005,
+                         help="learning rate")
+     parser.add_argument('--weight-decay', type=float, default=5e-4,
+                         help="weight decay")
+     parser.add_argument('--alpha', type=float, default=0.2,
+                         help="the negative slop of leaky relu")
+     parser.add_argument('--fastmode', action="store_true", default=False,
+                         help="skip re-evaluate the validation set")
+     args = parser.parse_args()
+     print(args)
+ 
+     main(args)
+ &lt;denchmark-h:h2&gt;Expected behavior&lt;/denchmark-h&gt;
+ 
+ I assumed that the GPU usage should keep unchanged all the time, since the size of the input graph is not changed.
+ &lt;denchmark-h:h2&gt;Environment&lt;/denchmark-h&gt;
+ 
+ 
+ DGL Version (0.2, the lasted one until 20:48, 6/10/2019):
+ Backend Library &amp; Version (PyTorch 1.1.0):
+ OS (Linux 18.04):
+ How you installed DGL (source):
+ Build command you used (if compiling from source):
+ just build it normally with GPU-enabled
+ Python version: 3.6
+ CUDA/cuDNN version (if applicable): CUDA 10.2
+ GPU models and configuration (e.g. V100): GTX 1080Ti
+ Any other relevant information:
+ 
+ &lt;denchmark-h:h2&gt;Additional context&lt;/denchmark-h&gt;
+ 
+ 	</description>
+ 	<comments>
+ 		<comment id='1' author='yangysc' date='2019-06-10T14:30:42Z'>
+ 		@ylfdq1118 I remember that DGL 0.3 would cache an csr representation of the graph for operations like edge_softmax. Would you clear the cache when the graph structure changes(like the case in this issue)?
+ 		</comment>
+ 		<comment id='2' author='yangysc' date='2019-06-10T16:33:46Z'>
+ 		@ylfdq1118 could you have a look? It looks a like a bug of our new NN module.
+ 		</comment>
+ 		<comment id='3' author='yangysc' date='2019-06-10T21:29:18Z'>
+ 		&lt;denchmark-link:https://github.com/yangysc&gt;@yangysc&lt;/denchmark-link&gt;
+  &lt;denchmark-link:https://github.com/yzh119&gt;@yzh119&lt;/denchmark-link&gt;
+  &lt;denchmark-link:https://github.com/jermainewang&gt;@jermainewang&lt;/denchmark-link&gt;
+  The bug is, in edge_softmax operator, the backward function used a separate cache to save forward pass tensors and did not explicitly clear the cache. It's not because caching DGL graph structure.
+ Similar issue was discussed &lt;denchmark-link:https://discuss.pytorch.org/t/when-should-you-save-for-backward-vs-storing-in-ctx/6522&gt;here&lt;/denchmark-link&gt;
+ . I will push a fix.
+ 		</comment>
+ 		<comment id='4' author='yangysc' date='2019-06-11T02:07:23Z'>
+ 		Thanks a lot! @ylfdq1118 &lt;denchmark-link:https://github.com/yzh119&gt;@yzh119&lt;/denchmark-link&gt;
+  &lt;denchmark-link:https://github.com/jermainewang&gt;@jermainewang&lt;/denchmark-link&gt;
+ 
+ 		</comment>
+ 	</comments>
+ </bug>
+<commit id='5549c70d337168414879bcd95f32daf817d72576' author='Lingfan Yu' date='2019-06-10 18:44:23-04:00'>
+ 	<dmm_unit complexity='1.0' interfacing='1.0' size='0.75'></dmm_unit>
+ 	<modification change_type='MODIFY' old_name='python\dgl\backend\mxnet\tensor.py' new_name='python\dgl\backend\mxnet\tensor.py'>
+ 		<file_info nloc='278' complexity='70' token_count='2492'></file_info>
+ 		<method name='backward' parameters='self,grad_out'>
+ 				<method_info nloc='21' complexity='1' token_count='229' nesting_level='1' start_line='294' end_line='315'></method_info>
+ 			<added_lines>313,314</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines>356,357</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='python\dgl\nn\mxnet\softmax.py' new_name='python\dgl\nn\mxnet\softmax.py'>
+ 		<file_info nloc='82' complexity='4' token_count='392'></file_info>
+ 		<method name='backward' parameters='self,grad_out'>
+ 				<method_info nloc='14' complexity='1' token_count='138' nesting_level='1' start_line='57' end_line='80'></method_info>
+ 			<added_lines>68,69,70</added_lines>
+ 			<deleted_lines>68</deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines></added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='python\dgl\nn\pytorch\softmax.py' new_name='python\dgl\nn\pytorch\softmax.py'>
+ 		<file_info nloc='78' complexity='3' token_count='370'></file_info>
+ 		<method name='backward' parameters='ctx,grad_out'>
+ 				<method_info nloc='13' complexity='1' token_count='136' nesting_level='1' start_line='54' end_line='76'></method_info>
+ 			<added_lines>65,66</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines></added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ </commit>
+</bug_data>

@@ -1,0 +1,347 @@
+<bug id='1173' author='alexeykarnachev' open_date='2020-03-17T19:01:51Z' closed_time='2020-04-08T12:35:48Z'>
+	<summary>Metrics are logged on each batch, but not on each accum. step</summary>
+	<description>
+&lt;denchmark-h:h2&gt;🐛 Bug&lt;/denchmark-h&gt;
+
+I'm not sure, that this is a bug, but it's really unexpected behavior.
+Metrics are logged on each batch, as we can see here:
+
+
+
+pytorch-lightning/pytorch_lightning/trainer/training_loop.py
+
+
+        Lines 435 to 439
+      in
+      c32e3f3
+
+
+
+
+
+
+ # when metrics should be logged 
+
+
+
+ should_log_metrics = batch_idx % self.row_log_interval == 0 or early_stop_epoch 
+
+
+
+ if should_log_metrics or self.fast_dev_run: 
+
+
+
+ # logs user requested information to logger 
+
+
+
+ self.log_metrics(batch_step_metrics, grad_norm_dic) 
+
+
+
+
+
+In case of using Tensorboard logger we will see the following picture:
+&lt;denchmark-link:https://user-images.githubusercontent.com/7495098/76891240-b4279780-6899-11ea-8df9-3583e9757d26.png&gt;&lt;/denchmark-link&gt;
+
+these vertical lines are a sets of points, logged for each individual step.
+Is there any way to log aggregated metrics for each step (so that only one log point appears for each step) ?
+I can set row_log_interval equal to the accumulation steps, and only one logging point will appear, but in this case, I'll not aggregate the accumulation step metrics, but only take the last one.
+&lt;denchmark-h:h3&gt;Environment&lt;/denchmark-h&gt;
+
+PyTorch version: 1.4.0
+OS: Ubuntu 16.04.6 LTS
+Python version: 3.7
+Versions of relevant libraries:
+[pip] numpy==1.18.1
+[pip] pytorch-lightning==0.7.1
+[pip] torch==1.4.0
+[pip] torchvision==0.5.0
+	</description>
+	<comments>
+		<comment id='1' author='alexeykarnachev' date='2020-03-18T21:44:59Z'>
+		could you also pass the sample code you are using?
+		</comment>
+		<comment id='2' author='alexeykarnachev' date='2020-03-18T22:46:40Z'>
+		Here is my function for Trainer construction:
+def get_trainer(args: argparse.Namespace, experiment_name: str) -&gt; pytorch_lightning.Trainer:
+    tb_logger_callback = pytorch_lightning.loggers.TensorBoardLogger(
+        save_dir=args.tensorboard_logdir,
+        version=experiment_name
+    )
+
+    model_checkpoint_callback = pytorch_lightning.callbacks.ModelCheckpoint(
+        filepath=pathlib.Path(args.experiments_root) / experiment_name / 'models',
+        verbose=True,
+        save_top_k=args.hold_n_models
+    )
+
+    trainer_args = copy.deepcopy(args.__dict__)
+    trainer_args.update(
+        {
+            'logger': tb_logger_callback,
+            'checkpoint_callback': model_checkpoint_callback,
+            'show_progress_bar': True,
+            'progress_bar_refresh_rate': 1,
+            'row_log_interval': 1,
+            'val_check_interval': int(trainer_args['val_check_interval']),
+        }
+    )
+
+    trainer = pytorch_lightning.Trainer(
+        **trainer_args
+    )
+
+    return trainer
+And here is the Module (some lines are omitted)
+class MyModule(pl.LightningModule):
+    def __init__(self, hparams: Union[dict, argparse.Namespace]):
+        super().__init__()
+        if isinstance(hparams, dict):
+            hparams = argparse.Namespace(**hparams)
+
+        self.hparams = hparams
+
+        # ----------------------------------------
+        # My custom fields initialization here
+        # ----------------------------------------
+
+    def prepare_data(self):
+        # ----------------------------------------
+        # My custom dataset creation here
+        # ----------------------------------------
+        pass
+
+    def forward(
+            self, data: rnd_datasets.JointCollateBatchT
+    ) -&gt; Tuple[torch.tensor, torch.tensor, torch.tensor]:
+        """
+        Args:
+            data: list with input model data (tensors). It contains 4 tensors:
+                token_ids, token_types, reply_lengths, is_distractor.
+
+        Returns:
+            Tuple with 3 losses: (loss, lm_loss, mc_loss)
+        """
+        loss, lm_loss, mc_loss = self._model(data)
+
+        if self.trainer.use_dp or self.trainer.use_ddp2:
+            loss = loss.unsqueeze(0)
+            lm_loss = lm_loss.unsqueeze(0)
+            mc_loss = mc_loss.unsqueeze(0)
+
+        return loss, lm_loss, mc_loss
+
+    def training_step(self, batch, batch_idx):
+        loss, lm_loss, mc_loss = self.forward(batch)
+        lr = self.trainer.optimizers[0].param_groups[0]['lr']
+        log = {
+            'MC-Loss/train': mc_loss,
+            'LM-Loss/train': lm_loss,
+            'Learning-Rate': lr
+        }
+        # Set up placeholders for valid metrics.
+        if batch_idx == 0:
+            loss_val = torch.tensor(np.inf).unsqueeze(0).to(loss.device) if len(loss.size()) else np.inf
+            log.update({'MC-Loss/valid': loss_val, 'LM-Loss/valid': loss_val})
+
+        return {'loss': loss, 'log': log}
+
+    def validation_step(self, batch, batch_idx):
+        loss, lm_loss, mc_loss = self.forward(batch)
+        return {'val_loss': lm_loss, 'mc_loss': mc_loss, 'lm_loss': lm_loss}
+
+    def validation_epoch_end(self, outputs):
+        mc_loss = torch.stack([x['mc_loss'] for x in outputs]).mean()
+        lm_loss = torch.stack([x['lm_loss'] for x in outputs]).mean()
+
+        logs = {
+            'MC-Loss/valid': mc_loss,
+            'LM-Loss/valid': lm_loss
+        }
+
+        return {'val_loss': lm_loss, 'log': logs}
+
+    def train_dataloader(self):
+        return self._train_dataloader
+
+    def val_dataloader(self):
+        return self._valid_dataloader
+
+    def configure_optimizers(self):
+        parameters = self._model.parameters()
+        optimizer = transformers.AdamW(parameters, lr=self._learning_rate)
+
+        # ----------------------------------------
+        # My custom lr_scheduler creation here
+        # ----------------------------------------
+
+        scheduler = {
+            'scheduler': lr_scheduler,
+            'interval': 'step',
+            'frequency': self.trainer.accumulate_grad_batches,
+            'reduce_on_plateau': True,
+            'monitor': 'LM-Loss/valid'
+        }
+
+        return [optimizer], [scheduler]
+		</comment>
+		<comment id='3' author='alexeykarnachev' date='2020-03-18T23:08:10Z'>
+		Let me show more extreme case.
+Here I set 
+and wait 100 steps:
+&lt;denchmark-link:https://user-images.githubusercontent.com/7495098/77015166-13aea180-6985-11ea-8b0c-b85a50ab5e0a.png&gt;&lt;/denchmark-link&gt;
+
+And this I can see on tensorboard:
+&lt;denchmark-link:https://user-images.githubusercontent.com/7495098/77015200-32149d00-6985-11ea-8608-82aabf9e8c6a.png&gt;&lt;/denchmark-link&gt;
+
+Only 2 steps are logged (as expected), but each step (vertical orange lines) contains all accumulation step metrics. That's why the vertical lines are here.
+On the other hand, if I set  and wait 5 steps, I'll see the following picture:
+&lt;denchmark-link:https://user-images.githubusercontent.com/7495098/77015334-920b4380-6985-11ea-93ef-c6aa1ec276c7.png&gt;&lt;/denchmark-link&gt;
+
+This image is clear. No vertical lines. Each step corresponds to a single metric estimation.
+This problem may look minor :) But in my particular case, there is a huge variance between metrics inside the one accumulation step and I don't want to plot them all, but I want to have one aggregated estimation. Without such aggregation I have a dirty messy plots:
+&lt;denchmark-link:https://user-images.githubusercontent.com/7495098/77015637-689ee780-6986-11ea-94ea-baae3554213d.png&gt;&lt;/denchmark-link&gt;
+
+Hope this will help to understand the problem)
+		</comment>
+		<comment id='4' author='alexeykarnachev' date='2020-03-22T09:45:21Z'>
+		&lt;denchmark-link:https://github.com/Borda&gt;@Borda&lt;/denchmark-link&gt;
+ any thoughts on this? I can do a PR, so you can look closer on this.
+		</comment>
+		<comment id='5' author='alexeykarnachev' date='2020-03-22T14:35:46Z'>
+		&lt;denchmark-link:https://github.com/jeffling&gt;@jeffling&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/jeremyjordan&gt;@jeremyjordan&lt;/denchmark-link&gt;
+ any thought? ^^
+		</comment>
+		<comment id='6' author='alexeykarnachev' date='2020-03-23T00:06:54Z'>
+		at a quick glance i would think you'd want to use &lt;denchmark-link:https://pytorch-lightning.readthedocs.io/en/0.7.1/lightning-module.html#training-step-end-method&gt;training_step_end&lt;/denchmark-link&gt;
+ to do the aggregation. does that resolve your issue? i'm not sure if it would apply when accumulating gradients over many timesteps, though.
+		</comment>
+		<comment id='7' author='alexeykarnachev' date='2020-03-26T12:52:07Z'>
+		Hi! Sorry for the late reply.
+I think, the training_step_end won't help, because it can not aggregate accum-batches (or maybe I've missed something)
+		</comment>
+		<comment id='8' author='alexeykarnachev' date='2020-03-27T03:38:18Z'>
+		yeah we should handle that case better, would you be interested in drafting a PR to address this?
+		</comment>
+		<comment id='9' author='alexeykarnachev' date='2020-03-27T16:02:12Z'>
+		Yes, I'll try to handle this
+		</comment>
+		<comment id='10' author='alexeykarnachev' date='2020-03-27T17:36:16Z'>
+		&lt;denchmark-link:https://github.com/jeremyjordan&gt;@jeremyjordan&lt;/denchmark-link&gt;
+ Let me first formalize the problem.
+Here are log_metrics methods for few pytorch-lightning loggers:
+TensorBoardLogger:
+    @rank_zero_only
+    def log_metrics(self, metrics: Dict[str, float], step: Optional[int] = None) -&gt; None:
+        for k, v in metrics.items():
+            if isinstance(v, torch.Tensor):
+                v = v.item()
+            self.experiment.add_scalar(k, v, step)
+NeptuneLogger:
+    @rank_zero_only
+    def log_metrics(
+            self,
+            metrics: Dict[str, Union[torch.Tensor, float]],
+            step: Optional[int] = None
+    ) -&gt; None:
+        for key, val in metrics.items():
+            self.log_metric(key, val, step=step)
+NeptuneLogger:
+    @rank_zero_only
+    def log_metrics(
+            self,
+            metrics: Dict[str, Union[torch.Tensor, float]],
+            step: Optional[int] = None
+    ) -&gt; None:
+        for key, val in metrics.items():
+            self.log_metric(key, val, step=step)
+MLFlowLogger:
+    @rank_zero_only
+    def log_metrics(self, metrics: Dict[str, float], step: Optional[int] = None) -&gt; None:
+        timestamp_ms = int(time() * 1000)
+        for k, v in metrics.items():
+            if isinstance(v, str):
+                log.warning(f'Discarding metric with string value {k}={v}.')
+                continue
+            self.experiment.log_metric(self.run_id, k, v, timestamp_ms, step)
+CometLogger:
+    @rank_zero_only
+    def log_metrics(
+            self,
+            metrics: Dict[str, Union[torch.Tensor, float]],
+            step: Optional[int] = None
+    ) -&gt; None:
+        # Comet.ml expects metrics to be a dictionary of detached tensors on CPU
+        for key, val in metrics.items():
+            if is_tensor(val):
+                metrics[key] = val.cpu().detach()
+
+        self.experiment.log_metrics(metrics, step=step)
+As we can see, each logger's method receives the step argument.
+And it works great, when there is accumulate_grad_batches equals 1.
+But if we set accumulate_grad_batches, for instance equals 2, then
+each step will be logged twice. There will be 2 sets of metrics for step 0,
+2 sets of metrics for step 1 and so on.
+It happens, because the train loop calls log_metrics routine on each batch:
+
+
+
+pytorch-lightning/pytorch_lightning/trainer/training_loop.py
+
+
+        Lines 445 to 449
+      in
+      12b39a7
+
+
+
+
+
+
+ # when metrics should be logged 
+
+
+
+ should_log_metrics = batch_idx % self.row_log_interval == 0 or early_stop_epoch 
+
+
+
+ if should_log_metrics or self.fast_dev_run: 
+
+
+
+ # logs user requested information to logger 
+
+
+
+ self.log_metrics(batch_step_metrics, grad_norm_dic) 
+
+
+
+
+
+And when we have accumulate_grad_batches != 1, batch and step are not the same thing.
+So, I see here the following solutions:
+
+Perform a step check in each logger's log_metrics method. If step is equal to the previous one, don't log metrics, but instead, aggregate them with the previous ones (sum or weighted sum).
+It's a bad solution, because it'll require a lot of fixing (actually in all existing loggers) and also, it'll make it oblige future loggers developers to implement such the check and aggregation in their loggers.
+The same as the 1, but it moves all logic (step check and metrics aggregation) to some super-class. All loggers will be inherited from this super class and such the aggregation will be performed automatically.
+It's also a bad solution: it requires a lot of refactoring and also, I feel, that there are a lot of corner cases here.
+Don't touch loggers, but instead, move the train loop log_metrics method in another place (where the actual optimizer step is performed). Such the refactoring assumes, that all accum. batches metrics will be stored somewhere in the train loop, aggregated and passed to the  log_metrics method after optimizer step is performed.
+It's slightly better solution, than previous two, but is also assumes a portion of refactoring and structure changes.
+Don't touch anything. Each user, which will faced this issue (like me) will implement custom logger for his project like it's describe in the 1. option.
+Obviously, this is the most clean solution, it'll not touch any PL code, but in such case, the global problem will not be solved: the loggers will continue log metrics accumulate_grad_batches times for each optimizer step.
+
+What do you think? maybe you have another options? Or maybe I've totally missed something, and there exists some already implemented trick in the PL, which solves this issue?
+		</comment>
+		<comment id='11' author='alexeykarnachev' date='2020-03-27T17:52:03Z'>
+		&lt;denchmark-link:https://github.com/alexeykarnachev&gt;@alexeykarnachev&lt;/denchmark-link&gt;
+ great analysis! Personally I would not do abstraction in Trainer as it is already very large, rather I would do some abstraction in base logger classes and the logic is very similar for all particular loggers...
+&lt;denchmark-link:https://github.com/orgs/PyTorchLightning/teams/core-contributors&gt;@PyTorchLightning/core-contributors&lt;/denchmark-link&gt;
+ any other thoughts?
+		</comment>
+	</comments>
+</bug>

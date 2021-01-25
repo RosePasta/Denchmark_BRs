@@ -1,0 +1,132 @@
+<bug id='5559' author='tarepan' open_date='2021-01-18T17:56:17Z' closed_time='2021-01-20T09:47:58Z'>
+	<summary>GPU memory leak in For Loop with AMP mode</summary>
+	<description>
+&lt;denchmark-h:h2&gt;🐛 Bug&lt;/denchmark-h&gt;
+
+Computation in For loop with AMP ON cause GPU memory leak, and crash training.
+&lt;denchmark-h:h3&gt;To Reproduce&lt;/denchmark-h&gt;
+
+&lt;denchmark-link:https://colab.research.google.com/drive/1cLuIO_oPPwuXZJ-YXL9T_naHB3_ykhdO?usp=sharing&gt;Notebook&lt;/denchmark-link&gt;
+.
+Core part:
+    def generate(self, device: str) -&gt; None:
+        ipt = torch.tensor([[float(j) for j in range(0, self.size_i)]], device=device)
+        for _ in range(0, 10000):
+            self.fc(ipt)
+Run .generate() in validation step with precision=16 trainer's argument.
+&lt;denchmark-h:h3&gt;Expected behavior&lt;/denchmark-h&gt;
+
+self.fc(ipt)'s output is simply discarded, so GPU memory will be released.
+GPU memory leak never occur.
+&lt;denchmark-h:h3&gt;Actual behavior&lt;/denchmark-h&gt;
+
+Out of Memory error only when precision=16, not precision=32.
+&lt;denchmark-code&gt;RuntimeError: CUDA out of memory. ....
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h3&gt;Environment&lt;/denchmark-h&gt;
+
+Check in Colab Notebook.
+	</description>
+	<comments>
+		<comment id='1' author='tarepan' date='2021-01-18T21:10:44Z'>
+		&lt;denchmark-h:h2&gt;Estimated cause&lt;/denchmark-h&gt;
+
+Seems to be related to &lt;denchmark-link:https://github.com/pytorch/pytorch/issues/45910&gt;pytorch/pytorch#45910&lt;/denchmark-link&gt;
+.
+Lightning enable native AMP with torch.cuda.amp.autocast() context manager.
+
+
+
+pytorch-lightning/pytorch_lightning/accelerators/gpu_accelerator.py
+
+
+        Lines 62 to 64
+      in
+      18d2ae8
+
+
+
+
+
+
+ if self.trainer.amp_backend == AMPType.NATIVE: 
+
+
+
+ with torch.cuda.amp.autocast(): 
+
+
+
+ output = model_step(*args) 
+
+
+
+
+
+Above pytorch issue said that autocast context manager should be used per forward pass, not per whole epoch.
+Also said "this is user error".
+Current implementation is autocast per validation epoch, so the above bug seems to be caused by PyTorch-Lightning.
+It may affect all models which use nativeAMP (many models are consuming too much GPU memory now?)
+But...I have no idea of how to fix this critical bug.
+accelerator and validation_step is well separated, so it is not easy to embed autocast within each validation forward pass...
+		</comment>
+		<comment id='2' author='tarepan' date='2021-01-19T18:26:53Z'>
+		Hi &lt;denchmark-link:https://github.com/tarepan&gt;@tarepan&lt;/denchmark-link&gt;
+! Thanks for providing code and debugging a bit already!
+
+autocast context manager should be used per forward pass, not per whole epoch.
+
+It is currently implemented like that. model_step would be (for example) the validation_step in your LightningModule. Usually, forward is only called once inside model_step.
+In your colab link, you are doing the opposite, calling forward repeatedly within your validation_step. Just as PyTorch devs advise against!
+What are you actually trying to accomplish? Maybe we can help.
+		</comment>
+		<comment id='3' author='tarepan' date='2021-01-19T19:01:37Z'>
+		Hi &lt;denchmark-link:https://github.com/carmocca&gt;@carmocca&lt;/denchmark-link&gt;
+, thanks for response!
+What I hope to do is running inference of autoregressive model.
+Above notebook is most simplified version for bug reports.
+For example, autoregressive model has inference code like below.
+&lt;denchmark-code&gt;    def generate(self, input_series: Tensor) -&gt; None:
+        for input in torch.unbind(input_series, dim=1):
+            hidden_t = self.rnnCell(cat(input, output_t), hidden_t)
+            output_t = self.fc1(hidden_t)
+            output_series.append(output_t.item())
+        return output_series
+&lt;/denchmark-code&gt;
+
+This code cause OoM error.
+For autoregressive model, above code is single output generation step (equivalent to single validation_step).
+In the case of audio generation, a output_series is equal to a 5-seconds audio.
+The problem is that generate (~validation_step) contain multiple forward-equivalent.
+Actually we need code like below for run without OoM.
+&lt;denchmark-code&gt;    def generate(self, input_series: Tensor) -&gt; None:
+        for input in torch.unbind(input_series, dim=1):
+            with torch.cuda.amp.autocast(): 
+                hidden_t = self.rnnCell(cat(input, output_t), hidden_t)
+                output_t = self.fc1(hidden_t)
+                output_series.append(output_t.item())
+        return output_series
+&lt;/denchmark-code&gt;
+
+But generate is equivalent to validation_step, so we cannot embed autocast() into validation_step.
+And generate is proper validation_step (generating a sample is proper role of validation_step).
+		</comment>
+		<comment id='4' author='tarepan' date='2021-01-19T20:51:12Z'>
+		Okay, I just checked with torch==1.7.1 and couldn't reproduce it, can you check with your actual code?
+		</comment>
+		<comment id='5' author='tarepan' date='2021-01-19T21:05:03Z'>
+		It might also be worth checking pytorch-nightly as well to see if this fixes it. There was a caching issue with AMP that was recently fixed: &lt;denchmark-link:https://github.com/PyTorchLightning/pytorch-lightning/issues/4614&gt;#4614&lt;/denchmark-link&gt;
+
+&lt;denchmark-code&gt;conda install pytorch -c pytorch-nightly
+&lt;/denchmark-code&gt;
+
+EDIT: nvm, it made it into 1.7.1, should fix the issue!
+		</comment>
+		<comment id='6' author='tarepan' date='2021-01-20T09:47:58Z'>
+		Checked with torch==1.7.1, it works without OoM (&lt;denchmark-link:https://colab.research.google.com/drive/1JusPklN8vQIsMtMHKgW-y4FAuSzmZpE2?usp=sharing&gt;notebook&lt;/denchmark-link&gt;
+)!
+Thanks for your great help!
+		</comment>
+	</comments>
+</bug>

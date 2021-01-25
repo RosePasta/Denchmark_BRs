@@ -1,0 +1,181 @@
+<bug id='323' author='Breakend' open_date='2020-01-21T22:40:56Z' closed_time='2020-06-12T16:25:25Z'>
+	<summary>Occassional error on exit due to None type not checked</summary>
+	<description>
+With parallel slurm workers and pickleDB, occasionally I seem to get this happening. It may be because the underlying git repo changed and the trial was removed, but I'm not sure. Either way should probably raise a different exception rather than NoneType AttributeError. Thought I should flag it just in case it's already been investigated.
+Exception in thread Thread-1:
+Traceback (most recent call last):
+File "/u/scr/phend/miniconda3/envs/py37-phend/lib/python3.7/threading.py", line 926, in _bootstrap_inner
+self.run()
+File "/u/scr/phend/miniconda3/envs/py37-phend/lib/python3.7/site-packages/orion/core/worker/trial_pacemaker.py", line 43, in run
+self._monitor_trial()
+File "/u/scr/phend/miniconda3/envs/py37-phend/lib/python3.7/site-packages/orion/core/worker/trial_pacemaker.py", line 48, in _monitor_trial
+if trial.status in STOPPED_STATUS:
+AttributeError: 'NoneType' object has no attribute 'status'
+	</description>
+	<comments>
+		<comment id='1' author='Breakend' date='2020-01-22T01:41:26Z'>
+		Thanks for sharing. I never heard about this issue. It's surprising because the pacemaker is started only when the trial is selected (and thus it exist in the database), and get_trial only return None if the trial does not exist in the database. That would suggest a few scenarios.
+
+The db was deleted meanwhile by the user (possible with pickleddb)
+The db got corrupted
+The indexation/query is broken
+
+Did you notice if the issue usually coincide with (manual) manipulations with the db?
+Otherwise, do you have a large number of workers in parallel? A bug with the locking may end up corrupting the db. That could have slipped our unit tests. Finally, are you using a Lustre FS to save the db?
+		</comment>
+		<comment id='2' author='Breakend' date='2020-01-22T08:03:46Z'>
+		So i was able to reproduce the issue. For 1. the DB was definitely there and not deleted (i am using pickledb). I didn't do any manual manipulations on the DB (in fact i tried deleting the pickleDB and starting from scratch and got the same result). I am using ~5 workers in parallel and not using Lustre FS (as far as i know), but the cluster I'm using does use some sort of distributed file system (not sure which one).
+I did however notice that there is a lock file on the database that seems to have gotten left there. That may be the issue?
+UPDATE: Ok, so this actually seems to happen consistently every time i try to launch any search using the pickle db.
+		</comment>
+		<comment id='3' author='Breakend' date='2020-01-23T01:16:02Z'>
+		I'm wondering if this would fix it? or what the status of this pull request is?
+&lt;denchmark-link:https://github.com/Epistimio/orion/pull/276/files&gt;https://github.com/Epistimio/orion/pull/276/files&lt;/denchmark-link&gt;
+
+Actually, simply replacing FileLock with SoftFileLock in the pickledb code seems to be working for now (though i haven't fully tested). I think the problem is that FileLock assumes multiple processes on the same machine not multiple machines.
+		</comment>
+		<comment id='4' author='Breakend' date='2020-01-23T15:04:32Z'>
+		Is it a public cluster for which there is public doc available? 5 workers is not a lot so unless your training  takes 1 ms there should be very little stress on the PickledDB backend. The lock file should disappear when PickledDB release the lock, so that may be part of the issue. However deadlock should lead to a FileLock.Timeout error, so I don't understand why the query would be executed and return None. You did try to delete the lock file between two executions?
+Are you able to reproduce this as well on your personal computer? I know there is issues with Lustre if they don't have flock, but I don't know for others. If the SoftFileLock solves your problem maybe we should make this optional in PickledDB.
+		</comment>
+		<comment id='5' author='Breakend' date='2020-01-31T18:27:45Z'>
+		Sorry, there's no public doc for the cluster, but I think it's just a standard slurm cluster. I think it actually makes sense that it doesn't work without SoftFileLock. Since FileLock is meant to be used on a single machine between shared processes it uses unix locking, but across machine's that won't work.
+The issue I'm running into now is that when I first launch a new experiment with a new pickledb at least one of the workers (usually the second worker) always gets: "Cannot register an existing experiment with a new config".
+		</comment>
+		<comment id='6' author='Breakend' date='2020-01-31T18:34:09Z'>
+		I may be wrong but I though NFS was working fine with FileLock.
+That sounds like an issue with configuration mismatch between experiments. Is only one worker from the group of workers crashing or all the subsequent ones too? There is often a race condition between workers when they start simultaneously working on a new experiment, but normally they share the same configuration and thus can rollback and reload the experiment from db that was registered from first successful worker.
+		</comment>
+		<comment id='7' author='Breakend' date='2020-01-31T18:49:30Z'>
+		It's always at least one worker if several are launched at once. So, for example, I launch 3 with a clean db, one will drop out with that message. If 3 are launched simultaneously later to continue the experiment, one will drop out with that message again. It might be the race condition, but I'm not sure what's the best way to fix it.
+For the FileLock, this issue seems to suggest that it wouldn't work with NFS, but it could be outdated: &lt;denchmark-link:https://github.com/benediktschmitt/py-filelock/issues/6&gt;benediktschmitt/py-filelock#6&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='8' author='Breakend' date='2020-01-31T18:54:06Z'>
+		Good to know, thanks!
+For the single dying worker that is surprising. Do you generate any file within the repository of your script during execution? This may change the code version detection and cause configuration mismatch between workers. Can you provide the full stack-trace?
+		</comment>
+		<comment id='9' author='Breakend' date='2020-01-31T19:04:20Z'>
+		All files are logged to a different directory, so I don't think there should be anything created.
+Here's the logs that i get from orion:
+DEBUG:orion.core.worker.experiment:Creating Experiment object with name: experiment_name
+DEBUG:orion.core.worker.experiment:Found existing experiment, experiment_name, under user, username, registered in database.
+DEBUG:orion.core.worker.experiment:configuring (name: experiment_name)
+DEBUG:orion.core.worker.experiment:Creating Experiment object with name: experiment_name
+DEBUG:orion.core.worker.experiment:Found existing experiment, experiment_name, under user, username, registered in database.
+DEBUG:orion.algo.base:Creating Algorithm object of PrimaryAlgo type with parameters:
+{'algorithm': {'random': {'seed': None}}}
+DEBUG:orion.algo.base:Creating Algorithm object of Random type with parameters:
+{'seed': None}
+INFO:orion.core.worker.experiment:Found section 'user' in configuration. Experiments do not support this option. Ignoring.
+INFO:orion.core.worker.experiment:Found section 'worker_trials' in configuration. Experiments do not support this option. Ignoring.
+INFO:orion.core.worker.experiment:Found section 'worker' in configuration. Experiments do not support this option. Ignoring.
+INFO:orion.core.worker.experiment:Found section 'debug' in configuration. Experiments do not support this option. Ignoring.
+INFO:orion.core.worker.experiment:Found section 'config' in configuration. Experiments do not support this option. Ignoring.
+INFO:orion.core.worker.experiment:Found section 'manual_resolution' in configuration. Experiments do not support this option. Ignoring.
+INFO:orion.core.worker.experiment:Found section 'algorithm_change' in configuration. Experiments do not support this option. Ignoring.
+INFO:orion.core.worker.experiment:Found section 'user_args' in configuration. Experiments do not support this option. Ignoring.
+INFO:orion.core.worker.experiment:Found section 'leafs' in configuration. Experiments do not support this option. Ignoring.
+DEBUG:orion.algo.base:Creating Algorithm object of PrimaryAlgo type with parameters:
+{'algorithm': {'random': {'seed': None}}}
+DEBUG:orion.algo.base:Creating Algorithm object of Random type with parameters:
+{'seed': None}
+DEBUG:orion.algo.base:Creating Algorithm object of PrimaryAlgo type with parameters:
+{'algorithm': {'random': {'seed': None}}}
+DEBUG:orion.algo.base:Creating Algorithm object of Random type with parameters:
+{'seed': None}
+DEBUG:orion.core.worker.experiment:updating experiment (name: experiment_name)
+Cannot register an existing experiment with a new config
+		</comment>
+		<comment id='10' author='Breakend' date='2020-01-31T19:08:01Z'>
+		There is no stack-trace? Do you have stdout and stderr separated?
+&lt;denchmark-link:#&gt;…&lt;/denchmark-link&gt;
+
+
+On Fri, Jan 31, 2020 at 2:04 PM Peter Henderson ***@***.***&gt; wrote:
+ All files are logged to a different directory, so I don't think there
+ should be anything created.
+
+ Here's the logs that i get from orion:
+
+ DEBUG:orion.core.worker.experiment:Creating Experiment object with name:
+ experiment_name
+ DEBUG:orion.core.worker.experiment:Found existing experiment,
+ experiment_name, under user, username, registered in database.
+ DEBUG:orion.core.worker.experiment:configuring (name: experiment_name)
+ DEBUG:orion.core.worker.experiment:Creating Experiment object with name:
+ experiment_name
+ DEBUG:orion.core.worker.experiment:Found existing experiment,
+ experiment_name, under user, username, registered in database.
+ DEBUG:orion.algo.base:Creating Algorithm object of PrimaryAlgo type with
+ parameters:
+ {'algorithm': {'random': {'seed': None}}}
+ DEBUG:orion.algo.base:Creating Algorithm object of Random type with
+ parameters:
+ {'seed': None}
+ INFO:orion.core.worker.experiment:Found section 'user' in configuration.
+ Experiments do not support this option. Ignoring.
+ INFO:orion.core.worker.experiment:Found section 'worker_trials' in
+ configuration. Experiments do not support this option. Ignoring.
+ INFO:orion.core.worker.experiment:Found section 'worker' in configuration.
+ Experiments do not support this option. Ignoring.
+ INFO:orion.core.worker.experiment:Found section 'debug' in configuration.
+ Experiments do not support this option. Ignoring.
+ INFO:orion.core.worker.experiment:Found section 'config' in configuration.
+ Experiments do not support this option. Ignoring.
+ INFO:orion.core.worker.experiment:Found section 'manual_resolution' in
+ configuration. Experiments do not support this option. Ignoring.
+ INFO:orion.core.worker.experiment:Found section 'algorithm_change' in
+ configuration. Experiments do not support this option. Ignoring.
+ INFO:orion.core.worker.experiment:Found section 'user_args' in
+ configuration. Experiments do not support this option. Ignoring.
+ INFO:orion.core.worker.experiment:Found section 'leafs' in configuration.
+ Experiments do not support this option. Ignoring.
+ DEBUG:orion.algo.base:Creating Algorithm object of PrimaryAlgo type with
+ parameters:
+ {'algorithm': {'random': {'seed': None}}}
+ DEBUG:orion.algo.base:Creating Algorithm object of Random type with
+ parameters:
+ {'seed': None}
+ DEBUG:orion.algo.base:Creating Algorithm object of PrimaryAlgo type with
+ parameters:
+ {'algorithm': {'random': {'seed': None}}}
+ DEBUG:orion.algo.base:Creating Algorithm object of Random type with
+ parameters:
+ {'seed': None}
+ DEBUG:orion.core.worker.experiment:updating experiment (name:
+ experiment_name)
+ Cannot register an existing experiment with a new config
+
+ —
+ You are receiving this because you commented.
+ Reply to this email directly, view it on GitHub
+ &lt;#323?email_source=notifications&amp;email_token=AAQARWTMV6KL5XNF3K3GT23RARY3JA5CNFSM4KJ4KGXKYY3PNVWWK3TUL52HS4DFVREXG43VMVBW63LNMVXHJKTDN5WW2ZLOORPWSZGOEKPVLWA#issuecomment-580867544&gt;,
+ or unsubscribe
+ &lt;https://github.com/notifications/unsubscribe-auth/AAQARWSIA2I7DAUGD5J5FB3RARY3JANCNFSM4KJ4KGXA&gt;
+ .
+
+
+
+		</comment>
+		<comment id='11' author='Breakend' date='2020-01-31T19:08:54Z'>
+		I did have them separated and outputting via slurm's interface. The above is the two combined, I didn't get a full stack trace.
+		</comment>
+		<comment id='12' author='Breakend' date='2020-01-31T19:11:43Z'>
+		:'( I'll make my way up from the raise then. What version are you using, master (stable from PyPi) or develop?
+		</comment>
+		<comment id='13' author='Breakend' date='2020-01-31T19:13:30Z'>
+		i'm using my fork from the most recent master, modified with the SoftFileLock &lt;denchmark-link:https://github.com/Breakend/orion/&gt;https://github.com/Breakend/orion/&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='14' author='Breakend' date='2020-03-31T15:01:56Z'>
+		From offline discussion a bug was found &lt;denchmark-link:https://github.com/Epistimio/orion/blob/master/src/orion/core/io/experiment_builder.py#L250&gt;here&lt;/denchmark-link&gt;
+ causing a failure during race-conditions instead of handling it properly. It was already fixed in  however.
+&lt;denchmark-link:https://github.com/Breakend&gt;@Breakend&lt;/denchmark-link&gt;
+ Did you try it with  since we discussed it offline? Do you still have the issue?
+		</comment>
+		<comment id='15' author='Breakend' date='2020-06-12T16:25:25Z'>
+		I'm assuming his problem is resolved since there is no activity in this issue for a while.
+		</comment>
+	</comments>
+</bug>

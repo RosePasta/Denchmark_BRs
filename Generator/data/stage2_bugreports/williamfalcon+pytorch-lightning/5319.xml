@@ -1,0 +1,237 @@
+<bug id='5319' author='Shreeyak' open_date='2020-12-31T19:23:05Z' closed_time='2021-01-01T14:08:29Z'>
+	<summary>Hanging process on DDP and ModelCheckpoint Callback if one of the dirpath is None</summary>
+	<description>
+&lt;denchmark-h:h2&gt;🐛 Bug&lt;/denchmark-h&gt;
+
+When running on DDP and using the ModelCheckpoint Callback, if the callback is given dirpath=None in one of the processes, the trainer hangs before sanity checks start and becomes unresponsive.
+&lt;denchmark-h:h2&gt;Please reproduce using the BoringModel&lt;/denchmark-h&gt;
+
+Cannot reproduce on Colab due to needing 2 GPUs to reproduce
+&lt;denchmark-h:h3&gt;To Reproduce&lt;/denchmark-h&gt;
+
+# Copyright The PyTorch Lightning team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# --------------------------------------------
+# --------------------------------------------
+# --------------------------------------------
+# USE THIS MODEL TO REPRODUCE A BUG YOU REPORT
+# --------------------------------------------
+# --------------------------------------------
+# --------------------------------------------
+import os
+
+import torch
+from torch.utils.data import Dataset
+
+from pl_examples import cli_lightning_logo
+from pytorch_lightning import LightningModule, Trainer
+from pytorch_lightning.callbacks import ModelCheckpoint
+
+
+class RandomDataset(Dataset):
+    """
+    &gt;&gt;&gt; RandomDataset(size=10, length=20)  # doctest: +ELLIPSIS
+    &lt;...bug_report_model.RandomDataset object at ...&gt;
+    """
+
+    def __init__(self, size, length):
+        self.len = length
+        self.data = torch.randn(length, size)
+
+    def __getitem__(self, index):
+        return self.data[index]
+
+    def __len__(self):
+        return self.len
+
+
+class BoringModel(LightningModule):
+    """
+    &gt;&gt;&gt; BoringModel()  # doctest: +ELLIPSIS +NORMALIZE_WHITESPACE
+    BoringModel(
+      (layer): Linear(...)
+    )
+    """
+
+    def __init__(self):
+        """
+        Testing PL Module
+
+        Use as follows:
+        - subclass
+        - modify the behavior for what you want
+
+        class TestModel(BaseTestModel):
+            def training_step(...):
+                # do your own thing
+
+        or:
+
+        model = BaseTestModel()
+        model.training_epoch_end = None
+
+        """
+        super().__init__()
+        self.layer = torch.nn.Linear(32, 2)
+
+    def forward(self, x):
+        return self.layer(x)
+
+    def loss(self, batch, prediction):
+        # An arbitrary loss to have a loss that updates the model weights during `Trainer.fit` calls
+        return torch.nn.functional.mse_loss(prediction, torch.ones_like(prediction))
+
+    def step(self, x):
+        x = self.layer(x)
+        out = torch.nn.functional.mse_loss(x, torch.ones_like(x))
+        return out
+
+    def training_step(self, batch, batch_idx):
+        output = self.layer(batch)
+        loss = self.loss(batch, output)
+        self.log("loss", loss)
+        return {"loss": loss}
+
+    def training_step_end(self, training_step_outputs):
+        return training_step_outputs
+
+    def training_epoch_end(self, outputs) -&gt; None:
+        torch.stack([x["loss"] for x in outputs]).mean()
+
+    def validation_step(self, batch, batch_idx):
+        output = self.layer(batch)
+        loss = self.loss(batch, output)
+        return {"x": loss}
+
+    def validation_epoch_end(self, outputs) -&gt; None:
+        torch.stack([x["x"] for x in outputs]).mean()
+
+    def test_step(self, batch, batch_idx):
+        output = self.layer(batch)
+        loss = self.loss(batch, output)
+        return {"y": loss}
+
+    def test_epoch_end(self, outputs) -&gt; None:
+        torch.stack([x["y"] for x in outputs]).mean()
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.SGD(self.layer.parameters(), lr=0.1)
+        lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
+        return [optimizer], [lr_scheduler]
+
+
+#  NOTE: If you are using a cmd line to run your script,
+#  provide the cmd line as below.
+#  opt = "--max_epochs 1 --limit_train_batches 1".split(" ")
+#  parser = ArgumentParser()
+#  args = parser.parse_args(opt)
+
+def get_local_rank():
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    return local_rank
+
+
+def create_log_dir():
+    """Each run's log dir will have same name as wandb runid"""
+    if get_local_rank() != 0:
+        return
+
+    return "./logs"
+
+
+def test_run():
+    class TestModel(BoringModel):
+        def on_train_epoch_start(self) -&gt; None:
+            print("override any method to prove your bug")
+
+    # fake data
+    train_data = torch.utils.data.DataLoader(RandomDataset(32, 64))
+    val_data = torch.utils.data.DataLoader(RandomDataset(32, 64))
+    test_data = torch.utils.data.DataLoader(RandomDataset(32, 64))
+
+    ##### Error occurs here #####
+    log_dir = create_log_dir()  # Rank0 process gets str, Rank1 gets None
+    print(f"Rank-{get_local_rank()}: log_dir: {log_dir}")
+    callbacks = [ModelCheckpoint(dirpath=log_dir, monitor="loss", mode="min", save_last=True, period=1, save_top_k=1)] 
+
+    # model
+    model = TestModel()
+    trainer = Trainer(
+        default_root_dir=os.getcwd(),
+        limit_train_batches=1,
+        limit_val_batches=1,
+        max_epochs=1,
+        weights_summary=None,
+        gpus=2,
+        accelerator="ddp",
+        callbacks=callbacks,
+    )
+    trainer.fit(model, train_data, val_data)
+    trainer.test(test_dataloaders=test_data)
+
+
+if __name__ == "__main__":
+    cli_lightning_logo()
+    test_run()
+&lt;denchmark-h:h3&gt;Expected behavior&lt;/denchmark-h&gt;
+
+The trainer starts and performs as normal. The default value for dirpath is None, so one of the processes passing None should not affect it.
+&lt;denchmark-h:h3&gt;Environment&lt;/denchmark-h&gt;
+
+* CUDA:
+        - GPU:
+                - GeForce GTX 1080 Ti
+                - GeForce GTX 1080 Ti
+        - available:         True
+        - version:           10.2
+* Packages:
+        - numpy:             1.19.4
+        - pyTorch_debug:     False
+        - pyTorch_version:   1.7.1
+        - pytorch-lightning: 1.1.2
+        - tqdm:              4.54.1
+* System:
+        - OS:                Linux
+        - architecture:
+                - 64bit
+                - ELF
+        - processor:         x86_64
+        - python:            3.8.0
+        - version:           #109-Ubuntu SMP Fri Jun 19 11:33:10 UTC 2020
+
+How you installed PyTorch (conda, pip, source): pip
+
+&lt;denchmark-h:h3&gt;Additional context&lt;/denchmark-h&gt;
+
+Bug does not occur when running on a single GPU.
+Bug does not occur if both processes give valid dirpath (str)
+	</description>
+	<comments>
+		<comment id='1' author='Shreeyak' date='2021-01-01T11:44:23Z'>
+		you need to make sure that all ranks get the same initial conditions. ModelCheckpoint must get a valid dirpath on all ranks.
+		</comment>
+		<comment id='2' author='Shreeyak' date='2021-01-01T14:08:29Z'>
+		Ah, so not a bug.
+Can the dirpath being different on each process cause an issue? (I've not noticed any so far). Only rank0 would actually log anything, so I guess not.
+		</comment>
+		<comment id='3' author='Shreeyak' date='2021-01-01T14:24:43Z'>
+		
+Can the dirpath being different on each process cause an issue?
+
+it could for some features in Lightning, like auto loading best weights for testing.
+You can savely give the ModelCheckpoint the same path on all ranks. Lightning will make sure checkpoints are only saved on rank 0. It is important that the internal states of objects like ModelCheckpoint stays in sync even on rank &gt; 0 where nothing gets saved, because some features that Lightning provies requires knowing the best model path or last model path, and this information needs to be known and tracked on all process ranks.
+		</comment>
+	</comments>
+</bug>

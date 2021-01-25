@@ -1,0 +1,128 @@
+<bug id='2137' author='BarclayII' open_date='2020-09-01T07:28:13Z' closed_time='2020-09-03T04:49:00Z'>
+	<summary>[Bug] 0.5.x taking too much shared memory during multiprocess training</summary>
+	<description>
+&lt;denchmark-h:h2&gt;🐛 Bug&lt;/denchmark-h&gt;
+
+After upgrading to 0.5.x, training with multiprocessing now requires much larger shared memory, like, much larger, especially compared to 0.4.x.
+Also the consumption of shared memory scales linearly with the number of worker processes, but that's also a problem in 0.4.x.
+&lt;denchmark-h:h2&gt;To Reproduce&lt;/denchmark-h&gt;
+
+Steps to reproduce the behavior:
+
+Take examples/pytorch/graphsage/train_sampling.py as an example.
+Replace the node features with a much bigger dimension, like 50000.
+Train and observe the shared memory consumption via df.  The shared memory consumption can be found as /dev/shm.
+
+Here is my result on Reddit with feature size of 50000:
+
+
+
+Version
+2 workers
+4 workers
+
+
+
+
+0.4.x branch
+39M
+67M
+
+
+master
+92G
+184G
+
+
+
+&lt;denchmark-h:h2&gt;Expected behavior&lt;/denchmark-h&gt;
+
+&lt;denchmark-h:h2&gt;Environment&lt;/denchmark-h&gt;
+
+
+DGL Version (e.g., 1.0):
+Backend Library &amp; Version (e.g., PyTorch 0.4.1, MXNet/Gluon 1.3):
+OS (e.g., Linux):
+How you installed DGL (conda, pip, source):
+Build command you used (if compiling from source):
+Python version:
+CUDA/cuDNN version (if applicable):
+GPU models and configuration (e.g. V100):
+Any other relevant information:
+
+&lt;denchmark-h:h2&gt;Additional context&lt;/denchmark-h&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='BarclayII' date='2020-09-01T08:50:17Z'>
+		The 0.5 version copies the feature tensor of the parent graph to shared memory while 0.4.3 does not. It is due to the lazy-feature-copy behavior -- when a subgraph/block is created, it will hold a reference to the feature tensor of the parent graph and slice out subfeatures upon feature access. When the subgraph/block is transmitted to another process, the current behavior will copy the parent graph feature to shared memory, causing an excessive amount of shared memory usage. Three viable solutions:
+
+For lazy features, instead of copying the parent graph feature to shared memory, first slice out subfeatures and then copy the subfeatures to shared memory. However, this may cause many unnecessary data transmission.
+Try to deduce that the parent graph feature is transmitted back to the main process so there is no need to put it in shared memory. It is not clear whether it is feasible as the serializer/pickler has no knowledge about the receiver of the data.
+In the high-level interfaces (e.g., NodeDataLoader and EdgeDataLoader), do not pass the parent features to the sampler process so that the sampled subgraphs/blocks will have no features. Once the main process gets the subgraphs/blocks, restore  the lazy features.
+
+It looks like No.3 is a better solution.
+		</comment>
+		<comment id='2' author='BarclayII' date='2020-09-01T10:01:46Z'>
+		How can we tell user to avoid such problem if we adopt No.3 as the solution? I prefer the No.1 solution. Also I'm wondering what's the benefit of the lazy features? And also what's the unnecessary data transmission?
+		</comment>
+		<comment id='3' author='BarclayII' date='2020-09-02T02:19:20Z'>
+		After some testing I confirm that the tensors returned by subprocesses consume shared memory; the original tensor from the main process and the usage of that tensor in subprocesses do not consume shared memory.
+For instance, consider the following code:
+import torch
+import torch.utils.data
+import tqdm
+
+I = 10
+N = 4
+
+class Dataset(torch.utils.data.Dataset):
+    def __init__(self, X):
+        self.X = X
+
+    def __getitem__(self, i):
+        max_ = self.X[:, 0].long()
+        return self.X[max_[i]:max_[i]+I]
+
+    def __len__(self):
+        return self.X.shape[0]
+
+x = torch.zeros(20000, 50000)    # This takes 3.7G memory
+X = Dataset(x)
+
+dataloader = torch.utils.data.DataLoader(X, batch_size=20, num_workers=N)
+for _ in tqdm.tqdm(dataloader):
+    pass
+The amount of shared memory consumed v.s. N and I goes as follows:
+
+
+
+
+2
+4
+
+
+
+
+10
+~100M
+~202M
+
+
+100
+~1.2G
+~2G
+
+
+directly returning self.X
+~100G
+&gt;200G
+
+
+
+Note that even if the original feature tensor is 3.7G, the shared memory consumed can go below that, meaning that the feature tensor transmitted from the main process to the subprocesses does not consume shared memory.
+So I think we should be good if we can somehow avoid returning the feature tensors of the original graph altogether.
+Another insight is that the linear scaling of shared memory consumption w.r.t. number of subprocesses is still there even if all the subprocesses return the very same tensor.
+		</comment>
+	</comments>
+</bug>

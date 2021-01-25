@@ -1,0 +1,107 @@
+<bug id='37157' author='mcarilli' open_date='2020-04-23T17:35:28Z' closed_time='2020-05-07T01:21:15Z'>
+	<summary>CUBLAS_STATUS_EXECUTION_FAILED for ConvTranspose2d backward with FP16 inputs</summary>
+	<description>
+&lt;denchmark-h:h2&gt;🐛 Bug&lt;/denchmark-h&gt;
+
+While helping &lt;denchmark-link:https://github.com/vfdev-5&gt;@vfdev-5&lt;/denchmark-link&gt;
+ integrate  with &lt;denchmark-link:https://github.com/pytorch/ignite&gt;Ignite&lt;/denchmark-link&gt;
+, he asked me to debug a CycleGan+Amp example.  I saw weird nondeterministic errors.  Eventually I narrowed down a repro with ConvTranspose2d, FP16 inputs, and shapes taken from cyclegan.  It fails with illegal memory accesses in .  (The repro does not involve  or &lt;denchmark-link:https://github.com/vfdev-5&gt;@vfdev-5&lt;/denchmark-link&gt;
+ 's script at all, so I think these are innocent.)
+I don't know the cause yet, the failure may or may not occur based on input addresses, and I'm not sure what distinguishes "bad" input addresses.
+Posting for visibility.  I will check for similar issues and keep digging.  Related:
+
+#31690, which discusses how nonzero output_padding can force ConvTranspose2d to use the "slow conv" backend (im2col+col2im+cublas GEMM) instead of cudnn.
+#23545, same failing call (ConvTranspose2d with FP16 inputs, even the same shapes as my repro!) but fails with different symptoms.  The "fix" (9130ab3) is a one-line change that replaced a macro with a hardcoded character, so any deep memory movement problems likely weren't affected.
+#15584, also cyclegan backward() failure, but failure came from cudnn.  Not resolved.
+
+&lt;denchmark-h:h2&gt;To Reproduce&lt;/denchmark-h&gt;
+
+This may not work on a different system, but out.sum().backward() reliably fails for me at iteration 48.
+import torch
+
+dtype = torch.half
+
+for i in range(0,500):
+    torch.cuda.manual_seed(17)
+    # dummy tensors to fuzz where ConvTranspose2d inputs get allocated
+    dummy0 = torch.empty((7777*i,), device="cuda", dtype=dtype)
+    a = torch.randn((6, 256, 50, 50), device="cuda", dtype=dtype)
+    dummy1 = torch.empty((7777*i,), device="cuda", dtype=dtype)
+    # shape from CycleGAN
+    m = torch.nn.ConvTranspose2d(256, 128, kernel_size=3, stride=2, padding=1, output_padding=1, bias=True).cuda().to(dtype)
+    dummy2 = torch.empty((7777*i,), device="cuda", dtype=dtype)
+    out = m(a)
+    out.sum().backward()
+    print(i,
+          "weight grad sum = ", m.weight.grad.data.double().sum().item() if m.weight.grad is not None else None,
+          "bias grad sum = ", m.bias.grad.data.double().sum().item() if m.bias.grad is not None else None)
+    m.zero_grad()
+Stack trace with CUDA_LAUNCH_BLOCKING=1
+(weight grad and bias grad sums are deterministic for the first 47 iterations)
+&lt;denchmark-code&gt;weight grad sum =  1366953.875 bias grad sum =  98304.0
+47 torch.Size([6, 128, 100, 100]) 140174484123648 140173632753664 140173635366912
+140173633344000
+weight grad sum =  1366953.875 bias grad sum =  98304.0
+48 torch.Size([6, 128, 100, 100]) 140174476443648 140173636979712 140173633344000
+140173637570048
+Traceback (most recent call last):
+  File "transpose2d.py", line 131, in &lt;module&gt;
+    out.sum().backward()
+  File "/home/mcarilli/anaconda3/envs/python373/lib/python3.7/site-packages/torch/tensor.py", line 198, in backward
+    torch.autograd.backward(self, gradient, retain_graph, create_graph)
+  File "/home/mcarilli/anaconda3/envs/python373/lib/python3.7/site-packages/torch/autograd/__init__.py", line 100, in backward
+    allow_unreachable=True)  # allow_unreachable flag
+RuntimeError: CUDA error: CUBLAS_STATUS_EXECUTION_FAILED when calling `cublasGemmEx( handle, opa, opb, m, n, k, &amp;falpha, a, CUDA_R_16F, lda, b, CUDA_R_16F, ldb, &amp;fbeta, c, CUDA_R_16F, ldc, CUDA_R_32F, CUBLAS_GEMM_DFALT_TENSOR_OP)` (gemm&lt;c10::Half&gt; at ../aten/src/ATen/cuda/CUDABlas.cpp:226)
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; const&amp;) + 0x6a (0x7f7d201cbe1a in /home/mcarilli/anaconda3/envs/python373/lib/python3.7/site-packages/torch/lib/libc10.so)
+frame #1: &lt;unknown function&gt; + 0x35ccb46 (0x7f7d239b2b46 in /home/mcarilli/anaconda3/envs/python373/lib/python3.7/site-packages/torch/lib/libtorch_cuda.so)
+frame #2: &lt;unknown function&gt; + 0x35cd4d9 (0x7f7d239b34d9 in /home/mcarilli/anaconda3/envs/python373/lib/python3.7/site-packages/torch/lib/libtorch_cuda.so)
+frame #3: at::native::(anonymous namespace)::slow_conv_transpose2d_acc_grad_parameters_cuda_template(at::Tensor const&amp;, at::Tensor const&amp;, at::Tensor&amp;, at::Tensor&amp;, at::Tensor const&amp;, at::Tensor const&amp;, c10::ArrayRef&lt;long&gt;, c10::ArrayRef&lt;long&gt;, c10::ArrayRef&lt;long&gt;, c10::ArrayRef&lt;long&gt;, c10::ArrayRef&lt;long&gt;, int) + 0xe46 (0x7f7d22946446 in /home/mcarilli/anaconda3/envs/python373/lib/python3.7/site-packages/torch/lib/libtorch_cuda.so)
+frame #4: at::native::slow_conv_transpose2d_backward_cuda(at::Tensor const&amp;, at::Tensor const&amp;, at::Tensor const&amp;, c10::ArrayRef&lt;long&gt;, c10::ArrayRef&lt;long&gt;, c10::ArrayRef&lt;long&gt;, c10::ArrayRef&lt;long&gt;, c10::ArrayRef&lt;long&gt;, at::Tensor const&amp;, at::Tensor const&amp;, std::array&lt;bool, 3ul&gt;) + 0x422 (0x7f7d2294c3d2 in /home/mcarilli/anaconda3/envs/python373/lib/python3.7/site-packages/torch/lib/libtorch_cuda.so)
+frame #5: &lt;unknown function&gt; + 0x3649d49 (0x7f7d23a2fd49 in /home/mcarilli/anaconda3/envs/python373/lib/python3.7/site-packages/torch/lib/libtorch_cuda.so)
+frame #6: &lt;unknown function&gt; + 0x365927d (0x7f7d23a3f27d in /home/mcarilli/anaconda3/envs/python373/lib/python3.7/site-packages/torch/lib/libtorch_cuda.so)
+frame #7: &lt;unknown function&gt; + 0x2bae96a (0x7f7d43cbe96a in /home/mcarilli/anaconda3/envs/python373/lib/python3.7/site-packages/torch/lib/libtorch_cpu.so)
+frame #8: &lt;unknown function&gt; + 0xf39d3d (0x7f7d42049d3d in /home/mcarilli/anaconda3/envs/python373/lib/python3.7/site-packages/torch/lib/libtorch_cpu.so)
+frame #9: torch::autograd::generated::SlowConvTranspose2DBackward::apply(std::vector&lt;at::Tensor, std::allocator&lt;at::Tensor&gt; &gt;&amp;&amp;) + 0x520 (0x7f7d4391f490 in /home/mcarilli/anaconda3/envs/python373/lib/python3.7/site-packages/torch/lib/libtorch_cpu.so)
+...
+&lt;/denchmark-code&gt;
+
+cuda-memcheck --tool memcheck python transpose2d.py reports a bunch of invalid reads like
+&lt;denchmark-code&gt; Invalid __global__ read of size 2
+=========     at 0x00001340 in void gemv2T_kernel_val&lt;int, int, __half, __half, float, int=128, int=16, int=2, int=2, bool=0, cublasGemvParams&lt;cublasGemvTensorStridedBatched&lt;__half const &gt;, cublasGemvTensorStridedBatched&lt;__half&gt;, float&gt;&gt;(__half const , float, float)
+=========     by thread (112,0,0) in block (768,0,0)
+=========     Address 0x7f58ea60000e is out of bounds
+=========     Device Frame:void gemv2T_kernel_val&lt;int, int, __half, __half, float, int=128, int=16, int=2, int=2, bool=0, cublasGemvParams&lt;cublasGemvTensorStridedBatched&lt;__half const &gt;, cublasGemvTensorStridedBatched&lt;__half&gt;, float&gt;&gt;(__half const , float, float) (void gemv2T_kernel
+_val&lt;int, int, __half, __half, float, int=128, int=16, int=2, int=2, bool=0, cublasGemvParams&lt;cublasGemvTensorStridedBatched&lt;__half const &gt;, cublasGemvTensorStridedBatched&lt;__half&gt;, float&gt;&gt;(__half const , float, float) : 0x1340)
+...
+=========     Host Frame:/home/mcarilli/anaconda3/envs/python373/lib/python3.7/site-packages/torch/lib/libtorch_cuda.so (_ZN2at6native97_GLOBAL__N__73_tmpxft_00003c73_00000000_7_NaiveConvolutionTranspose2d_compute_61_cpp1_ii_1a68c69d55slow_conv_transpose2d_acc_grad_parameters_cuda_
+templateERKNS_6TensorES4_RS2_S5_S4_S4_N3c108ArrayRefIlEES8_S8_S8_S8_i + 0xe46) [0x2560446]
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h2&gt;Environment&lt;/denchmark-h&gt;
+
+Cublas is being loaded from a vanilla public cuda 10.2 install:
+&lt;denchmark-code&gt;(python373) $ LD_DEBUG=libs python transpose2d.py 2&gt;&amp;1 | grep cublas
+      ...
+      8876:     calling init: /home/mcarilli/cuda_versions/10.2_files/cuda-toolkit/lib64/libcublasLt.so.10
+      8876:     calling init: /home/mcarilli/cuda_versions/10.2_files/cuda-toolkit/lib64/libcublas.so.10
+&lt;/denchmark-code&gt;
+
+Pytorch is based on a recent-ish master (__version__ is unique because it's a source build from a local commit with debugging print statements).
+cc &lt;denchmark-link:https://github.com/ezyang&gt;@ezyang&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/gchanan&gt;@gchanan&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/zou3519&gt;@zou3519&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/csarofeen&gt;@csarofeen&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/ptrblck&gt;@ptrblck&lt;/denchmark-link&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='mcarilli' date='2020-04-23T21:52:16Z'>
+		Hi pri because it is a crash.
+		</comment>
+		<comment id='2' author='mcarilli' date='2020-04-24T02:07:53Z'>
+		At the &lt;denchmark-link:https://github.com/pytorch/pytorch/blob/master/aten/src/ATen/native/cuda/NaiveConvolutionTranspose2d.cu#L736&gt;spot where the error occurs&lt;/denchmark-link&gt;
+, the gemv arguments have the expected shape.  If replace the gemv call with dummy in-place s applied to the argument tensors, the repro runs end to end under cuda-memcheck without errors, so the argument tensors appear properly allocated.
+Looks more and more like a misconfigured cublas call or an internal cublas error.  Tomorrow i'll figure out which.
+		</comment>
+	</comments>
+</bug>

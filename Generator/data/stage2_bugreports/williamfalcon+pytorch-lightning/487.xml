@@ -1,0 +1,370 @@
+<bug id='487' author='Vichoko' open_date='2019-11-09T17:20:53Z' closed_time='2019-11-20T19:48:21Z'>
+	<summary>Training stops without error</summary>
+	<description>
+Describe the bug
+The training stops without user interaction at an arbitrary epoch. I don't know why it stops.
+To Reproduce
+I use the template scheme proposed in the example code.
+&lt;denchmark-code&gt;
+        logger = ptl.logging.TestTubeLogger(
+            save_dir=MODELS_DATA_PATH / experiment_name,
+            version=1  # An existing version with a saved checkpoint
+        )
+        trainer = ptl.Trainer(
+            gpus=hyperparams.gpus,
+            distributed_backend=hyperparams.distributed_backend,
+            logger=logger,
+            default_save_path=MODELS_DATA_PATH / experiment_name
+        )
+        trainer.fit(model)
+&lt;/denchmark-code&gt;
+
+Expected behavior
+As I have not stated the epoch limit or stopping criteria explicitly, it should train indefinitely.
+If is a lightning feature it should say the stoppin criteria.
+Screenshots
+&lt;denchmark-code&gt;(aidio) [vichoko@pumba aidio]$ python train.py  --model waveNetTransformer --features_path ~/data/ --gpus 1
+info: experiment_name is wavenet_transformer_pure_1
+Epoch 11: 100%|██████████████████████████████████████████████████████████████████████████| 74/74 [16:04&lt;00:00, 13.04s/batch, batch_nb=48, gpu=0, loss=1.337, train_loss=1.09, v_nb=1, val_acc=0.347, val_loss=1.34]
+(aidio) [vichoko@pumba aidio]$
+&lt;/denchmark-code&gt;
+
+Desktop (please complete the following information):
+
+OS Arch Linux
+Version  0.5.3.2
+
+	</description>
+	<comments>
+		<comment id='1' author='Vichoko' date='2019-11-09T18:09:50Z'>
+		run it with coolmodel first. if it works fine then u probably have something in your lightningmodule that exits early
+		</comment>
+		<comment id='2' author='Vichoko' date='2019-11-09T18:53:26Z'>
+		I think it has something to do to metrics not improving during several sequential epochs. Because the checkpoint saved is from epoch 3, and by epoch 11 metrics haven't got any better. (Now it crashed in epoch 9)
+Could it be this?
+My module is very similar to CoolModel, as you can see here:
+class WavenetTramsformerClassifier(ptl.LightningModule):
+    """
+    Sample model to show how to define a template
+    """
+
+    def __init__(self, hparams, num_classes, train_dataset, eval_dataset, test_dataset):
+        super(WavenetTramsformerClassifier, self).__init__()
+        self.hparams = hparams
+        self.loss = torch.nn.CrossEntropyLoss()
+        self.train_dataset = train_dataset
+        self.eval_dataset = eval_dataset
+        self.test_dataset = test_dataset
+        # build model
+        self.model = WaveNetTransformerClassifier(num_classes)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=hparams.learning_rate)
+
+    # ---------------------
+    # TRAINING
+    # ---------------------
+    def forward(self, x):
+        """
+        No special modification required for lightning, define as you normally would
+        :param x:
+        :return:
+        """
+        return self.model(x)
+
+    def training_step(self, batch, batch_idx):
+        """
+        Lightning calls this inside the training loop
+        :param batch:
+        :return:
+        """
+        # forward pass
+        x, y = batch['x'], batch['y']
+        y_pred = self.forward(x)
+
+        # calculate loss
+        loss_val = self.loss(y_pred, y)
+
+        tqdm_dict = {'train_loss': loss_val}
+        output = OrderedDict({
+            'loss': loss_val,
+            'progress_bar': tqdm_dict,
+            'log': tqdm_dict
+        })
+
+        # can also return just a scalar instead of a dict (return loss_val)
+        return output
+
+    def validation_step(self, batch, batch_idx):
+        """
+        Lightning calls this inside the validation loop
+        :param batch:
+        :return:
+        """
+        x, y = batch['x'], batch['y']
+        y_pred = self.forward(x)
+
+        # calculate loss
+        loss_val = self.loss(y_pred, y)
+
+        # acc
+        labels_hat = torch.argmax(y_pred, dim=1)
+        val_acc = torch.sum(y == labels_hat).item() / (len(y) * 1.0)
+        val_acc = torch.tensor(val_acc)
+
+        if self.on_gpu:
+            val_acc = val_acc.cuda(loss_val.device.index)
+
+        output = OrderedDict({
+            'val_loss': loss_val,
+            'val_acc': val_acc,
+        })
+
+        # can also return just a scalar instead of a dict (return loss_val)
+        return output
+
+    def validation_end(self, outputs):
+        """
+        Called at the end of validation to aggregate outputs
+        :param outputs: list of individual outputs of each validation step
+        :return:
+        """
+        # if returned a scalar from validation_step, outputs is a list of tensor scalars
+        # we return just the average in this case (if we want)
+        # return torch.stack(outputs).mean()
+
+        val_loss_mean = 0
+        val_acc_mean = 0
+        for output in outputs:
+            val_loss = output['val_loss']
+
+            # reduce manually when using dp
+            if self.trainer.use_dp or self.trainer.use_ddp2:
+                val_loss = torch.mean(val_loss)
+            val_loss_mean += val_loss
+
+            # reduce manually when using dp
+            val_acc = output['val_acc']
+            if self.trainer.use_dp or self.trainer.use_ddp2:
+                val_acc = torch.mean(val_acc)
+
+            val_acc_mean += val_acc
+
+        val_loss_mean /= len(outputs)
+        val_acc_mean /= len(outputs)
+        tqdm_dict = {'val_loss': val_loss_mean, 'val_acc': val_acc_mean}
+        result = {'progress_bar': tqdm_dict, 'log': tqdm_dict, 'val_loss': val_loss_mean}
+        return result
+
+    # ---------------------
+    # TRAINING SETUP
+    # ---------------------
+    def configure_optimizers(self):
+        """
+        return whatever optimizers we want here
+        :return: list of optimizers
+        """
+        return [self.optimizer]
+
+    @ptl.data_loader
+    def train_dataloader(self):
+        # logging.info('training data loader called')
+        return DataLoader(self.train_dataset, batch_size=WAVENET_BATCH_SIZE, shuffle=True,
+                          num_workers=NUM_WORKERS)
+
+    @ptl.data_loader
+    def val_dataloader(self):
+        # logging.info('val data loader called')
+        return DataLoader(self.eval_dataset, batch_size=WAVENET_BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
+
+    @ptl.data_loader
+    def test_dataloader(self):
+        # logging.info('test data loader called')
+        return DataLoader(self.test_dataset, batch_size=WAVENET_BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
+		</comment>
+		<comment id='3' author='Vichoko' date='2019-11-09T19:03:47Z'>
+		Ran the same code in CPU and finished after 6 epochs with exit code 0.
+&lt;denchmark-code&gt;Epoch 6:  99%|█████████▉| 142/143 [13:59&lt;00:04,  4.14s/batch, batch_nb=94, loss=0.654, train_loss=0.395, v_nb=1, val_acc=0.458, val_loss=0.754]
+Epoch 6: 100%|██████████| 143/143 [14:01&lt;00:00,  3.05s/batch, batch_nb=94, loss=0.654, train_loss=0.395, v_nb=1, val_acc=0.458, val_loss=0.778]
+Epoch 6: 100%|██████████| 143/143 [14:01&lt;00:00,  5.89s/batch, batch_nb=94, loss=0.654, train_loss=0.395, v_nb=1, val_acc=0.458, val_loss=0.778]
+
+Process finished with exit code 0
+
+&lt;/denchmark-code&gt;
+
+It doesn't look like an error.
+		</comment>
+		<comment id='4' author='Vichoko' date='2019-11-16T00:38:25Z'>
+		Hello, I'm on a Windows 10 PC. In a previous version of lightning, I got no errors and it ran until it reached max epochs. Now, I reinstalled everything, including Conda, and with the same script, it terminates at random epochs as well with exit code 0. I don't think it's an early stopping thing, as my validation loss on a recent attempt kept decreasing continuously until it randomly stopped.
+My model is:
+`
+class UNetLightning(pl.LightningModule):
+def (
+self,
+hparams,
+in_channels=3,
+padding=False,
+batch_norm=False,
+up_mode='upconv',
+batch_size=12,
+num_classes=9,
+patch_size=512,
+):
+"""
+Implementation of
+U-Net: Convolutional Networks for Biomedical Image Segmentation
+(Ronneberger et al., 2015)
+&lt;denchmark-link:https://arxiv.org/abs/1505.04597&gt;https://arxiv.org/abs/1505.04597&lt;/denchmark-link&gt;
+
+Using the default arguments will yield the exact version used
+in the original paper
+Args:
+in_channels (int): number of input channels
+n_classes (int): number of output channels
+depth (int): depth of the network
+wf (int): number of filters in the first layer is 2**wf
+padding (bool): if True, apply padding such that the input shape
+is the same as the output.
+This may introduce artifacts
+batch_norm (bool): Use BatchNorm after layers with an
+activation function
+up_mode (str): one of 'upconv' or 'upsample'.
+'upconv' will use transposed convolutions for
+learned upsampling.
+'upsample' will use bilinear upsampling.
+"""
+super(UNetLightning, self).()
+self.batch_size = batch_size
+self.num_classes = num_classes
+self.class_weights = torch.tensor(CLASS_WEIGHTS, device=DEVICE)
+self.ignore_index = -1
+self.learning_rate = hparams.learning_rate
+self.data_path = 'exported tiles/train'
+self.valid_path = 'exported tiles/valid'
+self.patch_size = patch_size
+self.hyperparameters = hparams
+&lt;denchmark-code&gt;    assert up_mode in ('upconv', 'upsample')
+    self.padding = padding
+    self.depth = hparams.depth
+    self._build_model(padding, hparams.wf, batch_norm, in_channels, hparams.depth, up_mode, num_classes)
+
+def _build_model(self, padding, wf, batch_norm, prev_channels, depth, up_mode, n_classes):
+    self.down_path = nn.ModuleList()
+    for i in range(depth):
+        self.down_path.append(
+            unet.UNetConvBlock(prev_channels, 2 ** (wf + i), padding, batch_norm)
+        )
+        prev_channels = 2 ** (wf + i)
+
+    self.up_path = nn.ModuleList()
+    for i in reversed(range(depth - 1)):
+        self.up_path.append(
+            unet.UNetUpBlock(prev_channels, 2 ** (wf + i), up_mode, padding, batch_norm)
+        )
+        prev_channels = 2 ** (wf + i)
+
+    self.last = nn.Conv2d(prev_channels, n_classes, kernel_size=1)
+
+
+def forward(self, x):
+    blocks = []
+    for i, down in enumerate(self.down_path):
+        x = down(x)
+        if i != len(self.down_path) - 1:
+            blocks.append(x)
+            x = F.max_pool2d(x, 2)
+
+    for i, up in enumerate(self.up_path):
+        x = up(x, blocks[-i - 1])
+
+    return self.last(x)
+
+def configure_optimizers(self):
+    """
+    Setup optimizer and potentially the learning rate scheduler.
+    learning_rate must be defined in the init function of the class.
+    :return: optimizer
+    """
+    return torch.optim.Adam(self.parameters(), lr=self.learning_rate)
+
+@pl.data_loader
+def train_dataloader(self):
+    """
+    Called during training loop. Loads the training data.
+    In init, must define data_path, num_classes, and batch_size.
+    :return: data loader
+    """
+    return load_segmentation_dataset(self.data_path, self.num_classes, train=True, batch_size=self.batch_size, patch_size=self.patch_size)
+
+@pl.data_loader
+def val_dataloader(self):
+    """
+    Called during validation step of loop. Loads the validation data.
+    In init, must define data_path, num_classes, and batch_size.
+    :return: data loader
+    """
+    return load_segmentation_dataset(self.valid_path, self.num_classes, train=False, batch_size=self.batch_size, patch_size=self.patch_size)
+
+def training_step(self, batch, batch_nb):
+    """
+    In this step you do the forward pass and calculate the loss for a batch.
+    Both class_weights and ignore_index must be defined in init function of the class.
+    :param batch: The output of the dataloader
+    :type batch: A tensor, tuple, or list
+    :param batch_nb: The batch number
+    :type batch_nb: int
+    :return: Dictionary or OrderedDict containing the following keys:
+        loss: tensor scalar (Required)
+        progress_bar: Dict for progress bar display. Must have only tensors (Optional)
+        log: Dict of metrics to add to logger. Must have only tensors (no images, etc.) (Optional)
+    """
+    if self.current_epoch == 0:
+        self.logger.experiment.tag(self.hyperparameters.dict_of_parameters)
+    x, y = batch
+    y_hat = self.forward(x)
+    loss = F.cross_entropy(y_hat, y, weight=self.class_weights, ignore_index=self.ignore_index)
+    tensorboard_logs = {'train_loss': loss}
+    if batch_nb == 0:  # Perform once at the begining of each epoch
+        predicted_image_grid = create_image_grid(x, y, y_hat)
+        self.logger.experiment.add_image('Training Images', np.swapaxes(predicted_image_grid, 0, 2), global_step=self.current_epoch)
+    return {'loss': loss,
+            'progress_bar': {'training_loss': loss},
+            'log': tensorboard_logs}
+
+def validation_step(self, batch, batch_nb):
+    # OPTIONAL
+    x, y = batch
+    y_hat = self.forward(x)
+    return {'val_loss': F.cross_entropy(y_hat, y, weight=self.class_weights, ignore_index=self.ignore_index)}
+
+def validation_end(self, outputs):
+    # OPTIONAL
+    avg_loss = torch.stack([x['val_loss'] for x in outputs]).mean()
+    tensorboard_logs = {'val_loss': avg_loss}
+    return {'avg_val_loss': avg_loss, 'log': tensorboard_logs}
+&lt;/denchmark-code&gt;
+
+`
+		</comment>
+		<comment id='5' author='Vichoko' date='2019-11-18T16:19:42Z'>
+		I also ran into this issue. According to the docs, the trainer has a default EarlyStopping defined. Setting this to None resolved the issue for me. However, I find it strange that early stopping takes effect even without defining validation_step/validation_end (in my case at least).
+		</comment>
+		<comment id='6' author='Vichoko' date='2019-11-19T19:30:44Z'>
+		Nice finding.
+The corresponding docs are &lt;denchmark-link:https://williamfalcon.github.io/pytorch-lightning/Trainer/Training%20Loop/#early-stopping&gt;here&lt;/denchmark-link&gt;
+.
+The default early stop is defined by:
+&lt;denchmark-code&gt;early_stop_callback = EarlyStopping(
+    monitor='val_loss',
+    min_delta=0.00,
+    patience=3,
+    verbose=False,
+    mode='min'
+)
+&lt;/denchmark-code&gt;
+
+It can be disabled with:
+&lt;denchmark-code&gt;trainer = Trainer(early_stop_callback=None)
+&lt;/denchmark-code&gt;
+
+		</comment>
+	</comments>
+</bug>

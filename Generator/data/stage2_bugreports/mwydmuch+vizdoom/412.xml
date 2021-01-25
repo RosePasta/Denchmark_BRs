@@ -1,0 +1,145 @@
+<bug id='412' author='mhe500' open_date='2019-10-20T15:31:16Z' closed_time='2019-11-03T14:40:42Z'>
+	<summary>Incorrect Results from get_last_reward() when Replaying LMP in Mode.PLAYER</summary>
+	<description>
+Issue: Playback of .lmp using Mode.PLAYER results in game.get_last_reward() sometimes combining rewards of two time steps.
+ViZDoom version 1.1.7
+Platform: Ubuntu 18.04, Python 3.7.3
+To reproduce:
+
+Record an episode of basic.cfg/basic.wad (as bundled with ViZDoom) doing nothing (timeout = 300 tics, living reward = -1.0). Every step should have a reward of exactly -1.0 and total return should be -300.0 (see .lmp attached, remove .txt extension, basic-stand-there-do-nothing-300-timeout.lmp.txt)
+Replay using script (attached, simple_replay.py.txt) based off of https://github.com/mwydmuch/ViZDoom/blob/master/examples/python/record_episodes.py. Replay with Mode.PLAYER results in return &lt; -300.0. Replay with Mode.SPECTATOR results in correct return of -300.0.
+
+This implies either a bug in the code, or that the documentation example which states that replay can be used in any mode should be updated to indicate Mode.SPECTATOR is required (and possibly a validation in the code that disallows replaying LMP files in Mode.PLAYER).
+Separately, the example also states that game.get_last_action() is not supported for replay, which it is now.
+Thank you!
+Example output when using Mode.PLAYER:
+&lt;denchmark-code&gt;REPLAY OF EPISODE
+************************
+
+State #1
+Game variables: 50.0
+Reward: -1.0
+=====================
+State #2
+Game variables: 50.0
+Reward: -2.0
+=====================
+State #3
+Game variables: 50.0
+Reward: -2.0
+=====================
+State #4
+Game variables: 50.0
+Reward: -2.0
+=====================
+...
+=====================
+State #299
+Game variables: 50.0
+Reward: -1.0
+=====================
+Episode finished.
+total reward: -355.0
+************************
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='mhe500' date='2019-10-21T08:37:20Z'>
+		Nice catch. Tested on Windows 10, Python 3.6.8 and ViZDoom 1.1.8pre and I am getting same results (does not work with PLAYER mode, but works with SPECTATOR mode). The sleep trick from &lt;denchmark-link:https://github.com/mwydmuch/ViZDoom/issues/354&gt;#354&lt;/denchmark-link&gt;
+ does not help here, although they might be related.
+		</comment>
+		<comment id='2' author='mhe500' date='2019-10-21T13:40:52Z'>
+		This feels like a race condition and I think my assertion that "it works in Mode.SPECTATOR" is not correct.
+If I insert a sleep in the loop and print state.tic in addition to state.number, in Mode.SPECTATOR the results become very far off. Tic increments by more than 1 on each iteration, the loop runs fewer than 300 times and the rewards are duplicated:
+Example output with Mode.SPECTATOR when adding sleep(0.1) into the loop and also printing the state.tic.
+&lt;denchmark-code&gt;...
+=====================
+State #80 state.tic=289
+Game variables: 50.0
+Reward: -5.0
+=====================
+State #81 state.tic=293
+Game variables: 50.0
+Reward: -4.0
+=====================
+State #82 state.tic=296
+Game variables: 50.0
+Reward: -5.0
+=====================
+State #83 state.tic=300
+Game variables: 50.0
+Reward: -4.0
+=====================
+State #84 state.tic=303
+Game variables: 50.0
+Reward: -5.0
+=====================
+State #85 state.tic=307
+Game variables: 50.0
+Reward: -4.0
+=====================
+Episode finished.
+total reward: -380.0
+************************
+&lt;/denchmark-code&gt;
+
+However, if I do the same in Mode.player, the result is still wrong but it's "less wrong" since I get about the correct number of iterations (300) and state.tic seems to increment by about 1 each time, though sometimes by +2 and sometimes by 0.
+Net, net, this feels like a race condition, but the effects are somewhat more limited in Mode.PLAYER. Though the living reward is effectively doubled. In terms of training this means that transitions from an expert trajectory replayed using this method actually look less appealing than those found randomly!
+		</comment>
+		<comment id='3' author='mhe500' date='2019-10-21T14:12:16Z'>
+		Thanks for pointing this out! I first found it weird SPECTATOR mode worked better since it was designed to be used by human players (and hence closer to asynchronous behavior than synchronized). I will fix the FAQ according to this discovery :)
+		</comment>
+		<comment id='4' author='mhe500' date='2019-10-21T15:59:50Z'>
+		Well to be clear: Mode.SPECTATOR works better only when the Python script's loop is able to run quickly enough -- put in a sleep and the result is worse than with Mode.PLAYER. In all cases I think there is a race condition and neither SPECTATOR nor PLAYER is producing the right result.
+I've experimented a bit and if I change ViZDoomGame.cpp as follows:
+&lt;denchmark-code&gt;diff --git a/src/lib/ViZDoomGame.cpp b/src/lib/ViZDoomGame.cpp
+index 54d1764..cae7529 100644
+--- a/src/lib/ViZDoomGame.cpp
++++ b/src/lib/ViZDoomGame.cpp
+@@ -215,7 +215,10 @@ namespace vizdoom {
+         this-&gt;summaryReward += reward;
+         this-&gt;lastReward = reward;
+ 
+-        this-&gt;lastMapTic = this-&gt;doomController-&gt;getMapTic();
++        if (this-&gt;doomController-&gt;isRunDoomAsync())
++            this-&gt;lastMapTic = this-&gt;doomController-&gt;getMapTic();
++        else
++            this-&gt;lastMapTic = this-&gt;doomController-&gt;getMapLastTic();
+ 
+         /* Update state */
+         if (!this-&gt;isEpisodeFinished()) {
+&lt;/denchmark-code&gt;
+
+My belief is that for synchronous cases, it seems more correct for the DoomGame to get the last map tic executed by the user of the DoomGame using the value that the DoomController holds, rather than using DoomController::getMapTic which queries shared memory that may have been updated by Doom running in a separate thread.
+In testing of cases of human game play (SPECTATOR), .lmp playback (PLAYER) and agent play (PLAYER) I get the results I expect. However, given I don't really know the internals of ViZDoom, I'm not really sure whether this is a reasonable fix or not, but for now I will try this as a workaround.
+		</comment>
+		<comment id='5' author='mhe500' date='2019-10-21T16:02:38Z'>
+		In the words of &lt;denchmark-link:https://github.com/mwydmuch&gt;@mwydmuch&lt;/denchmark-link&gt;
+ , the whole project is a hack on top of ZDoom so solutions tend not to be too pretty. If this solution works reliably for you, it would be quite dandy if you could make a PR out of it :)
+		</comment>
+		<comment id='6' author='mhe500' date='2019-10-21T16:06:17Z'>
+		Let me play with it a bit and if it works I will gladly submit a PR. Thanks!
+		</comment>
+		<comment id='7' author='mhe500' date='2019-10-21T17:44:08Z'>
+		One more update:
+I think the below is an additional problem.  The missing waitForDoomWork() causes the controller and VizDoom to become out of sync and subsequent TIC/UPDATE/TIC+UPDATE requests from the controller receive an acknowledgement that should have been paired with the prior message.
+The two changes I made seem to be working well for me but needs additional testing.
+diff --git a/src/lib/ViZDoomController.cpp b/src/lib/ViZDoomController.cpp
+index daf6bba..faafbc8 100644
+--- a/src/lib/ViZDoomController.cpp
++++ b/src/lib/ViZDoomController.cpp
+@@ -441,6 +441,7 @@ namespace vizdoom {
+             // Workaround for some problems
+             this-&gt;sendCommand(std::string("map ") + this-&gt;map);
+             this-&gt;MQDoom-&gt;send(MSG_CODE_TIC);
++            this-&gt;waitForDoomWork();
+ 
+             this-&gt;sendCommand(std::string("playdemo ") + prepareLmpFilePath(demoPath));
+		</comment>
+		<comment id='8' author='mhe500' date='2019-11-03T14:40:42Z'>
+		Fixed by &lt;denchmark-link:https://github.com/mwydmuch/ViZDoom/pull/415&gt;#415&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

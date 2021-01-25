@@ -1,0 +1,241 @@
+<bug id='5159' author='egonuel' open_date='2020-12-16T12:57:49Z' closed_time='2020-12-23T10:53:07Z'>
+	<summary>performance loss from 1.0.8 to 1.1.* when using 16 bit precision</summary>
+	<description>
+&lt;denchmark-h:h2&gt;🐛 Bug&lt;/denchmark-h&gt;
+
+After updating pytorch-lightning from 1.0.8 to 1.1.0/1.1.1 the use of 16 bit precision destroys the performances.
+In my actual code of object detection losses are by a factor of 4 larger at the beginning than compared to 32 bit or 16 bit with pl 1.08.
+They converge to a much higher value and the resulting model lost its detection capabilities completely.
+To replicate I tested the pl notebooks and the 06-cifar10-baseline.ipynb also shows this and the classification accuracy corresponds to guessing the class when switching from 32 to 16 bit.
+I integrated it into the BoringModel notebook and the problem is also happening in google colab.
+&lt;denchmark-h:h2&gt;Please reproduce using the BoringModel and post here&lt;/denchmark-h&gt;
+
+&lt;denchmark-link:https://colab.research.google.com/drive/1FqXG9Xw9gVZxnwiGnjsHpAtb-vUqFaob?usp=sharing&gt;https://colab.research.google.com/drive/1FqXG9Xw9gVZxnwiGnjsHpAtb-vUqFaob?usp=sharing&lt;/denchmark-link&gt;
+
+&lt;denchmark-h:h3&gt;To Reproduce&lt;/denchmark-h&gt;
+
+&lt;denchmark-h:h3&gt;Expected behavior&lt;/denchmark-h&gt;
+
+Same performance for 32 and 16 bit.
+&lt;denchmark-h:h3&gt;Environment&lt;/denchmark-h&gt;
+
+
+CUDA:
+
+GPU:
+
+Tesla P100-PCIE-16GB
+
+
+available:         True
+version:           10.1
+
+
+Packages:
+
+numpy:             1.18.5
+pyTorch_debug:     True
+pyTorch_version:   1.7.0+cu101
+pytorch-lightning: 1.1.1
+tqdm:              4.41.1
+
+
+System:
+
+OS:                Linux
+architecture:
+
+64bit
+
+
+
+processor:         x86_64
+python:            3.6.9
+version:           #1 SMP Thu Jul 23 08:00:38 PDT 2020
+
+
+
+&lt;denchmark-h:h3&gt;Additional context&lt;/denchmark-h&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='egonuel' date='2020-12-16T18:29:10Z'>
+		Can verify I see this issue, setting enable_pl_optimizer=False in the trainer seems to fix convergence, investigating now!
+you can use enable_pl_optimizer=False as a temporary hotfix in this case
+		</comment>
+		<comment id='2' author='egonuel' date='2020-12-16T19:26:56Z'>
+		Here is a script to reproduce the underlying issue, seems like behaviour is different when using the pl optimizer:
+import os
+import torch
+from torch.utils.data import Dataset
+from pytorch_lightning import Trainer, LightningModule, seed_everything
+
+
+class RandomDataset(Dataset):
+    def __init__(self, size, length):
+        self.len = length
+        self.data = torch.randn(length, size)
+
+    def __getitem__(self, index):
+        return self.data[index]
+
+    def __len__(self):
+        return self.len
+
+
+class BoringModel(LightningModule):
+
+    def __init__(self):
+        """
+        Testing PL Module
+
+        Use as follows:
+        - subclass
+        - modify the behavior for what you want
+
+        class TestModel(BaseTestModel):
+            def training_step(...):
+                # do your own thing
+
+        or:
+
+        model = BaseTestModel()
+        model.training_epoch_end = None
+
+        """
+        super().__init__()
+        self.layer = torch.nn.Linear(32, 2)
+
+    def forward(self, x):
+        return self.layer(x)
+
+    def loss(self, batch, prediction):
+        # An arbitrary loss to have a loss that updates the model weights during `Trainer.fit` calls
+        return torch.nn.functional.mse_loss(prediction, torch.ones_like(prediction))
+
+    def step(self, x):
+        x = self.layer(x)
+        out = torch.nn.functional.mse_loss(x, torch.ones_like(x))
+        return out
+
+    def training_step(self, batch, batch_idx):
+        output = self.layer(batch)
+        loss = self.loss(batch, output)
+        print(loss)
+        return {"loss": loss}
+
+    def training_step_end(self, training_step_outputs):
+        return training_step_outputs
+
+    def training_epoch_end(self, outputs) -&gt; None:
+        torch.stack([x["loss"] for x in outputs]).mean()
+
+    def validation_step(self, batch, batch_idx):
+        output = self.layer(batch)
+        loss = self.loss(batch, output)
+        return {"x": loss}
+
+    def validation_epoch_end(self, outputs) -&gt; None:
+        torch.stack([x['x'] for x in outputs]).mean()
+
+    def test_step(self, batch, batch_idx):
+        output = self.layer(batch)
+        loss = self.loss(batch, output)
+        return {"y": loss}
+
+    def test_epoch_end(self, outputs) -&gt; None:
+        torch.stack([x["y"] for x in outputs]).mean()
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.SGD(self.layer.parameters(), lr=0.1)
+        lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
+        return [optimizer], [lr_scheduler]
+
+
+#  NOTE: If you are using a cmd line to run your script,
+#  provide the cmd line as below.
+#  opt = "--max_epochs 1 --limit_train_batches 1".split(" ")
+#  parser = ArgumentParser()
+#  args = parser.parse_args(opt)
+
+def run_test():
+    seed_everything(42)
+
+    # fake data
+    train_data = torch.utils.data.DataLoader(RandomDataset(32, 64))
+    val_data = torch.utils.data.DataLoader(RandomDataset(32, 64))
+
+    # model
+    before = BoringModel()
+    trainer = Trainer(
+        default_root_dir=os.getcwd(),
+        max_epochs=1,
+        limit_train_batches=4,
+        limit_val_batches=0,
+        weights_summary=None,
+        gpus=1,
+        precision=16,
+    )
+    trainer.fit(before, train_data, val_data)
+
+    seed_everything(42)
+    # fake data
+    train_data = torch.utils.data.DataLoader(RandomDataset(32, 64))
+    val_data = torch.utils.data.DataLoader(RandomDataset(32, 64))
+
+    # model
+    after = BoringModel()
+    trainer = Trainer(
+        default_root_dir=os.getcwd(),
+        max_epochs=1,
+        limit_train_batches=4,
+        limit_val_batches=0,
+        weights_summary=None,
+        gpus=1,
+        precision=16,
+        enable_pl_optimizer=False
+    )
+    trainer.fit(after, train_data, val_data)
+
+    # Assert model parameters are identical after fit
+    for before, after in zip(before.parameters(), after.parameters()):
+        assert torch.equal(before, after), 'Model parameters are different'
+
+
+if __name__ == '__main__':
+    run_test()
+We should expect the same model trained on both (you can confirm if you disable pl optimizer)
+		</comment>
+		<comment id='3' author='egonuel' date='2020-12-16T20:54:56Z'>
+		I can confirm this issue with my network too. My model does not converge with fp16 and PL 1.1.* and using enable_pl_optimizer=False fixes the issue.
+		</comment>
+		<comment id='4' author='egonuel' date='2020-12-17T15:06:28Z'>
+		shall we add some vanilla AMP loop for parity testing?
+		</comment>
+		<comment id='5' author='egonuel' date='2020-12-17T15:08:42Z'>
+		Hey &lt;denchmark-link:https://github.com/mees&gt;@mees&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/egonuel&gt;@egonuel&lt;/denchmark-link&gt;
+,
+We found the bug, a fix should be merged soon !
+We apologise for the inconvenience.
+Best regards,
+T.C
+		</comment>
+		<comment id='6' author='egonuel' date='2020-12-17T15:39:41Z'>
+		thanks &lt;denchmark-link:https://github.com/tchaton&gt;@tchaton&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/SeanNaren&gt;@SeanNaren&lt;/denchmark-link&gt;
+! what was the bug?
+		</comment>
+		<comment id='7' author='egonuel' date='2020-12-17T17:21:52Z'>
+		Hey &lt;denchmark-link:https://github.com/mees&gt;@mees&lt;/denchmark-link&gt;
+,
+Sneaky bug :) The gradients were unscaled twice by the scaler. It uses an attribute on the optimizer to track if it needs to upscale. However, it was calling _unscale on LightningOptimizer, and then performing step on the unwrapped optimizer. As the attributes was unscaled was True on LightningOptimizer, but still False on unwrapped optimizer, it was unsealing a second time.
+Simple fix, unscaled on unwrapped optimizer.
+Best,
+T.C
+		</comment>
+		<comment id='8' author='egonuel' date='2020-12-19T23:53:50Z'>
+		Has this been resolved?
+		</comment>
+	</comments>
+</bug>
