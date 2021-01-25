@@ -23,15 +23,16 @@ access_tokens = [ "eb70e3bb56fb272e26cb94810a5c18a87a7beaab", "69c6b06d66e7af694
 token_id = 0
 g = Github(access_tokens[token_id])
 
+project_names = set()
 project_file_path = "./data/stage1_projects/"
 f = open(project_file_path+"1st_candidate_projects.csv", 'w', encoding='utf8')
 for framework in frameworks:    
     print(g.get_rate_limit(), framework, " loading..")
-    repositories = g.search_repositories(query='topic:'+framework, sort='stars',order ='desc')
-
+    repositories = g.search_repositories(query='topic:'+framework, sort='stars',order ='desc')    
     i = 0    
     for repo in repositories:        
-        # 1. Filtering the projects with at least 1,000 star each based on The Scent of Deep Learning Code: An Empirical Study, MSR'20
+        if str(repo.full_name).lower() in project_names:
+            continue
         num_stars = repo.stargazers_count
         num_forks = repo.forks_count
         if num_stars < 100:
@@ -58,14 +59,15 @@ for framework in frameworks:
         for bug_label in bug_labels:
             issues = repo.get_issues(state='closed', labels=[bug_label])
             num_closed_brs += issues.totalCount        
-        if num_closed_brs < 100:
+        if num_closed_brs < 1:
             continue
         
         print(framework, i, repo.full_name, languages, num_stars, num_forks, num_closed_brs)
         f = open(project_file_path+"1st_candidates.csv", 'a')
-        f.write(framework+","+str(i)+","+repo.full_name+","+str(num_stars)+","+str(num_forks)+","+str(num_closed_brs)+","+'|'.join(languages)+"\n")
+        f.write(repo.full_name+","+str(num_stars)+","+str(num_closed_brs)+"\n")
         f.close()
 
+        project_names.add(str(repo.full_name).lower())
         i +=1
     print(framework, i)
 
