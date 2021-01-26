@@ -12,7 +12,7 @@
 3. Project_description.tsv
    - Project description
 
-4. Statisticx.xlsx
+4. Dataset.xlsx
    - Detail statistics
    - Data schema for dataset in JsonSet
 
