@@ -1,0 +1,207 @@
+<bug id='12957' author='rkooo567' open_date='2020-12-17T23:03:39Z' closed_time='2020-12-18T10:33:29Z'>
+	<summary>[Object Spilling] multi node streaming shuffle check failure.</summary>
+	<description>
+&lt;denchmark-h:h3&gt;What is the problem?&lt;/denchmark-h&gt;
+
+I saw this failed the job.
+&lt;denchmark-code&gt;[2020-12-17 12:17:40,095 C 36944 1325020] object_directory.cc:51:  Check failed: !update.spilled_url().empty() 
+[2020-12-17 12:17:40,096 E 36944 1325020] logging.cc:414: *** Aborted at 1608236260 (unix time) try "date -d @1608236260" if you are using GNU date ***
+[2020-12-17 12:17:40,096 E 36944 1325020] logging.cc:414: PC: @                0x0 (unknown)
+[2020-12-17 12:17:40,097 E 36944 1325020] logging.cc:414: *** SIGABRT (@0x7fff6caaf33a) received by PID 36944 (TID 0x115647dc0) stack trace: ***
+[2020-12-17 12:17:40,098 E 36944 1325020] logging.cc:414:     @     0x7fff6cb605fd _sigtramp
+[2020-12-17 12:17:40,099 E 36944 1325020] logging.cc:414:     @        0x106051320 absl::lts_2019_08_08::time_internal::cctz::ZoneInfoSource
+[2020-12-17 12:17:40,099 E 36944 1325020] logging.cc:414:     @     0x7fff6ca36808 abort
+[2020-12-17 12:17:40,100 E 36944 1325020] logging.cc:414:     @        0x1058dd5a6 ray::SpdLogMessage::Flush()
+[2020-12-17 12:17:40,100 E 36944 1325020] logging.cc:414:     @        0x1058ae6e9 ray::RayLog::~RayLog()
+[2020-12-17 12:17:40,100 E 36944 1325020] logging.cc:414:     @        0x1054b0358 ray::(anonymous namespace)::UpdateObjectLocations()
+[2020-12-17 12:17:40,101 E 36944 1325020] logging.cc:414:     @        0x1054b2c2e std::__1::__function::__func&lt;&gt;::operator()()
+[2020-12-17 12:17:40,102 E 36944 1325020] logging.cc:414:     @        0x105574e5c _ZNSt3__110__function6__funcIZZN3ray3gcs30ServiceBasedObjectInfoAccessor25AsyncSubscribeToLocationsERKNS2_8ObjectIDERKNS_8functionIFvS7_RKNS_6vectorINS2_3rpc20ObjectLocationChangeENS_9allocatorISB_EEEEEEERKNS8_IFvNS2_6StatusEEEEENK4$_61clESP_EUlRKNS_12basic_stringIcNS_11char_traitsIcEENSC_IcEEEESX_E_NSC_ISY_EEFvSX_SX_EEclESX_SX_
+[2020-12-17 12:17:40,102 E 36944 1325020] logging.cc:414:     @        0x1055b7da2 std::__1::__function::__func&lt;&gt;::operator()()
+[2020-12-17 12:17:40,102 E 36944 1325020] logging.cc:414:     @        0x1055d2839 _ZN5boost4asio6detail12handler_workIZN3ray3gcs20RedisCallbackManager12CallbackItem8DispatchERNSt3__110shared_ptrINS4_13CallbackReplyEEEEUlvE_NS0_15system_executorESD_E8completeISC_EEvRT_RSC_
+[2020-12-17 12:17:40,103 E 36944 1325020] logging.cc:414:     @        0x1055d2710 _ZN5boost4asio6detail18completion_handlerIZN3ray3gcs20RedisCallbackManager12CallbackItem8DispatchERNSt3__110shared_ptrINS4_13CallbackReplyEEEEUlvE_E11do_completeEPvPNS1_19scheduler_operationERKNS_6system10error_codeEm
+[2020-12-17 12:17:40,103 E 36944 1325020] logging.cc:414:     @        0x105d639a9 boost::asio::detail::scheduler::do_run_one()
+[2020-12-17 12:17:40,104 E 36944 1325020] logging.cc:414:     @        0x105d57332 boost::asio::detail::scheduler::run()
+[2020-12-17 12:17:40,104 E 36944 1325020] logging.cc:414:     @        0x105d571cc boost::asio::io_context::run()
+[2020-12-17 12:17:40,105 E 36944 1325020] logging.cc:414:     @        0x1053bbfdb main
+[2020-12-17 12:17:40,105 E 36944 1325020] logging.cc:414:     @     0x7fff6c967cc9 start
+[2020-12-17 12:17:40,105 E 36944 1325020] logging.cc:414:     @               0x18 (unknown)
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h3&gt;Reproduction (REQUIRED)&lt;/denchmark-h&gt;
+
+Please provide a short code snippet (less than 50 lines if possible) that can be copy-pasted to reproduce the issue. The snippet should have no external library dependencies (i.e., use fake or mock data / environments):
+import time
+import typing
+import json
+import ray
+import numpy as np
+from typing import List
+import threading
+
+from ray.cluster_utils import Cluster
+
+c = Cluster()
+c.add_node(
+    num_cpus=4,
+    object_store_memory=300 * 1024 * 1024,
+    _system_config={
+        "automatic_object_spilling_enabled": True,
+        "max_io_workers": 4,
+        "object_spilling_config": json.dumps(
+            {"type": "filesystem", "params": {"directory_path": "/tmp/spill"}},
+            separators=(",", ":")
+        )
+    })
+for _ in range(3):
+    c.add_node(
+        num_cpus=4,
+        object_store_memory=500 * 1024 * 1024)
+    
+time.sleep(10)
+print("Start!")
+ray.init(address=c.address)
+
+streaming_shuffle = True
+partition_size = int(30e6)
+num_partitions = 100
+rows_per_partition = partition_size // (8 * 2)
+
+@ray.remote
+class Counter:
+    def __init__(self):
+        self.num_map = 0
+        self.num_reduce = 0
+
+    def inc(self):
+        self.num_map += 1
+        print("Num map tasks finished", self.num_map)
+
+    def inc2(self):
+        self.num_reduce += 1
+        print("Num reduce tasks finished", self.num_reduce)
+
+    def finish(self):
+        pass
+
+counter = Counter.remote()
+
+
+# object store peak memory: O(partition size)
+# heap memory: O(partition size)
+@ray.remote(num_returns=num_partitions)
+def shuffle_map(i) -&gt; List[np.ndarray]:
+    start = time.perf_counter()
+    outputs = [
+        np.ones((rows_per_partition // num_partitions, 2), dtype=np.int64)
+        for _ in range(num_partitions)
+    ]
+    import sys
+    counter.inc.remote()
+    print(f"map executed!!: {time.perf_counter() - start}")
+    return outputs
+
+
+# object store peak memory: O(partition size / num partitions)
+# heap memory: O(partition size / num partitions)
+@ray.remote(num_returns=num_partitions)
+def shuffle_map_streaming(i) -&gt; List["ObjectRef[np.ndarray]"]:
+    outputs = [
+        ray.put(np.ones((rows_per_partition // num_partitions, 2), dtype=np.int64))
+        for _ in range(num_partitions)
+    ]
+    counter.inc.remote()
+    return outputs
+
+
+# object store peak memory: O(partition size * 2)
+# heap memory: O(partition size)
+@ray.remote
+def shuffle_reduce(*inputs) -&gt; np.ndarray:
+    print("reduce start!")
+    start = time.perf_counter()
+    counter.inc2.remote()
+    result = np.concatenate(inputs)
+    print(f"reduce executed!!: {time.perf_counter() - start}")
+    return result
+
+
+working = True
+# object store peak memory: O(partition size / num partitions)
+# heap memory: O(partition size) -- TODO can be reduced too
+@ray.remote
+def shuffle_reduce_streaming(*inputs) -&gt; np.ndarray:
+    # Process in a background thread because otherwise ray.get will block the worker, which leads to unbound number of worker growth.
+    import threading
+    output = []
+    if not working:
+        # print(f"sang outside {ray.get_runtime_context().task_id}")
+        def process(inputs, output=None):
+            # print(f"sang inside {ray.get_runtime_context().task_id}")
+            out = None
+            for chunk in inputs:
+                print(ray.get_runtime_context().task_id)
+                print(chunk)
+                if out is None:
+                    out = ray.get(chunk)
+                else:
+                    temp_out = ray.get(chunk)
+                    print(f"Chunk ray.get called! {chunk}")
+                    time.sleep(1)
+                    out = np.concatenate([out, temp_out])
+            counter.inc2.remote()
+            output.append(out)
+        t = threading.Thread(target=process, args=(inputs,), kwargs={"output": output})
+        t.start()
+        t.join()
+    else:
+        out = None
+        for chunk in inputs:
+            if out is None:
+                out = ray.get(chunk, _release_resources=False)
+            else:
+                out = np.concatenate([out, ray.get(chunk, _release_resources=False)])
+        counter.inc2.remote()
+        output.append(out)
+    return output[0]
+
+
+if streaming_shuffle:
+    shuffle_map = shuffle_map_streaming
+    shuffle_reduce = shuffle_reduce_streaming
+
+start = time.time()
+shuffle_map_out = [shuffle_map.remote(i) for i in range(num_partitions)]
+for a in shuffle_map_out:
+    ray.get(a)
+# wait until all map is done before reduce phase.
+print("start map")
+shuffle_reduce_out = [
+    shuffle_reduce.remote(
+        *[shuffle_map_out[i][j] for i in range(num_partitions)])
+    for j in range(num_partitions)
+]
+print("start shuffle.")
+
+total_rows = 0
+ready, unready = ray.wait(shuffle_reduce_out)
+while unready:
+    ready, unready = ray.wait(unready)
+    for output in ready:
+        total_rows += ray.get(output).shape[0]
+delta = time.time() - start
+
+ray.get(counter.finish.remote())
+time.sleep(1)
+print("Shuffled", total_rows * 8 * 2, "bytes in", delta, "seconds")
+ray.shutdown()
+
+ I have verified my script runs in a clean environment and reproduces the issue.
+ I have verified the issue also occurs with the latest wheels.
+
+	</description>
+	<comments>
+		<comment id='1' author='rkooo567' date='2020-12-18T10:33:29Z'>
+		This should be solved by the open PR
+		</comment>
+	</comments>
+</bug>

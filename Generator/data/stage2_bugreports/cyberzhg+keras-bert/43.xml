@@ -1,0 +1,224 @@
+<bug id='43' author='yewang01' open_date='2019-04-09T02:41:09Z' closed_time='2019-04-16T05:28:38Z'>
+	<summary>Inconsistency definition of the training param of load_trained_model_from_checkpoint function</summary>
+	<description>
+Inconsistency definition of the training param of load_trained_model_from_checkpoint function
+I loaded the pre-trained BERT model from an official tf checkpoint, using load_trained_model_from_checkpoint with param training=False.
+I don't want to train the BERT model from scratch, i.e. by MLM or NSP, however, I do want my downstream data will somehow update params inside BERT model. As shown in the fig below, the bert is trainable as a keras model, however all weights inside the model are non-trainable weights.
+I'm confused is there anything wrong with my code or anything wrong with the training param?
+&lt;denchmark-link:https://user-images.githubusercontent.com/30275007/55769564-d9216100-5ab3-11e9-8b3d-0828620fd28f.png&gt;&lt;/denchmark-link&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='yewang01' date='2019-04-09T03:59:33Z'>
+		I try to separate training param into 'training' and 'training_bert' in loader.py and bert.py.
+now, everything seems good to me. But still not sure if I did the right thing. Can anyone give me any hints?
+&lt;denchmark-code&gt;def get_model(token_num,
+              pos_num=512,
+              seq_len=512,
+              embed_dim=768,
+              transformer_num=12,
+              head_num=12,
+              feed_forward_dim=3072,
+              dropout_rate=0.1,
+              attention_activation=None,
+              feed_forward_activation=gelu,
+              custom_layers=None,
+              training=True,  ### here what i change
+              training_bert=False,   ### here what i change
+              lr=1e-4):
+    """Get BERT model.
+
+    See: https://arxiv.org/pdf/1810.04805.pdf
+
+    :param token_num: Number of tokens.
+    :param pos_num: Maximum position.
+    :param seq_len: Maximum length of the input sequence or None.
+    :param embed_dim: Dimensions of embeddings.
+    :param transformer_num: Number of transformers.
+    :param head_num: Number of heads in multi-head attention in each transformer.
+    :param feed_forward_dim: Dimension of the feed forward layer in each transformer.
+    :param dropout_rate: Dropout rate.
+    :param attention_activation: Activation for attention layers.
+    :param feed_forward_activation: Activation for feed-forward layers.
+    :param custom_layers: A function that takes the embedding tensor and returns the tensor after feature extraction.
+                          Arguments such as `transformer_num` and `head_num` will be ignored if `custom_layer` is not
+                          `None`.
+    :param training: The built model will be returned if it is `True`, otherwise the input layers and the last feature
+                     extraction layer will be returned.
+    :param lr: Learning rate.
+    :return: The compiled model.
+    """
+    inputs = get_inputs(seq_len=seq_len)
+    embed_layer, embed_weights = get_embedding(
+        inputs,
+        token_num=token_num,
+        embed_dim=embed_dim,
+        pos_num=pos_num,
+        dropout_rate=dropout_rate,
+        trainable=training,
+    )
+    transformed = embed_layer
+    if custom_layers is not None:
+        kwargs = {}
+        if keras.utils.generic_utils.has_arg(custom_layers, 'trainable'):
+            kwargs['trainable'] = training
+        transformed = custom_layers(transformed, **kwargs)
+    else:
+        transformed = get_encoders(
+            encoder_num=transformer_num,
+            input_layer=transformed,
+            head_num=head_num,
+            hidden_dim=feed_forward_dim,
+            attention_activation=attention_activation,
+            feed_forward_activation=feed_forward_activation,
+            dropout_rate=dropout_rate,
+            trainable=training,
+        )
+    if not training_bert:  ### here what i change
+        return inputs[:2], transformed
+    mlm_dense_layer = keras.layers.Dense(
+        units=embed_dim,
+        activation=feed_forward_activation,
+        name='MLM-Dense',
+    )(transformed)
+    mlm_norm_layer = LayerNormalization(name='MLM-Norm')(mlm_dense_layer)
+    mlm_pred_layer = EmbeddingSimilarity(name='MLM-Sim')([mlm_norm_layer, embed_weights])
+    masked_layer = Masked(name='MLM')([mlm_pred_layer, inputs[-1]])
+    extract_layer = Extract(index=0, name='Extract')(transformed)
+    nsp_dense_layer = keras.layers.Dense(
+        units=embed_dim,
+        activation='tanh',
+        name='NSP-Dense',
+    )(extract_layer)
+    nsp_pred_layer = keras.layers.Dense(
+        units=2,
+        activation='softmax',
+        name='NSP',
+    )(nsp_dense_layer)
+    model = keras.models.Model(inputs=inputs, outputs=[masked_layer, nsp_pred_layer])
+    model.compile(
+        optimizer=keras.optimizers.Adam(lr=lr),
+        loss=keras.losses.sparse_categorical_crossentropy,
+    )
+    return model
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-code&gt;def load_trained_model_from_checkpoint(config_file,
+                                       checkpoint_file,
+                                       training=False,  ### here what i change
+                                       training_bert=False,  ### here what i change
+                                       seq_len=None):
+    """Load trained official model from checkpoint.
+
+    :param config_file: The path to the JSON configuration file.
+    :param checkpoint_file: The path to the checkpoint files, should end with '.ckpt'.
+    :param training: If training, the whole model will be returned.
+                     Otherwise, the MLM and NSP parts will be ignored.
+    :param seq_len: If it is not None and it is shorter than the value in the config file, the weights in
+                    position embeddings will be sliced to fit the new length.
+    :return:
+    """
+    with open(config_file, 'r') as reader:
+        config = json.loads(reader.read())
+    if seq_len is None:
+        seq_len = config['max_position_embeddings']
+    else:
+        seq_len = min(seq_len, config['max_position_embeddings'])
+    loader = checkpoint_loader(checkpoint_file)
+    model = get_model(
+        token_num=config['vocab_size'],
+        pos_num=seq_len,
+        seq_len=seq_len,
+        embed_dim=config['hidden_size'],
+        transformer_num=config['num_hidden_layers'],
+        head_num=config['num_attention_heads'],
+        feed_forward_dim=config['intermediate_size'],
+        training=training,
+    )
+    if not training_bert:  ### here what i change
+        inputs, outputs = model
+        model = keras.models.Model(inputs=inputs, outputs=outputs)
+        model.compile(
+            optimizer=keras.optimizers.Adam(),
+            loss=keras.losses.sparse_categorical_crossentropy,
+        )
+    model.get_layer(name='Embedding-Token').set_weights([
+        loader('bert/embeddings/word_embeddings'),
+    ])
+    model.get_layer(name='Embedding-Position').set_weights([
+        loader('bert/embeddings/position_embeddings')[:seq_len, :],
+    ])
+    model.get_layer(name='Embedding-Segment').set_weights([
+        loader('bert/embeddings/token_type_embeddings'),
+    ])
+    model.get_layer(name='Embedding-Norm').set_weights([
+        loader('bert/embeddings/LayerNorm/gamma'),
+        loader('bert/embeddings/LayerNorm/beta'),
+    ])
+    for i in range(config['num_hidden_layers']):
+        model.get_layer(name='Encoder-%d-MultiHeadSelfAttention' % (i + 1)).set_weights([
+            loader('bert/encoder/layer_%d/attention/self/query/kernel' % i),
+            loader('bert/encoder/layer_%d/attention/self/query/bias' % i),
+            loader('bert/encoder/layer_%d/attention/self/key/kernel' % i),
+            loader('bert/encoder/layer_%d/attention/self/key/bias' % i),
+            loader('bert/encoder/layer_%d/attention/self/value/kernel' % i),
+            loader('bert/encoder/layer_%d/attention/self/value/bias' % i),
+            loader('bert/encoder/layer_%d/attention/output/dense/kernel' % i),
+            loader('bert/encoder/layer_%d/attention/output/dense/bias' % i),
+        ])
+        model.get_layer(name='Encoder-%d-MultiHeadSelfAttention-Norm' % (i + 1)).set_weights([
+            loader('bert/encoder/layer_%d/attention/output/LayerNorm/gamma' % i),
+            loader('bert/encoder/layer_%d/attention/output/LayerNorm/beta' % i),
+        ])
+        model.get_layer(name='Encoder-%d-MultiHeadSelfAttention-Norm' % (i + 1)).set_weights([
+            loader('bert/encoder/layer_%d/attention/output/LayerNorm/gamma' % i),
+            loader('bert/encoder/layer_%d/attention/output/LayerNorm/beta' % i),
+        ])
+        model.get_layer(name='Encoder-%d-FeedForward' % (i + 1)).set_weights([
+            loader('bert/encoder/layer_%d/intermediate/dense/kernel' % i),
+            loader('bert/encoder/layer_%d/intermediate/dense/bias' % i),
+            loader('bert/encoder/layer_%d/output/dense/kernel' % i),
+            loader('bert/encoder/layer_%d/output/dense/bias' % i),
+        ])
+        model.get_layer(name='Encoder-%d-FeedForward-Norm' % (i + 1)).set_weights([
+            loader('bert/encoder/layer_%d/output/LayerNorm/gamma' % i),
+            loader('bert/encoder/layer_%d/output/LayerNorm/beta' % i),
+        ])
+    if training_bert:  ### here what i change
+        model.get_layer(name='MLM-Dense').set_weights([
+            loader('cls/predictions/transform/dense/kernel'),
+            loader('cls/predictions/transform/dense/bias'),
+        ])
+        model.get_layer(name='MLM-Norm').set_weights([
+            loader('cls/predictions/transform/LayerNorm/gamma'),
+            loader('cls/predictions/transform/LayerNorm/beta'),
+        ])
+        model.get_layer(name='MLM-Sim').set_weights([
+            loader('cls/predictions/output_bias'),
+        ])
+        model.get_layer(name='NSP-Dense').set_weights([
+            loader('bert/pooler/dense/kernel'),
+            loader('bert/pooler/dense/bias'),
+        ])
+        model.get_layer(name='NSP').set_weights([
+            np.transpose(loader('cls/seq_relationship/output_weights')),
+            loader('cls/seq_relationship/output_bias'),
+        ])
+    return model
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='2' author='yewang01' date='2019-04-09T04:07:37Z'>
+		I've added an argument trainable:
+load_trained_model_from_checkpoint(
+    ...
+    ...
+    training=False,
+    trainable=True,
+)
+		</comment>
+		<comment id='3' author='yewang01' date='2019-04-14T04:40:10Z'>
+		This issue has been automatically marked as stale because it has not had recent activity. It will be closed if no further activity occurs. Thank you for your contributions.
+		</comment>
+	</comments>
+</bug>

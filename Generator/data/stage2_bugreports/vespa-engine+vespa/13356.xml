@@ -1,0 +1,445 @@
+<bug id='13356' author='riida' open_date='2020-05-25T07:04:28Z' closed_time='2020-07-06T15:11:06Z'>
+	<summary>DELETE request of document API may not be reflected when one of replica nodes is initializing</summary>
+	<description>
+Hi.
+We have a question about DELETE operation of document API.
+&lt;denchmark-h:h2&gt;Environment and Setting&lt;/denchmark-h&gt;
+
+
+Vespa version is 7.207.47
+
+vespaengine/vespa:7.207.47
+
+
+content redundancy is 2
+we check that .idealstate.merge_bucket.pending is 0 before stop content node(container)
+we set Maximum storage transition time is 20 minutes to avoid pending bucket in release
+document prune age was 2 weeks (default) in our setting
+
+&lt;denchmark-h:h2&gt;Problem&lt;/denchmark-h&gt;
+
+We found DELETE operation of document API would not be reflected.
+This seems to be happened only when one of replica nodes is initializing (vespa process is running but storage state is not up).
+Applying partial update (UPDATE document API and create: false) to the document that DELETE operation would be not be reflected, the update was reflected.
+This partial update was for the field indexing: attribute and attribute: fast-search.
+The time series was as follows.
+&lt;denchmark-code&gt;Container up (Storage Node State is Maintenance) -&gt; DELETE Request -&gt; Storage Node State is Up -&gt; UPDATE Request
+
+* these were in about 30 minutes
+&lt;/denchmark-code&gt;
+
+Document timestamp is the same as UPDATE Request time.
+We checked access log and found that both DELETE and UPDATE request returned 200 (StatusOK).
+&lt;denchmark-h:h2&gt;Question&lt;/denchmark-h&gt;
+
+We expect that the document will not be revival when partial update was applyed after DELETE request returns 200.
+Is there any solution for this problem ?
+Thanks.
+	</description>
+	<comments>
+		<comment id='1' author='riida' date='2020-05-25T08:10:04Z'>
+		
+Applying partial update (UPDATE document API and create: false) to the document that DELETE &gt;operation would be not be reflected, the update was reflected.
+
+Could you please try to clarify this sentence, preferably with the sequence of operations, e.g time a send delete for doc x, time b, send update for doc x with create:false. Etc.
+		</comment>
+		<comment id='2' author='riida' date='2020-05-25T09:37:22Z'>
+		Thank you for your quick reply.
+Our sequence of operations was as follows.
+
+[05/08/2020 20:27:06.326] DELETE request for /document/v1/namespace/doctype/docid/1.hoge
+[05/08/2020 20:46:19.723] UPDATE request for /document/v1/namespace/doctype/docid/1.hoge
+
+http method is PUT
+send data-binary is like a below, create field is not specify actually (we expect default is false)
+
+{"fields": {"field1": {"assign": {"a": 1} } } }
+
+
+
+DELETE and UPDATE operation were executed by feed client implemented by Golang.
+		</comment>
+		<comment id='3' author='riida' date='2020-05-25T09:52:10Z'>
+		So unless create:true was specified with the update the expected behaviour is a NOOP (but with 200 OK as updates against non-existing document will always succeed) and after those two operations a GET request for /document/v1/namespace/doctype/docid/1.hoge should return 404 (Not Found). What is the observed end state?
+		</comment>
+		<comment id='4' author='riida' date='2020-05-25T10:12:54Z'>
+		Thank you for the detailed report! I have a suspicion this is an edge case bug with how tombstones interact with updates when replicas are not in sync.
+Updates to documents that have out-of-sync replicas shall normally be handled in such a way that they are only applied to the newest document version. This is done by requesting the document from all divergent replica sets and comparing the returned timestamps. However, if the newest version of a document is a tombstone it looks like we today do not propagate sufficient meta-information about this back from the replicas. This means that the update will be erroneously applied against the newest non-tombstoned version and written back to the replicas with a higher timestamp. This effectively resurrects the document, violating operation ordering and consistency.
+Here's what I believe has happened in your case:
+
+Document is replicated on nodes A and B with timestamp X
+Node A is set into maintenance mode and taken down. Replica B remains
+A Delete is written to replica B with timestamp Y &gt; X
+Node A is taken back up, replicas have not yet been synced
+An update is received. Replicas are detected as inconsistent and write-repair logic is triggered.
+Document is requested from nodes A and B. A returns document at X, B returns nil since document is logically deleted. Tombstone presence not properly propagated.
+Update is performed against document that existed at timestamp X since tombstone at timestamp Y is not accounted for
+New document version written with timestamp Z &gt; Y to both replicas A and B, effectively hiding the timestamp at Y.
+
+This will only happen when replicas are inconsistent, as Vespa will propagate tombstones to all replicas as quickly as possible, removing older document versions.
+I'll create a system test for this edge case to verify this hypothesis. Assuming it holds, I'll start working on a fix ASAP.
+		</comment>
+		<comment id='5' author='riida' date='2020-05-25T11:25:11Z'>
+		Thank you for your detail description.
+
+after those two operations a GET request for /document/v1/namespace/doctype/docid/1.hoge should return 404 (Not Found). What is the observed end state?
+
+We found that operation GET request for /document/v1/namespace/doctype/docid/1.hoge return 200 (OK) after those two operations.
+And we inserted GET operation to check whether document is exists or not before UPDATE request but it did not work well.
+We could understand our situation more by your description.
+
+I'll create a system test for this edge case to verify this hypothesis. Assuming it holds, I'll start working on a fix ASAP.
+
+We expect that your working resolves our problem.
+		</comment>
+		<comment id='6' author='riida' date='2020-05-27T15:34:46Z'>
+		A fix has been committed in &lt;denchmark-link:https://github.com/vespa-engine/vespa/pull/13379&gt;#13379&lt;/denchmark-link&gt;
+ and will be part of a Vespa RPM release in the near future. Any version &gt;= 7.228.8 should contain the fix, assuming no regressions. It will pass through our internal testing and deployment pipelines and needs to reach high confidence for some time before it can be made public. This normally only takes a couple of days.
+I'll keep this issue open until a version containing the fix is publicly available.
+		</comment>
+		<comment id='7' author='riida' date='2020-05-29T14:47:43Z'>
+		&lt;denchmark-link:https://github.com/riida&gt;@riida&lt;/denchmark-link&gt;
+ Vespa 7.228.15 has just been released. Could confirm if it resolves the problems you have observed?
+		</comment>
+		<comment id='8' author='riida' date='2020-06-01T00:27:31Z'>
+		&lt;denchmark-link:https://github.com/vekterli&gt;@vekterli&lt;/denchmark-link&gt;
+
+Thank you for your working to fix quickly.
+We confirm whether new Vespa 7.228.15 resolves our observation.
+We will inform you the result after we finish confirmation.
+		</comment>
+		<comment id='9' author='riida' date='2020-06-02T07:58:12Z'>
+		&lt;denchmark-link:https://github.com/vekterli&gt;@vekterli&lt;/denchmark-link&gt;
+
+We have done verification with vespa-7.228.15 but the same problem has happened.
+Our system executed rolling update (updating node sequentialy), and we confirmed that the following event series has happened.
+
+Document is replicated on nodes A and B with timestamp X
+[14:14:13.836] Node A is set into maintenance mode and taken down. Replica B remains
+[14:16:31:923] DELETE operation against document M
+[14:18:15.833] Node A is taken up (maintenance -&gt; up)
+Waiting until pending bucket was zero
+[14:18:32.788] Node B is set into maintenance and taken down. Replica A remains
+[14:18:47.533] PUT operation (partial update) against document M
+[14:22:45.085] Node B is taken up (maintenance -&gt; up)
+Document M is not deleted
+
+We have two question related with above event series.
+
+Does pending bucket treat with DELETE operation(tombstone)?
+If the node with newer version is maintenance(down), does the update is considered with newer version?
+
+		</comment>
+		<comment id='10' author='riida' date='2020-06-02T08:54:35Z'>
+		&lt;denchmark-link:https://github.com/riida&gt;@riida&lt;/denchmark-link&gt;
+ thank you for another detailed report!
+
+Does pending bucket treat with DELETE operation(tombstone)?
+
+Yes, tombstones are explicitly exchanged between nodes as part of replica reconciliation (merge operations). When the "merges pending" metric is zero, tombstones shall be present on all replicas.
+
+If the node with newer version is maintenance(down), does the update is considered with newer version?
+
+In your case; yes. Since you waited for merges to complete, the newer (tombstone) version on node B should have been copied to node A. When executing the update operation, this is the version the update should have been applied against.
+What you're observing is certainly not the intended behavior. We have system tests for explicitly testing the behavior of &lt;denchmark-link:https://github.com/vespa-engine/system-test/blob/master/tests/vds/merging.rb&gt;Put&lt;/denchmark-link&gt;
+, &lt;denchmark-link:https://github.com/vespa-engine/system-test/blob/master/tests/search/inconsistent_replicas/updates_to_inconsistent_buckets.rb&gt;Update&lt;/denchmark-link&gt;
+ and &lt;denchmark-link:https://github.com/vespa-engine/system-test/blob/master/tests/vds/removewhilenodedown/visitremoveddocs.rb&gt;Remove&lt;/denchmark-link&gt;
+ operations in the presence of node failures. I'm not sure if we have tests for the exact case you mentioned. If not, I will add it and see if I can reproduce your results locally.
+		</comment>
+		<comment id='11' author='riida' date='2020-06-02T11:33:16Z'>
+		&lt;denchmark-link:https://github.com/vekterli&gt;@vekterli&lt;/denchmark-link&gt;
+
+Thank you for your answer to my questions.
+We understand that our case is not intended behavior.
+We will try to review whether the program waiting for pending bucket is zero works well.
+Currently, we check the vds.idealstate.merge_bucket.pending (.values.last) metric of all distributor status page (/state/v1/metrics).
+Is this procedure is no problem?
+		</comment>
+		<comment id='12' author='riida' date='2020-06-02T12:10:50Z'>
+		
+Currently, we check the vds.idealstate.merge_bucket.pending (.values.last) metric of all &gt;distributor status page (/state/v1/metrics).
+Is this procedure is no problem?
+
+Yes that should work fine.
+An alternative approach is to modify node states using what we refer to as "safe mode", which delegates all this work to the cluster controller component. The cluster controller already receives and aggregates metrics from all nodes. Setting a node into maintenance with safe mode enabled only allows the transition to happen if the system is considered in sync.
+If you're using vespa-set-node-state, using safe mode is as easy as adding --safe as a command line parameter:
+&lt;denchmark-code&gt;$ vespa-set-node-state --help
+(...)
+ -a --safe                : Only carries out state changes if deemed safe by the
+                            cluster controller. For maintenance mode, will also
+                            set the distributor with the same distribution key
+                            to down atomically as part of the same state change.
+                            For up mode, transition is only allowed if the
+                            content node reports itself as up. Only supported
+                            for type storage.
+(...)
+&lt;/denchmark-code&gt;
+
+If you're using the &lt;denchmark-link:https://docs.vespa.ai/documentation/content/api-state-rest-api.html&gt;cluster controller state management REST API&lt;/denchmark-link&gt;
+ directly, you can add
+"condition": "safe"
+to the top-level request JSON object. This is not currently publicly documented, but it's what we use internally for our orchestrated upgrades/restarts.
+		</comment>
+		<comment id='13' author='riida' date='2020-06-02T13:57:41Z'>
+		I am currently not able to reproduce this locally using the test added in &lt;denchmark-link:https://github.com/vespa-engine/system-test/pull/765&gt;vespa-engine/system-test#765&lt;/denchmark-link&gt;
+
+Here's a summary of the events and results from the test. Note that I've added dumping of replica state using vespa-stat --document &lt;doc id&gt; --dump for debugging purposes.
+Initial state: nodes 0 and 1 are in state Up, redundancy is 2.
+Note: I'm intermixing parts of Ruby test code and console output here. Sorry for the mess.
+&lt;denchmark-h:h3&gt;1. Feed initial document&lt;/denchmark-h&gt;
+
+http_post('/document/v1/storage_test/music/number/1/foo', '{"fields":{"title":"first title","artist":"cool dude"}}'
+&lt;denchmark-code&gt;$ vespa-stat --document id:storage_test:music:n=1:foo --dump
+Bucket maps to the following actual files:
+	BucketInfo(BucketId(0x2000000000000001): [distributor:0] [node(idx=0,crc=0xa1d71e26,docs=1/1,bytes=185/185,trusted=true,active=true,ready=true), node(idx=1,crc=0xa1d71e26,docs=1/1,bytes=185/185,trusted=true,active=false,ready=true)])
+
+Details for BucketId(0x2000000000000001):
+	Bucket information from node 0:
+Persistence bucket BucketId(0x2000000000000001), partition 0
+  Timestamp: 1591097190000000, Doc(id:storage_test:music:n=1:foo), gid(0x01000000b575b0d0d8db50a2), size: 185
+
+
+	Bucket information from node 1:
+Persistence bucket BucketId(0x2000000000000001), partition 0
+  Timestamp: 1591097190000000, Doc(id:storage_test:music:n=1:foo), gid(0x01000000b575b0d0d8db50a2), size: 185
+&lt;/denchmark-code&gt;
+
+Document is persisted to both nodes as expected with timestamp 1591097190000000.
+&lt;denchmark-h:h3&gt;2. Take down node 1 and remove document with single replica present&lt;/denchmark-h&gt;
+
+(state REST API invoked to take node 1 down)
+http_delete('/document/v1/storage_test/music/number/1/foo')
+&lt;denchmark-code&gt;$ vespa-stat --document id:storage_test:music:n=1:foo --dump
+Bucket maps to the following actual files:
+	BucketInfo(BucketId(0x2000000000000001): [distributor:0] [node(idx=0,crc=0x0,docs=0/1,bytes=0/30,trusted=true,active=true,ready=true)])
+
+Details for BucketId(0x2000000000000001):
+	Bucket information from node 0:
+Persistence bucket BucketId(0x2000000000000001), partition 0
+  Timestamp: 1591097196000001, id:storage_test:music:n=1:foo, gid(0x01000000b575b0d0d8db50a2) (remove)
+&lt;/denchmark-code&gt;
+
+Here we see a single replica active on node 0, containing a remove entry (tombstone) for the document. This tombstone has timestamp 1591097196000001, which is greater than 1591097190000000.
+&lt;denchmark-h:h3&gt;3. Take node 1 back up and allow merges to complete&lt;/denchmark-h&gt;
+
+(state REST API invoked to take node 1 up)
+(wait for merge completion)
+&lt;denchmark-code&gt;$ vespa-stat --document id:storage_test:music:n=1:foo --dump
+Bucket maps to the following actual files:
+	BucketInfo(BucketId(0x2000000000000001): [distributor:0] [node(idx=0,crc=0x0,docs=0/1,bytes=0/30,trusted=true,active=true,ready=true), node(idx=1,crc=0x0,docs=0/1,bytes=0/30,trusted=true,active=false,ready=true)])
+
+Details for BucketId(0x2000000000000001):
+	Bucket information from node 0:
+Persistence bucket BucketId(0x2000000000000001), partition 0
+  Timestamp: 1591097196000001, id:storage_test:music:n=1:foo, gid(0x01000000b575b0d0d8db50a2) (remove)
+
+
+	Bucket information from node 1:
+Persistence bucket BucketId(0x2000000000000001), partition 0
+  Timestamp: 1591097196000001, id:storage_test:music:n=1:foo, gid(0x01000000b575b0d0d8db50a2) (remove)
+&lt;/denchmark-code&gt;
+
+Tombstone at timestamp 1591097196000001 has now been propagated to node 1, overwriting the old document version.
+&lt;denchmark-h:h3&gt;4. Take node 0 down and ensure update is a no-op&lt;/denchmark-h&gt;
+
+(state REST API invoked to take node 0 down)
+http_put('/document/v1/storage_test/music/number/1/foo?create=false', '{"fields":{"title":{"assign":"uh oh"}}}'
+&lt;denchmark-code&gt;$ vespa-stat --document id:storage_test:music:n=1:foo --dump
+Bucket maps to the following actual files:
+	BucketInfo(BucketId(0x2000000000000001): [distributor:0] [node(idx=1,crc=0x0,docs=0/1,bytes=0/30,trusted=true,active=true,ready=true)])
+
+Details for BucketId(0x2000000000000001):
+	Bucket information from node 1:
+Persistence bucket BucketId(0x2000000000000001), partition 0
+  Timestamp: 1591097196000001, id:storage_test:music:n=1:foo, gid(0x01000000b575b0d0d8db50a2) (remove)
+&lt;/denchmark-code&gt;
+
+The update operation has not been applied to the replica. This is the expected behavior.
+&lt;denchmark-link:https://github.com/riida&gt;@riida&lt;/denchmark-link&gt;
+ would it be possible for you to try running the  command to observe the state of the document replicas in a similar fashion? I'd be very interested to know what I'm missing. Also please let me know if this test does not sufficiently model your observations.
+		</comment>
+		<comment id='14' author='riida' date='2020-06-02T14:27:40Z'>
+		&lt;denchmark-link:https://github.com/vekterli&gt;@vekterli&lt;/denchmark-link&gt;
+
+Thank you for proposing another approach.
+We didn't set a node into maintenance mode explicitly because we extend Maximum storage transition time to 20 minutes.
+And we didn't know "safe mode".
+We will try to set a node state maintenance mode before node down by vespa-set-node-statel with --safe option.
+
+would it be possible for you to try running the vespa-stat command to observe the state of the document replicas in a similar fashion?
+I'd be very interested to know what I'm missing. Also please let me know if this test does not sufficiently model your observations.
+
+I think that your local test result suffciently reproduce our observation.
+So our observation was certainly not the intended behavior according to your local test result.
+Our observation occured in high traffic production environment.
+(Somtimes, deleted document is recreated by POST request which is truely creating request.)
+So we don't know that we can definitely share the result you want, but we try to capture the state of the document replicas!
+		</comment>
+		<comment id='15' author='riida' date='2020-06-05T10:49:41Z'>
+		&lt;denchmark-link:https://github.com/vekterli&gt;@vekterli&lt;/denchmark-link&gt;
+
+We checked the same procedure you showed in our test environment.
+As a result, the last partial update (step 4 in your test) has not been applied to the replica.
+So we suspect that our pending bucket waiting logic does not work well.
+We are testing vespa-set-node-state --safe, and we have one question about node state transition.
+It seems that cluster controller marked node down before maximum storage transition time exceeded when node state was changed into UP (User state).
+We set Maximum storage transition time to 20 minutes.
+Is this expected behavior?
+Cluster controller event logs is below.
+
+
+
+Date (UTC)
+Type
+Node
+Bucket space
+Event
+
+
+
+
+2020-06-05 10:21:37.361
+CURRENT
+storage.0
+-
+Altered node state in cluster state from 'U, t 1591352435, b 10' to 'U, b 10'
+
+
+2020-06-05 10:21:37.348
+CURRENT
+storage.0
+-
+Altered node state in cluster state from 'D, b 10: controlled shutdown' to 'U, t 1591352435, b 10'
+
+
+2020-06-05 10:21:37.347
+REPORTED
+storage.0
+-
+Now reporting state U, t 1591352435, b 10
+
+
+2020-06-05 10:21:36.043
+REPORTED
+storage.0
+-
+Node got back into slobrok with same address as before: tcp/dev-vespa-content00.test:19103
+
+
+2020-06-05 10:20:25.945
+CURRENT
+storage.0
+-
+Altered node state in cluster state from 'M, b 10' to 'D, b 10: controlled shutdown'
+
+
+2020-06-05 10:20:25.945
+CURRENT
+storage.0
+-
+Exceeded implicit maintenance mode grace period of 1200000 milliseconds. Marking node down.
+
+
+2020-06-05 10:20:25.943
+REPORTED
+storage.0
+-
+Wanted state Up, but we cannot force node into that state yet as it is currently in Down, start timestamp 1591282606, minimum used bits 10, disk states: disk 0: DiskState(u): controlled shutdown
+
+
+2020-06-05 10:19:51.912
+REPORTED
+storage.0
+-
+Failed to get node state: D, t 1591282606, b 10: controlled shutdown
+
+
+2020-06-05 10:19:51.912
+REPORTED
+storage.0
+-
+Failed to get node state: D, t 1591282606, b 10: controlled shutdown
+
+
+2020-06-05 10:19:51.912
+REPORTED
+storage.0
+-
+Node is no longer in slobrok. No pending state request to node.
+
+
+2020-06-05 10:19:51.811
+REPORTED
+storage.0
+-
+Now reporting state S, t 1591282606, b 10: controlled shutdown
+
+
+2020-06-05 10:19:42.206
+CURRENT
+storage.0
+-
+Altered node state in cluster state from 'U, b 10' to 'M, b 10'
+
+
+2020-06-05 10:19:42.203
+WANTED
+storage.0
+-
+Node state set to Maintenance.
+
+
+
+		</comment>
+		<comment id='16' author='riida' date='2020-06-05T12:01:51Z'>
+		From the timeline you've presented it looks like there might be an edge case where the configured limit is not respected when a node is marked as Up. I'll take a look.
+Note that using safe mode is recommended rather than relying on maximum storage transition time. Safe mode avoids nodes prematurely transitioning into Down state. Safe mode also explicitly commits a state change to the backing ZooKeeper cluster instead of being part of internal, transient cluster controller state. This means it will be stable in the case of a sudden cluster controller restart or leader reelection.
+Safe mode works both for setting nodes into maintenance and taking them back up. It has roughly the following semantics:
+Setting a node into Maintenance is only allowed if:
+
+No other nodes are already in maintenance mode
+The cluster replicas are in sync, i.e. no pending merges
+
+Setting a node into Up is only allowed if:
+
+The requested node has come online and is reporting itself as Up. This means that the node will remain in Maintenance mode until it can be directly transitioned to Up.
+
+With safe mode you don't have to rely on the max storage transition time config nor need to track merge metrics yourself. This makes the rolling upgrade more robust and usually much more simple to implement.
+For rolling upgrades, our internal orchestration systems do something like this (very simplified pseudo code--we also use the REST APIs internally instead of the client tools):
+&lt;denchmark-code&gt;for each node in cluster:
+  # Set node into Maintenance
+  while `vespa-set-node-state -i $node -t storage --safe maintenance 'Rolling upgrade'` fails:
+    sleep for a bit before retrying
+  perform required upgrades on node
+  # Take node back up
+  while `vespa-set-node-state -i $node -t storage --safe up` fails:
+    sleep for a bit before retrying
+&lt;/denchmark-code&gt;
+
+Please let me know if you have any questions!
+		</comment>
+		<comment id='17' author='riida' date='2020-06-09T10:08:05Z'>
+		&lt;denchmark-link:https://github.com/vekterli&gt;@vekterli&lt;/denchmark-link&gt;
+
+
+From the timeline you've presented it looks like there might be an edge case where the configured limit is not respected when a node is marked as Up. I'll take a look.
+
+We'd be glad to know the cause if possible.
+
+Note that using safe mode is recommended rather than relying on maximum storage transition time.
+...
+
+Thank you for your detailed description.
+It was very helpful, and we've learned the logic of node state transition more.
+We used safe mode when changing node state against both Maintenance and Up from your advise,
+and we have not found the problem including the deleted document revival.
+We will operate our system which uses safe mode state transition,
+and we will continue to observe that any problem does not occur.
+		</comment>
+		<comment id='18' author='riida' date='2020-07-06T15:11:06Z'>
+		I'm closing this issue since the root underlying problem related to gets/updates with tombstones shall have been fixed.
+&lt;denchmark-link:https://github.com/riida&gt;@riida&lt;/denchmark-link&gt;
+ thank you for your detailed reports and follow-ups! Please create an issue if you observe any other problems or strange system behaviors.
+		</comment>
+	</comments>
+</bug>

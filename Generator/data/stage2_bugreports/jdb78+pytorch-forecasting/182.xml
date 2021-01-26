@@ -1,0 +1,292 @@
+<bug id='182' author='JakeForsey' open_date='2020-11-30T19:41:34Z' closed_time='2020-12-01T18:01:03Z'>
+	<summary>Is there leakage?</summary>
+	<description>
+My model (DeepAR) is performing way better than I think it should.
+I've done some hunting and it appears that even in test mode  at this &lt;denchmark-link:https://github.com/jdb78/pytorch-forecasting/blob/2ed96c63a8970f6a2c31a3626832c8ec516c593a/pytorch_forecasting/models/deepar/__init__.py#L299&gt;point&lt;/denchmark-link&gt;
+ contains scaled target values.
+I tried following things further to &lt;denchmark-link:https://github.com/jdb78/pytorch-forecasting/blob/2ed96c63a8970f6a2c31a3626832c8ec516c593a/pytorch_forecasting/models/deepar/__init__.py#L248&gt;here&lt;/denchmark-link&gt;
+, and note that there is specific handling in place for when n_samples is not None (which is the case when using DeepAR.predict()), but I can't see where the scaled values masked / excluded.
+Am I just lost / paranoid or is there leakage somewhere?
+	</description>
+	<comments>
+		<comment id='1' author='JakeForsey' date='2020-11-30T21:43:33Z'>
+		There should be an easy way to find out. Can you sample one batch from the time series data set. Fix a seed and pass it directly through the forward function of the network. Now modify the target values of decoder_cont of the batch, set the same seed, and pass it again. Is the result different. If yes, we have a problem.
+		</comment>
+		<comment id='2' author='JakeForsey' date='2020-11-30T22:07:16Z'>
+		Thanks for the debugging idea!
+&lt;denchmark-code&gt;import numpy as np
+import pandas as pd
+import torch
+
+from pytorch_forecasting import TimeSeriesDataSet, DeepAR
+
+
+if __name__ == "__main__":
+    df = pd.DataFrame(dict(
+        time_idx=range(10), target=np.array([i for i in range(10)]) / 9.0
+    )).assign(id=1)
+    df.target = df.target
+
+    ds = TimeSeriesDataSet(
+        df,
+        time_idx="time_idx",
+        target="target
+tensor([[[0.6245],
+         [0.7737]]])
+Another forward pass to check the seeding works
+tensor([[[0.6245],
+         [0.7737]]])
+Another forward pass to check that updating decoder_target does not change output",
+        group_ids=["id"],
+        min_encoder_length=8,
+        max_encoder_length=8,
+        min_prediction_length=2,
+        max_prediction_length=2,
+        time_varying_unknown_reals=["target"],
+        predict_mode=True,
+        randomize_length=False,
+    )
+    dl = ds.to_dataloader(train=False)
+
+    model = DeepAR.from_dataset(ds, cell_type="GRU")
+    model.eval()
+
+    print("First forward pass")
+    torch.manual_seed(1)
+    x, y = next(iter(dl))
+    y_pred = model.forward(x, n_samples=1)
+    print(y_pred["prediction"])
+
+    print("Another forward pass to check the seeding works")
+    torch.manual_seed(1)
+    x, y = next(iter(dl))
+    y_pred = model.forward(x, n_samples=1)
+    print(y_pred["prediction"])
+
+    print("Another forward pass to check that updating decoder_target does not change output")
+    torch.manual_seed(1)
+    x, y = next(iter(dl))
+    x['decoder_target'] = torch.tensor([0., 0.])
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-code&gt;First forward pass
+tensor([[[0.6245],
+         [0.7737]]])
+
+Another forward pass to check the seeding works
+tensor([[[0.6245],
+         [0.7737]]])
+
+Another forward pass to check that updating decoder_target does not change output
+tensor([[[0.6245],
+         [0.7737]]])
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='3' author='JakeForsey' date='2020-11-30T22:26:01Z'>
+		I've managed to recreate the case that is causing me concern with fake data and some of my extra code removed.
+&lt;denchmark-code&gt;import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import torch
+
+from pytorch_forecasting import TimeSeriesDataSet, DeepAR, GroupNormalizer
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import EarlyStopping
+
+
+if __name__ == "__main__":
+    predict_steps = 4
+
+    target = np.array([0.25] * 20 + [0.75] * 25 + [0.3] * 41)
+    target[-2:] = 0.01
+
+    print(target.shape)
+
+    df = pd.DataFrame(dict(
+        time_idx=range(86), target=target
+    )).assign(id=1)
+
+    max_time_idx = df.time_idx.max()
+
+    train_cutoff = int(max_time_idx - (predict_steps * 2))
+    val_cutoff = int(max_time_idx - (predict_steps * 1))
+
+    train_df = df[df.time_idx &lt;= train_cutoff].copy()
+    val_df = df[df.time_idx &lt;= val_cutoff].copy()
+    test_df = df.copy()
+
+    min_encoder_length = int((train_cutoff - predict_steps) * 0.25)
+    max_encoder_length = train_cutoff - predict_steps
+    print(f"encoder length: {min_encoder_length} -&gt; {max_encoder_length}")
+
+    train = TimeSeriesDataSet(
+        train_df,
+        time_idx="time_idx",
+        target="target",
+        group_ids=["id"],
+        min_encoder_length=min_encoder_length,
+        max_encoder_length=max_encoder_length,
+        min_prediction_length=predict_steps,
+        max_prediction_length=predict_steps,
+        time_varying_unknown_reals=["target"],
+        target_normalizer=GroupNormalizer(groups=["id"], center=True, coerce_positive=False),
+        randomize_length=True,
+    )
+
+    val = TimeSeriesDataSet.from_dataset(
+        train, val_df,
+        predict=True,
+        stop_randomization=True,
+    )
+
+    test = TimeSeriesDataSet.from_dataset(
+        train, test_df,
+        predict=True,
+        stop_randomization=True
+    )
+
+    batch_size = 64
+    train_dataloader = train.to_dataloader(
+        train=True, batch_size=batch_size, num_workers=8
+    )
+    val_dataloader = val.to_dataloader(
+        train=False, batch_size=batch_size, num_workers=8
+    )
+
+    model = DeepAR.from_dataset(
+        train,
+        dropout=0.0,
+        cell_type="GRU",
+        hidden_size=30,
+        rnn_layers=2,
+        learning_rate=5e-3,
+        log_val_interval=1,
+        reduce_on_plateau_patience=10,
+        reduce_on_plateau_min_lr=1e-5,
+        weight_decay=0.001,
+        optimizer="adamw"
+    )
+    early_stop_callback = EarlyStopping(
+        monitor="val_loss",
+        min_delta=1e-3,
+        patience=30,
+        verbose=True,
+        mode="min"
+    )
+
+    trainer = pl.Trainer(
+        max_epochs=1500,
+        gpus=1,
+        callbacks=[early_stop_callback],
+    )
+    trainer.fit(
+        model,
+        train_dataloader=train_dataloader,
+        val_dataloaders=val_dataloader
+    )
+
+    model = DeepAR.load_from_checkpoint(
+        trainer.checkpoint_callback.best_model_path
+    )
+
+    y = torch.cat([y.unsqueeze(0) for x, y in iter(test)])
+
+    raw_preds, x = model.predict(test, mode="raw", return_x=True)
+    preds = model.predict(test)
+    model.plot_prediction(x, raw_preds, idx=0)
+    plt.savefig(f"test.png")
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-link:https://user-images.githubusercontent.com/15824258/100673196-f5de6c80-335a-11eb-8a08-1a01eb5a9078.png&gt;&lt;/denchmark-link&gt;
+
+I've gone over the datasets config and contents with debugger and can't see anything I've botched. Can't sleep easy until I get to the bottom of this!
+Edit: I appreciate the time-series data is not really suitable for forecasting, but its one outlying time-series of many.
+		</comment>
+		<comment id='4' author='JakeForsey' date='2020-11-30T22:29:42Z'>
+		Think you want to do x["decoder_cont"] = torch.zeros_like(x["decoder_cont"]) in the last step but the result is the same for me. There is one bug, however, which is unlikely to cause issues: the network seems to modify x["decoder_cont"]. We might need to make an explicit copy.
+		</comment>
+		<comment id='5' author='JakeForsey' date='2020-11-30T22:33:20Z'>
+		it does look a bit like leakage - agreed. But it must be some sophisticated form because there would be 100% convergence otherwise.
+		</comment>
+		<comment id='6' author='JakeForsey' date='2020-11-30T22:36:31Z'>
+		Using the GroupNormalizer instead of the EncoderNormalizer could cause maybe a slight issue (should normally not really be big)
+		</comment>
+		<comment id='7' author='JakeForsey' date='2020-11-30T23:07:00Z'>
+		
+Using the GroupNormalizer instead of the EncoderNormalizer could cause maybe a slight issue (should normally not really be big)
+
+I figured the norm values for the target_normalizer would only be fit on the initial dataset? I checked this  and indeed the norms are the same for the test and train target_normalizers:
+debugger in:
+&lt;denchmark-code&gt;test.target_normalizer.norm_ == train.target_normalizer.norm_
+&lt;/denchmark-code&gt;
+
+debugger out:
+&lt;denchmark-code&gt;center  scale [id               ] [0     True   True]
+&lt;/denchmark-code&gt;
+
+This dataset seems to break with EncoderNormalizer, loss goes through the roof
+		</comment>
+		<comment id='8' author='JakeForsey' date='2020-11-30T23:28:55Z'>
+		Makes sense if the normalization by the EncoderNormalizer is not stable. Could you check the distribution of predictions for the example above? I wonder if this is just a random one. Does it always happen?
+		</comment>
+		<comment id='9' author='JakeForsey' date='2020-11-30T23:53:55Z'>
+		
+Makes sense if the normalization by the EncoderNormalizer is not stable. Could you check the distribution of predictions for the example above? I wonder if this is just a random one. Does it always happen?
+
+That image was from the first example I ran. I will run a bunch more and attach in the morning. G'night, thanks for your time.
+		</comment>
+		<comment id='10' author='JakeForsey' date='2020-12-01T09:55:57Z'>
+		&lt;denchmark-link:https://user-images.githubusercontent.com/15824258/100724967-5ac9af00-33bb-11eb-8530-adf4c776485d.png&gt;&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://user-images.githubusercontent.com/15824258/100724968-5b624580-33bb-11eb-8648-84da0786d480.png&gt;&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://user-images.githubusercontent.com/15824258/100724970-5b624580-33bb-11eb-94a8-2f8c479047cc.png&gt;&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://user-images.githubusercontent.com/15824258/100724971-5bfadc00-33bb-11eb-98b2-3769efddf1d8.png&gt;&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='11' author='JakeForsey' date='2020-12-01T10:01:52Z'>
+		I've experimented with changing where the step change occurs in the held out data and the dip follows it precisely...
+&lt;denchmark-code&gt;   target = np.array([0.25] * 20 + [0.75] * 25 + [0.3] * 41)
+   target[-3:] = 0.01
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-link:https://user-images.githubusercontent.com/15824258/100725582-1e4a8300-33bc-11eb-8065-bfa593d748c2.png&gt;&lt;/denchmark-link&gt;
+
+&lt;denchmark-code&gt;    target = np.array([0.25] * 20 + [0.75] * 25 + [0.3] * 41)
+    target[-1:] = 0.01
+
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-link:https://user-images.githubusercontent.com/15824258/100725587-21457380-33bc-11eb-9463-feae91a403f4.png&gt;&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='12' author='JakeForsey' date='2020-12-01T11:44:41Z'>
+		Hm. Can you trace it the change through the code to find out where the leakage happens?
+		</comment>
+		<comment id='13' author='JakeForsey' date='2020-12-01T12:35:18Z'>
+		Its pretty hardcore! The scaled target is being fed straight in (see screenshot) :D
+Seems like the test that modified the decoder_cont is not adequate somehow (even with decoder_target switched to decoder_cont).
+&lt;denchmark-link:https://user-images.githubusercontent.com/15824258/100740852-44c6e900-33d1-11eb-9a23-bd88a7b14f87.png&gt;&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='14' author='JakeForsey' date='2020-12-01T12:56:39Z'>
+		I think 1 possible bug is that the below block does not over ride the target variable, I think maybe because target_pos is incorrect?
+&lt;denchmark-code&gt;                x = input_vector[:, [idx]]
+                x[:, 0, target_pos] = input_target
+&lt;/denchmark-code&gt;
+
+Another thing that looks possible to me is that I think maybe there is an off by one error, the prediction starts first value of the held out data.
+AKA, I can't see anything here that prevents the first value going into the model (even if the target_pos was correct) as the input_target is not yet updated.
+&lt;denchmark-code&gt;            input_target = input_vector[:, 0, target_pos]
+            output = []
+            for idx in range(input_vector.size(1)):
+                x = input_vector[:, [idx]]
+                x[:, 0, target_pos] = input_target
+&lt;/denchmark-code&gt;
+
+1st part is resolved by the linked MR, second part is handled by construct_input_vector(... one_off_target) I think?
+		</comment>
+	</comments>
+</bug>

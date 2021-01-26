@@ -1,0 +1,665 @@
+<bug id='273' author='allenling' open_date='2019-12-13T11:32:49Z' closed_time='2020-11-17T10:31:36Z'>
+	<summary>bilinear IResizeLayer setting align_corners=False makes different result to torch interpolate</summary>
+	<description>
+&lt;denchmark-h:h2&gt;Description&lt;/denchmark-h&gt;
+
+the result from IResizeLayer(scale_factor=scale_factor, align_corners=False) is different from the  torch.nn.functional.interpolate(input_tensor, scale_factor=scale_factor, mode="bilinear", align_corners=False)
+but setting align_corners=True, we got the same result...
+&lt;denchmark-h:h2&gt;Environment&lt;/denchmark-h&gt;
+
+TensorRT Version: 6.0.1.5
+GPU Type: RTX2080
+Nvidia Driver Version: 440.33.01
+CUDA Version: 10.1
+CUDNN Version: 7.6
+Operating System + Version: Ubuntu16.04
+Python Version (if applicable): 3.5.2
+TensorFlow Version (if applicable):
+PyTorch Version (if applicable): 1.3
+Baremetal or Container (if container which image + tag):
+&lt;denchmark-h:h2&gt;Relevant Files&lt;/denchmark-h&gt;
+
+import tensorrt as trt
+import torch
+
+
+input_name = "data"
+
+output_name = "resize_output"
+
+
+
+def build_engine(input_tensor, scale_factor, align_corners):
+    print("build_engine, scale_factor %s align_corners %s" % (scale_factor, align_corners))
+#     net = TestNet(2, True)
+#     it = torch.randn(1, 2, 2).to("cuda:0")
+    logger = trt.Logger(trt.Logger.INFO)
+    builder = trt.Builder(logger)
+    network = builder.create_network()
+    
+    trt_tensor = network.add_input(name=input_name, shape=tuple(input_tensor.shape),
+                                   dtype=trt.float32,
+                                   )
+    trt_tensor.location = trt.TensorLocation.DEVICE
+
+    layer = network.add_resize(trt_tensor)
+    layer.resize_mode = trt.ResizeMode.LINEAR
+    layer.align_corners = align_corners
+#     layer.scales = [1, scale_factor, scale_factor]
+    layer.shape = (int(trt_tensor.shape[0]), int(trt_tensor.shape[1] * scale_factor), int(trt_tensor.shape[2] * scale_factor))
+
+    output_tensor = layer.get_output(0)
+    
+    output_tensor.name = output_name
+    output_tensor.location = trt.TensorLocation.DEVICE
+    output_tensor.dtype = trt.float32
+    
+    network.mark_output(output_tensor)
+
+    
+    print(network.num_layers)
+    tmp = network.get_layer(0)
+    print(tmp, tmp.type)
+
+    builder.max_workspace_size = 1&lt;&lt;30
+    builder.fp16_mode = False
+    builder.max_batch_size = 1
+    builder.strict_type_constraints = False
+
+    engine = builder.build_cuda_engine(network)
+    
+
+    trt_file = "test_bilinear2d.trt"
+    
+    with open(trt_file, "wb") as f:
+        f.write(engine.serialize())
+
+    return trt_file, output_tensor.shape
+
+
+def compare(input_tensor, trt_file, output_shape, scale_factor, align_corners):
+    
+    print("compare, scale_factor %s align_corners %s" % (scale_factor, align_corners))
+
+    logger = trt.Logger(trt.Logger.INFO)
+    runtime = trt.Runtime(logger)
+    with open(trt_file,  "rb") as f:
+        engine = runtime.deserialize_cuda_engine(f.read())
+        context = engine.create_execution_context()
+    
+    output_tensor = torch.zeros(size=tuple(output_shape), dtype=torch.float32).to("cuda:0")
+
+    bindings = [input_tensor.data_ptr(), output_tensor.data_ptr()]
+
+    context.execute_async(1, bindings, torch.cuda.current_stream().cuda_stream)
+    torch.cuda.current_stream().synchronize()
+    
+
+    torch_res = torch.nn.functional.interpolate(input_tensor.unsqueeze(0), scale_factor=scale_factor, mode="bilinear", align_corners=align_corners)
+    
+    print("----------torch output")
+    print(torch_res)
+    print("==========trt output")
+    print(output_tensor)
+    return
+
+
+def main():
+    
+    scale_factor =  2
+    align_corners = False
+    
+    print("scale_factor:", scale_factor)
+    print("align_corners:", align_corners)
+
+    input_tensor = torch.tensor([[[-0.2651,  0.2095],
+                                  [ 0.7789, -1.2223]]], device='cuda:0')
+    
+    print(input_tensor.shape)
+
+    trt_file, output_shape = build_engine(input_tensor, scale_factor, align_corners)
+
+    print("&gt;&gt;&gt;&gt;&gt;", trt_file)
+    
+    compare(input_tensor, trt_file, output_shape, scale_factor, align_corners)
+
+    return
+    
+if __name__ == "__main__":
+    main()
+&lt;denchmark-h:h2&gt;Steps To Reproduce&lt;/denchmark-h&gt;
+
+build_engine build a network with only one layer, IReizeLayer
+compare would print the trt result and torch result
+got different result with align_corner=False
+&lt;denchmark-code&gt;scale_factor: 2
+align_corners: False
+torch.Size([1, 2, 2])
+build_engine, scale_factor 2 align_corners False
+1
+&lt;tensorrt.tensorrt.ILayer object at 0x7fb423d4c848&gt; LayerType.RESIZE
+[TensorRT] WARNING: Tensor DataType is determined at build time for tensors not marked as input or output.
+[TensorRT] INFO: Detected 1 inputs and 1 output network tensors.
+&gt;&gt;&gt;&gt;&gt; test_bilinear2d.trt
+compare, scale_factor 2 align_corners False
+----------torch output
+tensor([[[[-0.2651, -0.1464,  0.0908,  0.2095],
+          [-0.0041, -0.0402, -0.1124, -0.1485],
+          [ 0.5179,  0.1723, -0.5188, -0.8644],
+          [ 0.7789,  0.2786, -0.7220, -1.2223]]]], device='cuda:0')
+==========trt output
+tensor([[[-0.2651, -0.0278,  0.2095,  0.2095],
+         [ 0.2569, -0.1248, -0.5064, -0.5064],
+         [ 0.7789, -0.2217, -1.2223, -1.2223],
+         [ 0.7789, -0.2217, -1.2223, -1.2223]]], device='cuda:0')
+&lt;/denchmark-code&gt;
+
+but setting align_corners=True, we got same result
+&lt;denchmark-code&gt;scale_factor: 2
+align_corners: True
+torch.Size([1, 2, 2])
+build_engine, scale_factor 2 align_corners True
+1
+[TensorRT] WARNING: Tensor DataType is determined at build time for tensors not marked as input or output.
+&lt;tensorrt.tensorrt.ILayer object at 0x7fc911ed2848&gt; LayerType.RESIZE
+[TensorRT] INFO: Detected 1 inputs and 1 output network tensors.
+&gt;&gt;&gt;&gt;&gt; test_bilinear2d.trt
+compare, scale_factor 2 align_corners True
+----------torch output
+tensor([[[[-0.2651, -0.1069,  0.0513,  0.2095],
+          [ 0.0829, -0.0340, -0.1509, -0.2678],
+          [ 0.4309,  0.0389, -0.3531, -0.7450],
+          [ 0.7789,  0.1118, -0.5552, -1.2223]]]], device='cuda:0')
+==========trt output
+tensor([[[-0.2651, -0.1069,  0.0513,  0.2095],
+         [ 0.0829, -0.0340, -0.1509, -0.2678],
+         [ 0.4309,  0.0389, -0.3531, -0.7450],
+         [ 0.7789,  0.1118, -0.5552, -1.2223]]], device='cuda:0')
+
+&lt;/denchmark-code&gt;
+
+and why we got tensorrt.tensorrt.ILayer, not tensorrt.tensorrt.IResizeLayer , by calling network.get_layer(0)
+	</description>
+	<comments>
+		<comment id='1' author='allenling' date='2019-12-14T08:17:25Z'>
+		and further more, the project &lt;denchmark-link:https://github.com/onnx/onnx-tensorrt&gt;onnx-tensorrt&lt;/denchmark-link&gt;
+ master branch do not support  param now
+
+
+resize op set align_corner=False hard-coding
+
+
+upsample op do not parse align_corner param
+
+
+		</comment>
+		<comment id='2' author='allenling' date='2019-12-14T08:51:49Z'>
+		about onnx-tensort, something seems wrong
+even we set align_corners=True manually, still got error result
+checkout master, make some modifies
+
+line 2145
+
+&lt;denchmark-code&gt;    if (mode == "linear")
+    {
+        // Linear resize support 1-D, 2-D and 3D resize
+        // =========&gt; remove ASSERT, onnx contains 4 dims.
+    	//ASSERT((nbDims &gt;= 1) &amp;&amp; (nbDims &lt;= 3), ErrorCode::kUNSUPPORTED_NODE);
+        resizeMode = nvinfer1::ResizeMode::kLINEAR;
+    }
+&lt;/denchmark-code&gt;
+
+
+line 2155, set align_corners=True manually
+
+&lt;denchmark-code&gt;    // =========&gt; setAlignCorners(true)
+    layer-&gt;setAlignCorners(true);
+    std::cout&lt;&lt;"set align_corner "&lt;&lt;layer-&gt;getAlignCorners()&lt;&lt;"\n";
+&lt;/denchmark-code&gt;
+
+and The result is the same as  setting align_corners=False....
+		</comment>
+		<comment id='3' author='allenling' date='2020-01-25T23:58:09Z'>
+		Hi &lt;denchmark-link:https://github.com/allenling&gt;@allenling&lt;/denchmark-link&gt;
+,
+Is this still an issue with TensorRT 7? How about TensorRT 7 + OSS ONNX Parser?
+		</comment>
+		<comment id='4' author='allenling' date='2020-02-16T07:59:15Z'>
+		&lt;denchmark-link:https://github.com/rmccorm4&gt;@rmccorm4&lt;/denchmark-link&gt;
+
+sorry for late late reply
+yes, still got error with TRT7(7.0.0.1)
+&lt;denchmark-code&gt;TRT version:  7.0.0.11
+Torch version:  1.2.0
+scale_factor: 2
+align_corners: False
+torch.Size([1, 2, 2])
+build_engine, scale_factor 2 align_corners False
+[TensorRT] WARNING: Tensor DataType is determined at build time for tensors not marked as input or output.
+1
+&lt;tensorrt.tensorrt.ILayer object at 0x7f6c57dbc420&gt; LayerType.RESIZE
+[TensorRT] INFO: Detected 1 inputs and 1 output network tensors.
+&gt;&gt;&gt;&gt;&gt; test_bilinear2d.trt
+compare, scale_factor 2 align_corners False
+[TensorRT] WARNING: Current optimization profile is: 0. Please ensure there are no enqueued operations pending in this context prior to switching profiles
+----------torch output
+tensor([[[[-0.2651, -0.1464,  0.0908,  0.2095],
+          [-0.0041, -0.0402, -0.1124, -0.1485],
+          [ 0.5179,  0.1723, -0.5188, -0.8644],
+          [ 0.7789,  0.2786, -0.7220, -1.2223]]]], device='cuda:0')
+==========trt output
+tensor([[[-0.2651, -0.0278,  0.2095,  0.2095],
+         [ 0.2569, -0.1248, -0.5064, -0.5064],
+         [ 0.7789, -0.2217, -1.2223, -1.2223],
+         [ 0.7789, -0.2217, -1.2223, -1.2223]]], device='cuda:0')
+&lt;/denchmark-code&gt;
+
+and if trt layer implement go wrong, what onnx can do?
+what onnx do is helping us to create trt layer
+and now we create layer directly, which onnx eventually go here, and it goes wrong, i do not think onnx can do anything
+&lt;denchmark-code&gt;# here, we create layer without onnx
+layer = network.add_resize(trt_tensor)
+layer.resize_mode = trt.ResizeMode.LINEAR
+layer.align_corners = align_corners
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-code&gt;   // onnx master code
+
+   // and eventually, onnx create layer and set align_corners, which what we exactly do above
+    layer = ctx-&gt;network()-&gt;addResize(input);
+
+    OnnxAttrs attrs(node, ctx);
+    auto alignCorners = attrs.get&lt;bool&gt;("align_corners", false);
+    auto mode = attrs.get&lt;nvinfer1::ResizeMode&gt;("mode");
+    layer-&gt;setAlignCorners(alignCorners);
+    layer-&gt;setResizeMode(mode);
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='5' author='allenling' date='2020-02-20T23:31:13Z'>
+		&lt;denchmark-link:https://github.com/allenling&gt;@allenling&lt;/denchmark-link&gt;
+ Hi
+I recommend you to use this: torch2trt &lt;denchmark-link:url&gt; https://github.com/NVIDIA-AI-IOT/torch2trt &lt;/denchmark-link&gt;
+
+It actually brings interpolate operation from ATen extension because of difference between TRT and Pytorch.
+You can check the operation here.
+&lt;denchmark-link:url&gt;https://github.com/NVIDIA-AI-IOT/torch2trt/blob/master/torch2trt/converters/interpolate/interpolate.cpp &lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='6' author='allenling' date='2020-02-20T23:38:04Z'>
+		&lt;denchmark-link:https://github.com/allenling&gt;@allenling&lt;/denchmark-link&gt;
+
+Well... actually if you use torch2trt I recommend you to change some codes.
+
+Define interpolate plugin with newer abstract class like ipluginv2dynamicext.
+If you plan to use model with TRTIS, I recommend you to remove namespace of interpolate plugin (torch2trt) since default custom module loading logic in TRTIS doesn't use any namespace.
+
+		</comment>
+		<comment id='7' author='allenling' date='2020-02-21T03:22:31Z'>
+		&lt;denchmark-link:https://github.com/cathy-kim&gt;@cathy-kim&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/dhkim0225&gt;@dhkim0225&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://github.com/rmccorm4&gt;@rmccorm4&lt;/denchmark-link&gt;
+
+yes, we use torch2trt for some use cases now
+first i asked about why interpolate implemented by plugin not IResizeLayer &lt;denchmark-link:https://github.com/NVIDIA-AI-IOT/torch2trt/issues/210&gt;here&lt;/denchmark-link&gt;
+
+and  they said
+
+One reason is that IResizeLayer was not introduced until TensorRT 6.0. torch2trt was originally targeting TensorRT 5.0.
+
+but we really wanna catch up latest TRT(we use TRT7 now)
+and second it is really hard to integrate libtorch(ATen) or torch2trt plugin into cpp project
+really hard(e.g C ABI problem), trust me...
+so, the difference between TRT and torch in interpolation is not a Bug, TRT implement interpolation in a different way compared to torch, am i right?
+		</comment>
+		<comment id='8' author='allenling' date='2020-03-09T04:01:41Z'>
+		&lt;denchmark-link:https://github.com/allenling&gt;@allenling&lt;/denchmark-link&gt;
+ Hi Allen. I really appreciate your investigation on the conversion of interpolate function in PyTorch. I am now trying to convert something like this " x = F.interpolate(x, size=size, mode='bilinear',align_corners=True)" from Pytorch to TensorRT but TensorRT gives me this error. Do you have any idea to avoid it?
+
+Assertion failed: (transformationMode == "asymmetric") &amp;&amp; "This version of TensorRT only supports asymmetric resize!"
+
+		</comment>
+		<comment id='9' author='allenling' date='2020-03-27T10:03:41Z'>
+		Hi, we have encountered the same problem.
+We used tensorrt python API to create resize layer, and setting the align_corners param doesn't make any change, the result is always the same as when setting align_corners=False in your example:
+&lt;denchmark-code&gt;[[-0.2651     -0.02779999  0.2095      0.2095    ]
+ [ 0.2569     -0.12475003 -0.5064     -0.5064    ]
+ [ 0.7789     -0.22170007 -1.2223     -1.2223    ]
+ [ 0.7789     -0.22170007 -1.2223     -1.2223    ]]
+&lt;/denchmark-code&gt;
+
+TensorRT Version: 7.0.0.11
+GPU Type: GTX1660
+Nvidia Driver Version: 440.33.01
+CUDA Version: 10.0
+CUDNN Version: 7.6
+Operating System + Version: Ubuntu16.04
+Python Version (if applicable): 3.6.10
+TensorFlow Version (if applicable):
+PyTorch Version (if applicable):
+Baremetal or Container (if container which image + tag):
+		</comment>
+		<comment id='10' author='allenling' date='2020-03-27T19:41:08Z'>
+		Hi all,
+I noticed a PR related to this recently here: &lt;denchmark-link:https://github.com/onnx/onnx-tensorrt/pull/418/files&gt;https://github.com/onnx/onnx-tensorrt/pull/418/files&lt;/denchmark-link&gt;
+
+Maybe someone could test/verify if that actually fixes your issues.
+		</comment>
+		<comment id='11' author='allenling' date='2020-03-30T06:21:09Z'>
+		&lt;denchmark-h:h3&gt;Hi @allenling, first I want to say that the result of your experiment is true.&lt;/denchmark-h&gt;
+
+
+Tensorrt and pytorch implement resize operator in a same way when resize mode=bilinear and align_corners=True
+Tensorrt and pytorch implement resize operator in a different way when resize mode=bilinear and align_corners=False
+
+&lt;denchmark-h:h3&gt;Second, the reason:&lt;/denchmark-h&gt;
+
+Here are two components, resize mode and coordinate transformation mode.
+resize mode -- like nearest, bilinear, ...
+coordinate transformation mode -- like asymmetric, align_corners, pytorch_half_pixel, ...
+Tensorrt's default coordinate transformation mode is asymmetric, as you set align_corners=False.
+On the contrary, pytorch use pytorch_half_pixel as you set align_corners=False.
+&lt;denchmark-h:h3&gt;Something may be helpful:&lt;/denchmark-h&gt;
+
+Introduction of coordinate_transformation_mode(&lt;denchmark-link:https://github.com/onnx/onnx/blob/master/docs/Operators.md#Resize&gt;copy from onnx)&lt;/denchmark-link&gt;
+
+coordinate_transformation_mode : string (default is half_pixel)
+This attribute describes how to transform the coordinate in the resized tensor to the coordinate in the original tensor.
+The coordinate of each dimension is transformed individually. Let's describe a case using axis x as an example. Denote x_resized as the coordinate of axis x in the resized tensor, x_original as the coordinate of axis x in the original tensor, length_original as the length of the original tensor in axis x, length_resized as the length of the resized tensor in axis x, roi_x = (start_x, end_x) of the axis x in input "roi", scale = length_resized / length_original,
+if coordinate_transformation_mode is "half_pixel",
+x_original = (x_resized + 0.5) / scale - 0.5,
+if coordinate_transformation_mode is "pytorch_half_pixel",
+x_original = length_resized &gt; 1 ? (x_resized + 0.5) / scale - 0.5 : 0,
+if coordinate_transformation_mode is "align_corners",
+x_original = x_resized * (length_original - 1) / (length_resized - 1),
+if coordinate_transformation_mode is "asymmetric",
+x_original = x_resized / scale,
+if coordinate_transformation_mode is "tf_half_pixel_for_nn",
+x_original = (x_resized + 0.5) / scale,
+if coordinate_transformation_mode is "tf_crop_and_resize",
+x_original = length_resized &gt; 1 ? start_x * (length_original - 1) + x_resized * (end_x - start_x) * (length_original - 1) / (length_resized - 1) : 0.5 * (start_x + end_x) * (length_original - 1).
+		</comment>
+		<comment id='12' author='allenling' date='2020-04-20T10:38:48Z'>
+		
+Hi all,
+I noticed a PR related to this recently here: https://github.com/onnx/onnx-tensorrt/pull/418/files
+Maybe someone could test/verify if that actually fixes your issues.
+
+I think I understood you well.
+However,
+
+cd $TRT_Source 
+mkdir -p build &amp; cd build
+make.. -DTRT_LIB_DIR=$TRT_RELEASE/lib -DTRT_BIN_DIR='pWD'/out
+-j$(nproc)
+
+If you execute the above code, it will not be make.
+By any chance, did you correct the builtin_op_importer.cpp, and did you have any errors?
+		</comment>
+		<comment id='13' author='allenling' date='2020-04-20T11:51:57Z'>
+		Sorry for my carelessness. I have made a mistake in ASSERT statement. I have fixed it. Please try angain. Thanks for your attentions.
+
+2020-04-20 18:39:03"Daehan Kim" &lt;notifications@github.com&gt;写道：
+
+Hi all,
+
+I noticed a PR related to this recently here: &lt;denchmark-link:https://github.com/onnx/onnx-tensorrt/pull/418/files&gt;https://github.com/onnx/onnx-tensorrt/pull/418/files&lt;/denchmark-link&gt;
+
+
+Maybe someone could test/verify if that actually fixes your issues.
+
+I think I understood you well.
+
+However,
+
+cd $TRT_Source
+mkdir -p build &amp; cd build
+make.. -DTRT_LIB_DIR=$TRT_RELEASE/lib -DTRT_BIN_DIR='pWD'/out
+-j$(nproc)
+
+If you execute the above code, it will not be made.
+By any chance, did you correct the builtin_op_importer.cpp, and did you have any errors?
+
+—
+You are receiving this because you commented.
+Reply to this email directly, view it on GitHub, or unsubscribe.
+		</comment>
+		<comment id='14' author='allenling' date='2020-04-20T13:13:27Z'>
+		
+Maybe someone could test/verify if that actually fixes your issues.
+
+I am still getting the error.
+&lt;denchmark-code&gt;[8] Assertion failed: transformationMode != "align_corners" &amp;&amp; "Align_corners should use size information not scale factors!"
+&lt;/denchmark-code&gt;
+
+I use The code below. Can you comment?
+&lt;denchmark-code&gt;import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class Resize(nn.Module):
+    def __init__(self):
+        super(Resize, self).__init__()
+    def forward(self, x):
+        return F.interpolate(x, size=(448,448), mode='bilinear', align_corners=True)
+
+def export_resize_onnx_model():
+    model = Resize()
+    model.eval()
+    x = torch.rand(1,3,224,224)
+    x.requires_grad = True
+    y = model(x)
+    torch.onnx.export(
+        model,
+        x,
+        'resize_align_corners.onnx',
+        export_params=True,
+        opset_version=11,
+        input_names = ['x'],
+        output_names = ['y'],
+    )
+
+
+export_resize_onnx_model()
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='15' author='allenling' date='2020-04-20T13:49:53Z'>
+		It's OK with me for the onnx model generated by your pytorch code.
+the onnx model is like below:
+
+pytorch version I used: 1.4.0
+&lt;denchmark-link:https://user-images.githubusercontent.com/32504696/79757870-38fd4980-834f-11ea-8181-51396c1a8ed9.png&gt;&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='16' author='allenling' date='2020-04-20T14:00:43Z'>
+		
+It's OK with me for the onnx model generated by your pytorch code.
+the onnx model is like below:
+The resize node should have 4 inputs and the fourth input contains the size information. Your error may be caused by the pytorch version, which generates resize node with scale information instead of size information.
+pytorch version I used: 1.4.0
+
+
+my_onnx.
+&lt;denchmark-link:https://user-images.githubusercontent.com/48986889/79763537-2be85680-835f-11ea-948d-457283af9010.png&gt;&lt;/denchmark-link&gt;
+
+i try this command : ./trtexec --onnx=resize_align_corners.onnx --explicitBatch --verbose=True --workspace=9000
+Hello.
+I respect you for your great research.
+I didn't even think.
+I'm sure, torch == 1.4.0,
+output.onnx is recognized as 1.3.0. Can you comment on this issue ?.
+&lt;denchmark-link:https://user-images.githubusercontent.com/48986889/79760431-01949a00-835b-11ea-879f-d05309751c90.png&gt;&lt;/denchmark-link&gt;
+
+&lt;denchmark-link:https://user-images.githubusercontent.com/48986889/79760233-bed2c200-835a-11ea-8d47-6a428d71284c.png&gt;&lt;/denchmark-link&gt;
+
+I'm really very sorry for leaving so many comments.
+If it's okay, if you're working in a container, can you share the container?
+(Docker image)
+		</comment>
+		<comment id='17' author='allenling' date='2020-04-20T18:49:36Z'>
+		
+I'm sure, torch == 1.4.0,
+output.onnx is recognized as 1.3.0
+
+This is a PyTorch bug, it's probably just cosmetic and safe to ignore: &lt;denchmark-link:https://github.com/pytorch/pytorch/issues/32561&gt;pytorch/pytorch#32561&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='18' author='allenling' date='2020-04-21T01:42:28Z'>
+		I have pushed a image to docker hub. You can do the following steps to convert your onnx model.
+1:  docker pull bohrhh/tensorrt:7.0
+2:  docker run -it --gpus all bohrhh/tensorrt:7.0 /bin/bash
+(my docker version: 19.03, previous version 18.03 need --runtime=nvidia instead of --gpus all)
+3:  cd /opt/onnx-tensorrt
+4:  mkdir build &amp;&amp; cd build
+5:  cmake -DCUDA_INCLUDE_DIRS=/usr/local/cuda/include/ ..
+6:  make -j$(nproc)
+7:  ./onnx2trt ../data/resize_align_corners.onnx -o resize_align_corners.trt
+		</comment>
+		<comment id='19' author='allenling' date='2020-04-21T08:10:08Z'>
+		I confirmed it. I really really sincerely thank you.
+I'm the first one who kindly informed me on github.
+Thank you so much.
+
+I confirmed that it works.
+
+I sincerely pray that you will have many achievements in your research in
+the future.
+
+2020년 4월 21일 (화) 오전 10:42, kmlee &lt;notifications@github.com&gt;님이 작성:
+&lt;denchmark-link:#&gt;…&lt;/denchmark-link&gt;
+
+
+ I have pushed a image to docker hub. You can do the following steps to
+ convert your onnx model.
+
+ 1: docker pull bohrhh/tensorrt:7.0
+ 2: docker run -it --gpus all bohrhh/tensorrt:7.0 /bin/bash
+ (my docker version: 19.03, previous version 18.03 need --runtime=nvidia
+ instead of --gpus all)
+ 3: cd /opt/onnx-tensorrt
+ 4: mkdir build &amp;&amp; cd build
+ 5: cmake -DCUDA_INCLUDE_DIRS=/usr/local/cuda/include/ ..
+ 6: make -j$(nproc)
+ 7: ./onnx2trt ../data/resize_align_corners.onnx -o resize_align_corners.trt
+
+ —
+ You are receiving this because you commented.
+ Reply to this email directly, view it on GitHub
+ &lt;#273 (comment)&gt;,
+ or unsubscribe
+ &lt;https://github.com/notifications/unsubscribe-auth/ALVXWCNEDGCMNPBKEWKK46TRNT2ZDANCNFSM4J2LXJDA&gt;
+ .
+
+
+
+		</comment>
+		<comment id='20' author='allenling' date='2020-04-21T08:13:22Z'>
+		If it is ok, can I get inference code for reference?
+
+I know it is wrong to ask from 1 to 10, but there is an emergency.
+
+Of course, even if you refuse, the words of thanks will not change.
+
+2020년 4월 21일 (화) 오후 5:09, DH K &lt;eogks1525@gmail.com&gt;님이 작성:
+&lt;denchmark-link:#&gt;…&lt;/denchmark-link&gt;
+
+
+ I confirmed it. I really really sincerely thank you.
+ I'm the first one who kindly informed me on github.
+ Thank you so much.
+
+ I confirmed that it works.
+
+ I sincerely pray that you will have many achievements in your research in
+ the future.
+
+ Can I follow you if you like?
+
+ 2020년 4월 21일 (화) 오전 10:42, kmlee ***@***.***&gt;님이 작성:
+
+&gt; I have pushed a image to docker hub. You can do the following steps to
+&gt; convert your onnx model.
+&gt;
+&gt; 1: docker pull bohrhh/tensorrt:7.0
+&gt; 2: docker run -it --gpus all bohrhh/tensorrt:7.0 /bin/bash
+&gt; (my docker version: 19.03, previous version 18.03 need --runtime=nvidia
+&gt; instead of --gpus all)
+&gt; 3: cd /opt/onnx-tensorrt
+&gt; 4: mkdir build &amp;&amp; cd build
+&gt; 5: cmake -DCUDA_INCLUDE_DIRS=/usr/local/cuda/include/ ..
+&gt; 6: make -j$(nproc)
+&gt; 7: ./onnx2trt ../data/resize_align_corners.onnx -o
+&gt; resize_align_corners.trt
+&gt;
+&gt; —
+&gt; You are receiving this because you commented.
+&gt; Reply to this email directly, view it on GitHub
+&gt; &lt;#273 (comment)&gt;,
+&gt; or unsubscribe
+&gt; &lt;https://github.com/notifications/unsubscribe-auth/ALVXWCNEDGCMNPBKEWKK46TRNT2ZDANCNFSM4J2LXJDA&gt;
+&gt; .
+&gt;
+
+
+
+		</comment>
+		<comment id='21' author='allenling' date='2020-04-22T02:26:25Z'>
+		Sorry for late response.
+I have python inference code which is modifed from onnx2trt python API and hope it is helpful to you.
+I have pushed a tensorrt image with python API. You can do the following steps to do inference.
+1: docker pull bohrhh/tensorrt:7.0-python3.6
+2: docker run -it --gpus all bohrhh/tensorrt:7.0-python3.6 /bin/bash
+3: cd /opt/onnx-tensorrt
+4: &lt;denchmark-link:https://github.com/NVIDIA/TensorRT/issues/273#issuecomment-616899833&gt;generate trt engine &lt;/denchmark-link&gt;
+
+5: python code
+&lt;denchmark-code&gt;import numpy as np
+from inference_python.backend import prepare
+model = prepare("build/resize_align_corners.trt")
+x = np.random.rand(1,3,224,224).astype('float32')
+y = model.run(x)
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='22' author='allenling' date='2020-04-22T06:35:29Z'>
+		Thanks so much for the reply.
+
+I'm sorry to bother you.
+
+
+Do you have any information you know about the warnings below? Can I ignore
+it? iffy.
+
+
+[TensorRT] WARNING: Current optimization profile is: 0. Please ensure there
+are no enqueued operations pending in this context prior to switching
+profiles
+
+Additionally, deeplabv3 was converted to measure the speed. However, the performance improvement is too small. Was it originally?
+
+2020년 4월 22일 (수) 오후 3:22, DH K &lt;eogks1525@gmail.com&gt;님이 작성:
+&lt;denchmark-link:#&gt;…&lt;/denchmark-link&gt;
+
+
+ Thanks so much for the reply.
+ I'm sorry to bother you.
+ I followed the whole process.
+ But,
+ ```
+ from inference_python.backend import prepare
+ ```
+ I encountered an import error. Is there a workaround?
+
+
+
+
+		</comment>
+		<comment id='23' author='allenling' date='2020-11-17T10:31:36Z'>
+		&lt;denchmark-link:https://github.com/koreadhkim&gt;@koreadhkim&lt;/denchmark-link&gt;
+ the warning is just an advisory to the user. The application must ensure all pending enqueue operations are completed (stream sync) before switching execution contexts.
+I'll close the issue due to lack of activity.
+		</comment>
+	</comments>
+</bug>

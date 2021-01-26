@@ -1,0 +1,134 @@
+<bug id='2594' author='baldwint' open_date='2020-07-22T00:03:43Z' closed_time='2020-07-31T07:37:18Z'>
+	<summary>RayContext fails when Spark configuration object returns None</summary>
+	<description>
+I am trying to use the RayContext in a hosted Spark environment (Databricks) using the SparkContext that is provided to me rather than instantiating one myself.
+The code ray_ctx = RayContext(sc=sc) fails with the error
+    223         # Ray Manager is only needed for Spark cluster mode to monitor ray processes.
+    224         else:
+--&gt; 225             self.num_ray_nodes = int(self.sc.getConf().get("spark.executor.instances"))
+    226             self.ray_node_cpu_cores = int(self.sc.getConf().get("spark.executor.cores"))
+    227             self.python_loc = os.environ['PYSPARK_PYTHON']
+
+TypeError: int() argument must be a string, a bytes-like object or a number, not 'NoneType'
+It seems the RayContext initializer is not handling the possibility that some spark contexts can return None for these configuration values.
+I am using analytics-zoo 0.8.1 from PyPI on the Databricks 6.6 ML runtime.
+	</description>
+	<comments>
+		<comment id='1' author='baldwint' date='2020-07-22T06:49:32Z'>
+		Hi &lt;denchmark-link:https://github.com/baldwint&gt;@baldwint&lt;/denchmark-link&gt;
+
+Thanks for pointing out this. I just noticed this issue recently.
+Are you running on a yarn cluster or other clusters on Databricks? Seems for a yarn cluster, "spark.executor.instances" should be there but for standalone clusters, such property is probably missing.
+		</comment>
+		<comment id='2' author='baldwint' date='2020-07-22T18:11:02Z'>
+		I created and launched a cluster using the Azure Databricks user interface, using the standard mode (not high concurrency), with fixed number of nodes (no autoscaling). I am not sure whether this product uses YARN internally or not. I assumed it did, but after searching the internet I now think it may be running Spark in the standalone mode.
+		</comment>
+		<comment id='3' author='baldwint' date='2020-07-23T06:00:20Z'>
+		
+I created and launched a cluster using the Azure Databricks user interface, using the standard mode (not high concurrency), with fixed number of nodes (no autoscaling). I am not sure whether this product uses YARN internally or not. I assumed it did, but after searching the internet I now think it may be running Spark in the standalone mode.
+
+Thanks so much for the information. Then can you check if spark.executor.cores and spark.cores.max are in the conf? Seens spark.executor.instances is only for yarn and for standalone clusters, we can calculate the number using floor(total cores/executor cores).
+		</comment>
+		<comment id='4' author='baldwint' date='2020-07-23T19:23:47Z'>
+		Unfortunately spark.executor.cores and spark.cores.max are also missing from the conf.
+It seems that in standalone mode Spark has poor support for determining these values from within Python. After reading &lt;denchmark-link:https://kb.databricks.com/clusters/calculate-number-of-cores.html&gt;this documentation page&lt;/denchmark-link&gt;
+ I was able to determine the correct number of executors using
+def get_num_executors(sc):
+    return len(sc._jsc.sc().statusTracker().getExecutorInfos()) - 1
+Where 1 is subtracted because we do not want to count the driver node. It's hard to believe that this is the intended way to do it, but I have found versions of this on various Stack Overflow answers.
+Executor cores is more difficult. The method described in the above article does not work because in my cluster the driver node is not the same type as the workers (it has a different number of cores). There is an environment variable, $SPARK_WORKER_CORES, with cores per executor, but this is not set on the driver node (only on workers). I had to do a UDF in order to see this value from the driver node:
+import os
+import pyspark.sql.functions as F
+
+def get_executor_cores(spark):
+    df = spark.createDataFrame([[i,] for i in range(100)], schema=["dummy"]).withColumn(
+        "swc", F.udf(lambda: os.popen("echo $SPARK_WORKER_CORES").read())()
+    )
+    return int(df.select(F.max("swc")).collect()[0][0])
+Both of these solutions are too hacky to be a part of any library code, in my opinion, but I have not found a better way.
+Once I know these two values, I am able to avoid the error by manually setting the configuration values that RayContext expects. On a cluster with 2 worker nodes and 4 cores per worker node:
+sc._conf.set('spark.executor.instances', '2')
+sc._conf.set('spark.executor.cores', '4')
+And then RayContext can pick these values up. However I would prefer to pass these directly to RayContext somehow, rather than modifying the spark config.
+		</comment>
+		<comment id='5' author='baldwint' date='2020-07-27T17:54:29Z'>
+		I think the broader issue here is support for non-YARN Spark clusters, which might not be an intended use case for the project at all (in which case no action is needed here and this issue can be closed).
+Even if that's true, I wanted to say a little bit more about the steps I took to get the RayContext working on a cluster in the standalone mode, in case others find this issue while trying to do the same. In my case (using Databricks runtime 6.6 ML and analytics-zoo 0.8.1), there are a total of five configuration options that I had to set:
+from zoo.ray import RayContext
+from zoo.common.nncontext import init_nncontext
+
+sc._conf.set('spark.executor.instances', str(NUMBER_OF_EXECUTORS))
+sc._conf.set('spark.executor.cores', str(CORES_PER_EXECUTOR))
+sc._conf.set('spark.cores.max', str(NUMBER_OF_EXECUTORS * CORES_PER_EXECUTOR))
+sc._conf.set('spark.shuffle.blockTransferService', 'nio')
+sc._conf.set('spark.scheduler.minRegisteredResourcesRatio', '1.0')
+
+init_nncontext()
+ray_ctx = RayContext(sc=sc)
+Where NUMBER_OF_EXECUTORS and CORES_PER_EXECUTOR are determined manually. This works, provided that the two JARs mentioned in the BIGDL_JARS environment variable are properly loaded (which I had to do manually using Databricks' UI).
+Finally, I had to monkey patch faulthandler.enable with a no-op to resolve an incompatibility with Databricks' ConsoleBuffer object that it uses for stdout/stderr streams, but this is a runtime-specific fix that is not related to Analytics Zoo.
+After all that, everything seems to work.
+		</comment>
+		<comment id='6' author='baldwint' date='2020-07-28T02:04:39Z'>
+		Hi &lt;denchmark-link:https://github.com/baldwint&gt;@baldwint&lt;/denchmark-link&gt;
+
+So sorry that I missed your reply last week. We are planning to support non-yarn clusters and thanks so much for your detailed information!
+Yeah, the jars and some configurations are required by the BigDL. For RayOnSpark, as you mentioned, I can modify our implementation so that users can directly pass the configurations if they wish in case the values are not detectable. I would raise a PR for this very soon. Thanks so much for your help and support!
+		</comment>
+		<comment id='7' author='baldwint' date='2020-07-28T02:07:50Z'>
+		&lt;denchmark-link:https://github.com/jason-dai&gt;@jason-dai&lt;/denchmark-link&gt;
+ For the other configuration handling, shall we add the experience shared by Thomas to FAQ or somewhere else?
+		</comment>
+		<comment id='8' author='baldwint' date='2020-07-28T12:17:11Z'>
+		
+@jason-dai For the other configuration handling, shall we add the experience shared by Thomas to FAQ or somewhere else?
+
+We should at least update &lt;denchmark-link:https://analytics-zoo.github.io/master/#ProgrammingGuide/AnalyticsZoo-on-Databricks/&gt;https://analytics-zoo.github.io/master/#ProgrammingGuide/AnalyticsZoo-on-Databricks/&lt;/denchmark-link&gt;
+
+Will these be fixed by init_spark_local?
+		</comment>
+		<comment id='9' author='baldwint' date='2020-07-29T01:55:49Z'>
+		
+
+@jason-dai For the other configuration handling, shall we add the experience shared by Thomas to FAQ or somewhere else?
+
+We should at least update https://analytics-zoo.github.io/master/#ProgrammingGuide/AnalyticsZoo-on-Databricks/
+Will these be fixed by init_spark_local?
+
+If the BigDL required configurations could not be obtained, I think there's the same problem with init_spark_on_local?
+		</comment>
+		<comment id='10' author='baldwint' date='2020-07-29T10:16:48Z'>
+		Hi &lt;denchmark-link:https://github.com/baldwint&gt;@baldwint&lt;/denchmark-link&gt;
+
+When you launch the cluster on Azure Databricks, isn't there a place for you to add a conf file to start Spark?
+		</comment>
+		<comment id='11' author='baldwint' date='2020-07-30T17:22:15Z'>
+		Yes, there is, and I had forgotten about this interface when I posted my messages above since I don't use it very often. Entering the config variables in the Databricks UI as described in your documentation page is the correct way to set them, rather than using sc._conf.set as I described above. I have since switched to doing that.
+I'm afraid I'm guilty of not having read your &lt;denchmark-link:https://analytics-zoo.github.io/master/#ProgrammingGuide/AnalyticsZoo-on-Databricks/&gt;documentation page&lt;/denchmark-link&gt;
+ before posting this issue (somehow didn't see it). Indeed, the five values I mentioned earlier are not sufficient for RayOnSpark, and the other values from the docs are needed to avoid other problems. In particular, setting the memory size configs has helped me avoid hitting physical memory limits. My complete configuration now reads
+&lt;denchmark-code&gt;spark.serializer org.apache.spark.serializer.JavaSerializer
+spark.shuffle.blockTransferService nio
+spark.databricks.delta.preview.enabled true
+spark.executor.cores 8
+spark.executor.memory 17g
+spark.speculation false
+spark.executor.instances 6
+spark.driver.memory 16g
+spark.scheduler.minRegisteredResourcesRatio 1.0
+spark.cores.max 48
+&lt;/denchmark-code&gt;
+
+which is the same as in the documentation, but with cores/instances/memory values set for a cluster of Standard_DS4_v2 nodes with 6 workers.
+I think your documentation page is in good shape, I just didn't understand that it was my responsibility to set these configuration values in the first place (my mistake, sorry). Seeing TypeError made me think it was a code issue.
+Thanks for your attentive support.
+		</comment>
+		<comment id='12' author='baldwint' date='2020-07-31T01:38:36Z'>
+		Hi &lt;denchmark-link:https://github.com/baldwint&gt;@baldwint&lt;/denchmark-link&gt;
+
+Thanks for your information!
+Actually only num executors and executor cores are required for RayOnSpark. Other configurations are required for starting Spark, Analytics Zoo or BigDL, you need them even you don't use RayOnSpark.
+I have proposed a PR to allow users specify num executors and executor cores for RayOnSpark in case the values can't be detected in SparkConf.
+Feel free to tell me if you encounter further problems!
+		</comment>
+	</comments>
+</bug>

@@ -10,7 +10,7 @@ frameworks = ['tensorflow','keras','cntk','caffe','caffe2','torch','pytorch','mx
 
 # https://machinelearningmastery.com/a-tour-of-machine-learning-algorithms/
 frameworks += ['deep-learning','deep-neural-network','deep-reinforcement-learning','deep-q-learing','convolution-neural-network','recurrent-neural-network','deep-belief-network','long-short-term-memory-networks','deep-boltzmann-machine']
-frameworks += ['dnn','drl','dql','cnn','rnn','dbn','lstm','dbm']
+# frameworks += ['dnn','drl','dql','cnn','rnn','dbn','lstm','dbm']
 
 
 # Based on https://madnight.github.io/githut/#/pull_requests/2020/3 
@@ -59,7 +59,7 @@ for framework in frameworks:
         for bug_label in bug_labels:
             issues = repo.get_issues(state='closed', labels=[bug_label])
             num_closed_brs += issues.totalCount        
-        if num_closed_brs < 1:
+        if num_closed_brs < 10:
             continue
         
         print(framework, i, repo.full_name, languages, num_stars, num_forks, num_closed_brs)

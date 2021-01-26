@@ -1,0 +1,157 @@
+<bug id='743' author='albanD' open_date='2020-06-04T20:10:06Z' closed_time='2020-06-11T19:51:28Z'>
+	<summary>Cmake build target for compat_libs does not look correct in some context</summary>
+	<description>
+Hi,
+I am having some issues with the CMake code here:
+
+
+oneDNN/src/CMakeLists.txt
+
+
+         Line 170
+      in
+      ad368f4
+
+
+
+
+
+
+ COMMAND ${CMAKE_COMMAND} -E create_symlink libdnnl${ext_and_ver} libmkldnn${ext_and_ver} 
+
+
+
+
+
+I found this issue while building &lt;denchmark-link:https://github.com/pytorch/pytorch/&gt;pytorch&lt;/denchmark-link&gt;
+:
+
+compat_libs is added to the ALL target and so is required for every build
+It depends on this libmkldnn${ext_and_ver} that is symlinked by hand inside the build/third_party/path_to_mkldnn/src/ folder.
+But this folder does NOT contain libdnnl as it is generated in build/lib.
+Every time we build, the symlink points to nothing, so cmake regenerates libdnnl from scratch (takes 20s+ on my machine), and then redo the symlink (that still points nowhere).
+Even though it is in the ALL target, compat_libs is never used and so this missing symlink is not an issue and the compilation finishes successfully.
+
+So I was wondering if the issue is with
+
+the way pytorch uses the library
+the symlinking that is outdated and should be updated
+compat_libs that should be removed altogether (I did that and pytorch builds fine and stop rebuilding the lib every time.
+
+Thanks for your help!
+	</description>
+	<comments>
+		<comment id='1' author='albanD' date='2020-06-04T20:20:00Z'>
+		Hi &lt;denchmark-link:https://github.com/albanD&gt;@albanD&lt;/denchmark-link&gt;
+,
+compat_libs present since the time we renamed the library from Intel MKL-DNN to DNNL, to preserve backwards compatibility with existing software by that time. What you described looks like an issue with oneDNN being a sub-project of another project.
+Thank you for the your report. I will try to reproduce and check what we can do about that. Will come back shortly.
+		</comment>
+		<comment id='2' author='albanD' date='2020-06-04T20:24:39Z'>
+		Thanks for the quick answer.
+Let me know if you need any help to reproduce or you need me to send a PR for a fix.
+Note that we statically link the library in case that changes anything.
+		</comment>
+		<comment id='3' author='albanD' date='2020-06-04T23:48:11Z'>
+		Hi &lt;denchmark-link:https://github.com/albanD&gt;@albanD&lt;/denchmark-link&gt;
+,
+Few findings...
+First of all, the reason libmkldnn.a points to nowhere is because PyTorch overwrite the place where libraries being generated using:
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
+This makes libdnnl.a (main oneDNN library) go to build/lib/libdnnl.a, while the symlink keeps living in build/third_party/ideep/mkl-dnn/src/libmkldnn.a and pointing to non-existing build/third_party/ideep/mkl-dnn/src/libdnnl.a.
+However, I cannot reproduce the behavior you describe. When re-run the build, cmake will regenerate libmkldnn.a (symlink), but not libdnnl.a (library). This should not be costly.
+Could you please help reproduce the issue? I simply did [1]. A standalone reproducer would be awesome too -- dealing with PyTorch building system is time consuming and non-trivial task :)
+$ python setup.py develop # [1]
+		</comment>
+		<comment id='4' author='albanD' date='2020-06-05T06:07:45Z'>
+		Hi &lt;denchmark-link:https://github.com/albanD&gt;@albanD&lt;/denchmark-link&gt;
+,
+Assuming you use the current PyTorch-target oneDNN version (which is v1.2), could you please validate the following fix?
+commit 268b8e003784604a0aa3b69ee42c319db48df09a (HEAD -&gt; emfomenk/rls-v1.2/cmake-compat)
+Author: Fomenko, Evarist M &lt;evarist.m.fomenko@intel.com&gt;
+Date:   Fri Jun 5 06:05:08 2020 +0000
+
+    build: mkldnn compat: symlink should follow the lib
+
+    this closes #743
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 491a457ff..7da4e429e 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -166,15 +166,19 @@ else()
+     endif()
+     foreach(ver "" ${vers})
+         set_ternary(ext_and_ver APPLE "${ver}${ext}" "${ext}${ver}")
+-        add_custom_command(OUTPUT libmkldnn${ext_and_ver}
++        get_property(lib_location TARGET ${LIB_NAME} PROPERTY LIBRARY_OUTPUT_DIRECTORY)
++        if(lib_location)
++            set(compat_link "${lib_location}/libmkldnn${ext_and_ver}")
++        else()
++            set(compat_link "${CMAKE_CURRENT_BINARY_DIR}/libmkldnn${ext_and_ver}")
++        endif()
++        add_custom_command(OUTPUT ${compat_link}
+             # to make the next command work fine
+-            COMMAND ${CMAKE_COMMAND} -E remove -f libmkldnn${ext_and_ver}
+-            COMMAND ${CMAKE_COMMAND} -E create_symlink libdnnl${ext_and_ver} libmkldnn${ext_and_ver}
++            COMMAND ${CMAKE_COMMAND} -E remove -f ${compat_link}
++            COMMAND ${CMAKE_COMMAND} -E create_symlink libdnnl${ext_and_ver} ${compat_link}
+             DEPENDS ${LIB_NAME})
+-        add_custom_target(compat_libs${ver} ALL
+-                DEPENDS libmkldnn${ext_and_ver})
+-        install(FILES ${CMAKE_CURRENT_BINARY_DIR}/libmkldnn${ext_and_ver}
+-            DESTINATION ${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR})
++        add_custom_target(compat_libs${ver} ALL DEPENDS ${compat_link})
++        install(FILES ${compat_link} DESTINATION ${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR})
+     endforeach()
+ endif()
+		</comment>
+		<comment id='5' author='albanD' date='2020-06-05T14:25:17Z'>
+		Hi,
+For the repro, what I am doing is:
+&lt;denchmark-code&gt;# build everything
+python setup.py develop
+
+# Rerunning it only reruns the python install so it is fine
+python setup.py develop
+
+# Change some cpp file
+vim torch/csrc/autograd/engine.cpp
+
+# Now it takes a log of time to build libmkldnn.a at the beginning  with a single core being used.
+python setup.py develop
+&lt;/denchmark-code&gt;
+
+And yes I confirm that with this patch, I don't see this behavior anymore!
+Were there changes in the latest version of oneDNN that would already fix this?
+		</comment>
+		<comment id='6' author='albanD' date='2020-06-05T15:41:35Z'>
+		Hi &lt;denchmark-link:https://github.com/albanD&gt;@albanD&lt;/denchmark-link&gt;
+,
+Thanks for the confirmation!
+No, this is just ad-hoc change that hasn't been landed yet :)
+The fix can go to the master branch, which is future v1.6.
+Also v1.5 is in &lt;denchmark-link:https://github.com/oneapi-src/oneDNN/releases/tag/v1.5-rc&gt;rc-state&lt;/denchmark-link&gt;
+ now, so we can try to get in.
+What is PyTorch plans wrt updating oneDNN version?
+Tagging &lt;denchmark-link:https://github.com/pinzhenx&gt;@pinzhenx&lt;/denchmark-link&gt;
+.
+		</comment>
+		<comment id='7' author='albanD' date='2020-06-05T16:11:09Z'>
+		
+No, this is just ad-hoc change that hasn't been landed yet :)
+
+Ok, I was worried that this was an issue of us running an old version. Good.
+We get it via ideep and pinzhenx you mentionned seem to have done the last update both on ideep and pytorch. So he will know better.
+Worst case, I'll do a temporary fix on pytorch until we update oneDNN.
+		</comment>
+		<comment id='8' author='albanD' date='2020-06-08T01:51:32Z'>
+		&lt;denchmark-link:https://github.com/albanD&gt;@albanD&lt;/denchmark-link&gt;
+ We will send upgrade PR to pytorch ASAP once we get the internal tests done
+		</comment>
+		<comment id='9' author='albanD' date='2020-06-08T14:50:17Z'>
+		Awesome, thanks!
+You can add me as a reviewer there.
+		</comment>
+	</comments>
+</bug>

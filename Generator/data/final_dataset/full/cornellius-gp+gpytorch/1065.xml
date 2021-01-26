@@ -1,0 +1,230 @@
+<bug_data>
+<bug id='1065' author='LemonPi' open_date='2020-03-01T22:15:35Z' closed_time='2020-04-07T17:08:47Z'>
+ 	<summary>[Bug] Lazy Tensor Internal Indexing Error for Large Variance Evaluation (MultitaskMultivariateNormal)</summary>
+ 	<description>
+ &lt;denchmark-h:h1&gt;🐛 Bug&lt;/denchmark-h&gt;
+ 
+ When calculating the variance of a MultitaskMultivariateNormal, evaluating self.lazy_covariance_matrix.diag() returns an indexing error when the number of query points is too large. When the number of data points is small (&lt;150), inside the MultitaskMultivariateNormal we have
+ &lt;denchmark-code&gt;self.lazy_covariance_matrix.lazy_tensors
+ Out[2]: 
+ (&lt;gpytorch.lazy.non_lazy_tensor.NonLazyTensor at 0x125d53350&gt;,
+  &lt;gpytorch.lazy.added_diag_lazy_tensor.AddedDiagLazyTensor at 0x12cd99050&gt;)
+ &lt;/denchmark-code&gt;
+ 
+ But when we increase the number of query points we get
+ &lt;denchmark-code&gt;self.lazy_covariance_matrix.lazy_tensors
+ Out[4]: 
+ (&lt;gpytorch.lazy.interpolated_lazy_tensor.InterpolatedLazyTensor at 0x131338410&gt;,
+  &lt;gpytorch.lazy.matmul_lazy_tensor.MatmulLazyTensor at 0x131338550&gt;,
+  &lt;gpytorch.lazy.block_diag_lazy_tensor.BlockDiagLazyTensor at 0x131338290&gt;,
+  &lt;gpytorch.lazy.diag_lazy_tensor.DiagLazyTensor at 0x131338610&gt;)
+ &lt;/denchmark-code&gt;
+ 
+ Having different implementation strategy depending on size is fine, but the strategy for large batches errors out when evaluating variance.
+ &lt;denchmark-h:h2&gt;To reproduce&lt;/denchmark-h&gt;
+ 
+ Pretty much the Batch Independent Multioutput GP &lt;denchmark-link:https://gpytorch.readthedocs.io/en/latest/examples/03_Multitask_Exact_GPs/Batch_Independent_Multioutput_GP.html&gt;tutorial&lt;/denchmark-link&gt;
+  but increase the  to 200 (no problems if you use 51 as in the tutorial)
+ ** Code snippet to reproduce **
+ import math
+ import torch
+ import gpytorch
+ from matplotlib import pyplot as plt
+ 
+ train_x = torch.linspace(0, 1, 100)
+ ntest = 200
+ 
+ train_y = torch.stack([
+     torch.sin(train_x * (2 * math.pi)) + torch.randn(train_x.shape[0]) * 0.2,
+     torch.cos(train_x * (2 * math.pi)) + torch.randn(train_x.shape[0]) * 0.8,
+ ], -1)
+ ny = train_y.shape[1]
+ 
+ 
+ class BatchIndependentMultitaskGPModel(gpytorch.models.ExactGP):
+     def __init__(self, train_x, train_y, likelihood):
+         super().__init__(train_x, train_y, likelihood)
+         self.mean_module = gpytorch.means.ConstantMean(batch_shape=torch.Size([ny]))
+         self.covar_module = gpytorch.kernels.ScaleKernel(
+             gpytorch.kernels.RBFKernel(batch_shape=torch.Size([ny])),
+             batch_shape=torch.Size([ny])
+         )
+ 
+     def forward(self, x):
+         mean_x = self.mean_module(x)
+         covar_x = self.covar_module(x)
+         return gpytorch.distributions.MultitaskMultivariateNormal.from_batch_mvn(
+             gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+         )
+ 
+ 
+ likelihood = gpytorch.likelihoods.MultitaskGaussianLikelihood(num_tasks=ny)
+ model = BatchIndependentMultitaskGPModel(train_x, train_y, likelihood)
+ 
+ training_iterations = 50
+ 
+ # Find optimal model hyperparameters
+ model.train()
+ likelihood.train()
+ 
+ # Use the adam optimizer
+ optimizer = torch.optim.Adam([
+     {'params': model.parameters()},  # Includes GaussianLikelihood parameters
+ ], lr=0.1)
+ 
+ # "Loss" for GPs - the marginal log likelihood
+ mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
+ 
+ for i in range(training_iterations):
+     optimizer.zero_grad()
+     output = model(train_x)
+     loss = -mll(output, train_y)
+     loss.backward()
+     print('Iter %d/%d - Loss: %.3f' % (i + 1, training_iterations, loss.item()))
+     optimizer.step()
+ # Set into eval mode
+ model.eval()
+ likelihood.eval()
+ 
+ # Initialize plots
+ f, axes = plt.subplots(1, ny, figsize=(8, 3))
+ 
+ # Make predictions
+ with torch.no_grad():
+     test_x = torch.linspace(0, 1, ntest)
+     xx = torch.stack([test_x, torch.linspace(0, 2, test_x.shape[0])], -1)
+     predictions = likelihood(model(test_x))
+     mean = predictions.mean
+     lower, upper = predictions.confidence_region()
+ 
+ # This contains predictions for both tasks, flattened out
+ # The first half of the predictions is for the first task
+ # The second half is for the second task
+ 
+ for i in range(train_y.shape[1]):
+     # Plot training data as black stars
+     axes[i].plot(train_x.detach().numpy(), train_y[:, i].detach().numpy(), 'k*')
+     # Predictive mean as blue line
+     axes[i].plot(test_x.numpy(), mean[:, i].numpy(), 'b')
+     # Shade in confidence
+     axes[i].fill_between(test_x.numpy(), lower[:, i].numpy(), upper[:, i].numpy(), alpha=0.5)
+     axes[i].set_ylim([-3, 3])
+ axes[-1].legend(['Observed Data', 'Mean', 'Confidence'])
+ axes[-1].set_title('Observed Values (Likelihood)')
+ plt.show()
+ ** Stack trace/error message **
+ &lt;denchmark-code&gt;Traceback (most recent call last):
+   File "/Library/Frameworks/Python.framework/Versions/3.7/lib/python3.7/site-packages/gpytorch/lazy/lazy_evaluated_kernel_tensor.py", line 88, in _getitem
+     x1 = x1[(*batch_indices, row_index, dim_index)]
+ IndexError: too many indices for tensor of dimension 2
+ 
+ During handling of the above exception, another exception occurred:
+ 
+ Traceback (most recent call last):
+   File "/Users/johnsonzhong/Research/meta_contact/simulation/temp.py", line 70, in &lt;module&gt;
+     lower, upper = predictions.confidence_region()
+   File "/Library/Frameworks/Python.framework/Versions/3.7/lib/python3.7/site-packages/gpytorch/distributions/multivariate_normal.py", line 80, in confidence_region
+     std2 = self.stddev.mul_(2)
+   File "/Library/Frameworks/Python.framework/Versions/3.7/lib/python3.7/site-packages/torch/distributions/distribution.py", line 111, in stddev
+     return self.variance.sqrt()
+   File "/Library/Frameworks/Python.framework/Versions/3.7/lib/python3.7/site-packages/gpytorch/distributions/multitask_multivariate_normal.py", line 219, in variance
+     var = super().variance
+   File "/Library/Frameworks/Python.framework/Versions/3.7/lib/python3.7/site-packages/gpytorch/distributions/multivariate_normal.py", line 189, in variance
+     diag = self.lazy_covariance_matrix.diag()
+   File "/Library/Frameworks/Python.framework/Versions/3.7/lib/python3.7/site-packages/gpytorch/lazy/sum_lazy_tensor.py", line 96, in diag
+     return sum(lazy_tensor.diag().contiguous() for lazy_tensor in self.lazy_tensors)
+   File "/Library/Frameworks/Python.framework/Versions/3.7/lib/python3.7/site-packages/gpytorch/lazy/sum_lazy_tensor.py", line 96, in &lt;genexpr&gt;
+     return sum(lazy_tensor.diag().contiguous() for lazy_tensor in self.lazy_tensors)
+   File "/Library/Frameworks/Python.framework/Versions/3.7/lib/python3.7/site-packages/gpytorch/lazy/interpolated_lazy_tensor.py", line 387, in diag
+     return super(InterpolatedLazyTensor, self).diag()
+   File "/Library/Frameworks/Python.framework/Versions/3.7/lib/python3.7/site-packages/gpytorch/lazy/lazy_tensor.py", line 839, in diag
+     return self[..., row_col_iter, row_col_iter]
+   File "/Library/Frameworks/Python.framework/Versions/3.7/lib/python3.7/site-packages/gpytorch/lazy/lazy_tensor.py", line 1716, in __getitem__
+     res = self._get_indices(row_index, col_index, *batch_indices)
+   File "/Library/Frameworks/Python.framework/Versions/3.7/lib/python3.7/site-packages/gpytorch/lazy/interpolated_lazy_tensor.py", line 110, in _get_indices
+     *[batch_index.view(*batch_index.shape, 1, 1) for batch_index in batch_indices],
+   File "/Library/Frameworks/Python.framework/Versions/3.7/lib/python3.7/site-packages/gpytorch/lazy/block_interleaved_lazy_tensor.py", line 58, in _get_indices
+     res = self.base_lazy_tensor._get_indices(row_index, col_index, *batch_indices, row_index_block)
+   File "/Library/Frameworks/Python.framework/Versions/3.7/lib/python3.7/site-packages/gpytorch/lazy/lazy_tensor.py", line 294, in _get_indices
+     base_lazy_tensor = self._getitem(_noop_index, _noop_index, *batch_indices)._expand_batch(final_shape)
+   File "/Library/Frameworks/Python.framework/Versions/3.7/lib/python3.7/site-packages/gpytorch/lazy/lazy_evaluated_kernel_tensor.py", line 97, in _getitem
+     f"Attempting to tensor index a non-batch matrix's batch dimensions. "
+ RuntimeError: Attempting to tensor index a non-batch matrix's batch dimensions. Got batch index {batch_indices} but my shape was {self.shape}
+ &lt;/denchmark-code&gt;
+ 
+ &lt;denchmark-h:h2&gt;Expected Behavior&lt;/denchmark-h&gt;
+ 
+ Calculating variance should work the same regardless of number of query points.
+ &lt;denchmark-h:h2&gt;System information&lt;/denchmark-h&gt;
+ 
+ 
+ 
+  gpytorch 1.01
+ 
+ 
+  pytorch 1.3.1
+ 
+ 
+  MacOS 10.15.3 
+ 
+ 
+ 	</description>
+ 	<comments>
+ 		<comment id='1' author='LemonPi' date='2020-03-01T23:31:06Z'>
+ 		&lt;denchmark-link:https://github.com/jacobrgardner&gt;@jacobrgardner&lt;/denchmark-link&gt;
+ , &lt;denchmark-link:https://github.com/gpleiss&gt;@gpleiss&lt;/denchmark-link&gt;
+  for 100 train points this happens exactly when switching eval points form 156 -&gt; 157. I.e. exactly when the full covariance matrix grows &gt; 256. Probably not a coincidence...
+ 		</comment>
+ 		<comment id='2' author='LemonPi' date='2020-03-02T00:32:25Z'>
+ 		Yup I suspect that it's switching implementation for larger matrices (suggested by the change in number of self.lazy_tensors), which is totally fine, but there's something wrong with the large matrix implementation
+ 		</comment>
+ 		<comment id='3' author='LemonPi' date='2020-03-03T21:06:23Z'>
+ 		This seems to be only an issue with the BatchIndependentMultitaskGPModel from the tutorial. The Multitask one (allow correlated outputs) works fine.
+ 		</comment>
+ 		<comment id='4' author='LemonPi' date='2020-03-04T00:19:27Z'>
+ 		:( My guess is this is probably related to &lt;denchmark-link:https://github.com/cornellius-gp/gpytorch/issues/1024&gt;#1024&lt;/denchmark-link&gt;
+  and &lt;denchmark-link:https://github.com/cornellius-gp/gpytorch/issues/1039&gt;#1039&lt;/denchmark-link&gt;
+  ... I'll work on this issue tomorrow.
+ 		</comment>
+ 	</comments>
+ </bug>
+<commit id='50eded402a7152b74c20fc86aa49e0afa31ffea9' author='Geoff Pleiss' date='2020-04-07 10:29:06-04:00'>
+ 	<dmm_unit complexity='0.10526315789473684' interfacing='0.10526315789473684' size='0.10526315789473684'></dmm_unit>
+ 	<modification change_type='MODIFY' old_name='gpytorch\lazy\block_lazy_tensor.py' new_name='gpytorch\lazy\block_lazy_tensor.py'>
+ 		<file_info nloc='109' complexity='35' token_count='822'></file_info>
+ 		<method name='_getitem' parameters='self,row_index,col_index,batch_indices'>
+ 				<method_info nloc='17' complexity='15' token_count='232' nesting_level='1' start_line='64' end_line='98'></method_info>
+ 			<added_lines>64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines>7,99</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='gpytorch\lazy\lazy_tensor.py' new_name='gpytorch\lazy\lazy_tensor.py'>
+ 		<file_info nloc='926' complexity='289' token_count='7049'></file_info>
+ 		<method name='_getitem' parameters='self,row_index,col_index,batch_indices'>
+ 				<method_info nloc='17' complexity='5' token_count='252' nesting_level='1' start_line='182' end_line='238'></method_info>
+ 			<added_lines>216</added_lines>
+ 			<deleted_lines>216</deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines>20</added_lines>
+ 			<deleted_lines>20</deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='gpytorch\utils\getitem.py' new_name='gpytorch\utils\getitem.py'>
+ 		<file_info nloc='102' complexity='46' token_count='714'></file_info>
+ 		<method name='_is_noop_index' parameters='index'>
+ 				<method_info nloc='2' complexity='2' token_count='17' nesting_level='0' start_line='171' end_line='175'></method_info>
+ 			<added_lines>171,172,173,174,175</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines>176,177</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ </commit>
+</bug_data>

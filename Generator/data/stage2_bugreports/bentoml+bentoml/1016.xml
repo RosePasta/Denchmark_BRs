@@ -1,0 +1,196 @@
+<bug id='1016' author='kushalvala23' open_date='2020-08-23T14:19:12Z' closed_time='2020-11-26T02:05:22Z'>
+	<summary>Error in Predict Function of TensorFlow 2.0 with Keras API (tf.keras)</summary>
+	<description>
+Describe the bug
+I have trained a text classification model using tf.keras, since BentoML Documentation gives TensorFlow 1.14.0 code snippet, I expected the code to run without any bugs for TensorFlow 2.0.
+ValueError: Could not find matching function to call loaded from the SavedModel. Got:
+Positional arguments (3 total):
+* Tensor("inputs:0", shape=(10, 20), dtype=int32)
+* False
+* None
+Keyword arguments: {}
+Expected these arguments to match one of the following 4 option(s):
+Option 1:
+Positional arguments (3 total):
+* TensorSpec(shape=(None, 20), dtype=tf.float32, name='inputs')
+* False
+* None
+Keyword arguments: {}
+Option 2:
+Positional arguments (3 total):
+* TensorSpec(shape=(None, 20), dtype=tf.float32, name='input_1')
+* True
+* None
+Keyword arguments: {}
+Option 3:
+Positional arguments (3 total):
+* TensorSpec(shape=(None, 20), dtype=tf.float32, name='inputs')
+* True
+* None
+Keyword arguments: {}
+Option 4:
+Positional arguments (3 total):
+* TensorSpec(shape=(None, 20), dtype=tf.float32, name='input_1')
+* False
+* None
+Keyword arguments: {}
+Screenshots/Logs
+To give us more information for diagnosing the issue, make sure to enable debug logging:
+Add the following lines to your Python code before invoking BentoML:
+import bentoml
+import logging
+bentoml.config().set('core', 'debug', 'true')
+bentoml.configure_logging(logging.DEBUG)
+import tensorflow as tf
+import pandas as pd
+import numpy as np
+import texthero as hero
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
+import json
+
+# tf version : 2.4.0
+MAX_LENGTH = 20
+max_words = 300000
+
+x = data['text'].values
+tokenizer = tf.keras.preprocessing.text.Tokenizer(num_words=max_words, char_level=False)
+tokenizer.fit_on_texts(x)
+text_seq = tokenizer.texts_to_sequences(x)
+X_train_val = tf.keras.preprocessing.sequence.pad_sequences(text_seq, maxlen=MAX_LENGTH)
+
+x_train, x_val, y_train, y_val = train_test_split(X_train_val, y, test_size=0.1, random_state=1)
+
+vocab_size = len(tokenizer.word_index) + 1
+
+# Model Architecture
+input_text = tf.keras.layers.Input(shape= (MAX_LENGTH))
+embedding = tf.keras.layers.Embedding(input_dim= vocab_size, output_dim= 64, input_length= 20)(input_text)
+globalmaxpool1 = tf.keras.layers.GlobalAveragePooling1D()(embedding)
+dense1a = tf.keras.layers.Dense(256, activation= 'relu')(globalmaxpool1)
+dropout1a = tf.keras.layers.Dropout(0.2)(dense1a)
+dense2a = tf.keras.layers.Dense(128 , activation= 'relu')(globalmaxpool1)
+dropout2a = tf.keras.layers.Dropout(0.2)(dense2a)
+output = tf.keras.layers.Dense(num_classes, activation= 'softmax')(dropout2a)
+model = tf.keras.Model(inputs = input_text, outputs = output)
+
+optimizer = tf.keras.optimizers.Adam(learning_rate= 0.001)
+model.compile(optimizer= optimizer ,loss='sparse_categorical_crossentropy',metrics=['acc'])
+history = model.fit(x_train, y_train, batch_size= 256 ,verbose=1 , epochs= 5, validation_data= (x_val, y_val))
+
+
+# BentoFile
+%%writefile debit_transaction_classifier.py
+
+import tensorflow as tf
+from bentoml import api, artifacts, env, BentoService
+from bentoml.artifact import PickleArtifact,JSONArtifact, TensorflowSavedModelArtifact
+from bentoml.adapters import DataframeInput
+#import keras
+import numpy as np
+import texthero as hero
+
+def preprocessing(df):
+    df['description'] = df['description'].astype('str')
+    df['customer_name'] = df['customer_name'].astype('str')
+    df['bank_account_name'] = df['bank_account_name'].astype('str')
+    df['text'] = df[['description', 'customer_name','bank_account_name']].apply(lambda x: ' '.join(x), axis=1)
+    df = df.drop(columns= ['amount_amount','description', 'customer_name','bank_account_name', 'account_type'])
+    df['text'] = hero.clean(df['text'])
+    return df
+
+MAX_LENGTH = 20
+
+@env(pip_dependencies=['tensorflow','pandas', 'numpy','texthero'])
+@artifacts([PickleArtifact('tokenizer'), TensorflowSavedModelArtifact('model'), JSONArtifact('category')])
+class DebitTransactionClassification(BentoService):
+    def tokenize_df(self, df):
+        df = preprocessing(df = df)
+        text = df['text'].values
+        tokenized = self.artifacts.tokenizer.texts_to_sequences(text)        
+        input_data = tf.keras.preprocessing.sequence.pad_sequences(tokenized, maxlen=MAX_LENGTH)
+        return input_data
+    
+    @api(input=DataframeInput())
+    def predict(self, df):
+        print('Started Tokenizing!')
+        input_data = self.tokenize_df(df)
+        print('Tokenization Ended')
+        prediction = self.artifacts.model(input_data)
+        top_5_values , top_5_indices = tf.math.top_k(prediction, k = 5)
+        
+#         with tf.Session() as sess:
+#             sess.run(tf.global_variables_initializer())
+#             values=sess.run(top_5_values)
+#             indices = sess.run(top_5_indices) 
+        indices = top_5_indices.numpy()
+        values = top_5_values.numpy()
+        
+        
+        idx2name = self.artifacts.category
+        
+        def label_encoding(s):
+            return idx2name[str(s)]
+        
+        names = []
+        for i in indices:
+            names.append(list(map(label_encoding,i))) 
+            
+        pred = []
+        for i,j in zip(names,values):
+            output_dict = {}
+            for k,r in zip(i,j):
+                output_dict[k] = r
+            pred.append(output_dict)
+            
+        return pred
+
+
+
+# 1) import the custom BentoService defined above
+from debit_transaction_classifier import DebitTransactionClassification
+
+# 2) `pack` it with required artifacts
+clf = DebitTransactionClassification()
+clf.pack('tokenizer', tokenizer)
+clf.pack('category',category_dict)
+clf.pack('model', model)
+saved_path = clf.save()
+
+# loading bento bundle
+bento_service = bentoml.load(saved_path)
+
+preds = bento_service.predict(sample_test)
+Environment:
+
+macOS
+BentoML 0.8.5
+-Python 3.7.4
+TensorFlow [2.4.0]
+
+Additional context
+I want to know if its a BentoML bug or a TensorFlow issue?
+Because I ran the script of tensorflow 1.14.0 and keras given in the documentation and it worked well!
+	</description>
+	<comments>
+		<comment id='1' author='kushalvala23' date='2020-08-23T21:27:25Z'>
+		&lt;denchmark-link:https://github.com/kushalvala23&gt;@kushalvala23&lt;/denchmark-link&gt;
+ Thank you for reporting!
+Since Tensorflow 2.4.0 is still under development, Could you give the latest public release version 2.3.0 and also 2.2.0a try?
+I did a quick test with the basic echo model from &lt;denchmark-link:https://github.com/bentoml/gallery/blob/master/tensorflow/echo/tensorflow-echo.ipynb&gt;bentoml/gallery&lt;/denchmark-link&gt;
+ with Tensorflow  and . I encountered a different issues on inferencing with version , but not .
+I will do more investigation while waiting for your results.
+		</comment>
+		<comment id='2' author='kushalvala23' date='2020-08-25T05:33:22Z'>
+		The error still persists. The basic echo model made in&lt;denchmark-link:https://github.com/bentoml/gallery/blob/master/tensorflow/echo/tensorflow-echo.ipynb&gt; bentoml/gallery&lt;/denchmark-link&gt;
+ is using core TensorFlow API's, whilst I have used Keras API from TensorFlow 2.0, using both Functional and Sequential Mode!
+		</comment>
+		<comment id='3' author='kushalvala23' date='2020-09-23T07:40:45Z'>
+		This error message is given by TensorFlow and is clear. The type of data fed to the model does not match the type expected. The model expects float32, and your data is int32 after tokenize. You can cast input_data to the right type before call self.artifacts.model(input_data)
+		</comment>
+		<comment id='4' author='kushalvala23' date='2020-11-26T02:05:22Z'>
+		Closed as part of the &lt;denchmark-link:https://github.com/bentoml/BentoML/issues/1188&gt;#1188&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

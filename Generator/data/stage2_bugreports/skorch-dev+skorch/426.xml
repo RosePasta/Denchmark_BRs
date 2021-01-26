@@ -1,0 +1,167 @@
+<bug id='426' author='ottonemo' open_date='2019-01-24T13:55:45Z' closed_time='2019-03-15T14:02:17Z'>
+	<summary>pickle fails before __setstate__ is reached</summary>
+	<description>
+Consider the following scenario:
+
+train model on GPU
+store model in pickle
+load model on non-GPU machine
+observe failure
+
+Loading the model on the non-GPU machine breaks since torch tensors are loaded before skorch is ever asked what to do with them.
+
+Why is this the case?
+What to do about it?
+Why don't the tests fail?
+
+I'm not sure about (1) but my guess is that __setstate__ is called recursively bottom-up which makes the tensors the leafs and called before the wrapping skorch model. This needs verification.
+An answer to (2) would be to always move the tensors to CPU space before writing the pickle state and restore them according the device specification of the net (this is already implemented).
+I have no answer for (3) but this needs investigation as well since we do have an explicit test case for this behavior AFAIR.
+	</description>
+	<comments>
+		<comment id='1' author='ottonemo' date='2019-01-24T14:46:32Z'>
+		When you say model, are you referring to the NeuralNet object or the nn.Module object?
+		</comment>
+		<comment id='2' author='ottonemo' date='2019-01-24T15:10:37Z'>
+		I'm referring to the NeuralNet instance as "model". The resulting traceback from the PyTorch exception doesn't include skorch code:
+m = pickle.load(f)
+results in
+&lt;denchmark-code&gt;Traceback (most recent call last):
+  File "load.py", line 8, in &lt;module&gt;
+    m = pickle.load(f)
+  File "&lt;env&gt;/lib/python3.6/site-packages/torch/storage.py", line 126, in _load_from_bytes
+    return torch.load(io.BytesIO(b))
+  File "&lt;env&gt;/lib/python3.6/site-packages/torch/serialization.py", line 367, in load
+    return _load(f, map_location, pickle_module)
+  File "&lt;env&gt;/lib/python3.6/site-packages/torch/serialization.py", line 538, in _load
+    result = unpickler.load()
+  File "&lt;env&gt;/lib/python3.6/site-packages/torch/serialization.py", line 504, in persistent_load
+    data_type(size), location)
+  File "&lt;env&gt;/lib/python3.6/site-packages/torch/serialization.py", line 113, in default_restore_location
+    result = fn(storage, location)
+  File "&lt;env&gt;/lib/python3.6/site-packages/torch/serialization.py", line 94, in _cuda_deserialize
+    device = validate_cuda_device(location)
+  File "&lt;env&gt;/lib/python3.6/site-packages/torch/serialization.py", line 78, in validate_cuda_device
+    raise RuntimeError('Attempting to deserialize object on a CUDA '
+RuntimeError: Attempting to deserialize object on a CUDA device but torch.cuda.is_available() is False. If you are running on a CPU-only machine, please use torch.load with map_location='cpu' to map your storages to the CPU.
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='3' author='ottonemo' date='2019-01-24T18:13:53Z'>
+		
+Why don't the tests fail?
+
+I don't believe we have a test of a model trained on GPU, then pickled, then loaded on a machine without GPU. The closest we have is &lt;denchmark-link:https://github.com/dnouri/skorch/blob/a9f1140cb4f28b123a35efa50286def121a3451a/skorch/tests/test_net.py#L656&gt;this&lt;/denchmark-link&gt;
+, but it uses . We would probably need an analogous test using pickle, i.e. a pickled  trained on GPU. (But how do we make sure that the artifact stays up-to-date?)
+
+Loading the model on the non-GPU machine breaks since torch tensors are loaded before skorch is ever asked what to do with them.
+
+In theory, this should be handled by map_location, have you checked that it is set correctly in your example?
+
+An answer to (2) would be to always move the tensors to CPU space before writing the pickle state and restore them according the device specification of the net (this is already implemented).
+
+I'm a little worried about this solution because the pytorch way seems to be to save the tensors as they are and only move to the corresponding device during loading. If we do it differently, that could lead to incompatibilities are weird behavior down the road.
+I wonder if we could instead try to re-use more of the save_params and load_params code so that __getstate__ and __setstate__ use that for everything pytorch-related and handle the skorch part "normally".
+Also consider that should we make such changes, it will probably prevent all current skorch models from being unpickled in the future.
+		</comment>
+		<comment id='4' author='ottonemo' date='2019-01-25T15:05:38Z'>
+		
+In theory, this should be handled by map_location, have you checked that it is set correctly in your example?
+
+skorch is never able to set the correct map location since it is not even asked in the first place. pickle tries to unpickle the leaf objects first which means that PyTorch's implementation for unpickling tensors blows up (due to wrong map location) before we can do anything about it. (see the traceback for reference)
+I agree with your concerns, though. I feel that a better way to move forward is to have a method similar to .to() for NeuralNet instances. This would make pickling only slightly more complicated (pickle.dump(net.to('cpu'), f)) but would be consistent with the way PyTorch works.
+		</comment>
+		<comment id='5' author='ottonemo' date='2019-01-25T22:10:56Z'>
+		
+skorch is never able to set the correct map location since it is not even asked in the first place
+
+Alright, so it never even gets to &lt;denchmark-link:https://github.com/dnouri/skorch/blob/a9f1140cb4f28b123a35efa50286def121a3451a/skorch/net.py#L1407&gt;this line&lt;/denchmark-link&gt;
+.
+
+This would make pickling only slightly more complicated (pickle.dump(net.to('cpu'), f)) but would be consistent with the way PyTorch works.
+
+As said earlier, this seems to be the wrong way round. I would try to find a way so that when persisting, a user doesn't need to decide yet on what device to unpickle.
+Is there a possibility to take all cuda_dependent_attributes_, then save and load their state_dict with torch.load/torch.save? For that to work, we would need to get control before the torch tensors are de-serialized, which appears not to be the case. This is strange in my opinion, but that probably means I don't understand pickle well enough.
+		</comment>
+		<comment id='6' author='ottonemo' date='2019-01-28T15:05:12Z'>
+		I tried to reproduce the error but couldn't.
+For this, I ran &lt;denchmark-link:https://gist.github.com/BenjaminBossan/44bcc885c5398f634a5a0ad639d364ea&gt;this script&lt;/denchmark-link&gt;
+ on my workstation with GPU support, copied the model to my laptop (without GPU), and there run &lt;denchmark-link:https://gist.github.com/BenjaminBossan/d443e58c32ae4c5473a1a1b89ce821d3&gt;this script&lt;/denchmark-link&gt;
+. The result was that the model was correctly loaded, skorch informed me that it was moved to CPU, and the end result was printed.
+I don't know what the difference is to the case above, maybe that model has cuda tensors that are not listed in cuda_dependent_attributes_?
+		</comment>
+		<comment id='7' author='ottonemo' date='2019-01-28T19:33:53Z'>
+		I can reproduce this when adding
+sometensor = torch.FloatTensor([1.] * 2).to('cuda')
+# ...
+criterion__weight=sometensor,
+to your example.
+The reason is that criterion_ is not in cuda_dependent_attributes_. I wonder why this is?
+		</comment>
+		<comment id='8' author='ottonemo' date='2019-01-28T19:42:35Z'>
+		There is probably no harm in adding criterion_ to the cuda_dependent_attributes_. Could you test whether that resolves the initial issue?
+		</comment>
+		<comment id='9' author='ottonemo' date='2019-01-28T19:46:14Z'>
+		Just tried that, it resolves the issue. I think we should add a test for this case and commit the fix.
+This, of course, leaves the question how to keep the necessary test artifacts up-to-date. Add them to the deploy script?
+		</comment>
+		<comment id='10' author='ottonemo' date='2019-01-28T19:56:11Z'>
+		
+Just tried that, it resolves the issue. I think we should add a test for this case and commit the fix.
+
+Sounds good, do you take that one?
+
+This, of course, leaves the question how to keep the necessary test artifacts up-to-date. Add them to the deploy script?
+
+I wonder what that would mean for the normal workflow. At what time would there be an update and when will a developer see that locally?
+		</comment>
+		<comment id='11' author='ottonemo' date='2019-01-28T20:00:55Z'>
+		
+
+Just tried that, it resolves the issue. I think we should add a test for this case and commit the fix.
+
+Sounds good, do you take that one?
+
+Sure, already on it.
+
+
+This, of course, leaves the question how to keep the necessary test artifacts up-to-date. Add them to the deploy script?
+
+I wonder what that would mean for the normal workflow. At what time would there be an update and when will a developer see that locally?
+
+Yes, maybe it is just best to keep the tests self-consistent? Mocking torch.cuda.is_available to simulate missing CUDA devices triggers the error. That means a viable way (which we already take, AFAIK) is to
+
+enforce CUDA
+train model
+pickle
+mock torch.cuda.is_available
+attempt to unpickle
+
+The drawback with this is that it won't work with the current CI pipeline.
+One alternative is to create the pickled model in the test directory and hope that it doesn't change as long as the model definition doesn't change so that git can track the status properly. Then, the developer who runs the tests and sees that the artifact changed, commits the artifact along with their modifications.
+		</comment>
+		<comment id='12' author='ottonemo' date='2019-01-28T22:13:21Z'>
+		
+Mocking torch.cuda.is_available to simulate missing CUDA devices triggers the error.
+
+Okay, if we can use this to trigger a test failure, that's good. I just wonder how much that approach relies on pytorch internals that could change in the future. E.g., the de-serialization code could change so that it stops relying on torch.cuda.is_available, given that this reliance is not "public API", making the test obsolete. However, it's probably still better to have the test than not to have it.
+		</comment>
+		<comment id='13' author='ottonemo' date='2019-01-31T17:31:38Z'>
+		While creating a fix for this issue I came across a more general issue. The criterion can have CUDA tensors as parameters (e.g. weight in case of NLLLoss) and these parameters can be set using set_params, e.g. Net(..., criterion__weight=w). As a consequence, net.__dict__['criterion__weight'] == w.
+This prevents the simple solution which is adding "criterion_" to NeuralNet.cuda_dependent_attributes_ since criterion_ matches net.criterion_ but doesn't match net.criterion__weight which is also present in the state.
+I see a number of ways forward:
+
+Use pattern matching (criterion_*)
+Use prefixes (criterion_ matches criterion_ as well as criterion__weight)
+Determine CUDA parameters automatically
+Do not add parameters to net.__dict__ upon setting them
+
+I favor (3) since it has been a while since the decision to use names was made and back then it was quite hard to identify devices, this is now easier. I take that back, we would have to traverse through the whole object tree of net.__dict__ to see which values have the device attribute. This is impractable.
+		</comment>
+		<comment id='14' author='ottonemo' date='2019-03-15T14:02:17Z'>
+		This should be resolved since &lt;denchmark-link:https://github.com/skorch-dev/skorch/pull/431&gt;#431&lt;/denchmark-link&gt;
+ and &lt;denchmark-link:https://github.com/skorch-dev/skorch/pull/435&gt;#435&lt;/denchmark-link&gt;
+ are merged.
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,223 @@
+<bug id='37' author='saudet' open_date='2017-05-18T09:30:00Z' closed_time='2017-06-23T04:02:35Z'>
+	<summary>A3C fails with current master of Deeplearning4j, but not with 0.8.0</summary>
+	<description>
+&lt;denchmark-h:h4&gt;Issue Description&lt;/denchmark-h&gt;
+
+In both ActorCriticSeparate and ActorCriticCompGraph, outputAll() quickly returns NaNs. They merely return the values of output() of neural networks, so it's something in Deeplearning4j, probably related to the latest changes to the updaters or the workspaces (but the issue still happens with WorkspaceMode.NONE). We can easily reproduce that by running the A3CCartpole example.
+I'm guessing it has something to do with sharing Gradient objects between independently running networks on different threads. The gradients are taken from one network on one thread in the gradient() method, and used on another network in another thread in applyGradient().
+I am not able to confirm yet that this is the cause, but even with DL4J 0.8.0, although it doesn't fail completely, there is something funny happening with threads. If I run A3CCartpole with a small number of threads (1~4), it's eventually able go over the target of 200 points in rewards (for a sequence length of 200) almost every time, but if I use 16 threads, that never happens, it doesn't learn:
+&lt;denchmark-code&gt;...
+{"stepCounter":31144,"epochCounter":3234,"reward":8.0,"episodeLength":8,"score":0.001687792285035054}
+{"stepCounter":31153,"epochCounter":3235,"reward":9.0,"episodeLength":9,"score":0.0014633663231506944}
+{"stepCounter":31163,"epochCounter":3236,"reward":10.0,"episodeLength":10,"score":0.001060936599969864}
+{"stepCounter":31173,"epochCounter":3237,"reward":10.0,"episodeLength":10,"score":0.0012606706470251084}
+{"stepCounter":31183,"epochCounter":3238,"reward":10.0,"episodeLength":10,"score":0.001138964109122753}
+{"stepCounter":31192,"epochCounter":3239,"reward":9.0,"episodeLength":9,"score":0.0014106297167018056}
+{"stepCounter":31201,"epochCounter":3240,"reward":9.0,"episodeLength":9,"score":0.0014329474652186036}
+{"stepCounter":31211,"epochCounter":3241,"reward":10.0,"episodeLength":10,"score":0.0011106519959867}
+{"stepCounter":31221,"epochCounter":3242,"reward":10.0,"episodeLength":10,"score":0.0010972227901220322}
+{"stepCounter":31231,"epochCounter":3243,"reward":10.0,"episodeLength":10,"score":0.0011741039343178272}
+{"stepCounter":31241,"epochCounter":3244,"reward":10.0,"episodeLength":10,"score":0.001272098533809185}
+&lt;/denchmark-code&gt;
+
+So, question to &lt;denchmark-link:https://github.com/AlexDBlack&gt;@AlexDBlack&lt;/denchmark-link&gt;
+ and &lt;denchmark-link:https://github.com/raver119&gt;@raver119&lt;/denchmark-link&gt;
+, are the gradients properly handled across threads in ActorCriticSeparate and ActorCriticCompGraph? And if not, how should we handle this?
+&lt;denchmark-h:h4&gt;Version Information&lt;/denchmark-h&gt;
+
+
+Deeplearning4j 0.8.0 and 0.8.1-SNAPSHOT
+platform information: tested on Linux only
+
+	</description>
+	<comments>
+		<comment id='1' author='saudet' date='2017-05-19T03:12:46Z'>
+		According to &lt;denchmark-link:https://github.com/AlexDBlack&gt;@AlexDBlack&lt;/denchmark-link&gt;
+, we'll probably need to add a method like  or some other way to copy the data across threads.
+		</comment>
+		<comment id='2' author='saudet' date='2017-06-14T10:09:57Z'>
+		Is that CUDA or native backend?
+		</comment>
+		<comment id='3' author='saudet' date='2017-06-14T10:10:58Z'>
+		CUDA is the only backend where thread affinity matters, IF data is shared for read-only purposes.
+		</comment>
+		<comment id='4' author='saudet' date='2017-06-14T11:54:30Z'>
+		I've checked if that's hidden workspace use somewhere, but no. If workspaceMode is set to NONE - nothing uses them during training here...
+		</comment>
+		<comment id='5' author='saudet' date='2017-06-14T12:12:46Z'>
+		Right, &lt;denchmark-link:https://github.com/AlexDBlack&gt;@AlexDBlack&lt;/denchmark-link&gt;
+ and me investigated this issue and here's what we have.
+By design, gradients updates are enqueued here by reference: &lt;denchmark-link:https://github.com/deeplearning4j/rl4j/blob/b62103d9e97b0a6c6a1102fda6a22c114949f5cf/rl4j-core/src/main/java/org/deeplearning4j/rl4j/learning/async/AsyncGlobal.java&gt;https://github.com/deeplearning4j/rl4j/blob/b62103d9e97b0a6c6a1102fda6a22c114949f5cf/rl4j-core/src/main/java/org/deeplearning4j/rl4j/learning/async/AsyncGlobal.java&lt;/denchmark-link&gt;
+
+enqueue method takes Gradient[]. Here's where it comes from: 
+
+
+rl4j/rl4j-core/src/main/java/org/deeplearning4j/rl4j/network/ac/ActorCriticSeparate.java
+
+
+        Lines 43 to 50
+      in
+      b62103d
+
+
+
+
+
+
+ public Gradient[] gradient(INDArray input, INDArray[] labels) { 
+
+
+
+     valueNet.setInput(input); 
+
+
+
+     valueNet.setLabels(labels[0]); 
+
+
+
+     valueNet.computeGradientAndScore(); 
+
+
+
+     policyNet.setInput(input); 
+
+
+
+     policyNet.setLabels(labels[1]); 
+
+
+
+     policyNet.computeGradientAndScore(); 
+
+
+
+ return new Gradient[] {valueNet.gradient(), policyNet.gradient()}; 
+
+
+
+
+
+So, we're basically referencing new Gradient objects, that shares the same gradientStateView array, one per MLN/CG instance. And here race condition becomes possible, between AsyncGlobal thread applying gradients, and networks that calculating "new Gradients".
+		</comment>
+		<comment id='6' author='saudet' date='2017-06-14T12:14:31Z'>
+		So, that part should be either rewritten (preferred, now we have "Gradients Sharing" used in PW), or gradients should get dup() method that'll enforce duplication  (that might be memory expensive though), or make that stuff synchronous.
+&lt;denchmark-link:https://github.com/AlexDBlack&gt;@AlexDBlack&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/saudet&gt;@saudet&lt;/denchmark-link&gt;
+ what do you think here guys?
+		</comment>
+		<comment id='7' author='saudet' date='2017-06-14T12:26:25Z'>
+		Depends if the global model does the updating (as in, updater - Adam/Nesterovs etc) or if the copies do it (I'm not familiar enough/sure on this)
+former case: duplicate (or possibly assign to a working buffer) - otherwise updating is likely to be a bottleneck
+latter case: use synchronized - axpy operation is approximately as quick to apply as a dup would be?
+Another thing to double check here: make sure we aren't applying the updater twice - once in the copies, once in the global
+(and also: we can avoid allocating updater state view arrays in one or the other - save a fair bit of memomry if we do that)
+		</comment>
+		<comment id='8' author='saudet' date='2017-06-14T13:17:07Z'>
+		
+I'm not familiar enough/sure on this
+
+I guess that's main problem here... None of us are really familiar with rl4j internals. I think it's time to do some reading, and investigate implementation in search of possible issues like this one.
+Plus, it would be nice to make it CUDA-compatible as well, if possible.
+		</comment>
+		<comment id='9' author='saudet' date='2017-06-14T13:36:42Z'>
+		Yup, I'll be the one working on understanding rl4j and fixing things there.
+Thanks for confirming my suspicions!
+		</comment>
+		<comment id='10' author='saudet' date='2017-06-16T10:14:26Z'>
+		Duplicating the gradient doesn't help. It's already cloning the MultiLayerNetwork or ComputationGraph before calling setInput(), setLabels(), computeGradientAndScore(), and gradient(), so the Gradient object that it returns should be independent from the original network/graph object, right?
+Synchronizing all the threads completely also doesn't help. So I guess it's not a threading problem...
+		</comment>
+		<comment id='11' author='saudet' date='2017-06-16T11:11:37Z'>
+		
+the Gradient object that it returns should be independent from the original network/graph object, right?
+
+The INDArray returned by Gradient.gradient() is the underlying gradient array for the entire network - it not a copy, and will be modified in-place the next time the model to which it belongs does backprop.
+However, if the network is being torn down and rebuilt at each iteration (which is obviously terrible for performance - but this is what it sounds like it's doing?) then it may be safe from a threading point of view.
+		</comment>
+		<comment id='12' author='saudet' date='2017-06-16T11:15:03Z'>
+		Yes, it looks like it's cloning the whole network at each iteration. Well, whatever, just trying to get something working for now :)
+I've narrowed down the problem to the subi() operations here:
+&lt;denchmark-link:https://github.com/deeplearning4j/rl4j/blob/master/rl4j-core/src/main/java/org/deeplearning4j/rl4j/network/ac/ActorCriticSeparate.java#L54&gt;https://github.com/deeplearning4j/rl4j/blob/master/rl4j-core/src/main/java/org/deeplearning4j/rl4j/network/ac/ActorCriticSeparate.java#L54&lt;/denchmark-link&gt;
+
+If I comment those out, nothing bad happens, but nothing good either obviously. Using setParams(... sub(...)) instead results in the same NaNs down the line. Does this appear like correct usage? The update() call doesn't seem to do anything bad.
+		</comment>
+		<comment id='13' author='saudet' date='2017-06-17T10:44:56Z'>
+		
+Synchronizing all the threads completely also doesn't help
+
+That is strange... What happens if number of threads gets limited to 1?
+		</comment>
+		<comment id='14' author='saudet' date='2017-06-17T14:19:34Z'>
+		Executing everything on the same thread doesn't help, same result.
+Here's something strange though. Currently, ActorCriticSeparate.applyGradient() is this:
+    valueNet.getUpdater().update(valueNet, gradient[0], 1, batchSize);
+    valueNet.params().subi(gradient[0].gradient());
+    policyNet.getUpdater().update(policyNet, gradient[1], 1, batchSize);
+    policyNet.params().subi(gradient[1].gradient());
+Commenting out the subi() makes it not crash:
+    valueNet.getUpdater().update(valueNet, gradient[0], 1, batchSize);
+//    valueNet.params().subi(gradient[0].gradient());
+    policyNet.getUpdater().update(policyNet, gradient[1], 1, batchSize);
+//    policyNet.params().subi(gradient[1].gradient());
+But this does crash (with or without the dup(), same result):
+        valueNet.getUpdater().update(valueNet, gradient[0], 1, batchSize);
+        INDArray oldParams = valueNet.params();
+        INDArray newParams = oldParams.sub(gradient[0].gradient());
+        valueNet.setParams(newParams);
+        valueNet.setParams(oldParams.dup());
+        policyNet.getUpdater().update(policyNet, gradient[1], 1, batchSize);
+        INDArray oldParams2 = policyNet.params();
+        INDArray newParams2 = oldParams2.sub(gradient[1].gradient());
+        policyNet.setParams(newParams2);
+        policyNet.setParams(oldParams2.dup());
+If we comment out setParams(newParams) and setParams(newParams2) from above, it stops crashing.
+While the following also does not crash (notice the position of the dup()):
+        valueNet.getUpdater().update(valueNet, gradient[0], 1, batchSize);
+        INDArray oldParams = valueNet.params().dup();
+        INDArray newParams = oldParams.sub(gradient[0].gradient());
+        valueNet.setParams(newParams);
+        valueNet.setParams(oldParams);
+        policyNet.getUpdater().update(policyNet, gradient[1], 1, batchSize);
+        INDArray oldParams2 = policyNet.params().dup();
+        INDArray newParams2 = oldParams2.sub(gradient[1].gradient());
+        policyNet.setParams(newParams2);
+        policyNet.setParams(oldParams2);
+		</comment>
+		<comment id='15' author='saudet' date='2017-06-18T00:47:15Z'>
+		Actually, that's not strange. setParams() actually modifies the object previously returned by params().
+So, there's something wrong with the implementation it seems. Time to start studying the algorithm...
+		</comment>
+		<comment id='16' author='saudet' date='2017-06-19T09:40:31Z'>
+		I think I found the cause of the issue. It's apparently not possible to apply the gradient from one network/graph to another network/graph, but it used to be possible with 0.8.0. The culprit appears to be this block of code where the  argument is not taken into account anywhere:
+&lt;denchmark-link:https://github.com/deeplearning4j/deeplearning4j/blob/master/deeplearning4j-nn/src/main/java/org/deeplearning4j/nn/updater/BaseMultiLayerUpdater.java#L248&gt;https://github.com/deeplearning4j/deeplearning4j/blob/master/deeplearning4j-nn/src/main/java/org/deeplearning4j/nn/updater/BaseMultiLayerUpdater.java#L248&lt;/denchmark-link&gt;
+
+Each  picks up the  from its own fields here:
+&lt;denchmark-link:https://github.com/deeplearning4j/deeplearning4j/blob/master/deeplearning4j-nn/src/main/java/org/deeplearning4j/nn/updater/UpdaterBlock.java#L123&gt;https://github.com/deeplearning4j/deeplearning4j/blob/master/deeplearning4j-nn/src/main/java/org/deeplearning4j/nn/updater/UpdaterBlock.java#L123&lt;/denchmark-link&gt;
+
+If those do not match the gradient argument from the update() method of the Updater, then it does not work correctly. I think the same could be said for the following call to getFlattenedGradientsView().
+&lt;denchmark-link:https://github.com/AlexDBlack&gt;@AlexDBlack&lt;/denchmark-link&gt;
+ How do you think we should fix this?
+		</comment>
+		<comment id='17' author='saudet' date='2017-06-19T10:34:13Z'>
+		&lt;denchmark-link:https://github.com/saudet&gt;@saudet&lt;/denchmark-link&gt;
+ Not sure yet, but I'll take a look, write some unit tests for that use case and get back to you.
+		</comment>
+		<comment id='18' author='saudet' date='2017-06-19T12:23:11Z'>
+		I've reproduced the issue in a unit test here, will look at actually fixing it tomorrow:
+&lt;denchmark-link:https://github.com/deeplearning4j/deeplearning4j/pull/3545&gt;https://github.com/deeplearning4j/deeplearning4j/pull/3545&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='19' author='saudet' date='2017-06-19T13:09:56Z'>
+		Thanks, I'll be sure to come up with the unit test first next time :) I was wondering more about how we should fix this. Should we copy the gradient values to the internal array first? That looks like what it assumes, but not entirely sure.
+		</comment>
+		<comment id='20' author='saudet' date='2017-06-23T03:04:16Z'>
+		Reopening - github decided to auto-close this :/
+Anyway, this  hopefully be fixed here: &lt;denchmark-link:https://github.com/deeplearning4j/deeplearning4j/pull/3545&gt;https://github.com/deeplearning4j/deeplearning4j/pull/3545&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='21' author='saudet' date='2017-06-23T04:02:35Z'>
+		Yes, it behaves the same as with 0.8.0, so I'm considering this fixed. Thanks!
+		</comment>
+	</comments>
+</bug>

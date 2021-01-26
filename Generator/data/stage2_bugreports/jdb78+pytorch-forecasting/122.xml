@@ -1,0 +1,129 @@
+<bug id='122' author='diditforlulz273' open_date='2020-10-22T09:02:12Z' closed_time='2020-11-24T16:09:36Z'>
+	<summary>Categorical encoding bug</summary>
+	<description>
+
+PyTorch-Forecasting version: 0.5.2
+PyTorch version: 1.6
+Python version: 3.8.X
+Operating System: Ubuntu 20.04
+
+Looks like I've found a bug/unexpected behavior.
+I'm making a prediction on a dataset with time-based features marked as 'categorical', namely month alongside day and year.
+The start of the dataset is 2020-01-01, and the end is 2020-08-30. The date is parsed into 'year, 'month', and 'day' columns for each row.
+Depending on the last dataset record's date(if I cut it for some reason), pytorch-forecasting throws an error that looks like:
+Traceback:
+File "XXX/venv/lib/python3.8/site-packages/pytorch_forecasting/data/encoders.py", line 105, in 
+encoded = [self.classes_[v] for v in y]
+KeyError: '8'
+I've made some experiments/stack traces and this is always the case when you, for instance, have this month(8, August) in the full set but don't have it in your training set - for the reason that your max_prediction_length is bigger than 31 (day) or you have a combination of the last date and max_pred_length like 2020-08-10 and 20, so the last date of training set will be ~2020-07-20 and it won't have '8' month inside.
+In this case, going back to the code line provided in traceback, you have this value(8) in np.unique(y) (iterator), BUT in self.classes_ you don't.
+Seems like self.classes_ is created based on the training set only, and when you try to invoke TimeSeriesDataSet.from_dataset(trainigset, fullset, .....) you get this error for any additional categorical values that might have appeared in the full dataset.
+This logic makes it practically hard to be used on any type of date/time categorically encoded datasets.
+Shouldn't any previously unseen categorical value be put into the special 'average' bin and treated as the average of all the known categories? As far as I remember, LightGBM exhibits this behavior for any new categorical values.
+	</description>
+	<comments>
+		<comment id='1' author='diditforlulz273' date='2020-10-24T10:50:41Z'>
+		You have to explicitly allow unknown categories (see  in &lt;denchmark-link:https://pytorch-forecasting.readthedocs.io/en/latest/api/pytorch_forecasting.data.timeseries.TimeSeriesDataSet.html#pytorch_forecasting.data.timeseries.TimeSeriesDataSet&gt;https://pytorch-forecasting.readthedocs.io/en/latest/api/pytorch_forecasting.data.timeseries.TimeSeriesDataSet.html#pytorch_forecasting.data.timeseries.TimeSeriesDataSet&lt;/denchmark-link&gt;
+). Would be a great PR to improve documentation. Essentially, this sets the embedding to a zero-vector. However, if you have a lot of categories that are not in the training set, it is questionable if you want to include the variable for training.
+I can think of three improvements to the current approach. Feel invited to submit a PR
+
+As you mentioned, one could simply take the average of all known embeddings - to my knowledge, this is a very uncommon approach in deep learning.
+Opposite to what the name of the parameter implies, no random dropout of categoricals in performed. Implementing this could improve the interpretation of the zeroed embeddings. This approach is likely to result in very similar behaviour as option 1.
+You could pre-train the network with a decoder network that predicts masked features. This is an architecture specific approach and might even boost final accuracy. A good example is TabNet.
+
+		</comment>
+		<comment id='2' author='diditforlulz273' date='2020-10-26T11:11:08Z'>
+		Thanks for pointing me into docs! 👍
+I'll investigate it further, and return with a PR into documentation if everything works well or Issue with a possible bug. Now I still can't get stable behavior on my dataset with a simple tail-cut cross-validation procedure
+		</comment>
+		<comment id='3' author='diditforlulz273' date='2020-11-18T07:02:21Z'>
+		&lt;denchmark-link:https://github.com/jdb78&gt;@jdb78&lt;/denchmark-link&gt;
+
+I'm still experiencing problems. Not creating a new issue - seems that my question is closely related to the current topic.
+As I wrote before, I have a grocery sales dataset where goods are coded by item_id and store_id. As it is the real data, some ids are jumping in and some hopping out literally every week, so I set dropout_categoricals to item_id explicitly.
+See what happens next. Upon creation of the first, cutted dataset with code:
+training_cutoff = data["time_idx"].max() - max_prediction_length # length=28
+training = TimeSeriesDataSet(
+data[lambda x: x.time_idx &lt;= training_cutoff], ...
+everything goes fine with no errors and warnings. All item_id and store_id get encoded into [1...len(column)] range internally.
+Next I do:
+vs = TimeSeriesDataSet.from_dataset(ts, data, predict=True, stop_randomization=True)
+and what I get is:
+File "... venv/lib/python3.8/site-packages/pytorch_forecasting/data/timeseries.py", line 759, in _construct_index
+assert (
+AssertionError: Time difference between steps has been idenfied as larger than 1 - set allow_missings=True
+Remarks:
+
+I'm confident that my dataset is not sparse and has a time difference of 1 everywhere. It is clear also because I get no errors in the first pass - training dataset creation.
+The problem sits somewhere around new entries(new item_id) which got encoded under the id "0" on test part creation. No matter what item_id was before, all of them are melted under the same item_id=0 - it is rather clear if you consider the same ids but different product_group_id and price in the transformed test dataset:
+
+
+I guess this is expected behavior - we discussed it here before.
+Next, taking a look into the root of the error, I checked df_index in _construct_index (timeseries.py, around line 730).
+What causes this dataset sparsity are newly 0-reencoded ids entered into the dataset after the first pass:
+&lt;denchmark-link:https://user-images.githubusercontent.com/59050128/99495818-44b3fb80-2984-11eb-8a15-8d3de797c6f4.jpg&gt;&lt;/denchmark-link&gt;
+
+All of these are 0-reencoded new item_ids(I checked)
+I can't get deeper, but it seems the bug is somewhere in the reencoding process - creating nonexistent sparsity.
+		</comment>
+		<comment id='4' author='diditforlulz273' date='2020-11-21T11:08:42Z'>
+		Yes. It looks indeed like a bug - good catch! For the moment, I guess new ids are not really supported if they are in the groups. A solution could look like the following:
+Group ids are separately encoded by the TimeSeriesDataSet._preprocess() method. A new label encoder would be needed that adds new ids rather than imputing zeros.
+		</comment>
+		<comment id='5' author='diditforlulz273' date='2020-11-25T20:39:51Z'>
+		&lt;denchmark-link:https://github.com/jdb78&gt;@jdb78&lt;/denchmark-link&gt;
+ The problem just transformed into another form. On data where crashes used to occur, now this is seen:
+GPU available: False, used: False
+TPU available: False, using: 0 TPU cores
+Number of parameters in network: 628.7k
+Epoch 0:  15%|█▌        | 15/99 [00:11&lt;01:04,  1.31it/s, loss=1.410, v_num=12, train_loss_step=1.29]Traceback (most recent call last):
+File "/home/seva/PycharmProjects/ECOM_demand/classes/model_tf_transformer.py", line 216, in 
+model = train(params=None, train_set=ts, valid_sets=vs, verbose_eval=20)
+File "/home/seva/PycharmProjects/ECOM_demand/classes/model_tf_transformer.py", line 175, in train
+trainer = mdl.fit(train_dataloader=train_dataloader, test_dataloader=val_dataloader)
+File "/home/seva/PycharmProjects/ECOM_demand/classes/model_tf_transformer.py", line 151, in fit
+trainer.fit(self._mdl, train_dataloader=train_dataloader, val_dataloaders=test_dataloader)
+File "/home/seva/PycharmProjects/ECOM_demand/venv/lib/python3.8/site-packages/pytorch_lightning/trainer/trainer.py", line 445, in fit
+results = self.accelerator_backend.train()
+File "/home/seva/PycharmProjects/ECOM_demand/venv/lib/python3.8/site-packages/pytorch_lightning/accelerators/cpu_accelerator.py", line 59, in train
+results = self.train_or_test()
+File "/home/seva/PycharmProjects/ECOM_demand/venv/lib/python3.8/site-packages/pytorch_lightning/accelerators/accelerator.py", line 66, in train_or_test
+results = self.trainer.train()
+File "/home/seva/PycharmProjects/ECOM_demand/venv/lib/python3.8/site-packages/pytorch_lightning/trainer/trainer.py", line 494, in train
+self.train_loop.run_training_epoch()
+File "/home/seva/PycharmProjects/ECOM_demand/venv/lib/python3.8/site-packages/pytorch_lightning/trainer/training_loop.py", line 561, in run_training_epoch
+batch_output = self.run_training_batch(batch, batch_idx, dataloader_idx)
+File "/home/seva/PycharmProjects/ECOM_demand/venv/lib/python3.8/site-packages/pytorch_lightning/trainer/training_loop.py", line 728, in run_training_batch
+self.optimizer_step(optimizer, opt_idx, batch_idx, train_step_and_backward_closure)
+File "/home/seva/PycharmProjects/ECOM_demand/venv/lib/python3.8/site-packages/pytorch_lightning/trainer/training_loop.py", line 469, in optimizer_step
+self.trainer.accelerator_backend.optimizer_step(
+File "/home/seva/PycharmProjects/ECOM_demand/venv/lib/python3.8/site-packages/pytorch_lightning/accelerators/accelerator.py", line 114, in optimizer_step
+model_ref.optimizer_step(
+File "/home/seva/PycharmProjects/ECOM_demand/venv/lib/python3.8/site-packages/pytorch_lightning/core/lightning.py", line 1380, in optimizer_step
+optimizer.step(closure=optimizer_closure, *args, **kwargs)
+File "/home/seva/PycharmProjects/ECOM_demand/venv/lib/python3.8/site-packages/pytorch_forecasting/optim.py", line 131, in step
+_ = closure()
+File "/home/seva/PycharmProjects/ECOM_demand/venv/lib/python3.8/site-packages/pytorch_lightning/trainer/training_loop.py", line 718, in train_step_and_backward_closure
+result = self.training_step_and_backward(
+File "/home/seva/PycharmProjects/ECOM_demand/venv/lib/python3.8/site-packages/pytorch_lightning/trainer/training_loop.py", line 823, in training_step_and_backward
+self.backward(result, optimizer, opt_idx)
+File "/home/seva/PycharmProjects/ECOM_demand/venv/lib/python3.8/site-packages/pytorch_lightning/trainer/training_loop.py", line 843, in backward
+result.closure_loss = self.trainer.accelerator_backend.backward(
+File "/home/seva/PycharmProjects/ECOM_demand/venv/lib/python3.8/site-packages/pytorch_lightning/accelerators/accelerator.py", line 95, in backward
+model.backward(closure_loss, optimizer, opt_idx, *args, **kwargs)
+File "/home/seva/PycharmProjects/ECOM_demand/venv/lib/python3.8/site-packages/pytorch_lightning/core/lightning.py", line 1258, in backward
+loss.backward(*args, **kwargs)
+File "/home/seva/PycharmProjects/ECOM_demand/venv/lib/python3.8/site-packages/torch/tensor.py", line 185, in backward
+torch.autograd.backward(self, gradient, retain_graph, create_graph)
+File "/home/seva/PycharmProjects/ECOM_demand/venv/lib/python3.8/site-packages/torch/autograd/init.py", line 125, in backward
+Variable._execution_engine.run_backward(
+RuntimeError: element 0 of tensors does not require grad and does not have a grad_fn
+I can not definitely trace it, because it happens on a random step in an epoch(see I have 99 steps here), but always somewhere on the very first epoch. Datasets that worked smoothly before, still run well now, and those which crashed proceeded to crash, but in a different way.
+If you need a reproducible example or some traces - just poke me here :)
+		</comment>
+		<comment id='6' author='diditforlulz273' date='2020-11-30T13:22:41Z'>
+		&lt;denchmark-link:https://github.com/jdb78&gt;@jdb78&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

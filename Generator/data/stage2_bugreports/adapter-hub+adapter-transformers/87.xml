@@ -1,0 +1,228 @@
+<bug id='87' author='cs1160701' open_date='2020-11-23T14:20:44Z' closed_time='2020-12-18T13:29:26Z'>
+	<summary>Unintuitive slowdown in data loading and model updating on using adapters</summary>
+	<description>
+&lt;denchmark-h:h2&gt;Environment info&lt;/denchmark-h&gt;
+
+
+transformers version: 1.0.1
+Platform: Linux-3.10.0-1127.19.1.el7.x86_64-x86_64-with-glibc2.10
+Python version: 3.8.5
+PyTorch version (GPU?): 1.7.0 (True)
+Tensorflow version (GPU?): not installed (NA)
+Using GPU in script?: Yes
+Using distributed or parallel set-up in script?: Yes
+
+Who can help:
+&lt;denchmark-link:https://github.com/LysandreJik&gt;@LysandreJik&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/patrickvonplaten&gt;@patrickvonplaten&lt;/denchmark-link&gt;
+
+Model I am using: Bert
+Language I am using the model on:English
+Adapter setup I am using (if any): HoulsbyConfig
+The problem arises when using:
+My own modified scripts:
+I want to use adapters for a project of mine, which will require fine-tuning BERT multiple times. In order to get an understanding of how much speedup I shall get from using adapters, I profiled the various steps in the training loop of BERT, both with and without the use of adapters
+The tasks I am working on is:
+Stanford Natural Language inference(SNLI)
+&lt;denchmark-h:h2&gt;To reproduce&lt;/denchmark-h&gt;
+
+Steps to reproduce the behavior:
+The following function is executed for a period of 4 hours on identical GPUs(via an LSF bach system) once with UseAdapter set to true and once with it set to False. The path contains a preloaded and tokenized version of the SNLI training set(as well as the test and dev sets, dropped here via underscores)
+&lt;denchmark-code&gt;def load_and_train(path, UseAdapter):
+    x_train,y_train,a_train,t_train,_,_,_,_,_,_,_,_=load(open(path,"rb"))
+    train_inst=torch.tensor(x_train)
+    train_att=torch.tensor(a_train)
+    train_types=torch.tensor(t_train)
+    train_targ=torch.tensor(y_train)
+    train_data = TensorDataset(train_inst, train_att, train_types,train_targ)
+    train_sampler = RandomSampler(train_data)
+    train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=32)
+    model = BertForSequenceClassification.from_pretrained('bert-base-uncased', num_labels=3)
+    if UseAdapter:
+        model.add_adapter("SNLI",AdapterType.text_task,HoulsbyConfig().__dict__)
+        model.train_adapter(["SNLI"])
+        model.set_active_adapters(["SNLI"])
+    model.cuda()
+    optimizer=AdamW(model.parameters(),lr=1e-4)
+    scheduler=get_linear_schedule_with_warmup(optimizer,0,len(train_dataloader)*EPOCHS)
+    iter=0
+    time_load=0
+    time_cler=0
+    time_forw=0
+    time_back=0
+    time_updt=0
+    for e in range(15):
+        model.train()
+        for batch in train_dataloader:
+            last=time()
+            x=batch[0].cuda()
+            a=batch[1].cuda()
+            t=batch[2].cuda()
+            y=batch[3].cuda()
+            time_load+=time()-last
+            last=time()
+            model.zero_grad()
+            time_cler+=time()-last
+            last=time()
+            outputs = model(x, token_type_ids=t, attention_mask=a, labels=y)
+            time_forw+=time()-last
+            last=time()
+            loss=outputs[0]
+            loss.backward()
+            time_back+=time()-last
+            last=time()
+            optimizer.step()
+            scheduler.step()
+            time_updt+=time()-last
+            iter+=1
+            print(time_load,time_cler,time_forw,time_back,time_updt)
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h2&gt;Expected behavior&lt;/denchmark-h&gt;
+
+
+With Adapters the trainer is able to run through more batches than without by the time the job gets timed out
+Per Batch time_load is identical for both cases
+Per Batch time_cler is slightly lower with adapters due to the presence of fewer gradients
+Per Batch time_forw is slightly higher with adapters due to extra layers that are introduced
+Per Batch time_back is significantly lower with adapters since it needs to save fewer gradients
+Per Batch time_updt is lower with adapters due to having fewer parameters to update
+
+&lt;denchmark-h:h2&gt;Observed Behaviour&lt;/denchmark-h&gt;
+
+Overall times(seconds):
+
+
+
+Adapter
+Load Time
+Clear Time
+Forward Prop
+Backward Prop
+Update
+Total
+No of Batches
+
+
+
+
+No
+9.141064644
+349.405822
+873.8870151
+11770.82554
+1159.772
+14163.03
+69022
+
+
+Yes
+2721.683394
+394.4980106
+1652.686945
+3192.402303
+6304.335
+14265.61
+95981
+
+
+
+Per Batch Times(seconds):
+
+
+
+Adapter
+Load Time
+Clear Time
+Forward Prop
+Backward Prop
+Update
+
+
+
+
+No
+0.000132437
+0.005062238
+0.012660992
+0.1705373
+0.016803
+
+
+Yes
+0.028356481
+0.004110168
+0.017218897
+0.033260774
+0.065683
+
+
+
+As is evident from above, points 2 and 6 above are not satisfied in this output.
+Note that similar observations were made in 2 reruns of the experiment.
+It is unclear to me if there is an explanation I am missing or if this is an implementation issue.
+	</description>
+	<comments>
+		<comment id='1' author='cs1160701' date='2020-11-23T14:56:19Z'>
+		Interesting observations! In our &lt;denchmark-link:https://arxiv.org/abs/2010.11918&gt;AdapterDrop paper&lt;/denchmark-link&gt;
+, we have measured time with  similar to:
+&lt;denchmark-link:https://discuss.pytorch.org/t/how-to-measure-time-in-pytorch/26964&gt;https://discuss.pytorch.org/t/how-to-measure-time-in-pytorch/26964&lt;/denchmark-link&gt;
+
+The reason is that CUDA is asynchronous and time() can be inaccurate. Maybe this is the reason for  e.g. the differences between load times in the above measurements. They should intuitively be the same because both are independent from whether adapters are included or not.
+Let me know if torch.cuda.event changes that!
+		</comment>
+		<comment id='2' author='cs1160701' date='2020-11-23T15:11:01Z'>
+		Hi, second author from the AdapterDrop paper here.
+Can you also additionally compute the standard deviation and median times of your measurements?
+The load time is a bit suspicious. I would not be surprised if the median for no/ yes-adapters turns out to be the same but yes-adapters has a high variance for some reason.
+Also, in general, GPU warmup can result in a few extreme values at the start that skew the mean upwards so discarding the first ~20 values can make the results more accurate.
+		</comment>
+		<comment id='3' author='cs1160701' date='2020-11-23T16:00:42Z'>
+		&lt;denchmark-link:https://github.com/Aaronsom&gt;@Aaronsom&lt;/denchmark-link&gt;
+ I don't think that is the issue here, since the times are quite uniform. You can have a look at the raw outputs here: &lt;denchmark-link:https://drive.google.com/drive/folders/11C2R-mmienyHip0DPOjmttf54v6Z0jM4?usp=sharing&gt;https://drive.google.com/drive/folders/11C2R-mmienyHip0DPOjmttf54v6Z0jM4?usp=sharing&lt;/denchmark-link&gt;
+
+The statistics you asked are as follows for load times:
+With adapter: Median=0.028345584869384766, StdDev=0.0002224897666539727
+Without Adapters: Median=0.00013184547424316406, StdDev=1.1399020784889467e-05
+As you see, the same trend persists
+		</comment>
+		<comment id='4' author='cs1160701' date='2020-11-23T16:05:53Z'>
+		&lt;denchmark-link:https://github.com/arueckle&gt;@arueckle&lt;/denchmark-link&gt;
+ The machine is busy right now, but I will get back as soon as possible. However, I doubt that asynchronous will be the issue, at least for the load times, since both the RAM and GDRAM are involved.
+		</comment>
+		<comment id='5' author='cs1160701' date='2020-11-23T16:43:04Z'>
+		
+@Aaronsom I don't think that is the issue here, since the times are quite uniform. You can have a look at the raw outputs here: https://drive.google.com/drive/folders/11C2R-mmienyHip0DPOjmttf54v6Z0jM4?usp=sharing
+The statistics you asked are as follows for load times:
+With adapter: Median=0.028345584869384766, StdDev=0.0002224897666539727
+Without Adapters: Median=0.00013184547424316406, StdDev=1.1399020784889467e-05
+As you see, the same trend persists
+
+Yep, that looks fine. Except, of course, for the fact that loading takes 200x the time with adapters enabled for some reason.
+Really weird and interesting. I hope you can find the cause for this.
+		</comment>
+		<comment id='6' author='cs1160701' date='2020-12-18T11:07:03Z'>
+		
+@arueckle The machine is busy right now, but I will get back as soon as possible. However, I doubt that asynchronous will be the issue, at least for the load times, since both the RAM and GDRAM are involved.
+
+any news on this?
+		</comment>
+		<comment id='7' author='cs1160701' date='2020-12-18T12:43:57Z'>
+		
+
+@arueckle The machine is busy right now, but I will get back as soon as possible. However, I doubt that asynchronous will be the issue, at least for the load times, since both the RAM and GDRAM are involved.
+
+any news on this?
+
+Hi,
+I used the code anyway as a part of my project, and when some other stuff was added into it (tensorboard, accuracy calculation, validation), both Cuda event and time give much better times, consistent with what I was expecting. Stripped down to barebones, however, the problem persists. Not sure what the issue is, but it does not occur in my real code, so I did not investigate further.
+Sorry for not replying earlier
+		</comment>
+		<comment id='8' author='cs1160701' date='2020-12-18T13:29:25Z'>
+		Ok, sounds good then. Thanks for the feedback!
+		</comment>
+		<comment id='9' author='cs1160701' date='2020-12-18T13:39:06Z'>
+		If you have additional findings, feel free to re-open this ticket. I think it is quite an interesting effect. It might be some interplay between I/O and asynchronous execution.
+		</comment>
+	</comments>
+</bug>

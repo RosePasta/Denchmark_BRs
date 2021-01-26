@@ -1,0 +1,184 @@
+<bug id='1523' author='aidanscannell' open_date='2020-07-03T20:08:49Z' closed_time='2020-08-04T17:31:57Z'>
+	<summary>separate_independent_conditional fails if q_sqrt=None</summary>
+	<description>
+Hello, I am using the conditionals method in a model that I am developing and I think that there is a bug, or at least some functionality missing which can easily be included.
+In my model I need to calculate a sparse GP conditional by sampling the inducing output distribution q_samples~N(q_mu, q_sqrt q_sqrt^T) instead of analytically integrating them. In order to achieve this (given conditional(Xnew, inducing_variable, kernel, f, full_cov, full_output_cov, q_sqrt, white)) I set f=q_sample (a single sample as I map over the samples) and q_sqrt=None, which I think is the correct way to achieve this?
+Using a separate independent multi-output kernel (and shared independent inducing variables) produces an error in separate_independent_conditional(Xnew, inducing_variable, kernel, f, full_cov, full_output_cov, q_sqrt, white) because q_sqrt=None is not handled.
+&lt;denchmark-h:h2&gt;To reproduce&lt;/denchmark-h&gt;
+
+Here is some code to reproduce the error. I do not sample the inducing outputs here but instead simply pass an input and set q_sqrt=None.
+import numpy as np
+import gpflow as gpf
+
+def func(X):
+    y1 = np.sin(X.flatten())
+    y2 = np.cos(X.flatten())
+    return np.stack([y1, y2]).T
+
+num_inducing = 30
+num_data = 100
+num_test = 200
+input_dim = 1
+
+X = np.linspace(0, 3, num_data).reshape(num_data, input_dim)
+Y = func(X)
+output_dim = Y.shape[1]
+
+# initialise SVGP with separate independent MOK and shared independent inducing variables
+idx = np.random.choice(range(num_data), size=num_inducing, replace=False)
+inducing_inputs = X[idx, ...].reshape(-1, input_dim)
+inducing_variable = gpf.inducing_variables.SharedIndependentInducingVariables(
+    gpf.inducing_variables.InducingPoints(inducing_inputs))
+kern_list = [gpf.kernels.RBF() for _ in range(output_dim)]
+kernel = gpf.kernels.SeparateIndependent(kern_list)
+model = gpf.models.SVGP(kernel,
+                        gpf.likelihoods.Gaussian(),
+                        inducing_variable=inducing_variable,
+                        num_latent_gps=output_dim)
+gpf.utilities.print_summary(model)
+
+# create test inputs
+Xnew = np.linspace(-1, 4, num_test).reshape(num_test, input_dim)
+
+# evaluate sparse gp conditional with q_sqrt=None
+mu, var = gpf.conditionals.conditional(Xnew,
+                                       model.inducing_variable,
+                                       model.kernel,
+                                       model.q_mu,
+                                       full_cov=False,
+                                       full_output_cov=False,
+                                       q_sqrt=None,
+                                       white=model.whiten)
+Stack trace, or error message
+&lt;denchmark-code&gt;AttributeError                            Traceback (most recent call last)
+~/Developer/python-projects/mixture-of-k-gp-experts/gpflow_cond_bug_reproduce.py in &lt;module&gt;
+     42                                        full_output_cov=False,
+     43                                        q_sqrt=None,
+---&gt; 44                                        white=model.whiten)
+
+~/.virtualenvs/mix-k-env/lib/python3.7/site-packages/multipledispatch/dispatcher.py in __call__(self, *args, **kwargs)
+    276             self._cache[types] = func
+    277         try:
+--&gt; 278             return func(*args, **kwargs)
+    279 
+    280         except MDNotImplementedError:
+
+~/.virtualenvs/mix-k-env/lib/python3.7/site-packages/gpflow/conditionals/multioutput/conditionals.py in separate_independent_conditional(Xnew, inducing_variable, kernel, f, full_cov, full_output_cov, q_sqrt, white)
+    122     fs = tf.transpose(f)[:, :, None]  # [P, M, 1]
+    123     # [P, 1, M, M]  or  [P, M, 1]
+--&gt; 124     q_sqrts = tf.transpose(q_sqrt)[:, :, None] if q_sqrt.shape.ndims == 2 else q_sqrt[:, None, :, :]
+    125 
+    126     def single_gp_conditional(t):
+
+AttributeError: 'NoneType' object has no attribute 'shape'
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h2&gt;Expected behavior&lt;/denchmark-h&gt;
+
+I expected the method to return the conditional mean [num_test, output_dim] and variance [num_test, output_dim].
+&lt;denchmark-h:h2&gt;System information&lt;/denchmark-h&gt;
+
+
+GPflow version: 2.0.5
+GPflow installed from: pip install gpflow
+TensorFlow version: 2.1.0
+Python version:  3.7.7
+Operating system: macOS Catalina 10.15.2
+
+&lt;denchmark-h:h2&gt;Additional context&lt;/denchmark-h&gt;
+
+I see two solutions that only require simple changes to the separate_independent_conditional method,
+
+Remove q_sqrt from the tuple being mapped through base_conditional if q_sqrt=None,
+Create a correctly sized Tensor for q_sqrt containing Nones that can be mapped through base_conditional.
+
+Here is the work around that I am using (I opted for solution 1 to prevent unnecessary mapping in the tf graph).
+@conditional.register(object, SeparateIndependentInducingVariables,
+                      SeparateIndependent, object)
+@conditional.register(object, SharedIndependentInducingVariables,
+                      SeparateIndependent, object)
+@conditional.register(object, SeparateIndependentInducingVariables,
+                      SharedIndependent, object)
+def separate_independent_conditional(
+    Xnew,
+    inducing_variable,
+    kernel,
+    f,
+    *,
+    full_cov=False,
+    full_output_cov=False,
+    q_sqrt=None,
+    white=False,
+):
+    """Multi-output GP with independent GP priors.
+    Number of latent processes equals the number of outputs (L = P).
+    The covariance matrices used to calculate the conditional have the following shape:
+    - Kuu: [P, M, M]
+    - Kuf: [P, M, N]
+    - Kff: [P, N] or [P, N, N]
+    Further reference
+    -----------------
+    - See `gpflow.conditionals._conditional` for a detailed explanation of
+      conditional in the single-output case.
+    - See the multioutput notebook for more information about the multioutput framework.
+    - See above for the parameters and the return value.
+    """
+    # Following are: [P, M, M]  -  [P, M, N]  -  [P, N](x N)
+    Kmms = covariances.Kuu(inducing_variable, kernel,
+                           jitter=default_jitter())  # [P, M, M]
+    Kmns = covariances.Kuf(inducing_variable, kernel, Xnew)  # [P, M, N]
+    if isinstance(kernel, Combination):
+        kernels = kernel.kernels
+    else:
+        kernels = [kernel.kernel] * len(
+            inducing_variable.inducing_variable_list)
+    Knns = tf.stack(
+        [k.K(Xnew) if full_cov else k.K_diag(Xnew) for k in kernels], axis=0)
+    fs = tf.transpose(f)[:, :, None]  # [P, M, 1]
+    # [P, 1, M, M]  or  [P, M, 1]
+    if q_sqrt is not None:
+        q_sqrts = tf.transpose(
+            q_sqrt)[:, :,
+                    None] if q_sqrt.shape.ndims == 2 else q_sqrt[:, None, :, :]
+        base_conditional_args_to_map = (Kmms, Kmns, Knns, fs, q_sqrts)
+        def single_gp_conditional(t):
+            Kmm, Kmn, Knn, f, q_sqrt = t
+            return base_conditional(Kmn,
+                                    Kmm,
+                                    Knn,
+                                    f,
+                                    full_cov=full_cov,
+                                    q_sqrt=q_sqrt,
+                                    white=white)
+    else:
+        base_conditional_args_to_map = (Kmms, Kmns, Knns, fs)
+        def single_gp_conditional(t):
+            Kmm, Kmn, Knn, f = t
+            return base_conditional(Kmn,
+                                    Kmm,
+                                    Knn,
+                                    f,
+                                    full_cov=full_cov,
+                                    q_sqrt=q_sqrt,
+                                    white=white)
+
+    rmu, rvar = tf.map_fn(
+        single_gp_conditional, base_conditional_args_to_map,
+        (default_float(),
+         default_float()))  # [P, N, 1], [P, 1, N, N] or [P, N, 1]
+
+    fmu = rollaxis_left(tf.squeeze(rmu, axis=-1), 1)  # [N, P]
+
+    if full_cov:
+        fvar = tf.squeeze(rvar, axis=-3)  # [..., 0, :, :]  # [P, N, N]
+    else:
+        fvar = rollaxis_left(tf.squeeze(rvar, axis=-1), 1)  # [N, P]
+
+    return fmu, expand_independent_outputs(fvar, full_cov, full_output_cov)
+If you think this is functionality that should be in GPflow then let me know and I will neaten it up and submit a pull request.
+Thanks,
+Aidan
+	</description>
+	<comments>
+	</comments>
+</bug>

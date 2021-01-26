@@ -1,0 +1,369 @@
+<bug id='339' author='axeldavy' open_date='2020-01-17T10:58:09Z' closed_time='2020-02-15T08:39:21Z'>
+	<summary>Group normalization crashes tensorrt</summary>
+	<description>
+&lt;denchmark-h:h2&gt;Description&lt;/denchmark-h&gt;
+
+Any keras model exported to onnx using group normalization crashes tensorrt.
+&lt;denchmark-h:h2&gt;Environment&lt;/denchmark-h&gt;
+
+TensorRT Version: 7
+GPU Type: 2080TI
+Nvidia Driver Version: 440.33
+CUDA Version: 10.2
+CUDNN Version: 7.6
+Operating System + Version: Ubuntu 18.04
+Python Version (if applicable): 3.6.9
+TensorFlow Version (if applicable): 1.15
+PyTorch Version (if applicable):
+Baremetal or Container (if container which image + tag):
+&lt;denchmark-h:h2&gt;Relevant Files&lt;/denchmark-h&gt;
+
+Here is a full script to produce a minimal onnx file reproducing the issue:
+import os
+import os.path
+import argparse
+import time
+import numpy as np
+import fnmatch
+import errno
+from tensorflow.python.compiler.tensorrt import trt_convert as trt
+
+import keras.backend as K
+import keras.layers
+
+from keras.models import Model
+
+import tensorflow as tf
+
+from tensorflow.python.training import saver as saver_lib
+from tensorflow.core.protobuf import saver_pb2
+from tensorflow.python.framework import graph_io
+from tensorflow.python.tools import freeze_graph
+from keras.layers.merge import concatenate
+
+from onnx import helper, shape_inference
+from onnx import optimizer
+
+import keras2onnx
+import onnx
+import onnx.utils
+
+from tensorflow.python.tools import optimize_for_inference_lib
+
+
+from keras.layers import Layer, InputSpec
+from keras import initializers, regularizers, constraints
+from keras import backend as K
+
+import tensorflow as tf
+
+def moments(x, axes, shift=None, keep_dims=False):
+    ''' Wrapper over tensorflow backend call '''
+
+    return tf.nn.moments(x, axes, shift=shift, keep_dims=keep_dims)
+
+# Code from here: https://github.com/keras-team/keras-contrib/blob/master/keras_contrib/layers/normalization/groupnormalization.py
+class GroupNormalization(Layer):
+    """Group normalization layer.
+
+    Group Normalization divides the channels into groups and computes
+    within each group
+    the mean and variance for normalization.
+    Group Normalization's computation is independent
+     of batch sizes, and its accuracy is stable in a wide range of batch sizes.
+
+    Relation to Layer Normalization:
+    If the number of groups is set to 1, then this operation becomes identical to
+    Layer Normalization.
+
+    Relation to Instance Normalization:
+    If the number of groups is set to the
+    input dimension (number of groups is equal
+    to number of channels), then this operation becomes
+    identical to Instance Normalization.
+
+    # Arguments
+        groups: Integer, the number of groups for Group Normalization.
+            Can be in the range [1, N] where N is the input dimension.
+            The input dimension must be divisible by the number of groups.
+        axis: Integer, the axis that should be normalized
+            (typically the features axis).
+            For instance, after a `Conv2D` layer with
+            `data_format="channels_first"`,
+            set `axis=1` in `BatchNormalization`.
+        epsilon: Small float added to variance to avoid dividing by zero.
+        center: If True, add offset of `beta` to normalized tensor.
+            If False, `beta` is ignored.
+        scale: If True, multiply by `gamma`.
+            If False, `gamma` is not used.
+            When the next layer is linear (also e.g. `nn.relu`),
+            this can be disabled since the scaling
+            will be done by the next layer.
+        beta_initializer: Initializer for the beta weight.
+        gamma_initializer: Initializer for the gamma weight.
+        beta_regularizer: Optional regularizer for the beta weight.
+        gamma_regularizer: Optional regularizer for the gamma weight.
+        beta_constraint: Optional constraint for the beta weight.
+        gamma_constraint: Optional constraint for the gamma weight.
+
+    # Input shape
+        Arbitrary. Use the keyword argument `input_shape`
+        (tuple of integers, does not include the samples axis)
+        when using this layer as the first layer in a model.
+
+    # Output shape
+        Same shape as input.
+
+    # References
+        - [Group Normalization](https://arxiv.org/abs/1803.08494)
+    """
+
+    def __init__(self,
+                 groups=32,
+                 axis=-1,
+                 epsilon=1e-5,
+                 center=True,
+                 scale=True,
+                 beta_initializer='zeros',
+                 gamma_initializer='ones',
+                 beta_regularizer=None,
+                 gamma_regularizer=None,
+                 beta_constraint=None,
+                 gamma_constraint=None,
+                 **kwargs):
+        super(GroupNormalization, self).__init__(**kwargs)
+        self.supports_masking = True
+        self.groups = groups
+        self.axis = axis
+        self.epsilon = epsilon
+        self.center = center
+        self.scale = scale
+        self.beta_initializer = initializers.get(beta_initializer)
+        self.gamma_initializer = initializers.get(gamma_initializer)
+        self.beta_regularizer = regularizers.get(beta_regularizer)
+        self.gamma_regularizer = regularizers.get(gamma_regularizer)
+        self.beta_constraint = constraints.get(beta_constraint)
+        self.gamma_constraint = constraints.get(gamma_constraint)
+
+    def build(self, input_shape):
+        dim = input_shape[self.axis]
+
+        if dim is None:
+            raise ValueError('Axis ' + str(self.axis) + ' of '
+                             'input tensor should have a defined dimension '
+                             'but the layer received an input with shape ' +
+                             str(input_shape) + '.')
+
+        if dim &lt; self.groups:
+            raise ValueError('Number of groups (' + str(self.groups) + ') cannot be '
+                             'more than the number of channels (' +
+                             str(dim) + ').')
+
+        if dim % self.groups != 0:
+            raise ValueError('Number of groups (' + str(self.groups) + ') must be a '
+                             'multiple of the number of channels (' +
+                             str(dim) + ').')
+
+        self.input_spec = InputSpec(ndim=len(input_shape),
+                                    axes={self.axis: dim})
+        shape = (dim,)
+
+        if self.scale:
+            self.gamma = self.add_weight(shape=shape,
+                                         name='gamma',
+                                         initializer=self.gamma_initializer,
+                                         regularizer=self.gamma_regularizer,
+                                         constraint=self.gamma_constraint)
+        else:
+            self.gamma = None
+        if self.center:
+            self.beta = self.add_weight(shape=shape,
+                                        name='beta',
+                                        initializer=self.beta_initializer,
+                                        regularizer=self.beta_regularizer,
+                                        constraint=self.beta_constraint)
+        else:
+            self.beta = None
+        self.built = True
+
+    def call(self, inputs, **kwargs):
+        input_shape = K.int_shape(inputs)
+        tensor_input_shape = K.shape(inputs)
+
+        # Prepare broadcasting shape.
+        reduction_axes = list(range(len(input_shape)))
+        del reduction_axes[self.axis]
+        broadcast_shape = [1] * len(input_shape)
+        broadcast_shape[self.axis] = input_shape[self.axis] // self.groups
+        broadcast_shape.insert(1, self.groups)
+
+        reshape_group_shape = K.shape(inputs)
+        group_axes = [reshape_group_shape[i] for i in range(len(input_shape))]
+        group_axes[self.axis] = input_shape[self.axis] // self.groups
+        group_axes.insert(1, self.groups)
+
+        # reshape inputs to new group shape
+        group_shape = [group_axes[0], self.groups] + group_axes[2:]
+        group_shape = K.stack(group_shape)
+        inputs = K.reshape(inputs, group_shape)
+
+        group_reduction_axes = list(range(len(group_axes)))
+        mean, variance = moments(inputs, group_reduction_axes[2:],
+                                    keep_dims=True)
+        inputs = (inputs - mean) / (K.sqrt(variance + self.epsilon))
+
+        # prepare broadcast shape
+        inputs = K.reshape(inputs, group_shape)
+
+        outputs = inputs
+
+        # In this case we must explicitly broadcast all parameters.
+        if self.scale:
+            broadcast_gamma = K.reshape(self.gamma, broadcast_shape)
+            outputs = outputs * broadcast_gamma
+
+        if self.center:
+            broadcast_beta = K.reshape(self.beta, broadcast_shape)
+            outputs = outputs + broadcast_beta
+
+        # finally we reshape the output back to the input shape
+        outputs = K.reshape(outputs, tensor_input_shape)
+
+        return outputs
+
+    def get_config(self):
+        config = {
+            'groups': self.groups,
+            'axis': self.axis,
+            'epsilon': self.epsilon,
+            'center': self.center,
+            'scale': self.scale,
+            'beta_initializer': initializers.serialize(self.beta_initializer),
+            'gamma_initializer': initializers.serialize(self.gamma_initializer),
+            'beta_regularizer': regularizers.serialize(self.beta_regularizer),
+            'gamma_regularizer': regularizers.serialize(self.gamma_regularizer),
+            'beta_constraint': constraints.serialize(self.beta_constraint),
+            'gamma_constraint': constraints.serialize(self.gamma_constraint)
+        }
+        base_config = super(GroupNormalization, self).get_config()
+        return dict(list(base_config.items()) + list(config.items()))
+
+    def compute_output_shape(self, input_shape):
+        return input_shape
+
+
+
+def mkdir_p(path):
+    """
+    Create a directory without complaining if it already exists.
+    """
+    if path:
+        try:
+            os.makedirs(path)
+        except OSError as exc: # requires Python &gt; 2.5
+            if exc.errno == errno.EEXIST and os.path.isdir(path):
+                pass
+            else: raise
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=('Testing Group Norm'))
+
+    parser.add_argument('onnx_net', type=str, default='mynetwork/net.onnx', help='Path to the output network')
+    args = parser.parse_args()
+
+    K.set_learning_phase(0)
+
+    input = keras.layers.Input(batch_shape=(1,512,512,1))
+    x = keras.layers.Conv2D(64, 3, padding='valid', kernel_initializer='he_normal')(input)
+    x = GroupNormalization()(x)
+    x = keras.layers.Conv2D(64, 3, padding='valid', kernel_initializer='he_normal')(x)
+    model = Model(input,x)
+
+    # Use tensorflow to export the model (Failure with keras codepath)
+    graph_def = keras2onnx.export_tf_frozen_graph(model)
+    onnx_model = keras2onnx.convert_tensorflow(graph_def, **keras2onnx.build_io_names_tf2onnx(model), target_opset=11)
+
+    # Check the onnx model is valid
+    onnx.checker.check_model(onnx_model)
+
+    # Create target dir if doesn't exist
+    dirname = os.path.dirname(args.onnx_net)
+    mkdir_p(dirname)
+
+    # Export the model
+    onnx.save_model(onnx_model, args.onnx_net)
+
+
+The produced file ran with  trtexec --verbose gives:
+
+----- Parsing of ONNX model /tmp/test.onnx is Done ----
+[01/17/2020-11:52:59] [V] [TRT] Applying generic optimizations to the graph for inference.
+[01/17/2020-11:52:59] [V] [TRT] Original: 31 layers
+[01/17/2020-11:52:59] [V] [TRT] After dead-layer removal: 31 layers
+[01/17/2020-11:52:59] [V] [TRT] After Myelin optimization: 31 layers
+[01/17/2020-11:52:59] [V] [TRT] After scale fusion: 31 layers
+[01/17/2020-11:52:59] [V] [TRT] Fusing conv2d_1/convolution__6 with group_normalization_1/Reshape
+[01/17/2020-11:52:59] [V] [TRT] Fusing group_normalization_1/add with (Unnamed Layer* 9) [Shuffle]
+[01/17/2020-11:52:59] [V] [TRT] Fusing group_normalization_1/add + (Unnamed Layer* 9) [Shuffle] with (Unnamed Layer* 10) [ElementWise]
+[01/17/2020-11:52:59] [V] [TRT] Fusing Min__9 with (Unnamed Layer* 12) [Shuffle]
+[01/17/2020-11:52:59] [V] [TRT] Fusing Max__11 with (Unnamed Layer* 15) [Shuffle]
+[01/17/2020-11:52:59] [V] [TRT] Removing group_normalization_1/Reshape_1
+[01/17/2020-11:52:59] [V] [TRT] Fusing group_normalization_1/Reshape_4 with conv2d_2/convolution__15
+[01/17/2020-11:52:59] [V] [TRT] Fusing conv2d_2/BiasAdd with (Unnamed Layer* 29) [Shuffle]
+[01/17/2020-11:52:59] [V] [TRT] Fusing group_normalization_1/add + (Unnamed Layer* 9) [Shuffle] + (Unnamed Layer* 10) [ElementWise] with (Unnamed Layer* 13) [ElementWise]
+Erreur de segmentation (core dumped)
+
+&lt;denchmark-h:h2&gt;Steps To Reproduce&lt;/denchmark-h&gt;
+
+run the python script, saving to test.onnx
+run trtexec --onnx=test.onnx --verbose
+	</description>
+	<comments>
+		<comment id='1' author='axeldavy' date='2020-01-22T01:17:50Z'>
+		Hi &lt;denchmark-link:https://github.com/axeldavy&gt;@axeldavy&lt;/denchmark-link&gt;
+,
+What're your keras and keras2onnx versions? Can you just give the output of pip freeze in case I'm missing anything else to repro?
+With keras==2.3.1 and tensorflow==1.15 I got:
+&lt;denchmark-code&gt;Tensorflow op [group_normalization_1/add: AddV2] is not supported
+Tensorflow op [group_normalization_1/add_1: AddV2] is not supported
+Unsupported ops: Counter({'AddV2': 2})
+Traceback (most recent call last):
+  File "repro.py", line 267, in &lt;module&gt;
+    onnx.checker.check_model(onnx_model)
+  File "/usr/local/lib/python3.6/dist-packages/onnx/checker.py", line 91, in check_model
+    C.check_model(model.SerializeToString())
+onnx.onnx_cpp2py_export.checker.ValidationError: No Op registered for AddV2 with domain_version of 11
+&lt;/denchmark-code&gt;
+
+With keras==2.1.3 and tensorflow==1.15:
+&lt;denchmark-code&gt;AttributeError: module 'keras.layers' has no attribute 'DepthwiseConv2D'
+&lt;/denchmark-code&gt;
+
+So I went back to keras==2.3.1 and downgraded to tensorflow==1.14 and ONNX model was produced fine
+&lt;denchmark-code&gt;$ ls -lh
+-rw-r--r-- 1 root root 151K Jan 22 01:18 test.onnx
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='2' author='axeldavy' date='2020-01-22T01:29:21Z'>
+		Repro'd segfault with ONNX opsets 7 - 11 using keras2onnx. I'm curious if tf2onnx will produce a different graph over keras2onnx
+		</comment>
+		<comment id='3' author='axeldavy' date='2020-01-22T08:04:32Z'>
+		keras2onnx.convert_tensorflow uses tf2onnx for the conversion.
+Indeed keras2onnx's convert_keras conversion doesn't work with tensorrt:
+&lt;denchmark-link:https://github.com/onnx/onnx-tensorrt/issues/363&gt;onnx/onnx-tensorrt#363&lt;/denchmark-link&gt;
+
+I think I met the same Addv2 problem with tensorflow 1.15, and that was solved by using keras2onnx with an updated ktf2onnx directory (which is a clone of tf2onnx). Unfortunately I think tf2onnx master is compatible now only with tensorflow 2.
+It seems you were able to reproduce with tensorflow 1.14, so I think it is fine, but if you need I can give the exact commit for tf2onnx and keras2onnx that work with tensorflow 1.15.
+		</comment>
+		<comment id='4' author='axeldavy' date='2020-01-22T08:17:26Z'>
+		I made several models (keras2onnx, tf2onnx, .pb) using tf1.14 and keras2onnx. Will look into the root cause.
+		</comment>
+		<comment id='5' author='axeldavy' date='2020-02-15T08:39:21Z'>
+		Hi &lt;denchmark-link:https://github.com/axeldavy&gt;@axeldavy&lt;/denchmark-link&gt;
+ ,
+It seems like this was caused by some infinity values propagating through the network to layers that didn't support it. This should be fixed for the next release.
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,318 @@
+<bug id='1346' author='mossadTB' open_date='2020-09-10T08:41:56Z' closed_time='2020-09-10T11:05:24Z'>
+	<summary>CLI no response and API Shuts down when calling a SimpleTransformers Model</summary>
+	<description>
+&lt;denchmark-h:h4&gt;Version&lt;/denchmark-h&gt;
+
+cli version: 0.19.0
+&lt;denchmark-h:h4&gt;Description&lt;/denchmark-h&gt;
+
+Hi Everyone,
+Thanks for the cool work you are doing. We have benefited a lot from it. Now to the bug:
+I am deploying a local cortex API for a BERT model from the SimpleTransformers library.
+Here is the code for my predictor:
+&lt;denchmark-code&gt;class PythonPredictor:
+    def __init__(self, config):
+        print('INITALIZING')
+        self.classifier = JobPostingClassifier()
+        self.classifier.load_saved_model()
+
+    def predict(self, payload):
+        """
+            expected payload:
+            {"html": "&lt;html&gt;&lt;body&gt; ... etc."}
+        """
+
+        print('recieved response. extracting text from html'.upper())
+        text = get_text(payload['html'])
+
+        print('TEXT EXTRACTED. LENGTH:', len(text),  'PREDICTING USING BERT')
+
+        predictions = self.classifier.predict_categories([text])
+        
+        print('PREDICTED', predictions[0])
+
+        return predictions[0]
+&lt;/denchmark-code&gt;
+
+Notice that it prints the lines before but not after the model prediction call.
+And here is the response I get in the logs pretty much instantly after I make the request:
+&lt;denchmark-code&gt;RECIEVED RESPONSE. EXTRACTING TEXT FROM HTML
+TEXT EXTRACTED. LENGTH: 0 PREDICTING USING BERT
+100% 1/1 [00:00&lt;00:00, 32.93it/s]
+2020-09-10 07:55:12.456679:cortex:pid-202:INFO:Shutting down
+2020-09-10 07:55:12.562235:cortex:pid-202:INFO:Waiting for connections to close. (CTRL+C to force quit)
+2020-09-10 08:00:30.450488:cortex:pid-202:INFO:Waiting for background tasks to complete. (CTRL+C to force quit)
+&lt;/denchmark-code&gt;
+
+The request contains an empty HTML document to make sure the model doesn't take time in predicting it. This request works locally without deploying to cortex.
+After I make the first request and it shuts down, the API doesn't print the logs for subsequent API calls. However, when I run cortex get --watch, the status is live.
+I noticed someone else had the same issue (also with the SimpleTransformers library) in &lt;denchmark-link:https://gitter.im/cortexlabs/cortex?at=5f3ee5eba05e464346da2c87&gt;this thread&lt;/denchmark-link&gt;
+ (Abdoulaye Faye &lt;denchmark-link:https://github.com/Bams2011&gt;@Bams2011&lt;/denchmark-link&gt;
+). But they never reported back on what worked for them to solve the issue.
+I also tried the debugging step mentioned in the same thread (by &lt;denchmark-link:https://github.com/RobertLucian&gt;@RobertLucian&lt;/denchmark-link&gt;
+) in which I call the predictor from within the docker and it also worked (just like it worked for &lt;denchmark-link:https://github.com/Bams2011&gt;@Bams2011&lt;/denchmark-link&gt;
+ in the thread)
+&lt;denchmark-h:h4&gt;Configuration&lt;/denchmark-h&gt;
+
+cortex.yaml:
+&lt;denchmark-code&gt;  kind: RealtimeAPI
+  predictor:
+    type: python
+    path: cortex_predictor.py
+    threads_per_process: 16
+&lt;/denchmark-code&gt;
+
+I tried it with and without the threads_per_process: 16 because I noticed the predictor makes the predictions in another thread. Both give the same response.
+&lt;denchmark-h:h4&gt;Steps to reproduce&lt;/denchmark-h&gt;
+
+
+Deploy a SimpleTransformers predictor via cortex
+Make a request to the API (e.g. for my case: curl http://localhost:8888 -X POST -H "Content-Type: application/json" -d '{"html": "&lt;html&gt;&lt;body&gt;&lt;/body&gt;&lt;/html&gt;"}')
+
+&lt;denchmark-h:h4&gt;Expected behavior&lt;/denchmark-h&gt;
+
+The API should return the predictions of the request.
+&lt;denchmark-h:h4&gt;Actual behavior&lt;/denchmark-h&gt;
+
+The API doesn't return a response (curl just hangs there waiting) and in the logs it says the API has crashed.
+If you need more documentation for the bug, please tell me what outputs/files are desired.
+Thanks again.
+	</description>
+	<comments>
+		<comment id='1' author='mossadTB' date='2020-09-10T10:15:52Z'>
+		Hi  mossadhelalitalentbait, after investigation with roberlucian ,below is
+the conclusion he made:
+
+The problem is with the simpletransformers package. The symptoms are:
+
+   1. When signals (i.e. SIGINT, SIGTERM) are handled, then when the
+   self.model.predict(inputs) method is called, it will send a SIGTERM
+   signal. Uvicorn comes with signal handlers enabled, which means that the
+   web server will always shut down when the signal is sent. The method should
+   never send a SIGTERM signal.
+   2. Another issue, which explains why the server doesn’t fully shut down,
+   and thus stop the container, is that when the SIGTERM is sent, the
+   self.model.predict(inputs) method doesn’t exit as it should and instead
+   it just keeps on executing. This is what I have noticed while running a
+   standalone Python script. While running this with Uvicorn (aka Cortex), it
+   just hangs.
+   3. Another issue, which may not be related, but it’s still there is that
+   the simpletransformers.classification.ClassificationModel class has a
+   memory leak bug. The model is never released from memory. My gut tells me
+   that this bug might have something to do with the SIGTERM bug because when
+   this happens with Cortex, the model is never released from memory
+
+A custom un-official version of uvicorn package has been built to disable
+the signal handlers. The package that has to be added to the
+requirements.txt file is git+
+&lt;denchmark-link:https://github.com/RobertLucian/uvicorn.git@0.11.9&gt;https://github.com/RobertLucian/uvicorn.git@0.11.9&lt;/denchmark-link&gt;
+. Use this as a temporary
+quick-n-dirty fix.
+
+The solution where the signal handlers are disabled is discouraged,
+especially in production, due to simpletransformers package being buggy.
+The recommended solution is to find an alternative to the simpletransformers
+ package.
+
+The following is a snippet of code that describes the above SIGTERM bug of
+simpletransformers.
+
+
+Hope this will help you !
+
+Best regards!
+Abdoulaye Faye
+Computer Scientist Engineer (ESP)
+Data Scientist at Baamtu SARL
+Cité Castors Municipaux Dalifort
++221 77 285 77 56 - +221 78 216 97 88
+
+
+Le jeu. 10 sept. 2020 à 08:42, mossadhelalitalentbait &lt;
+notifications@github.com&gt; a écrit :
+&lt;denchmark-link:#&gt;…&lt;/denchmark-link&gt;
+
+
+ Version
+
+ cli version: 0.19.0
+ Description
+
+ Hi Everyone,
+ Thanks for the cool work you are doing. We have benefited a lot from it.
+ Now to the bug:
+ I am deploying a *local cortex API* for a BERT model from the
+ SimpleTransformers library.
+
+ Here is the code for my predictor:
+
+ class PythonPredictor:
+     def __init__(self, config):
+         print('INITALIZING')
+         self.classifier = JobPostingClassifier()
+         self.classifier.load_saved_model()
+
+     def predict(self, payload):
+         """
+             expected payload:
+             {"html": "&lt;html&gt;&lt;body&gt; ... etc."}
+         """
+
+         print('recieved response. extracting text from html'.upper())
+         text = get_text(payload['html'])
+
+         print('TEXT EXTRACTED. LENGTH:', len(text),  'PREDICTING USING BERT')
+
+         predictions = self.classifier.predict_categories([text])
+
+         print('PREDICTED', predictions[0])
+
+         return predictions[0]
+
+ Notice that it prints the lines before but not after the model prediction
+ call.
+
+ And here is the response I get in the logs pretty much *instantly* after
+ I make the request:
+
+ RECIEVED RESPONSE. EXTRACTING TEXT FROM HTML
+ TEXT EXTRACTED. LENGTH: 0 PREDICTING USING BERT
+ 100% 1/1 [00:00&lt;00:00, 32.93it/s]
+ 2020-09-10 07:55:12.456679:cortex:pid-202:INFO:Shutting down
+ 2020-09-10 07:55:12.562235:cortex:pid-202:INFO:Waiting for connections to close. (CTRL+C to force quit)
+ 2020-09-10 08:00:30.450488:cortex:pid-202:INFO:Waiting for background tasks to complete. (CTRL+C to force quit)
+
+ The request contains an empty HTML document to make sure the model doesn't
+ take time in predicting it. This request works locally without deploying to
+ cortex.
+ I noticed someone else had the same issue (also with the
+ SimpleTransformers library) in this thread
+ &lt;https://gitter.im/cortexlabs/cortex?at=5f3ee5eba05e464346da2c87&gt;
+ (Abdoulaye Faye @Bams2011 &lt;https://github.com/Bams2011&gt;). But they never
+ reported back on what worked for them to solve the issue.
+ I also tried the debugging step mentioned in the same thread (by
+ @RobertLucian &lt;https://github.com/RobertLucian&gt;) in which I call the
+ predictor from within the docker and it also worked (just like it worked
+ for @Bams2011 &lt;https://github.com/Bams2011&gt; in the thread)
+ Configuration
+
+ cortex.yaml:
+
+   kind: RealtimeAPI
+   predictor:
+     type: python
+     path: cortex_predictor.py
+     threads_per_process: 16
+
+ I tried it with and without the threads_per_process: 16 because I noticed
+ the predictor makes the predictions in another thread. Both give the same
+ response.
+ Steps to reproduce
+
+    1. Deploy a SimpleTransformers predictor via cortex
+    2. Make a request to the API (e.g. for my case: curl
+    http://localhost:8888 -X POST -H "Content-Type: application/json" -d
+    '{"html": "&lt;html&gt;&lt;body&gt;&lt;/body&gt;&lt;/html&gt;"}')
+
+ Expected behavior
+
+ The API should return the predictions of the request.
+ Actual behavior
+
+ The API doesn't return a response (curl just hangs there waiting) and in
+ the logs it says the API has crashed.
+
+ If you need more documentation for the bug, please tell me what
+ outputs/files are desired.
+
+ Thanks again.
+
+ —
+ You are receiving this because you were mentioned.
+ Reply to this email directly, view it on GitHub
+ &lt;#1346&gt;, or unsubscribe
+ &lt;https://github.com/notifications/unsubscribe-auth/AIJ3EPQ6MVV56NJPXQF3DRDSFCGOJANCNFSM4RER7PPA&gt;
+ .
+
+
+
+		</comment>
+		<comment id='2' author='mossadTB' date='2020-09-10T10:37:23Z'>
+		&lt;denchmark-link:https://github.com/Bams2011&gt;@Bams2011&lt;/denchmark-link&gt;
+
+Thank you very much for the detailed explanation. Using the custom Uvicorn build has indeed fixed the issue (at least for now). I will forward this bug to the SimpleTransformers developers.
+You can close this issue.
+		</comment>
+		<comment id='3' author='mossadTB' date='2020-09-10T10:49:04Z'>
+		Yes you might forward the bug to simple transformers developers!
+How  can i close the issue ?
+Abdoulaye Faye
+Computer Scientist Engineer (ESP)
+Data Scientist at Baamtu SARL
+Cité Castors Municipaux Dalifort
++221 77 285 77 56 - +221 78 216 97 88
+
+
+Le jeu. 10 sept. 2020 à 10:37, mossadhelalitalentbait &lt;
+notifications@github.com&gt; a écrit :
+&lt;denchmark-link:#&gt;…&lt;/denchmark-link&gt;
+
+
+ @Bams2011 &lt;https://github.com/Bams2011&gt;
+ Thank you very much for the detailed explanation. Using the custom Uvicorn
+ build has indeed fixed the issue (at least for now). I will forward this
+ bug to the SimpleTransformers developers.
+ You can close this issue.
+
+ —
+ You are receiving this because you were mentioned.
+ Reply to this email directly, view it on GitHub
+ &lt;#1346 (comment)&gt;,
+ or unsubscribe
+ &lt;https://github.com/notifications/unsubscribe-auth/AIJ3EPVA45RULWO2INJDX43SFCT7JANCNFSM4RER7PPA&gt;
+ .
+
+
+
+		</comment>
+		<comment id='4' author='mossadTB' date='2020-09-10T11:05:24Z'>
+		&lt;denchmark-link:https://github.com/Bams2011&gt;@Bams2011&lt;/denchmark-link&gt;
+
+I have created an issue on the SimpleTransformers repo &lt;denchmark-link:https://github.com/ThilinaRajapakse/simpletransformers/issues/705&gt;here&lt;/denchmark-link&gt;
+.
+Thanks for your support. I will go ahead and close the issue here myself.
+		</comment>
+		<comment id='5' author='mossadTB' date='2020-09-10T11:44:58Z'>
+		Got it Thanks again!
+Best regards!
+Abdoulaye Faye
+Computer Scientist Engineer (ESP)
+Data Scientist at Baamtu SARL
+Cité Castors Municipaux Dalifort
++221 77 285 77 56 - +221 78 216 97 88
+
+
+Le jeu. 10 sept. 2020 à 11:05, mossadhelalitalentbait &lt;
+notifications@github.com&gt; a écrit :
+&lt;denchmark-link:#&gt;…&lt;/denchmark-link&gt;
+
+
+ Closed #1346 &lt;#1346&gt;.
+
+ —
+ You are receiving this because you were mentioned.
+ Reply to this email directly, view it on GitHub
+ &lt;#1346 (comment)&gt;, or
+ unsubscribe
+ &lt;https://github.com/notifications/unsubscribe-auth/AIJ3EPVTAU4C3TXNPD4NGD3SFCXILANCNFSM4RER7PPA&gt;
+ .
+
+
+
+		</comment>
+		<comment id='6' author='mossadTB' date='2020-09-16T21:49:09Z'>
+		For anyone who have the same issue: the problem turned out to be from the SimpleTransformers library (specifically, the way it handles multi-threading).
+Using train_args.use_multiprocessing = False when creating/loading the model has solved the issue for me.
+		</comment>
+	</comments>
+</bug>

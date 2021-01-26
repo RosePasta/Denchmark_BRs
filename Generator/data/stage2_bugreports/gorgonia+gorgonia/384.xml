@@ -1,0 +1,300 @@
+<bug id='384' author='owulveryck' open_date='2020-03-21T17:29:30Z' closed_time='2020-03-23T21:36:07Z'>
+	<summary>Optimisation in NewUniqueNode may be buggy</summary>
+	<description>
+I think this is related to &lt;denchmark-link:https://github.com/gorgonia/gorgonia/issues/373&gt;#373&lt;/denchmark-link&gt;
+  and &lt;denchmark-link:https://github.com/gorgonia/gorgonia/issues/375&gt;#375&lt;/denchmark-link&gt;
+
+I made a simple test, as described in &lt;denchmark-link:https://github.com/gorgonia/gorgonia/issues/375&gt;#375&lt;/denchmark-link&gt;
+:
+package gorgonia_test
+
+import (
+	"testing"
+
+	"gorgonia.org/gorgonia"
+)
+
+func TestMean_issue375(t *testing.T) {
+	g := gorgonia.NewGraph()
+
+	w0 := gorgonia.NewTensor(g, gorgonia.Float32, 4, gorgonia.WithShape(1, 64, 1, 64), gorgonia.WithName("w0"), gorgonia.WithInit(gorgonia.GlorotN(1.0)))
+	result, _ := gorgonia.Mean(w0, 3)
+	t.Log(result)
+}
+After some investigation, the code is panicking because of a call to WithShape here: 
+
+
+gorgonia/node.go
+
+
+        Lines 210 to 212
+      in
+      2d4605d
+
+
+
+
+
+
+ if !acceptVec &amp;&amp; !sameDims &amp;&amp; !acceptScalar { 
+
+
+
+ panic(fmt.Sprintf("Node %v, has %d dimensions(Shape: %v). Input shape is %v, which has %d dimensions", n, n.Dims(), n.shape, s, s.Dims())) 
+
+
+
+ } 
+
+
+
+
+
+which is called here: 
+
+
+gorgonia/op.go
+
+
+         Line 202
+      in
+      2d4605d
+
+
+
+
+
+
+ retVal = NewUniqueNode(WithType(retType), WithOp(op), WithChildren(children), In(g), WithShape(s...)) 
+
+
+
+
+
+The problem is in the function NewUniqueNode which calls newNode... which calls n.borrowNode for optimization: 
+
+
+gorgonia/node.go
+
+
+         Line 259
+      in
+      2d4605d
+
+
+
+
+
+
+ n := borrowNode() 
+
+
+
+
+
+It applies the WithShape function here ...
+
+
+gorgonia/node.go
+
+
+         Line 264
+      in
+      2d4605d
+
+
+
+
+
+
+ opt(n) 
+
+
+
+
+
+therefore, all the checks are performed on the node that is borrowed and full of rubbish!
+In the example, there is only one node to be borrowed; therefore, the panic always returns the same result, but with a more significant code, the problem could appear sporadically.
+	</description>
+	<comments>
+		<comment id='1' author='owulveryck' date='2020-03-21T23:08:48Z'>
+		Hmm, I thought I added the garbage cleanup on return to pool. Let me look into this further
+		</comment>
+		<comment id='2' author='owulveryck' date='2020-03-22T15:50:56Z'>
+		You're right, the cleanup happens here: 
+
+
+gorgonia/perf.go
+
+
+         Line 16
+      in
+      2d4605d
+
+
+
+
+
+
+ func returnNode(n *Node) { 
+
+
+
+
+
+This is really weird.
+		</comment>
+		<comment id='3' author='owulveryck' date='2020-03-22T16:02:40Z'>
+		&lt;denchmark-link:https://user-images.githubusercontent.com/11583401/77254035-c79e7e00-6c5e-11ea-9905-f7d77f8946ef.png&gt;&lt;/denchmark-link&gt;
+
+See on my debugging screenshot:
+
+n's fields have been nilled (n.shape is nil )
+nd is 4
+
+How is this possible?
+Note: the panic message is coherent with this, it displays 4 dimensions and a shape equal to ():
+&lt;denchmark-code&gt;Node Σ[3](%0) :: Tensor-4 float32, has 4 dimensions(Shape: ()). Input shape is (64), which has 1 dimensions [recovered]
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='4' author='owulveryck' date='2020-03-22T21:03:38Z'>
+		That message means that the Tensor-4 was defined with a type of dim 4, but the given shape is only of dim (). Let me recreate that
+		</comment>
+		<comment id='5' author='owulveryck' date='2020-03-22T21:04:14Z'>
+		the issue is likely in Mean more than anything
+		</comment>
+		<comment id='6' author='owulveryck' date='2020-03-22T22:41:59Z'>
+		The issue appears to be in reductionInferShape which is a bit overeager when it comes to squeezing dimensions.
+When (1, 64, 1, 64) gets Sum' d over axis 3, there can be multiple interpretations of what this means. For example, you can get (1, 64, 1, 1) which is what was expected by ApplyOp, you can also get (1, 64, 1) which is what numpy's API generate. reductionInferShape sees (1, 64, 1) and shrinks it to (64), which is a "machine view" of things.
+&lt;denchmark-h:h1&gt;Some opinions.&lt;/denchmark-h&gt;
+
+The "intuitive" notion should be that a Sum returns (1, 64, 1, 1). The "correct" notion should be (1, 64, 1).
+It's intuitive that if you reduce along an axis, you get a scalar (i.e. 1 element) back. However, this is solely due to one interpretation of the semantics of shapes. Examples follow.
+Consider the 2D case. A "sum" is essentially &lt;denchmark-link:https://render.githubusercontent.com/render/math?math=%5Cmathbf%7Ba%7D%20%5Ctimes%20%5Cmathbf%7B1%7D'&gt;&lt;/denchmark-link&gt;
+, where  is a vector of 1s of the same shape as . Its results are a scalar (i.e. of shape )
+Now consider a 3D case. The 3D case would be a BatchedMatMul in Gorgonia's terms. Now imagine a (2, 3, 4) 3-tensor, and we're summing over the 2nd axis. We're left with two batches of (3-rows of scalars). A row of scalars can be written (3) or (3,1).  It depends on your views on linear algebra - is this a subspace we're talking about?
+Hence the most generic solution would be to leave it as (2, 3, 1).
+A good argument for numpy style shape inference would be "but you said the sum results in a scalar". Ah, but we haven't yet determined the calculus of shapes did we? What happens if we append a () to a (2, 3)? What are the rules around this? Do we say that it's (2,3, ()) and that's equal to (2,3,1) or (2,3) ?
+I like to think of () as "unit". And _ as void. The question comes down to how we model "unit". Do we treat it as an identity element (alá 0 for additions and 1 for multiplication)?
+&lt;denchmark-h:h1&gt;More Opinions!&lt;/denchmark-h&gt;
+
+I have analysis paralysis. I do not know what choice to make.
+(2,3,1) is more generic - it doesn't lock people down to one definition of a "vector space". This for example, has been quite useful as I have been doing work in gyrovector spaces for a bit.
+(2,3) complies with numpy's API. It makes newcomers to Gorgonia feel more at ease.
+&lt;denchmark-h:h2&gt;What We Can Do Now&lt;/denchmark-h&gt;
+
+Fix reductionInferShape, but be prepared to break it for v0.10.0
+		</comment>
+		<comment id='7' author='owulveryck' date='2020-03-23T08:28:46Z'>
+		What do we do with this issue? I'd like to close it, but I do not want to lose your (very valuable comment) comment.
+		</comment>
+		<comment id='8' author='owulveryck' date='2020-03-23T21:35:20Z'>
+		The comments are mostly opinion. Should not be taken to be gospel. We can write a better version on the docs site once the ideas have stabilized. In the meantime this has gone into my personal org files. So... there.
+		</comment>
+		<comment id='9' author='owulveryck' date='2020-06-10T09:28:12Z'>
+		
+The issue appears to be in reductionInferShape which is a bit overeager when it comes to squeezing dimensions.
+What We Can Do Now
+Fix reductionInferShape, but be prepared to break it for v0.10.0
+
+Besides problem in reductionInferShape, WithShape seems to fail whenever the node is created using NewUniqueNode, since newNode will borrow a node with node.shape initialized to nil. This will always make the nd==0.
+Whenever WithShape op is applied, the shape is always mismatched unless the shape passed in from inferred shape is () too.
+See the flow
+&lt;denchmark-code&gt;// Max performs a max() on the input and the provided axes.
+func Max(a *Node, along ...int) (retVal *Node, err error) {
+	if a.IsScalar() {
+		// can't max a scalar. Should return error
+		return a, nil
+	}
+
+	dims := a.Dims()
+	if len(along) == 0 {
+		along = intRange(0, dims)
+	}
+
+	op := newMaxOp(along, dims)
+
+	return ApplyOp(op, a) // &lt;--
+}
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-code&gt;// ApplyOp is the generic function application - for when no specialization is required
+func ApplyOp(op Op, children ...*Node) (retVal *Node, err error) {
+	...
+	ds := Nodes(children).dimSizers()
+	var s tensor.Shape
+	if s, err = op.InferShape(ds...); err == nil {
+		shapeLogf("inferred shape %v", s)
+                // &lt;-- Call NewUniqueNode here
+		retVal = NewUniqueNode(WithType(retType), WithOp(op), WithChildren(children), In(g), WithShape(s...))
+	} else {
+		err = errors.Wrapf(err, "Failed to infer shape. Op: %v", op)
+		// retVal = newUniqueNode(withType(retType), withOp(op), withChildren(children), withGraph(g))
+	}
+	returnDimSizers(ds)
+	return
+}
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-code&gt;// NewUniqueNode creates a new unique node in a graph. If no graph was specified in the construction options then it will just return a graphless node.
+func NewUniqueNode(opts ...NodeConsOpt) *Node {
+	n := newNode(opts...) // &lt;--
+	if n.g == nil {
+		return n
+	}
+	n.fixChildren() // ensure that all the kids are in the graph first
+
+	m := n.g.AddNode(n)
+	if n != m {
+		returnNode(n)
+	}
+	m.fixEdges()
+	return m
+}
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-code&gt;func newNode(opts ...NodeConsOpt) *Node {
+	n := borrowNode()
+	n.dataOn = CPU
+	n.id = -1
+// &lt;-- n.shape == nil here
+	for _, opt := range opts {
+		opt(n)
+	}
+	n.fix()
+
+	incrNN()
+	return n
+}
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-code&gt;// WithShape is a node construction option to initialize a *Node with a particular shape.
+// This function panics if the shape's dimensions do not match the specified dimensions of the *Node.
+func WithShape(shp ...int) NodeConsOpt {
+	s := tensor.Shape(tensor.BorrowInts(len(shp)))
+	copy(s, shp)
+	f := func(n *Node) {
+		nd := n.Dims() // &lt;-- nd == 0 always
+		// if nd == 1 &amp;&amp; s.IsVector() {
+		// 	goto safe
+		// }
+		isVec := s.IsColVec() || s.IsRowVec()
+		acceptVec := (isVec &amp;&amp; (nd == 1))
+		sameDims := nd == s.Dims()
+		acceptScalar := nd == 0 &amp;&amp; scalarEquiv(s)
+
+		if !acceptVec &amp;&amp; !sameDims &amp;&amp; !acceptScalar {
+                        // &lt;--panic here!!
+			panic(fmt.Sprintf("Node %v, has %d dimensions(Shape: %v). Input shape is %v, which has %d dimensions", n, n.Dims(), n.shape, s, s.Dims()))
+		}
+		// safe:
+		n.shape = s
+	}
+	return f
+}
+&lt;/denchmark-code&gt;
+
+		</comment>
+	</comments>
+</bug>

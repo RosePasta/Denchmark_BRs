@@ -1,0 +1,275 @@
+<bug id='285' author='stengoes' open_date='2019-12-19T13:13:23Z' closed_time='2019-12-19T15:24:55Z'>
+	<summary>Mismatch in output: Native TF vs TF-TRT FP32</summary>
+	<description>
+&lt;denchmark-h:h2&gt;Description&lt;/denchmark-h&gt;
+
+I am experiencing a big accuracy drop when comparing our model in native TF (~88% accuracy) to a TF-TRT FP32 optimized version (~64% accuracy).
+&lt;denchmark-h:h2&gt;Environment&lt;/denchmark-h&gt;
+
+TensorRT Version:  5.1.5 (in docker container, see below)
+GPU Type: Tesla T4
+Nvidia Driver Version: 440.33.01
+CUDA Version: 10.2
+CUDNN Version: 7.6.2 (in docker container)
+Operating System + Version:  Ubuntu 18.04.3 (in docker container)
+Python Version (if applicable): 3.6.8 (in docker container)
+TensorFlow Version (if applicable):  TF 1.15.0 (in docker container)
+Baremetal or Container (if container which image + tag):  docker container image: tensorflow/tensorflow:1.15.0-gpu-py3-jupyter
+In container:
+# dpkg -l | grep libnvinfer
+ii  libnvinfer5                   5.1.5-1+cuda10.0                  amd64        TensorRT runtime libraries
+
+# nvidia-smi
+Thu Dec 19 13:18:51 2019       
++-----------------------------------------------------------------------------+
+| NVIDIA-SMI 440.33.01    Driver Version: 440.33.01    CUDA Version: 10.2     |
+|-------------------------------+----------------------+----------------------+
+| GPU  Name        Persistence-M| Bus-Id        Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp  Perf  Pwr:Usage/Cap|         Memory-Usage | GPU-Util  Compute M. |
+|===============================+======================+======================|
+|   0  Tesla T4            Off  | 00000000:3B:00.0 Off |                    0 |
+| N/A   43C    P0    27W /  70W |  14722MiB / 15109MiB |      0%      Default |
++-------------------------------+----------------------+----------------------+
+                                                                               
++-----------------------------------------------------------------------------+
+| Processes:                                                       GPU Memory |
+|  GPU       PID   Type   Process name                             Usage      |
+|=============================================================================|
++-----------------------------------------------------------------------------+
+Explaining the model:
+Our model is a bit different than most models because we take 6 different images as input instead of just 1. Our model takes 6 images as input and outputs softmax probabilities (20 categories). So we have a resnet-34-like architecture which extracts features each of the 6 images, features are concatenated and then a fully connected layer does the final classification.
+&lt;denchmark-h:h2&gt;Steps To Reproduce&lt;/denchmark-h&gt;
+
+Code used to optimize frozen graph:
+import tensorflow as tf
+from tensorflow.python.compiler.tensorrt import trt_convert as trt
+
+# Load frozen graphdef
+with tf.gfile.GFile("/models/model69.pb", 'rb') as f:
+    graph_def = tf.GraphDef()
+    graph_def.ParseFromString(f.read())
+
+# Create optimizer
+converter = trt.TrtGraphConverter(
+    input_graph_def=graph_def,
+    nodes_blacklist=["output"],
+    session_config=None,
+    max_batch_size=1,
+    max_workspace_size_bytes=6*10**9, # 6 GB
+    precision_mode="FP32",
+    minimum_segment_size=3,
+    is_dynamic_op=False,
+    maximum_cached_engines=1,
+    use_calibration=True             
+)    
+
+# Do optimalization
+optimized_graph = converter.convert()
+
+# Save optimized frozen graph
+with tf.gfile.GFile("/models/model69-FP32-optimized.pb", "wb") as f:
+    f.write(optimized_graph.SerializeToString())
+Code used to compare the models:
+import tensorflow as tf
+
+def predict(filepath_model, images):
+    
+    # Just to be sure clear the graph
+    tf.reset_default_graph()
+
+    graph = tf.Graph()
+    with tf.Session(graph=graph) as sess:
+
+        # Load frozen graphdef
+        with tf.gfile.GFile(filepath_model, 'rb') as f:
+            graph_def = tf.GraphDef()
+            graph_def.ParseFromString(f.read())
+
+        # Import graphdef
+        tf.import_graph_def(graph_def, name="")
+
+        # Get input/output tensors
+        input0 = graph.get_tensor_by_name("input_pipeline/input_0:0")    
+        input1 = graph.get_tensor_by_name("input_pipeline/input_1:0")    
+        input2 = graph.get_tensor_by_name("input_pipeline/input_2:0")    
+        input3 = graph.get_tensor_by_name("input_pipeline/input_3:0")    
+        input4 = graph.get_tensor_by_name("input_pipeline/input_4:0")    
+        input5 = graph.get_tensor_by_name("input_pipeline/input_5:0")   
+        output = graph.get_tensor_by_name("output:0")
+
+        # Do prediction
+        probabilities = sess.run(
+            output, 
+            feed_dict={
+                input0 : images[0],
+                input1 : images[1],
+                input2 : images[2],
+                input3 : images[3],
+                input4 : images[4],
+                input5 : images[5],
+            }
+        )
+        score = probabilities.max()
+        label = probabilities.argmax()        
+        return label, score, probabilities
+
+# Load examples from disk
+import pickle
+with open("examples.pkl", "rb") as f:
+    examples = pickle.load(f)
+
+# Loop over the examples
+print("Native TF \t TF-TRT FP32")
+for example in examples: 
+    
+    # Predict same example on both TF native and TF-trt optimized models
+    label1, score1, probabilities1 = predict("/models/model69.pb", example)
+    label2, score2, probabilities2 = predict("/models/model69-FP32-optimized.pb", example)
+    
+    # Print results
+    if label1 != label2:
+        print("{} ({:.2f}%) \t {} ({:.2f}%) \t MISMATCH!!".format(label1, score1*100, label2, score2*100))
+    else:        
+        print("{} ({:.2f}%) \t {} ({:.2f}%)".format(label1, score1*100, label2, score2*100))
+The above code has the following output:
+Native TF 	 TF-TRT FP32
+12 (100.00%) 	 12 (100.00%)
+12 (100.00%) 	 12 (100.00%)
+15 (92.73%) 	 15 (99.70%)
+12 (98.45%) 	 12 (100.00%)
+3 (97.02%) 	 3 (99.74%)
+12 (99.81%) 	 12 (100.00%)
+12 (100.00%) 	 12 (100.00%)
+11 (99.92%) 	 11 (80.92%)
+2 (96.95%) 	 1 (53.15%) 	 MISMATCH!!
+12 (99.99%) 	 12 (100.00%)
+8 (100.00%) 	 8 (100.00%)
+5 (53.45%) 	 17 (45.35%) 	 MISMATCH!!
+6 (100.00%) 	 5 (75.59%) 	 MISMATCH!!
+12 (100.00%) 	 12 (100.00%)
+1 (95.47%) 	 1 (90.35%)
+13 (99.61%) 	 13 (100.00%)
+12 (100.00%) 	 12 (100.00%)
+4 (100.00%) 	 4 (99.95%)
+8 (100.00%) 	 8 (100.00%)
+6 (99.99%) 	 5 (33.04%) 	 MISMATCH!!
+3 (93.78%) 	 6 (99.73%) 	 MISMATCH!!
+2 (96.58%) 	 5 (95.05%) 	 MISMATCH!!
+5 (76.41%) 	 5 (87.24%)
+2 (99.71%) 	 2 (99.86%)
+1 (93.94%) 	 0 (96.13%) 	 MISMATCH!!
+12 (100.00%) 	 12 (100.00%)
+4 (99.99%) 	 4 (99.53%)
+15 (94.14%) 	 15 (97.18%)
+5 (97.86%) 	 5 (69.65%)
+1 (46.04%) 	 5 (99.40%) 	 MISMATCH!!
+5 (59.42%) 	 2 (87.30%) 	 MISMATCH!!
+12 (100.00%) 	 12 (100.00%)
+5 (99.65%) 	 5 (69.83%)
+1 (63.76%) 	 1 (62.01%)
+5 (85.53%) 	 5 (98.04%)
+8 (98.48%) 	 1 (66.45%) 	 MISMATCH!!
+13 (87.91%) 	 13 (98.45%)
+12 (97.51%) 	 12 (100.00%)
+5 (99.85%) 	 5 (99.99%)
+12 (100.00%) 	 12 (99.98%)
+5 (99.59%) 	 13 (94.90%) 	 MISMATCH!!
+15 (97.62%) 	 12 (100.00%) 	 MISMATCH!!
+3 (81.02%) 	 3 (80.31%)
+8 (100.00%) 	 8 (99.93%)
+6 (99.85%) 	 5 (54.45%) 	 MISMATCH!!
+12 (100.00%) 	 12 (100.00%)
+2 (47.00%) 	 5 (78.62%) 	 MISMATCH!!
+5 (90.47%) 	 5 (99.79%)
+6 (99.64%) 	 3 (59.76%) 	 MISMATCH!!
+5 (99.75%) 	 5 (99.89%)
+13 (99.99%) 	 13 (100.00%)
+	</description>
+	<comments>
+		<comment id='1' author='stengoes' date='2019-12-19T14:14:39Z'>
+		Hi &lt;denchmark-link:https://github.com/stengoes&gt;@stengoes&lt;/denchmark-link&gt;
+,
+Since you're using a container anyway, would you mind verifying your results in our similarly versioned container: nvcr.io/nvidia/tensorflow:19.11-tf1-py3? It would be easier to help figure this out this way.
+I believe the only major difference in the environment versions is that it comes with TensorRT 6.0 and CUDNN 7.6.5, everything else looks about the same: &lt;denchmark-link:https://docs.nvidia.com/deeplearning/frameworks/tensorflow-release-notes/rel_19.11.html#rel_19.11&gt;https://docs.nvidia.com/deeplearning/frameworks/tensorflow-release-notes/rel_19.11.html#rel_19.11&lt;/denchmark-link&gt;
+
+Thanks,
+Ryan
+		</comment>
+		<comment id='2' author='stengoes' date='2019-12-19T14:19:31Z'>
+		Hi &lt;denchmark-link:https://github.com/rmccorm4&gt;@rmccorm4&lt;/denchmark-link&gt;
+,
+I just tried the same code example in a container with image nvcr.io/nvidia/tensorflow:19.11-tf2-py3 and it does not result in accuracy drop.
+The only thing I needed to change to the example was using the old v1 TF api, so replacing:
+import tensorflow as tf
+with
+import tensorflow.compat.v1 as tf
+tf.disable_v2_behavior()
+Will now also try the tf1 container, will let you know.
+		</comment>
+		<comment id='3' author='stengoes' date='2019-12-19T14:41:12Z'>
+		Good to hear. If tf1 also works, then I would think it was a bug in TRT 5.x that was fixed in TRT6.x.
+		</comment>
+		<comment id='4' author='stengoes' date='2019-12-19T14:57:24Z'>
+		I ran the exact same code example in a container with image nvcr.io/nvidia/tensorflow:19.11-tf1-py3 and the output is the same (see below).
+So it is indeed a bug in TensorRT 5.1.5 or cudnn 7.6.2 since they are different than the TensorRT 6.0.0 and cudnn 7.6.5 in this image. Everything else looks the same.
+Native TF 	 TF-TRT FP32
+12 (100.00%) 	 12 (100.00%)
+12 (100.00%) 	 12 (100.00%)
+15 (92.73%) 	 15 (92.73%)
+12 (98.45%) 	 12 (98.45%)
+3 (97.02%) 	 3 (97.02%)
+12 (99.81%) 	 12 (99.81%)
+12 (100.00%) 	 12 (100.00%)
+11 (99.92%) 	 11 (99.92%)
+2 (96.95%) 	 2 (96.95%)
+12 (99.99%) 	 12 (99.99%)
+8 (100.00%) 	 8 (100.00%)
+5 (53.45%) 	 5 (53.45%)
+6 (100.00%) 	 6 (100.00%)
+12 (100.00%) 	 12 (100.00%)
+1 (95.47%) 	 1 (95.47%)
+13 (99.61%) 	 13 (99.61%)
+12 (100.00%) 	 12 (100.00%)
+4 (100.00%) 	 4 (100.00%)
+8 (100.00%) 	 8 (100.00%)
+6 (99.99%) 	 6 (99.99%)
+3 (93.78%) 	 3 (93.78%)
+2 (96.58%) 	 2 (96.58%)
+5 (76.41%) 	 5 (76.41%)
+2 (99.71%) 	 2 (99.71%)
+1 (93.94%) 	 1 (93.94%)
+12 (100.00%) 	 12 (100.00%)
+4 (99.99%) 	 4 (99.99%)
+15 (94.14%) 	 15 (94.14%)
+5 (97.86%) 	 5 (97.86%)
+1 (46.04%) 	 1 (46.04%)
+5 (59.42%) 	 5 (59.42%)
+12 (100.00%) 	 12 (100.00%)
+5 (99.65%) 	 5 (99.65%)
+1 (63.76%) 	 1 (63.76%)
+5 (85.53%) 	 5 (85.53%)
+8 (98.48%) 	 8 (98.48%)
+13 (87.91%) 	 13 (87.91%)
+12 (97.51%) 	 12 (97.51%)
+5 (99.85%) 	 5 (99.85%)
+12 (100.00%) 	 12 (100.00%)
+5 (99.59%) 	 5 (99.59%)
+15 (97.62%) 	 15 (97.62%)
+3 (81.02%) 	 3 (81.02%)
+8 (100.00%) 	 8 (100.00%)
+6 (99.85%) 	 6 (99.85%)
+12 (100.00%) 	 12 (100.00%)
+2 (47.00%) 	 2 (47.00%)
+5 (90.47%) 	 5 (90.47%)
+6 (99.64%) 	 6 (99.64%)
+5 (99.75%) 	 5 (99.75%)
+13 (99.99%) 	 13 (99.99%)
+		</comment>
+		<comment id='5' author='stengoes' date='2019-12-19T15:07:01Z'>
+		Awesome, mind if I close this then?
+		</comment>
+		<comment id='6' author='stengoes' date='2019-12-19T15:16:36Z'>
+		Sure go ahead! Thanks for the support :)
+		</comment>
+	</comments>
+</bug>

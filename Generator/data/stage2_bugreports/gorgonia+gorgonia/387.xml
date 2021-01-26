@@ -1,0 +1,148 @@
+<bug id='387' author='MarkKremer' open_date='2020-03-24T20:09:29Z' closed_time='2020-03-25T21:34:54Z'>
+	<summary>Bug in Dropout function</summary>
+	<description>
+Hi people,
+I have a model that uses dropout during training, I'm using the exact same model but without the dropout layers during validation. For the validation step I copy all the learned values over to the validation model and run it over the validation data.
+Expectation: As the training cost goes down the validation cost will also decrease.
+&lt;denchmark-code&gt;cost 107.09594 | acc 0.03626 | val_cost 106.57639 | val_acc 0.00000 
+cost 106.46517 | acc 0.06484 | val_cost 106.11518 | val_acc 0.05714 
+cost 102.56391 | acc 0.08462 | val_cost 100.13887 | val_acc 0.20000 
+cost 98.47047 | acc 0.11978 | val_cost 98.32637 | val_acc 0.20000 
+cost 95.26812 | acc 0.14945 | val_cost 97.95923 | val_acc 0.25714
+&lt;/denchmark-code&gt;
+
+Actual: The validation cost skyrockets.
+&lt;denchmark-code&gt;cost 106.56745 | acc 0.03187 | val_cost 103.83164 | val_acc 0.00000 
+cost 106.14746 | acc 0.04725 | val_cost 137.27169 | val_acc 0.02857 
+cost 104.14275 | acc 0.05604 | val_cost 345.20932 | val_acc 0.08571 
+cost 99.59372 | acc 0.10440 | val_cost 423.45196 | val_acc 0.05714 
+cost 97.69338 | acc 0.10000 | val_cost 288.48028 | val_acc 0.17143 
+&lt;/denchmark-code&gt;
+
+If I also enable dropout during validation the cost decreases like expected. So I think the copying of the learned parameters works. Although maybe not optimal:
+learnablesTrain := mTrain.Learnables()
+learnablesTest := mTest.Learnables()
+for i := range learnablesTrain {
+	if err = gorgonia.Let(learnablesTest[i], learnablesTrain[i].Value()); err != nil {
+		return err
+	}
+}
+&lt;denchmark-h:hr&gt;&lt;/denchmark-h&gt;
+
+Looking at the current dropout implementation it looks like it tries to implement inverted dropout. So the values during training are increased to compensate for the decreased number of connections. This is in contrast to normal dropout where the outputs are decreased during inference. Assuming this is true, then I do not have to add any compensation myself in my validation model.
+&lt;denchmark-link:https://github.com/gorgonia/gorgonia/blob/39b728c1ca24b82cee00c838bed7d318c6bcbd2a/nn.go#L65&gt;Current dropout implementation&lt;/denchmark-link&gt;
+:
+// Dropout is a convenience function to implement dropout.
+// It uses randomly zeroes out a *Tensor with a probability drawn from
+// a uniform distribution
+func Dropout(x *Node, prob float64) (retVal *Node, err error) {
+	if prob == 0.0 {
+		return x, nil
+	}
+
+	var dt tensor.Dtype
+	if dt, err = dtypeOf(x.t); err != nil {
+		return nil, errors.Wrap(err, dtypeOfFail)
+	}
+
+	var opp, pr Value // opp = 1 per p
+	switch dt {
+	case Float64:
+		opp, _ = anyToScalar(1.0 / prob)
+		pr, _ = anyToScalar(prob)
+	case Float32:
+		opp, _ = anyToScalar(float32(1.0 / prob))
+		pr, _ = anyToScalar(float32(prob))
+	default:
+		return nil, errors.Errorf(nyiTypeFail, "Dropout()", dt)
+	}
+
+	p := NewConstant(pr)
+	c := NewConstant(opp)
+
+	m := UniformRandomNode(x.g, dt, 0, 1, x.shape...)
+	if retVal, err = Gt(m, p, true); err != nil {
+		return nil, errors.Wrap(err, "Greater Than failed")
+	}
+
+	if retVal, err = HadamardProd(x, retVal); err != nil {
+		return nil, errors.Wrap(err, mulFail)
+	}
+
+	return HadamardDiv(retVal, c)
+}
+I expect the last line to increase the return value. But c = 1.0 / prob which makes the whole thing return retVal / (1.0 / prob) &lt;=&gt; return retVal * prob, decreasing it instead.
+Proposed fix:
+// Dropout is a convenience function to implement dropout.
+// It uses randomly zeroes out a *Tensor with a probability drawn from
+// a uniform distribution
+func Dropout(x *Node, prob float64) (retVal *Node, err error) {
+	if prob == 0.0 {
+		return x, nil
+	}
+
+	var dt tensor.Dtype
+	if dt, err = dtypeOf(x.t); err != nil {
+		return nil, errors.Wrap(err, dtypeOfFail)
+	}
+
+	var pr Value // opp = 1 per p
+	switch dt {
+	case Float64:
+		pr, _ = anyToScalar(prob)
+	case Float32:
+		pr, _ = anyToScalar(float32(prob))
+	default:
+		return nil, errors.Errorf(nyiTypeFail, "Dropout()", dt)
+	}
+
+	p := NewConstant(pr)
+
+	m := UniformRandomNode(x.g, dt, 0, 1, x.shape...)
+	if retVal, err = Gt(m, p, true); err != nil {
+		return nil, errors.Wrap(err, "Greater Than failed")
+	}
+
+	if retVal, err = HadamardProd(x, retVal); err != nil {
+		return nil, errors.Wrap(err, mulFail)
+	}
+
+	return HadamardDiv(retVal, p)
+}
+This gives me the expected result when I run my prediction model without dropout.
+	</description>
+	<comments>
+		<comment id='1' author='MarkKremer' date='2020-03-24T20:11:47Z'>
+		This is my fault. I was asleep at the wheel. Send PR. Will merge.
+		</comment>
+		<comment id='2' author='MarkKremer' date='2020-03-24T20:12:37Z'>
+		oh in the PR, please also change the comment one per p
+		</comment>
+		<comment id='3' author='MarkKremer' date='2020-03-24T20:15:07Z'>
+		Will make a PR. Any suggestions for tests? I could test that the result is increased but other than that I'm not entirely sure what good tests would be for this.
+I removed the opp variable altogether so I will remove the comment in the PR too. I forgot to remove it in my snippet.
+		</comment>
+		<comment id='4' author='MarkKremer' date='2020-03-24T20:15:47Z'>
+		If anyone interested in how this bug was introduced - before initial release of Gorgonia, it used an internal package for random numbers that was clearly wrong. Eventually, this was changed to use other people's packages with a view to replace them with the new gorgonia.org/randomkit package.
+Obvs time wasn't in my favour.
+		</comment>
+		<comment id='5' author='MarkKremer' date='2020-03-24T20:16:16Z'>
+		
+I could test that the result is increased but other than that I'm not entirely sure what good tests would be for this.
+
+this works! Excellent property to test
+		</comment>
+		<comment id='6' author='MarkKremer' date='2020-03-24T20:17:12Z'>
+		Also could you please send me an email - chewxy [at] gmail.com with title "Gorgonia contributor"? Empty content is fine.
+		</comment>
+		<comment id='7' author='MarkKremer' date='2020-03-25T11:35:30Z'>
+		
+Also could you please send me an email - chewxy [at] gmail.com with title "Gorgonia contributor"? Empty content is fine.
+
+Done
+		</comment>
+		<comment id='8' author='MarkKremer' date='2020-04-21T16:02:30Z'>
+		I found that my fix is wrong still. It uses the dropout probability to compensate the decreased number of inputs but it should instead use the keep probability (1.0 - prob). I'll make a new PR soon-ish.
+		</comment>
+	</comments>
+</bug>

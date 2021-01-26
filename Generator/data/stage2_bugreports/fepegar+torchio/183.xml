@@ -1,0 +1,239 @@
+<bug id='183' author='GFabien' open_date='2020-06-05T13:36:32Z' closed_time='2020-06-21T14:48:44Z'>
+	<summary>Queue does not take full advantage of multiprocessing</summary>
+	<description>
+Enhancement
+Queue has a num_workers attributes to take advantage of multiprocessing to load faster the samples. However, if samples are loaded in parallel, patches are extracted in the main process whatever the num_workers value is which can greatly augment loading time.
+To reproduce
+import torch
+import torchio
+import timeit
+
+image_size = 120, 120, 120
+patch_size = 64, 64, 64
+dataset = torchio.ImagesDataset([torchio.Subject(
+    img=torchio.Image(tensor=torch.rand(image_size))
+) for i in range(10)])
+sampler = torchio.data.sampler.UniformSampler(patch_size)
+queue = torchio.data.Queue(dataset, max_length=100, samples_per_volume=10, sampler=sampler, num_workers=10)
+
+print(timeit.timeit(queue.fill, number=10))
+This code yields the result 76.48914761...
+Generating patches in workers
+The code now yields the result 10.45647265...
+My change was only to generate the patches inside the collate_fn of the DataLoader. It seems to make loading really faster but to consume more RAM (I guess because now workers that are waiting are not only waiting with a sample but also with patches). Because of this compromise I think it would be a good idea to give the user the option to get both samples and patches using multiprocess or only samples. What do you think?
+Here is the change I made to the Queue class:
+    def fill(self) -&gt; None:
+        ...
+        for _ in iterable:
+            patches = self.get_next_subject_sample()       # CHANGE HERE
+            self.patches_list.extend(patches)
+        if self.shuffle_patches:
+            random.shuffle(self.patches_list)
+
+    def get_next_subject_sample(self) -&gt; dict:
+        # A StopIteration exception is expected when the queue is empty
+        try:
+            subject_sample = next(self.subjects_iterable)
+        except StopIteration as exception:
+            self.print('Queue is empty:', exception)
+            self.subjects_iterable = self.get_subjects_iterable()
+            subject_sample = next(self.subjects_iterable)
+        return subject_sample
+
+    def get_subjects_iterable(self) -&gt; Iterator:
+        def collate_fn(x):                      # CHANGE HERE
+            iterable = self.sampler(x[0])
+            return list(islice(iterable, self.samples_per_volume))
+        # I need a DataLoader to handle parallelism
+        # But this loader is always expected to yield single subject samples
+        self.print(
+            '\nCreating subjects loader with', self.num_workers, 'workers')
+        subjects_loader = DataLoader(
+            self.subjects_dataset,
+            num_workers=self.num_workers,
+            collate_fn=collate_fn,          # CHANGE HERE
+            shuffle=self.shuffle_subjects,
+        )
+        return iter(subjects_loader)
+	</description>
+	<comments>
+		<comment id='1' author='GFabien' date='2020-06-19T19:01:35Z'>
+		That's impressive, thanks &lt;denchmark-link:https://github.com/GFabien&gt;@GFabien&lt;/denchmark-link&gt;
+. I've been doing some testing after understanding your code.
+Extracting the patches used to be much faster, that's why I was doing it in the main process. Now it seems very slow, I must have changed the behavior somewhere. I'll see if I can get shorter times and if not I'll implement what you suggest.
+		</comment>
+		<comment id='2' author='GFabien' date='2020-06-19T20:06:23Z'>
+		Ha. I'm running this code:
+import timeit
+from itertools import islice
+import torch
+import torchio as tio
+
+sampler = tio.data.UniformSampler(88)
+sample = torch.load('/tmp/subject_sample.pth')
+print(sample, sample.shape)  # Subject(Keys: ('one_modality', 'segmentation'); images: 2) (1, 213, 199, 207)
+iterable = sampler(sample)
+def f():
+    patches = list(islice(iterable, 20))
+print('Seconds:', timeit.timeit(f, number=1))
+It takes 17.5 seconds to sample the patches.
+I just discovered &lt;denchmark-link:https://github.com/benfred/py-spy&gt;py-spy&lt;/denchmark-link&gt;
+, which I'm probably going to use every day for the rest of my life. I ran it on the script and got this beauty:
+&lt;denchmark-code&gt; Py 3.8.2 (torchio)  ~/tmp  sudo py-spy top -- python slow.py                                                                                                ✔  100%  20:49:38
+
+
+Collecting samples from 'python slow.py' (python v3.8.2)
+Total Samples 1700
+GIL: 0.00%, Active: 100.00%, Threads: 1
+
+  %Own   %Total  OwnTime  TotalTime  Function (filename:line)
+ 82.00%  82.00%   11.81s    11.81s   GetImageFromArray (SimpleITK/SimpleITK.py:3446)
+  0.00%   0.00%   0.620s    0.620s   _wrapfunc (numpy/core/fromnumeric.py:61)
+  0.00%   0.00%   0.350s    0.350s   clone (torch/storage.py:46)
+  0.00%   0.00%   0.250s    0.250s   get_data (&lt;frozen importlib._bootstrap_external&gt;:973)
+  0.00%   0.00%   0.210s     1.87s   _call_with_frames_removed (&lt;frozen importlib._bootstrap&gt;:219)
+  1.00%   1.00%   0.180s    0.180s   __init__ (SimpleITK/SimpleITK.py:3727)
+  0.00%   0.00%   0.160s    0.160s   _amax (numpy/core/_methods.py:30)
+  0.00%   0.00%   0.140s    0.140s   get_cumulative_distribution_function (torchio/data/sampler/weighted.py:190)
+&lt;/denchmark-code&gt;
+
+etc.  is eating everything up! This happens because  is now used to crop the samples, which was introduced 17 days ago in &lt;denchmark-link:https://github.com/fepegar/torchio/pull/175&gt;#175&lt;/denchmark-link&gt;
+ when we refactored the samplers. If I replace this line
+
+
+with a call to this method
+@staticmethod
+    def crop_sample(sample, index_ini, patch_size):
+        # Ignores affine for now
+        import copy
+        sample = copy.deepcopy(sample)
+        for image in sample.get_images(intensity_only=False):
+            i0, j0, k0 = index_ini
+            i1, j1, k1 = np.array(index_ini) + np.array(patch_size)
+            image['data'] = image['data'][:, i0:i1, j0:j1, k0:k1]
+        return sample
+the profiler says now
+&lt;denchmark-code&gt; Py 3.8.2 (torchio)  ~/tmp  sudo py-spy top -- python slow.py                                                                                       ✔  100%  17.09s  20:50:34
+
+
+Collecting samples from 'python slow.py' (python v3.8.2)
+Total Samples 700
+GIL: 0.00%, Active: 100.00%, Threads: 1
+
+  %Own   %Total  OwnTime  TotalTime  Function (filename:line)
+ 48.00%  48.00%    1.93s     1.93s   clone (torch/storage.py:46)
+  0.00%   0.00%   0.460s     2.34s   _call_with_frames_removed (&lt;frozen importlib._bootstrap&gt;:219)
+  0.00%   0.00%   0.310s    0.310s   _wrapfunc (numpy/core/fromnumeric.py:61)
+ 31.00%  91.00%   0.310s     3.40s   inner (&lt;timeit-src&gt;:6)
+  0.00%   0.00%   0.290s    0.290s   _compile_bytecode (&lt;frozen importlib._bootstrap_external&gt;:580)
+  6.00%   6.00%   0.240s    0.250s   sample_probability_map (torchio/data/sampler/weighted.py:267)
+  0.00%   0.00%   0.210s    0.210s   get_data (&lt;frozen importlib._bootstrap_external&gt;:973)
+  5.00%   5.00%   0.170s    0.170s   _amax (numpy/core/_methods.py:30)
+  0.00%   0.00%   0.140s    0.140s   get_data (&lt;frozen importlib._bootstrap_external&gt;:972)
+  0.00%   0.00%   0.120s    0.120s   process_probability_map (torchio/data/sampler/weighted.py:110)
+  0.00%   0.00%   0.100s    0.100s   get_cumulative_distribution_function (torchio/data/sampler/weighted.py:190)
+&lt;/denchmark-code&gt;
+
+etc., and the sampling takes 1.26 seconds.
+This means that  should be avoided when possible, which is unfortunate. The fastest fix, for now, is to crop the patches naively, i.e. ignoring the affine. Then, we'd need to think about implementing some of the transforms. For example, cropping should be relatively simple to do with NumPy and PyTorch, and it's not acceptable that it's so slow. Looking into the &lt;denchmark-link:https://itkpythonpackage.readthedocs.io/en/master/index.html&gt;itk Python module&lt;/denchmark-link&gt;
+ would be interesting too, but I have no experience with it and every time I try it I give up after 5 minutes, swearing because it's probably the least pythonic library, apart from TensorFlow.
+		</comment>
+		<comment id='3' author='GFabien' date='2020-06-19T22:28:21Z'>
+		That being said, it still looks slow, so your approach will probably help.
+		</comment>
+		<comment id='4' author='GFabien' date='2020-06-20T10:04:31Z'>
+		Thanks for digging into it! py-spy seems super nice!
+I'll try to dive into the problem this week. I'm not sure my solution is better in every situation, it seems it works well when many patches are sampled but it is not that clear when the number of patches is small...
+It would be interesting to investigate precisely the implications of sampling in the workers and if there are both advantages and drawbacks leave the choice to the user.
+		</comment>
+		<comment id='5' author='GFabien' date='2020-06-21T14:48:44Z'>
+		I run out of RAM very quickly using the script below with the changes in &lt;denchmark-link:https://github.com/fepegar/torchio/pull/201&gt;#201&lt;/denchmark-link&gt;
+, so I'm going to close that and this for now. Feel free to reopen.
+import time
+import multiprocessing as mp
+
+from tqdm import tqdm, trange
+
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from torchvision.transforms import Compose
+
+from torchio import ImagesDataset, Queue, DATA
+from torchio.data.sampler import UniformSampler
+from torchio.utils import create_dummy_dataset
+from torchio.transforms import (
+    ZNormalization,
+    RandomNoise,
+    RandomFlip,
+    RandomAffine,
+)
+
+# Define training and patches sampling parameters
+num_epochs = 4
+patch_size = 128
+queue_length = 100
+samples_per_volume = 10
+batch_size = 4
+
+def model(batch, sleep_time=0.1):
+    """Dummy function to simulate a forward pass through the network"""
+    time.sleep(sleep_time)
+    return batch
+
+# Create a dummy dataset in the temporary directory, for this example
+subjects_list = create_dummy_dataset(
+    num_images=100,
+    size_range=(193, 229),
+    force=False,
+    verbose=True,
+)
+
+# Each element of subjects_list is an instance of torchio.Subject:
+# subject = Subject(
+#     one_image=torchio.Image(path_to_one_image, torchio.INTENSITY),
+#     another_image=torchio.Image(path_to_another_image, torchio.INTENSITY),
+#     a_label=torchio.Image(path_to_a_label, torchio.LABEL),
+# )
+
+# Define transforms for data normalization and augmentation
+transforms = (
+    ZNormalization(),
+    RandomNoise(std=(0, 0.25)),
+    RandomAffine(scales=(0.9, 1.1), degrees=10),
+    RandomFlip(axes=(0,)),
+)
+transform = Compose(transforms)
+subjects_dataset = ImagesDataset(subjects_list, transform)
+
+sampler = UniformSampler(patch_size)
+
+# Run a benchmark for different numbers of workers
+workers = range(mp.cpu_count() + 1)
+for num_workers in workers:
+    print('Number of workers:', num_workers)
+
+    # Define the dataset as a queue of patches
+    queue_dataset = Queue(
+        subjects_dataset,
+        queue_length,
+        samples_per_volume,
+        sampler,
+        num_workers=num_workers,
+        verbose=True,
+    )
+    batch_loader = DataLoader(queue_dataset, batch_size=batch_size)
+
+    start = time.time()
+    epochs_progress = trange(num_epochs, leave=False)
+    for epoch_index in epochs_progress:
+        batches_progress = tqdm(batch_loader, leave=False)
+        for batch in batches_progress:
+            # The keys of batch have been defined in create_dummy_dataset()
+            inputs = batch['one_modality'][DATA]
+            targets = batch['segmentation'][DATA]
+            logits = model(inputs)
+    print('Time:', int(time.time() - start), 'seconds')
+    print()
+		</comment>
+	</comments>
+</bug>

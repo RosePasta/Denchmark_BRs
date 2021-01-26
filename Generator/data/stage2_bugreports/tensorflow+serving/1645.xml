@@ -1,0 +1,218 @@
+<bug id='1645' author='quocdat32461997' open_date='2020-05-27T07:25:47Z' closed_time='2020-11-06T18:00:12Z'>
+	<summary>TF serving 1.15 does not load weights and tf.image.non-max-surpression not work as expected</summary>
+	<description>
+&lt;denchmark-h:h3&gt;System information&lt;/denchmark-h&gt;
+
+
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Amazon AMI
+TensorFlow Serving installed from (source or binary): docker
+TensorFlow Serving version: 1.15
+
+&lt;denchmark-h:h3&gt;Describe the problem&lt;/denchmark-h&gt;
+
+I deployed a custom YOLOv3 model that yields 3 outputs: boxes, scores, classes. The following snip set receives output of the last Conv layer and apply non-max-suppression to filter the best boxes/scores/classes. Usually, every image has 2-3 objects due to my dataset.The following snip set works perfectly when I load weights and make prediction by seas.run.
+&lt;denchmark-code&gt;def yolo_eval(yolo_outputs,
+              anchors,
+              num_classes,
+              image_shape,
+              max_boxes=20,
+              score_threshold=.6,
+              iou_threshold=.5):
+    """Evaluate YOLO model on given input and return filtered boxes."""
+    num_layers = len(yolo_outputs)
+    anchor_mask = [[6,7,8], [3,4,5], [0,1,2]] if num_layers==3 else [[3,4,5], [1,2,3]] # default setting
+    input_shape = K.shape(yolo_outputs[0])[1:3] * 32
+    boxes = []
+    box_scores = []
+    for l in range(num_layers):
+        _boxes, _box_scores = yolo_boxes_and_scores(yolo_outputs[l],
+            anchors[anchor_mask[l]], num_classes, input_shape, image_shape)
+        boxes.append(_boxes)
+        box_scores.append(_box_scores)
+    boxes = K.concatenate(boxes, axis=0)
+    box_scores = K.concatenate(box_scores, axis=0)
+
+    mask = box_scores &gt;= score_threshold
+    max_boxes_tensor = K.constant(max_boxes, dtype='int32')
+    boxes_ = []
+    scores_ = []
+    classes_ = []
+    
+    for c in range(num_classes):
+        # TODO: use keras backend instead of tf.
+        class_boxes = tf.boolean_mask(boxes, mask[:, c])
+        class_box_scores = tf.boolean_mask(box_scores[:, c], mask[:, c])
+        nms_index = tf.image.non_max_suppression(
+            class_boxes, class_box_scores, max_boxes_tensor, iou_threshold=iou_threshold)
+        class_boxes = K.gather(class_boxes, nms_index)
+        class_box_scores = K.gather(class_box_scores, nms_index)
+        classes = K.ones_like(class_box_scores, 'int32') * c
+        boxes_.append(class_boxes)
+        scores_.append(class_box_scores)
+        classes_.append(classes)
+    boxes_ = K.concatenate(boxes_, axis=0)
+    scores_ = K.concatenate(scores_, axis=0)
+    classes_ = K.concatenate(classes_, axis=0)
+    scores_ = K.expand_dims(scores_, axis = -1)
+    classes_ = K.cast(K.expand_dims(classes_, axis = -1), dtype = tf.float32)
+    result = K.concatenate([boxes_, scores_, classes_], axis = -1)
+    return result#boxes_, scores_, classes_
+&lt;/denchmark-code&gt;
+
+However, deploying in TensorflowServing yields 353 * 20 (brands * max_boxes) and accuracy is always below 0.3. [-115.073959, -10.6961603, 211.076065, 362.693237, 0.250115454, 0.0] = [x1,x2,y1,y2,score, class].  Looks like, weights are not loaded to the model and the tf.image.non-max-supression does not filter the correct boxes.
+&lt;denchmark-code&gt;[[-115.073959, -10.6961603, 211.076065, 362.693237, 0.250115454, 0.0],
+ [12.9201584, -42.7534599, 339.076935, 330.749573, 0.250105828, 0.0],
+ [172.933914, 85.2831039, 499.06543, 458.714569, 0.250105828, 0.0],
+ [76.9558487, 149.214142, 403.044342, 522.782776, 0.250102162, 0.0],
+ [172.965164, -106.637947, 499.032043, 266.634369, 0.250094861, 0.0],
+ [-147.05719, 117.388794, 179.059891, 490.608063, 0.250090837, 0.0],
+ [-147.036453, -138.594299, 179.037125, 234.591, 0.250087619, 0.0],
+ [-19.1025772, 85.229744, 307.101257, 458.769257, 0.250072032, 0.0],
+ [-19.0041, -170.610184, 307.001526, 202.608322, 0.250071794, 0.0],
+ [300.500427, 266.510376, 419.499298, 325.489502, 0.250064313, 0.0],
+ [-51.0949402, 213.395309, 275.100922, 586.607422, 0.25006175, 0.0],
+ [108.499969, 170.512253, 227.499008, 229.488052, 0.250061572, 0.0],
+ [60.49963, 170.513, 179.499466, 229.487411, 0.250059307, 0.0], ...]
+&lt;/denchmark-code&gt;
+
+To reproduce the error, clone &lt;denchmark-link:https://github.com/ilmonteux/logohunter.git&gt;logohunter&lt;/denchmark-link&gt;
+ and modify the  in  as  above.
+To export model, I do:
+&lt;denchmark-code&gt;""" deploy.py """
+
+import os
+import boto3
+import re 
+import shutil
+import argparse
+import sagemaker
+import tensorflow as tf
+from keras import backend as K
+import numpy as np
+from sagemaker.tensorflow.serving import Model as ServingModel
+from sagemaker import get_execution_role
+from keras.models import Model
+from keras.layers import Input, Lambda
+from tensorflow.keras.models import save_model, load_model
+from tensorflow.saved_model.utils import build_tensor_info
+from tensorflow.saved_model import tag_constants, builder
+from tensorflow.saved_model.signature_def_utils import predict_signature_def
+
+import train
+from keras_yolo3.model_data import settings
+from keras_yolo3.yolo3.model import yolo_eval, yolo_body
+
+sagemaker_session = sagemaker.Session()
+role = get_execution_role()
+
+def main(parser):
+    FLAGS = parser.parse_args()
+    
+    #parse settings
+    anchors = np.array(settings.ANCHORS)
+    num_anchors = len(anchors)
+    weights_path = os.path.join(settings.WEIGHTS_PATH, 'trained_weights_final.h5')
+    class_names = settings.CLASSES
+    num_classes = len(class_names)
+    image_shape = settings.IMAGE_SHAPE
+    score = 0.1 #score_threshold
+    iou = 0.45 #ignore_threshold
+    
+    export_dir = os.path.join(FLAGS.export_dir, str(FLAGS.model_ver))
+
+    if not os.path.exists(export_dir):
+        os.makedirs(export_dir)
+    else:
+        shutil.rmtree(export_dir)
+        os.makedirs(export_dir)
+
+    graph = tf.Graph()
+    with graph.as_default():
+    #placeholder for image bistring
+        inputs = tf.placeholder(tf.string, shape=[None], name="input_bytes")
+        # Transform bitstring to uint8 tensor
+        def decode_bytes(input):
+            input = tf.image.decode_png(input, channels=3)
+            return input
+        input_tensor = tf.map_fn(decode_bytes, inputs, dtype = tf.uint8)
+        # Convert to float32 tensor
+        input_tensor = tf.image.convert_image_dtype(input_tensor,  dtype=tf.float32)
+        #resize image
+        input_tensor = tf.image.resize(input_tensor, image_shape, method='bicubic', preserve_aspect_ratio=True)
+        #normalize
+        input_tensor /= 255.
+
+        # Ensure tensor has correct shape
+        input_tensor = tf.reshape(input_tensor, [1, image_shape[0], image_shape[1], -1])
+
+    with graph.as_default():
+        #make predictions
+        model = create_model(weights_path, num_anchors, num_classes, anchors, score, iou)
+        output_tensor = model(input_tensor)
+        
+    with graph.as_default():
+        #output_tensor = yolo_eval(output_tensor, anchors, num_classes, image_shape, score_threshold = score, iou_threshold = iou)
+        output_tensor = tf.identity(output_tensor, name = 'output_tensor')
+        saver = tf.train.Saver() #Instaniate a saver
+
+    with tf.Session(graph = graph) as sess:
+        sess.run(tf.global_variables_initializer())
+        
+        #export graph to ProtoBuf
+        output_graph_def = tf.graph_util.convert_variables_to_constants(sess, graph.as_graph_def(), [output_tensor.op.name])
+        tf.train.write_graph(output_graph_def, "brand-detection/protobufs", "model_v1", as_text=False)
+        
+    b = builder.SavedModelBuilder(export_dir)
+    with tf.gfile.GFile("brand-detection/protobufs/model_v1", "rb") as protobuf_file:
+        graph_def = tf.GraphDef()
+        graph_def.ParseFromString(protobuf_file.read())
+    # Get input and output tensors from GraphDef
+    # These are our injected bitstring layers
+    [inp, out] = tf.import_graph_def(graph_def, name="", return_elements=["input_bytes:0", "output_tensor:0"])
+    with tf.Session(graph = out.graph) as sess:
+        inputs = build_tensor_info(inp)
+        outputs = build_tensor_info(out)
+        signature = tf.saved_model.signature_def_utils.build_signature_def({"inputs" : inputs}, {"outputs" : outputs},
+        method_name=tf.saved_model.signature_constants.PREDICT_METHOD_NAME)
+
+        # Save the meta graph and variables
+        
+        b.add_meta_graph_and_variables(
+            sess=sess, tags=[tag_constants.SERVING],
+            signature_def_map={"serving_default": signature})
+    b.save()
+
+def create_model(weights_path, num_anchors, num_classes, anchors, score, iou):
+    #build model
+    image_input = Input(shape = (None, None, 3))
+    yolo_model = yolo_body(image_input, num_anchors // 3, num_classes)
+    yolo_model.load_weights(weights_path)
+    preds = Lambda(yolo_eval, name = 'yolo_eval', arguments = {'anchors' : anchors, 'num_classes' : num_classes, 'image_shape' : settings.IMAGE_SHAPE, 'score_threshold' : score, 'iou_threshold' : iou })(yolo_model.output)
+    model = Model(yolo_model.input, preds)
+    return model
+&lt;/denchmark-code&gt;
+
+Many thanks
+	</description>
+	<comments>
+		<comment id='1' author='quocdat32461997' date='2020-05-30T21:13:09Z'>
+		&lt;denchmark-link:https://github.com/quocdat32461997&gt;@quocdat32461997&lt;/denchmark-link&gt;
+ Did you try saving the model and then loading it and then using model.predict n the loaded model? Thanks!
+		</comment>
+		<comment id='2' author='quocdat32461997' date='2020-05-30T23:03:15Z'>
+		I tried to save model, load it but not using model.predict. I use the loaded model and seas.run for evaluation (this is before deploy in TF serving). This way works perfectly (correct detections). However, when deploying in TF Serving, I got the error as I described in the post. At first, I thought it was a bug in AWS SageMaker for Tensorflow (I tried to deploy in SageMaker), but not because I got the same error running TF serving on my Mac. Hope this helps
+		</comment>
+		<comment id='3' author='quocdat32461997' date='2020-06-05T20:33:10Z'>
+		I wonder if any updates on this?
+In details:
+I was using TF 1.15 and keras 2.2.4
+		</comment>
+		<comment id='4' author='quocdat32461997' date='2020-11-05T17:31:02Z'>
+		&lt;denchmark-link:https://github.com/quocdat32461997&gt;@quocdat32461997&lt;/denchmark-link&gt;
+ Please try posting this issue in stackoverflow as this is related to support not a bug in tf-serving. Thanks!
+		</comment>
+		<comment id='5' author='quocdat32461997' date='2020-11-06T18:00:15Z'>
+		Thanks
+		</comment>
+	</comments>
+</bug>

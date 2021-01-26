@@ -1,0 +1,125 @@
+<bug id='398' author='ShawnNew' open_date='2020-02-28T06:18:42Z' closed_time='2020-10-29T08:52:42Z'>
+	<summary>CPU allocation failed in int8 calibration.</summary>
+	<description>
+&lt;denchmark-h:h2&gt;Description&lt;/denchmark-h&gt;
+
+The onnx2trt parser stuck at some point and then broke with cpu allocation error raised.
+I used a customized onnx model, which has some self-defined operations. Also, I created corresponding plugins for TensorRT that passed fp32 and fp16 engine conversion.
+But the program broke for the whole model. Below is the error log:
+&lt;denchmark-code&gt;[2020-02-28 05:23:22   ERROR] FAILED_ALLOCATION: std::exception
+[2020-02-28 05:23:22   ERROR] Requested amount of memory (18446744065119617096 bytes) could not be allocated. There may not be enough free memory for allocation to succeed.
+[2020-02-28 05:23:22   ERROR] /home/jenkins/workspace/TensorRT/helpers/rel-6.0/L1_Nightly/build/source/rtSafe/resources.h (57) - OutOfMemory Error in CpuMemory: 0
+[2020-02-28 05:23:22   ERROR] FAILED_ALLOCATION: std::exception
+[2020-02-28 05:23:22   ERROR] Requested amount of memory (18446744065119617096 bytes) could not be allocated. There may not be enough free memory for allocation to succeed.
+[2020-02-28 05:23:22   ERROR] /home/jenkins/workspace/TensorRT/helpers/rel-6.0/L1_Nightly/build/source/rtSafe/resources.h (57) - OutOfMemory Error in CpuMemory: 0
+[2020-02-28 05:23:22   ERROR] FAILED_ALLOCATION: std::exception
+[2020-02-28 05:23:22   ERROR] Requested amount of memory (18446744065119617096 bytes) could not be allocated. There may not be enough free memory for allocation to succeed.
+terminate called after throwing an instance of 'std::out_of_range'
+  what():  _Map_base::at
+&lt;/denchmark-code&gt;
+
+Weird thing is, the int8 calibration is ok for the subset model (say the backbone). And I can use the calibration cache table created from backbone conversion to calibrate the whole model without that allocation error raised. And the generated trt engine can also be used with maybe a little performance drops.
+My server is a 64GB machine, and the memory usage is far from full when the program breaks.
+&lt;denchmark-h:h2&gt;Environment&lt;/denchmark-h&gt;
+
+TensorRT Version: 6.0.1.5
+GPU Type: 2080ti
+Nvidia Driver Version: 418.56
+CUDA Version: 10.1
+CUDNN Version:
+Operating System + Version: ubuntu 16.04
+Python Version (if applicable): 3.7
+TensorFlow Version (if applicable):
+PyTorch Version (if applicable): 1.4
+Baremetal or Container (if container which image + tag):
+&lt;denchmark-h:h2&gt;Relevant Files&lt;/denchmark-h&gt;
+
+I provide a calibrator to trt_builder with python api as follows:
+batchstream = ImageBatchStream(batch_size, batch_list, max_batches) # batch_list is list of pre-generated calibration data.
+int8_calibrator = PythonEntropyCalibrator(["input.1", "1"], batchstream, 'calibration_cache.bin')
+trt_builder.int8_mode = True
+trt_builder.int8_calibrator = int8_calibrator
+Then the PythonEntropyCalibrator and ImageBatchStream are implemented as follows:
+class PythonEntropyCalibrator(trt.IInt8EntropyCalibrator2):
+    def __init__(self, input_layers, stream, cache_file):
+        super(PythonEntropyCalibrator, self).__init__()
+        self.input_layers = input_layers
+        self.stream = stream
+        self.d_input = cuda.mem_alloc(self.stream.calibration_data.nbytes)
+        self.s_input = cuda.mem_alloc(self.stream.calibration_size.nbytes)
+        self.cache_file = cache_file
+        stream.reset()
+
+    def get_batch_size(self):
+        # should return batch 1 because explicit batch size of TensorRT engine.
+        return 1
+
+    def get_batch(self, names):
+        try:
+            batch, size = self.stream.next_batch()
+            if not batch.size:   
+                return None
+
+            cuda.memcpy_htod(self.d_input, batch)
+            cuda.memcpy_htod(self.s_input, size)
+            logger.info("Getting one batch done.")
+            return [int(self.d_input), int(self.s_input)]
+
+        except StopIteration:
+            # When we're out of batches, we return either [] or None.
+            # This signals to TensorRT that there is no calibration data remaining.
+            return None
+
+    def read_calibration_cache(self):
+        # If there is a cache, use it instead of calibrating again. Otherwise, implicitly return None.
+        if os.path.exists(self.cache_file):
+            with open(self.cache_file, "rb") as f:
+                logger.info("Reading from cache file.")
+                return f.read()
+
+    def write_calibration_cache(self, cache):
+        # cache = ctypes.c_char_p(int(ptr))
+        with open(self.cache_file, 'wb') as f:
+            logger.info("Writing from cache file.")
+            f.write(cache)
+
+class ImageBatchStream():
+    def __init__(self, batch_size, calibration_files, max_batches):
+        self.batch_size = batch_size
+        self.max_batches = max_batches
+        self.files = calibration_files
+        self.calibration_data = np.zeros((batch_size, CHANNEL, HEIGHT, WIDTH), \
+                                     dtype=np.float32)
+        self.calibration_size = np.zeros((batch_size, 2), dtype=np.int)
+        self.batch = 0
+         
+    def reset(self):
+        self.batch = 0
+     
+    def next_batch(self):
+        if self.batch &lt; self.max_batches:
+            file_path = self.files[self.batch]
+            with np.load(file_path) as data:
+                tensor = data['tensor']
+                size = data['sizes']
+                self.calibration_data = tensor
+                self.calibration_size = size
+            data = np.ascontiguousarray(self.calibration_data, dtype=np.float32)
+            size = np.ascontiguousarray(self.calibration_size, dtype=np.int)
+            self.batch += 1
+            return data, size
+        else:
+            return np.array([]), np.array([])
+&lt;denchmark-h:h2&gt;Steps To Reproduce&lt;/denchmark-h&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='ShawnNew' date='2020-10-27T19:42:40Z'>
+		&lt;denchmark-link:https://github.com/ShawnNew&gt;@ShawnNew&lt;/denchmark-link&gt;
+ your implementation looks correct from a high level. Given that the error message is generic, can you either share the repro steps or try again with a more recent release?
+		</comment>
+		<comment id='2' author='ShawnNew' date='2020-10-29T08:52:42Z'>
+		Seems like TRT7.0+ solved this problem.
+		</comment>
+	</comments>
+</bug>

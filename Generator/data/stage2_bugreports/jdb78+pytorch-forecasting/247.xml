@@ -1,0 +1,223 @@
+<bug id='247' author='jkunzel3h' open_date='2021-01-06T17:36:38Z' closed_time='2021-01-07T10:57:18Z'>
+	<summary>Multi-Target Forecasting with TFT Model Example Error</summary>
+	<description>
+
+PyTorch-Forecasting version: v0.8.0
+PyTorch version: 1.7.1
+Python version: 3.8.3
+Operating System: Ubuntu 18.04
+
+&lt;denchmark-h:h3&gt;Expected behavior&lt;/denchmark-h&gt;
+
+I am trying to get started with multi-target forecasting with a Temporal Fusion Transformer model by implementing a simple example.
+I used the existing &lt;denchmark-link:https://pytorch-forecasting.readthedocs.io/en/latest/tutorials/stallion.html&gt;Stallion&lt;/denchmark-link&gt;
+ tutorial example and added a second copy of the volume parameter to the dataset as is done in the &lt;denchmark-link:https://github.com/jdb78/pytorch-forecasting/blob/master/tests/test_data.py#L476&gt;test_multitarget&lt;/denchmark-link&gt;
+ test. I would expect the model to optimize hyperparameters, train and predict multitarget much as the single target example does.
+&lt;denchmark-h:h3&gt;Actual behavior&lt;/denchmark-h&gt;
+
+I am getting the following error both when trying to optimize hyperparameters and when I skip tuning and try to fit the model:
+&lt;denchmark-code&gt;...
+  File ".../pytorch_forecasting/models/base_model.py", line 235, in step
+    rnn.pack_padded_sequence(
+  File "...anaconda3/lib/python3.8/site-packages/torch/nn/utils/rnn.py", line 239, in pack_padded_sequence
+    sorted_indices = sorted_indices.to(input.device)
+AttributeError: 'list' object has no attribute 'device'
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h3&gt;Code to reproduce the problem&lt;/denchmark-h&gt;
+
+Loaded in Colab notebook here: &lt;denchmark-link:https://colab.research.google.com/drive/1Phfs5I9_vMPnnpJEwSwCecbgFDV3w7Q3&gt;https://colab.research.google.com/drive/1Phfs5I9_vMPnnpJEwSwCecbgFDV3w7Q3&lt;/denchmark-link&gt;
+
+import warnings
+import numpy as np
+from pandas.core.common import SettingWithCopyWarning
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import EarlyStopping, LearningRateMonitor
+from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_forecasting import TemporalFusionTransformer, TimeSeriesDataSet
+from pytorch_forecasting.data.examples import get_stallion_data 
+from pytorch_forecasting.data.encoders import EncoderNormalizer
+from pytorch_forecasting.metrics import QuantileLoss, MultiLoss
+from pytorch_forecasting.models.temporal_fusion_transformer.tuning import optimize_hyperparameters
+warnings.simplefilter("error", category=SettingWithCopyWarning)
+
+# Originally from https://github.com/jdb78/pytorch-forecasting/blob/master/tests/conftest.py#L27
+def get_test_data():
+    data = get_stallion_data()
+    data["month"] = data.date.dt.month.astype(str)
+    data["log_volume"] = np.log1p(data.volume)
+    data["weight"] = 1 + np.sqrt(data.volume)
+
+    data["time_idx"] = data["date"].dt.year * 12 + data["date"].dt.month
+    data["time_idx"] -= data["time_idx"].min()
+
+    special_days = [
+        "easter_day",
+        "good_friday",
+        "new_year",
+        "christmas",
+        "labor_day",
+        "independence_day",
+        "revolution_day_memorial",
+        "regional_games",
+        "fifa_u_17_world_cup",
+        "football_gold_cup",
+        "beer_capital",
+        "music_fest",
+    ]
+    data[special_days] = data[special_days].apply(lambda x: x.map({0: "", 1: x.name})).astype("category")
+
+    data = data[lambda x: x.time_idx &lt; 10]  # downsample
+    data = data.assign(volume1=lambda x: x.volume) # add second target
+    return data
+
+test_data = get_test_data()
+
+# Originally from https://github.com/jdb78/pytorch-forecasting/blob/master/tests/test_data.py#L476
+training = TimeSeriesDataSet(
+        test_data,
+        time_idx="time_idx",
+        target=["volume", "volume1"],
+        group_ids=["agency", "sku"],
+        max_encoder_length=5,
+        max_prediction_length=2,
+        min_prediction_length=1,
+        min_encoder_length=1,
+        time_varying_known_reals=["price_regular"],
+        scalers={"price_regular": EncoderNormalizer()}#,
+        #**kwargs,
+)
+
+# Originally from https://pytorch-forecasting.readthedocs.io/en/latest/tutorials/stallion.html
+validation = TimeSeriesDataSet.from_dataset(training, test_data, predict=True, stop_randomization=True)
+batch_size = 64
+train_dataloader = training.to_dataloader(train=True, batch_size=batch_size, num_workers=0)
+val_dataloader = validation.to_dataloader(train=False, batch_size=batch_size, num_workers=0)
+
+# configure network and trainer
+early_stop_callback = EarlyStopping(monitor="val_loss", min_delta=1e-4, patience=10, verbose=False, mode="min")
+lr_logger = LearningRateMonitor()  # log the learning rate
+logger = TensorBoardLogger("lightning_logs")  # logging results to a tensorboard
+
+trainer = pl.Trainer(
+    max_epochs=30,
+    gpus=0,
+    weights_summary="top",
+    gradient_clip_val=0.1,
+    limit_train_batches=30,  # coment in for training, running valiation every 30 batches
+    # fast_dev_run=True,  # comment in to check that networkor dataset has no serious bugs
+    callbacks=[lr_logger, early_stop_callback],
+    logger=logger,
+)
+
+
+tft = TemporalFusionTransformer.from_dataset(
+    training,
+    learning_rate=0.03,
+    hidden_size=16,
+    attention_head_size=1,
+    dropout=0.1,
+    hidden_continuous_size=8,
+    output_size=[7,7],  # 7 quantiles by default, two outputs for Multi-Target
+    loss=MultiLoss([QuantileLoss(),QuantileLoss()]), # using MultiLoss for Multi-Target
+    log_interval=10,  # uncomment for learning rate finder and otherwise, e.g. to 10 for logging every 10 batches
+    reduce_on_plateau_patience=4,
+)
+print(f"Number of parameters in network: {tft.size()/1e3:.1f}k")
+
+# find optimal learning rate
+# remove logging and artificial epoch size
+tft.hparams.log_interval = -1
+tft.hparams.log_val_interval = -1
+trainer.limit_train_batches = 1.0
+# run learning rate finder
+res = trainer.tuner.lr_find(
+    tft, train_dataloader=train_dataloader, val_dataloaders=val_dataloader, min_lr=1e-5, max_lr=1e2
+)
+print(f"suggested learning rate: {res.suggestion()}")
+fig = res.plot(show=True, suggest=True)
+fig.show()
+tft.hparams.learning_rate = res.suggestion()
+
+trainer.fit(
+    tft,
+    train_dataloader=train_dataloader,
+    val_dataloaders=val_dataloader,
+)
+
+# make a prediction on entire validation set
+preds, index = tft.predict(val_dataloader, return_index=True, fast_dev_run=True)
+preds, index
+
+# tune
+study = optimize_hyperparameters(
+    train_dataloader,
+    val_dataloader,
+    model_path="optuna_test",
+    n_trials=200,
+    max_epochs=50,
+    gradient_clip_val_range=(0.01, 1.0),
+    hidden_size_range=(8, 128),
+    hidden_continuous_size_range=(8, 128),
+    attention_head_size_range=(1, 4),
+    learning_rate_range=(0.001, 0.1),
+    dropout_range=(0.1, 0.3),
+    trainer_kwargs=dict(limit_train_batches=30),
+    reduce_on_plateau_patience=4,
+    use_learning_rate_finder=False,
+)
+Traceback:
+&lt;denchmark-code&gt;Traceback (most recent call last):
+  File ".../PyTorch_Forecasting_Multi-Target_Example.py", line 112, in &lt;module&gt;
+    trainer.fit(
+  File "...anaconda3/lib/python3.8/site-packages/pytorch_lightning/trainer/trainer.py", line 470, in fit
+    results = self.accelerator_backend.train()
+  File "...anaconda3/lib/python3.8/site-packages/pytorch_lightning/accelerators/cpu_accelerator.py", line 62, in train
+    results = self.train_or_test()
+  File "...anaconda3/lib/python3.8/site-packages/pytorch_lightning/accelerators/accelerator.py", line 69, in train_or_test
+    results = self.trainer.train()
+  File "...anaconda3/lib/python3.8/site-packages/pytorch_lightning/trainer/trainer.py", line 521, in train
+    self.train_loop.run_training_epoch()
+  File "...anaconda3/lib/python3.8/site-packages/pytorch_lightning/trainer/training_loop.py", line 560, in run_training_epoch
+    batch_output = self.run_training_batch(batch, batch_idx, dataloader_idx)
+  File "...anaconda3/lib/python3.8/site-packages/pytorch_lightning/trainer/training_loop.py", line 718, in run_training_batch
+    self.optimizer_step(optimizer, opt_idx, batch_idx, train_step_and_backward_closure)
+  File "...anaconda3/lib/python3.8/site-packages/pytorch_lightning/trainer/training_loop.py", line 493, in optimizer_step
+    model_ref.optimizer_step(
+  File "...anaconda3/lib/python3.8/site-packages/pytorch_lightning/core/lightning.py", line 1258, in optimizer_step
+    optimizer.step(closure=optimizer_closure)
+  File "...anaconda3/lib/python3.8/site-packages/pytorch_lightning/core/optimizer.py", line 278, in step
+    self.__optimizer_step(*args, closure=closure, profiler_name=profiler_name, **kwargs)
+  File "...anaconda3/lib/python3.8/site-packages/pytorch_lightning/core/optimizer.py", line 136, in __optimizer_step
+    optimizer.step(closure=closure, *args, **kwargs)
+  File ".../pytorch_forecasting/optim.py", line 131, in step
+    _ = closure()
+  File "...anaconda3/lib/python3.8/site-packages/pytorch_lightning/trainer/training_loop.py", line 708, in train_step_and_backward_closure
+    result = self.training_step_and_backward(
+  File "...anaconda3/lib/python3.8/site-packages/pytorch_lightning/trainer/training_loop.py", line 806, in training_step_and_backward
+    result = self.training_step(split_batch, batch_idx, opt_idx, hiddens)
+  File "...anaconda3/lib/python3.8/site-packages/pytorch_lightning/trainer/training_loop.py", line 330, in training_step
+    training_step_output = self.trainer.accelerator_backend.training_step(args)
+  File "...anaconda3/lib/python3.8/site-packages/pytorch_lightning/accelerators/cpu_accelerator.py", line 74, in training_step
+    return self._step(self.trainer.model.training_step, args)
+  File "...anaconda3/lib/python3.8/site-packages/pytorch_lightning/accelerators/cpu_accelerator.py", line 70, in _step
+    output = model_step(*args)
+  File ".../pytorch_forecasting/models/base_model.py", line 198, in training_step
+    log, _ = self.step(x, y, batch_idx)
+  File ".../pytorch_forecasting/models/temporal_fusion_transformer/__init__.py", line 547, in step
+    log, out = super().step(x, y, batch_idx)
+  File ".../pytorch_forecasting/models/base_model.py", line 235, in step
+    rnn.pack_padded_sequence(
+  File "...anaconda3/lib/python3.8/site-packages/torch/nn/utils/rnn.py", line 239, in pack_padded_sequence
+    sorted_indices = sorted_indices.to(input.device)
+AttributeError: 'list' object has no attribute 'device'
+&lt;/denchmark-code&gt;
+
+Thanks for the help and your work developing this library!
+	</description>
+	<comments>
+		<comment id='1' author='jkunzel3h' date='2021-01-07T10:44:17Z'>
+		Indeed an issue. Thanks for finding this! Adding a fix and regression test.
+		</comment>
+	</comments>
+</bug>

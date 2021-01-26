@@ -1,0 +1,176 @@
+<bug_data>
+<bug id='317' author='stsievert' open_date='2018-08-20T23:01:16Z' closed_time='2018-08-23T08:12:48Z'>
+ 	<summary>module weights don't update after copy.deepcopy</summary>
+ 	<description>
+ When a model is copied with copy.deepcopy, the weights are frozen and don't update when fit is called.
+ Here's an example:
+ from sklearn.datasets import make_regression
+ import torch.nn as nn
+ import torch
+ from skorch import NeuralNetRegressor
+ import copy
+ import toolz
+ 
+ def get_data(n, d):
+     X, y = make_regression(n_features=d, n_samples=n)
+     y -= y.min()
+     y /= y.max()
+     y = y.reshape(-1, 1).astype('float32')
+ 
+     X = X.astype('float32')
+     return X, y
+ 
+ X, y = get_data(1000, 28 * 28)
+ 
+ class Simple(nn.Module):
+     def __init__(self):
+         super().__init__()
+         self.simple = nn.Sequential(
+             nn.Linear(28 * 28, 1),
+             nn.Sigmoid(),
+         )
+         
+     def forward(self, x):
+         return self.simple(x)
+ n1 = NeuralNetRegressor(
+     module=Simple,
+ ).initialize()
+ 
+ def check(net, name=''):
+     p = toolz.first(net.module_.parameters()).detach().numpy()
+     print(name + ' first params =', p.flat[:3])
+ 
+ def assert_all_params_equal(net1, net2):
+     for p1, p2 in zip(net1.module_.parameters(), net2.module_.parameters()):
+         assert p1.requires_grad
+         assert p2.requires_grad
+         assert torch.all(p1 == p2)
+     
+ check(n1, name="n1")
+ n1.partial_fit(X, y)
+ check(n1, name="n1")
+ 
+ n2 = copy.deepcopy(n1)
+ check(n2, name="n2")
+ assert_all_params_equal(n1, n2)
+ 
+ n3 = n2.partial_fit(X, y[::-1])
+ 
+ check(n1, name="n1")
+ check(n2, name="n2")
+ check(n3, name="n3")
+ 
+ assert_all_params_equal(n2, n3)
+ assert_all_params_equal(n1, n2)
+ which, when run, outputs this:
+ &lt;denchmark-code&gt;n1 first params = [-0.03383204 -0.00945246  0.03146857]
+   epoch    train_loss    valid_loss     dur
+ -------  ------------  ------------  ------
+       1        0.0415        0.0529  0.0245
+       2        0.0404        0.0523  0.0251
+       3        0.0394        0.0517  0.0252
+ n1 first params = [-0.03349511 -0.00889289  0.02929294]
+ n2 first params = [-0.03349511 -0.00889289  0.02929294]
+       4        0.0431        0.0487  0.0250
+       5        0.0431        0.0487  0.0246
+       6        0.0431        0.0487  0.0247
+ n1 first params = [-0.03349511 -0.00889289  0.02929294]
+ n2 first params = [-0.03349511 -0.00889289  0.02929294]
+ n3 first params = [-0.03349511 -0.00889289  0.02929294]
+ &lt;/denchmark-code&gt;
+ 
+ 	</description>
+ 	<comments>
+ 		<comment id='1' author='stsievert' date='2018-08-21T00:24:10Z'>
+ 		The relevant code is with  and  at &lt;denchmark-link:https://github.com/dnouri/skorch/blob/16d7e52c7e2832f286e8db1d4aa6458d31f3491a/skorch/net.py#L1308-L1351&gt;https://github.com/dnouri/skorch/blob/16d7e52c7e2832f286e8db1d4aa6458d31f3491a/skorch/net.py#L1308-L1351&lt;/denchmark-link&gt;
+ , which called when the object is pickled.
+ 		</comment>
+ 		<comment id='2' author='stsievert' date='2018-08-21T00:46:00Z'>
+ 		I think this is happening because there's a disconnect between the gradients optimizer sees and the gradients the model weights calculate.
+ That is, with the same setup as above:
+ &gt;&gt;&gt; def check(net, name='', grad=False):
+ ...     p = toolz.first(net.module_.parameters()).detach().numpy()
+ ...     if not grad:
+ ...         print(name + ' first params =', p.flat[:3])
+ ...     p = toolz.first(net.module_.parameters()).grad
+ ...     if p is not None and grad:
+ ...         p = p.numpy()
+ ...         print(name + ' first params =', p.flat[:3])
+ 
+ &gt;&gt;&gt; check(n1, name="n1", grad=True)
+ n1 first grad params = [-0.00635823 -0.01619332 -0.0140646 ]
+ &gt;&gt;&gt; check(n2, name="n2", grad=True)
+ n2 first grad params = [ 0.04858593 -0.09615209  0.00394883]
+ The weights the optimizer sees are specified in : &lt;denchmark-link:https://github.com/pytorch/pytorch/blob/e449a27646f3b8b44e893e6be09606c4f24f7313/torch/optim/sgd.py#L82&gt;torch/optim/sgd.py#L82&lt;/denchmark-link&gt;
+ . Requiring the gradients for  does nothing if the optimizer can't see them.
+ 		</comment>
+ 		<comment id='3' author='stsievert' date='2018-08-21T08:27:23Z'>
+ 		Thanks for reporting this bug. You are right, during the copying process, the parameters in the module and in the optimizer are copied separately, leading to the disconnect, which is why they don't update (though "frozen" doesn't quite fit it).
+ The easiest solution to me seems to be to add the following lines to the end of __setstate__:
+ &lt;denchmark-code&gt;        if self.initialized_:
+             self.initialize_optimizer()
+ &lt;/denchmark-code&gt;
+ 
+ For your example code, the error is fixed by this snippet (btw. you don't need toolz.first, next does the same here). Could you confirm that this solves your initial problem?
+ The deeper problem, however, lies in the fact that we use  on the  and  here: &lt;denchmark-link:https://github.com/dnouri/skorch/blob/be050a15534924e38eaa06480c7f071a2cce16c7/skorch/net.py#L1310-L1316&gt;https://github.com/dnouri/skorch/blob/be050a15534924e38eaa06480c7f071a2cce16c7/skorch/net.py#L1310-L1316&lt;/denchmark-link&gt;
+ 
+ The reasoning here was to be able to load parameters to another device later in __getstate__, e.g. when you train on cuda and predict on cpu. We should, however, find a better solution to this, as with the current one, the parameters from module_ and optimizer_ are copied (leading to the bug).
+ Even with the proposed fix, we should still avoid the copy because it doubles the memory required for the state. Unfortunately, this will require a more specific solution instead of the more general use of cuda_dependent_attributes_, a solution that will fail if more attributes reference the parameters. But I guess that's still better than the current implementation.
+ 		</comment>
+ 		<comment id='4' author='stsievert' date='2018-08-21T10:35:51Z'>
+ 		I digged a little deeper and it seems that a similar issue, the de-coupling of module and optimizer parameters, has tripped some pytorch users in the past:
+ &lt;denchmark-link:https://discuss.pytorch.org/t/saving-and-loading-a-model-in-pytorch/2610&gt;https://discuss.pytorch.org/t/saving-and-loading-a-model-in-pytorch/2610&lt;/denchmark-link&gt;
+ 
+ I tried to create a minimal example that demonstrates what is required to preserve the connection:
+ &lt;denchmark-link:https://gist.github.com/benjamin-work/ca12831877c241935c224a34bcbda713&gt;https://gist.github.com/benjamin-work/ca12831877c241935c224a34bcbda713&lt;/denchmark-link&gt;
+ 
+ Critically, saving module and optimizer in &lt;denchmark-link:https://gist.github.com/benjamin-work/ca12831877c241935c224a34bcbda713#file-pytorch_save_and_load-py-L72&gt;one data structure&lt;/denchmark-link&gt;
+  instead of two solves the problem, which I admit was surprising to me. This, in conjunction with the use of , could point forward to a clean solution for the issue.
+ 		</comment>
+ 		<comment id='5' author='stsievert' date='2018-08-21T15:27:24Z'>
+ 		
+ Could you confirm that this solves your initial problem?
+ 
+ The proposed solution solves my initial problem: the weights update. But the optimizer is reinitialized; I don't think any state is preserved. I've let that be; it seems like &lt;denchmark-link:https://github.com/skorch-dev/skorch/issues/317#issuecomment-414629936&gt;#317 (comment)&lt;/denchmark-link&gt;
+  is a better solution.
+ 
+ Critically, saving module and optimizer in one data structure ... use of state_dict, could point forward to a clean solution for the issue.
+ 
+ Perfect. See &lt;denchmark-link:https://github.com/skorch-dev/skorch/pull/318&gt;#318&lt;/denchmark-link&gt;
+ . It does not use , but passes the test I wrote.
+ 		</comment>
+ 	</comments>
+ </bug>
+<commit id='0f7823cb6a27b5d7dfab56f06a6601bf2957594b' author='Scott Sievert' date='2018-08-23 10:12:48+02:00'>
+ 	<dmm_unit complexity='None' interfacing='None' size='None'></dmm_unit>
+ 	<modification change_type='MODIFY' old_name='skorch\net.py' new_name='skorch\net.py'>
+ 		<file_info nloc='737' complexity='170' token_count='4237'></file_info>
+ 		<method name='__getstate__' parameters='self'>
+ 				<method_info nloc='12' complexity='3' token_count='79' nesting_level='1' start_line='1308' end_line='1320'></method_info>
+ 			<added_lines>1310,1314,1315,1316,1317,1318</added_lines>
+ 			<deleted_lines>1313,1314,1315,1316</deleted_lines>
+ 		</method>
+ 		<method name='__setstate__' parameters='self,state'>
+ 				<method_info nloc='29' complexity='6' token_count='184' nesting_level='1' start_line='1322' end_line='1358'></method_info>
+ 			<added_lines>1328,1329,1330,1331,1332,1333,1334,1335,1336,1337,1338,1339,1340,1342,1344,1345,1346,1347,1348,1349,1350</added_lines>
+ 			<deleted_lines>1326,1328,1330,1331,1332,1333,1334,1335,1336,1337,1338,1339,1340,1341,1342,1343</deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines></added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ 	<modification change_type='MODIFY' old_name='skorch\tests\test_net.py' new_name='skorch\tests\test_net.py'>
+ 		<file_info nloc='1136' complexity='145' token_count='9112'></file_info>
+ 		<method name='test_train_net_after_copy' parameters='self,net_cls,module_cls,data,copy_method'>
+ 				<method_info nloc='2' complexity='1' token_count='13' nesting_level='1' start_line='130' end_line='131'></method_info>
+ 			<added_lines>130,131</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines>13,129,132,133,134,135,136,137,138,139,140,141,142,143,144,145,146,147,148,149,150,151,152,153,154,155,156,157,158,159,160,161,162,163,164,165,166,167,168,169,170,171,172,173,174</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ </commit>
+</bug_data>

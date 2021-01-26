@@ -1,0 +1,121 @@
+<bug id='299' author='DanielDowns' open_date='2021-01-20T21:39:13Z' closed_time='2021-01-21T09:34:18Z'>
+	<summary>[Bug] SAC Policy with loaded weights returns incorrect value</summary>
+	<description>
+After loading external weights into an SAC policy (latent_pi and mu), expected policy output does not match the output from a test model loaded with the same weights (that's not using SAC). I measured these results from sac\policies::get_action_dist_params to avoid having log_std affect the results.
+Looking at it in my debugger, it looks like its correctly placing the values into latent_pi and mu but the output isn't quite what it should be. Searching online suggests some people have seen occasional problems loading/saving pytorch models, not sure if that's what's happening here.
+input:
+&lt;denchmark-code&gt;tensor([[ 0.0000e+00,  4.6363e-01,  2.8770e-01,  3.3224e-02,  6.4662e-01,
+         -3.1398e-01, -1.4604e-01,  4.7870e-04, -7.0000e-05, -2.0692e-02,
+         -5.1917e-01,  5.2600e-01,  3.4382e-03,  0.0000e+00,  0.0000e+00,
+          1.0000e+00,  0.0000e+00,  1.0000e+00, -5.5713e-01, -3.4492e-01,
+          4.4638e-02,  0.0000e+00,  0.0000e+00,  0.0000e+00,  1.2450e-01,
+         -5.3079e-01,  4.4315e-02, -5.0478e-04, -4.4743e-03, -1.7209e-02]],
+       device='cuda:0')
+&lt;/denchmark-code&gt;
+
+expected output:
+&lt;denchmark-code&gt;tensor([[ 0.2665, -0.0349, -0.1470,  0.0130, -0.1034,  0.0865,  0.2703,  0.0194]],
+       device='cuda:0', grad_fn=&lt;TanhBackward&gt;)
+&lt;/denchmark-code&gt;
+
+output:
+&lt;denchmark-code&gt;tensor([[ 0.2731, -0.0350, -0.1481,  0.0131, -0.1038,  0.0867,  0.2772,  0.0194]],
+       device='cuda:0')
+&lt;/denchmark-code&gt;
+
+Network structure:
+external model
+torch.nn.Sequential( torch.nn.Linear(30, 512), torch.nn.ReLU(), torch.nn.Linear(512, 512), torch.nn.ReLU(), torch.nn.Linear(512, 512), torch.nn.ReLU(), torch.nn.Linear(512, 8), torch.nn.Tanh())
+SAC
+&lt;denchmark-code&gt;policy_kwargs = dict(net_arch=dict(pi=[512, 512, 512], qf=[256, 256]))
+&lt;/denchmark-code&gt;
+
+(input is 30, output is 8)
+model weights loaded and renamed to match SAC naming convention:
+&lt;denchmark-link:https://github.com/DLR-RM/stable-baselines3/files/5845428/bestWeights.zip&gt;bestWeights.zip&lt;/denchmark-link&gt;
+
+&lt;denchmark-code&gt;checkpoint = torch.load(unzippedWeights)
+
+#hold modifed checkpoint data for loading
+piCheckpoint, muCheckpoint = renameCheckpointKeys(checkpoint)
+model.actor.latent_pi.load_state_dict(piCheckpoint)
+model.actor.mu.load_state_dict(muCheckpoint)
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='DanielDowns' date='2021-01-20T21:55:37Z'>
+		Hello,
+
+After loading external weights
+
+I think this is an important point missing: where do they come from and how are you sure of the expected output?
+Are you using deterministic=True?
+For loading the weights, I would recommend you to use directly model.actor.load_state_dict() and check that all required keys are here (see model.actor.state_dict())
+For instance, I tested recently a code to load weights from rust to python (for PPO) and it looks like that:
+import torch as th
+
+from stable_baselines3 import PPO
+
+model = PPO("MlpPolicy", "CartPole-v1")
+
+saved_model = th.jit.load("ppo_cartpole.ot")
+
+# convert rust names to SB3 names
+rust_to_python = {
+    "actor1|bias": "mlp_extractor.policy_net.0.bias",
+    "actor2|bias": "mlp_extractor.policy_net.2.bias",
+    "actor1|weight": "mlp_extractor.policy_net.0.weight",
+    "actor2|weight": "mlp_extractor.policy_net.2.weight",
+    "al|bias": "action_net.bias",
+    "al|weight": "action_net.weight",
+}
+
+state_dict = model.policy.state_dict()
+
+for key, value in saved_model.state_dict().items():
+    if key in rust_to_python:
+        state_dict[rust_to_python[key]] = value
+
+model.policy.load_state_dict(state_dict)
+		</comment>
+		<comment id='2' author='DanielDowns' date='2021-01-20T22:27:42Z'>
+		it looks like off_policy_algorithm::_sample_action forces deterministic to be False. Is there some way for me to change this?
+&lt;denchmark-code&gt;            # Note: when using continuous actions,
+            # we assume that the policy uses tanh to scale the action
+            # We use non-deterministic action in the case of SAC, for TD3, it does not matter
+           
+            unscaled_action, _ = self.predict(self._last_obs, deterministic=False)
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='3' author='DanielDowns' date='2021-01-20T22:40:42Z'>
+		
+it looks like off_policy_algorithm::_sample_action forces deterministic to be False. Is there some way for me to change this?
+
+the line you shown is the one used during training, when a stochastic policy is required, so it is normal.
+If you just want to try the trained policy, you can use model.predict(obs, deterministic=True) and even use the actor alone (cf doc).
+		</comment>
+		<comment id='4' author='DanielDowns' date='2021-01-20T23:09:15Z'>
+		Ah, using the model.predict() yields a correct output:
+[[ 0.26650167 -0.0349468  -0.1470437   0.01304841 -0.10342735  0.08647192,   0.2703234   0.01935792]]
+So it appears the non-determinism is the factor here. If that's the case though, why was the mean_action above not giving the correct result?
+Regardless, the agent doesn't seem to be properly taking advantage of the effective pre-trained strategy as the non-determinism destroys its useful behavior. Maybe I need to try TD3 (deterministic) or figure out a way to play with log_std so it has decent behavior.
+		</comment>
+		<comment id='5' author='DanielDowns' date='2021-01-21T09:34:18Z'>
+		
+If that's the case though, why was the mean_action above not giving the correct result?
+
+not sure what you mean... The deterministic output is the mean of the Gaussian squashed using tanh.
+
+Regardless, the agent doesn't seem to be properly taking advantage of the effective pre-trained strategy as the non-determinism destroys its useful behavior.
+
+This is not an issue of stochasticity.
+You may take a look at that paper: &lt;denchmark-link:https://arxiv.org/abs/2006.09359&gt;https://arxiv.org/abs/2006.09359&lt;/denchmark-link&gt;
+
+Where they show that pre-training with behavior cloning does not really help (because you will get into the same issue of offline RL as soon as you start training).
+You may give residual RL a try though ;)
+Closing this as this original issue seems to be resolved.
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,110 @@
+<bug id='181' author='AdamGleave' open_date='2020-10-08T11:18:48Z' closed_time='2020-11-16T10:52:29Z'>
+	<summary>`evaluate_policy` reports preprocessed reward, whereas `rollout/ep_rew_mean` is unprocessed</summary>
+	<description>
+Describe the bug
+There are two kinds of reward that it might make sense to report:
+
+The unwrapped reward. This is computed by the original environment. This defines the objective of the RL task, and what would usually be used to compute the policy return when e.g. benchmarking the resulting policy for papers.
+The wrapped reward. This is the reward the RL algorithm actually uses for training, after any environment wrappers that mess with reward like VecNormalize or AtariPreprocessing have been applied. We hope the arg max of this is the same as the arg max of the original environment reward, but it need not be. Even if it is, they can vary substantially -- e.g. rescaling by a positive constant, or addition of shaping.
+
+Currently, common.evaluation.evaluate_policy reports the wrapped reward. Most (all?) RL algorithms report the unwrapped reward, e.g. OffPolicyAlgorithm._dump_logs in rollout/ep_rew_mean. The difference is common.evaluate.evaluate_policy directly records reward and computes statistics; whereas the RL algorithms rely on the "r" and "l" keys inserted into the info-dict by common.Monitor which is usually the first wrapper applied to the environment (before any preprocessing).
+In my opinion we would ideally report both types of reward (and episode length -- since wrappers can also affect done), in both the training and evaluation environment. But if we had to pick just one, I'd advocate for swapping the two -- report the reward used for training during training, and the reward usually used for evaluation for the evaluation environment.
+Credit to &lt;denchmark-link:https://github.com/ejmichaud&gt;@ejmichaud&lt;/denchmark-link&gt;
+ for first noticing this discrepancy.
+
+This is visible in &lt;denchmark-link:https://github.com/DLR-RM/rl-baselines3-zoo/blob/master/train.py&gt;train.py from Zoo&lt;/denchmark-link&gt;
+ on Atari:
+&lt;denchmark-code&gt;$ python train.py --algo dqn --env SeaquestNoFrameskip-v4
+# [ ... elided ... ]
+Eval num_timesteps=10000, episode_reward=52.00 +/- 48.33
+Episode length: 527.20 +/- 139.00
+New best mean reward!
+----------------------------------
+| eval/               |          |
+|    mean_ep_length   | 527      |
+|    mean_reward      | 52       |
+| rollout/            |          |
+|    ep_len_mean      | 2.16e+03 |
+|    ep_rew_mean      | 87       |
+|    exploration rate | 0.989    |
+| time/               |          |
+|    episodes         | 20       |
+|    fps              | 717      |
+|    time_elapsed     | 14       |
+|    total timesteps  | 10698    |
+----------------------------------
+&lt;/denchmark-code&gt;
+
+Note that not only do  and  disagree on reward per timestep (because  does reward clipping), they also disagree on the episode length (because  converts loss of life into loss of an episode)! See &lt;denchmark-link:https://github.com/DLR-RM/stable-baselines3/files/5347387/seaquest.log&gt;seaquest.log&lt;/denchmark-link&gt;
+ for full log.
+Note train.py does do some magic to disable reward normalization in VecNormalize. So this problem I think won't be visible in e.g. MuJoCo. Conceivably one could do something similar for AtariWrapper (set terminal_on_life_loss=False and clip_reward=False) -- but doing this for every wrapper seems error-prone, and some wrappers may just not support this out of the box.
+	</description>
+	<comments>
+		<comment id='1' author='AdamGleave' date='2020-10-08T11:45:37Z'>
+		Good catch! I agree we should report both if possible (i.e. checks for the "r" and "l" terms in info-dict), and thanks to Monitor wrapper this should be straight-forward. Updating all wrappers to work like AtariWrapper would become a mess and easy-to-forget down the line.
+I think we should also add a warning in Monitor that warns if it is not the lowest-level wrapper, because otherwise "r" or "l" can get distorted like this. However this might not be too practical as some environments come with "built-in" wrappers by default like Timeouts in Atari envs.
+		</comment>
+		<comment id='2' author='AdamGleave' date='2020-10-08T13:14:40Z'>
+		
+I think we should also add a warning in Monitor that warns if it is not the lowest-level wrapper, because otherwise "r" or "l" can get distorted like this. However this might not be too practical as some environments come with "built-in" wrappers by default like Timeouts in Atari envs.
+
+I like this idea. We should be able to whitelist wrappers that are known not to change rewards -- so TimeLimit for sure, but also potentially e.g. subclasses of gym.ObservationWrapper and gym.ActionWrapper. I'm sure there'll be edge cases we miss but users can always filter the warning.
+		</comment>
+		<comment id='3' author='AdamGleave' date='2020-10-09T17:09:52Z'>
+		Thanks for raising that issue.
+The main problem is that it requires users to always wrap their environment with a monitor wrapper (we do that internally though).
+Otherwise, I would be for reporting both, the issue is that we cannot really default to the unnormalized reward because we are not sure to find "r" and "l" keys in the info dict...
+So yes, defaulting to unnormalized reward sounds good and warning the user if the env is not wrapped properly. This would also require some update to the documentation.
+
+Note train.py does do some magic to disable reward normalization in VecNormalize
+
+👼 yes, I tried to avoid that issue when possible, that's also why the atari wrapper now uses a monitor wrapper first.
+		</comment>
+		<comment id='4' author='AdamGleave' date='2020-10-11T11:03:43Z'>
+		
+The main problem is that it requires users to always wrap their environment with a monitor wrapper (we do that internally though).
+Otherwise, I would be for reporting both, the issue is that we cannot really default to the unnormalized reward because we are not sure to find "r" and "l" keys in the info dict...
+So yes, defaulting to unnormalized reward sounds good and warning the user if the env is not wrapped properly. This would also require some update to the documentation.
+
+Good point. We might need to modify Monitor to allow us to detect if it has been applied. With an Env we can just recurse down the wrapper stack and check if Monitor is present. But with VecEnv the individual Envs may not be accessible (e.g. SubprocVecEnv). But we could have Monitor define some special attribute, e.g. _monitor_applied, and then use VecEnv.get_attr to check it exists.
+May take a couple of weeks before I have time to work on a PR for this, so if anyone else wants to start then feel free.
+		</comment>
+		<comment id='5' author='AdamGleave' date='2020-10-11T11:30:10Z'>
+		
+We might need to modify Monitor to allow us to detect if it has been applied
+
+Hmm, a simple solution would to check the existence of the keys "r" and "l" in the info dict when calling env.step(), no?
+		</comment>
+		<comment id='6' author='AdamGleave' date='2020-10-11T11:44:59Z'>
+		
+
+We might need to modify Monitor to allow us to detect if it has been applied
+
+Hmm, a simple solution would to check the existence of the keys "r" and "l" in the info dict when calling env.step(), no?
+
+I believe the keys are only present at the end of the episode, and the episode could end at a different time in the original (unwrapped) environment. So I'm not sure how to make a fool-proof check for this (though could imagine something heuristic).
+		</comment>
+		<comment id='7' author='AdamGleave' date='2020-11-06T00:18:46Z'>
+		I tried to work on this but ran into some design decisions I could not overcome. I was updating evaluate_policy to always use Monitor's episode info, but automatically wrapping the eval environment (in case it is not already wrapped) is tricky with vecenvs (if subprocvecenv, you simply can not wrap, and in other cases you need to un-vectorize the single environment, which does not sound nice either). If we can remove VecEnv support of evaluate_policy then this could be done, but I sense there is a good reason why the support is there.
+		</comment>
+		<comment id='8' author='AdamGleave' date='2020-11-06T09:37:08Z'>
+		
+I tried to work on this but ran into some design decisions I could not overcome. I was updating evaluate_policy to always use Monitor's episode info, but automatically wrapping the eval environment (in case it is not already wrapped) is tricky with vecenvs (if subprocvecenv,
+
+yes, it is not possible. And wrapping with a VecMonitor won't solve the issue of clipped reward by lower level wrappers.
+But I thought we agreed on "So yes, defaulting to unnormalized reward sounds good and warning the user if the env is not wrapped properly. This would also require some update to the documentation."
+
+If we can remove VecEnv support of evaluate_policy then this could be done, but I sense there is a good reason why the support is there.
+
+we cannot as many env rely on vec env wrappers like VecNormalize, VecFramestack (atari), ...
+		</comment>
+		<comment id='9' author='AdamGleave' date='2020-11-12T09:01:40Z'>
+		&lt;denchmark-link:https://github.com/Miffyli&gt;@Miffyli&lt;/denchmark-link&gt;
+ are you still working on it? otherwise I will give it a try ;)
+		</comment>
+		<comment id='10' author='AdamGleave' date='2020-11-12T09:04:12Z'>
+		&lt;denchmark-link:https://github.com/araffin&gt;@araffin&lt;/denchmark-link&gt;
+ Yup I will! Start of the week was super-busy with urgent deadlines but today I will return to this ^^'
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,79 @@
+<bug id='11686' author='vekterli' open_date='2020-01-07T16:31:15Z' closed_time='2020-01-15T14:46:31Z'>
+	<summary>Regression introduced in Vespa 7.141 may cause data loss or inconsistencies when using 'create: true' updates</summary>
+	<description>
+&lt;denchmark-h:h3&gt;High-level summary&lt;/denchmark-h&gt;
+
+There exists a regression introduced in Vespa 7.141 where updates marked as  (i.e. create if missing) may cause  in certain edge cases. This regression was introduced as part of an optimization effort to greatly reduce the common-case overhead of updates when replicas are out of sync (see &lt;denchmark-link:https://github.com/vespa-engine/vespa/issues/3703&gt;#3703&lt;/denchmark-link&gt;
+, &lt;denchmark-link:https://github.com/vespa-engine/vespa/pull/11319&gt;#11319&lt;/denchmark-link&gt;
+).
+The known edge cases triggering this bug are:
+
+An update is sent towards a document that is entirely missing on one more more replicas. This may happen e.g. during data migration caused by node failures or cluster topology changes.
+An update is sent towards a document whose replica set changes between the time the update is started on a distributor and the time update operations are sent.
+
+It is not believed that updates without create: true are impacted in practice by this bug.
+&lt;denchmark-h:h3&gt;Impact&lt;/denchmark-h&gt;
+
+When this bug is triggered, the most common outcome is that the document version resulting from the update is as if the document never existed in the first place. I.e. existing document data will be discarded. If the distributor process is terminated before the update completes it is also possible (though far less likely) that the documents are left in an undetectable state of inconsistency.
+A warning of the following form should be emitted in the Vespa logs on the content nodes if the bug is triggered:
+&lt;denchmark-code&gt;Update operation for 'id:foo::bar' in bucket Bucket(BucketSpace(0x0000000000000001), BucketId(0x4000000000f00baa)) updated documents with different timestamps. This should not happen and may indicate undetected replica divergence. Found ts=0 on node 5, ts=1576000000000001 on node 6
+&lt;/denchmark-code&gt;
+
+Where id:foo::bar is the ID of the affected document. Note that this log message is emitted after the update has been applied on the replicas, so it's possible for such messages to be missed if the distributor process is terminated before it can be printed.
+Such log warnings may be observed even when not using create: true, but since such updates cannot implicitly create new documents from scratch on replicas, it is not believed that this actually triggers an inconsistency or data loss.
+&lt;denchmark-h:h3&gt;Status&lt;/denchmark-h&gt;
+
+All known issues are fixed on HEAD (&lt;denchmark-link:https://github.com/vespa-engine/vespa/pull/11561&gt;#11561&lt;/denchmark-link&gt;
+, &lt;denchmark-link:https://github.com/vespa-engine/vespa/pull/11613&gt;#11613&lt;/denchmark-link&gt;
+), and the optimizations have additionally been temporarily entirely disabled (&lt;denchmark-link:https://github.com/vespa-engine/vespa/pull/11612&gt;#11612&lt;/denchmark-link&gt;
+) until we have further increased test coverage. Will update this issue once we have an Open-Source RPM release containing the fixes.
+Until then, anyone using updates with create: true may add the following config override to their services.xml file and redeploy the application:
+&lt;config name="vespa.config.content.core.stor-distributormanager"&gt;
+&lt;restart_with_fast_update_path_if_all_get_timestamps_are_consistent&gt;false&lt;/restart_with_fast_update_path_if_all_get_timestamps_are_consistent&gt;
+&lt;/config&gt;
+This is a live config change and takes place immediately with no need for restarting any services.
+After doing so, all documents that are suspected to be impacted by this bug should be re-fed into the system.
+If you are unable to determine which documents may have been impacted, a full refeed should be considered.
+&lt;denchmark-h:h3&gt;Follow-up&lt;/denchmark-h&gt;
+
+This is a severe bug with very unfortunate side effects. We are taking steps to significantly improve the internal testing of such edge cases to avoid anything like it happening again.
+I will update this issue with a post-mortem on the cause of the bug and why it manifested itself in the way it did.
+	</description>
+	<comments>
+		<comment id='1' author='vekterli' date='2020-01-10T09:52:48Z'>
+		Vespa 7.157.9 is now available. If you are on 7.141 or greater it is highly recommended to upgrade to this version as soon as possible.
+		</comment>
+		<comment id='2' author='vekterli' date='2020-01-13T14:39:32Z'>
+		&lt;denchmark-h:h3&gt;Post-mortem&lt;/denchmark-h&gt;
+
+The regression was accidentally introduced as part of an ongoing effort to greatly reduce the overhead of updates when replicas are inconsistent. Due to several edge case bugs it was possible for data to be lost or end up in an inconsistent state.
+&lt;denchmark-h:h3&gt;Background&lt;/denchmark-h&gt;
+
+Vespa is an eventually consistent data store and therefore occasionally requires reconciling inconsistencies as part of client operations. Vespa performs both read-repair and write-repair as needed.
+If replicas are out of sync with each other:
+
+A client Get operation needs to fetch documents from all possibly inconsistent replicas before returning the newest one back to the client. This is a read-repair operation.
+A client Update operation must ensure it does not apply the same update to diverging document versions. Otherwise the end result will be inconsistent. This is a write-repair operation.
+
+Vespa versions documents using a wall-clock timestamp assigned by distributor processes. Documents with a higher timestamp are assumed to have more recent data and will overwrite documents with older timestamps. Two replicas of a document are assumed to have identical content if they have the same timestamp.
+A mutating operation in Vespa assigns a brand new timestamp to the document. I.e. an update operation will write a new document version with a given timestamp on a replica regardless of the timestamp of the document it updated. Since Vespa assumes equality of two documents with the same timestamp, it is therefore vital that the system does not let such updates mutate different document versions.
+Avoiding that updates are applied to different document versions is the responsibility of the distributor update logic. Since a distributor knows of all currently visible replicas of document buckets, it can a-priori observe if the metadata (i.e. checksum of document ID/timestamps) differs across replicas. If the replicas are in sync, the distributor triggers a fast path where updates are sent directly to the backend replicas in parallel. This is the case when the system is operating normally.
+If the replicas are not in sync, the update falls back to a slower two-phase update protocol. Here, Get operations are sent to all possibly diverging replicas and the highest timestamped version is chosen as the update candidate. The update is then performed in-situ on the distributor before being pushed out to all replicas as a regular Put operation. This forces convergence of document content at the cost of introducing a possibly expensive update application and Put operations as part of the pipeline. Especially in systems where Puts are much more expensive than partial updates, this has had a significant penalty when replicas have been inconsistent. This has typically been during orchestrated upgrades where nodes are down for short periods of time.
+The optimization introduced was to detect when all received document versions as part of the Get-phase were equal, effectively restarting the update as a fast-path update and sending operations directly to the backend nodes.
+&lt;denchmark-h:h3&gt;Regression root cause&lt;/denchmark-h&gt;
+
+Code was added to the distributor Get operation logic to determine the consistency of the received responses. This was built on top of existing timestamp tracking in the operation code. The bug was in a subtle interaction of how the code determined whether it had yet to receive any timestamped responses. A sentinel timestamp value of 0 was used to signify "no replies received yet". However, if a Get is received from a replica that does not contain the document, it communicates this by setting the returned document timestamp to 0 as well. This meant that there was an edge where if the first replica that sent a response would return a timestamp of zero (i.e. not found), the code would effectively treat it as if it had not received any replies yet. If subsequent document versions were in sync, the Get operation would tag itself as all document replicas having been fully consistent, even though one was not.
+The end result of this was that the two-phase update logic would assume it was safe to send update operations directly to the nodes, possibly updating an empty replica on one and consistent replicas on the others. Updates without create: true are not applied to empty replicas and would therefore not incur inconsistencies. But updates with create: true would end up implicitly creating a new document version on the empty replica. Since this document would have the same timestamp as those on the nodes were an existing document was updated, it would appear to the system as if all versions were equal. From the perspective of Vespa, this is an undetectable inconsistency.
+This situation was made worse by a sanity checking feature that ironically is intended to help fix such inconsistencies. Update operations return the timestamp of the document they updated back to the distributor, and the update logic detects if they differ. If they do, it does its best to fetch the document from one of the replicas that updated the newest version and then push this document version out as a Put to all nodes involved in the update. However, updates with create: true that create a new document version from scratch return the timestamp of the new document as that of their old document. This was not handled appropriately in the distributor code. In turn, the inconsistency fixup logic ended up selecting the document created from scratch (having a higher timestamp than all others) as the most viable document to overwrite all replicas with. Needless to say, this is not likely to be optimal behavior.
+&lt;denchmark-h:h3&gt;Conclusion&lt;/denchmark-h&gt;
+
+Both these bugs were the result of ambiguities related to timestamp handling. One due certain transient edge cases triggering a wrongful interpretation of values, the other due to unexpected values being returned from another process. This demonstrates the importance of a rich system test suite in addition to the existing unit test suites, as the latter may encode assumptions that are inaccurate in reality.
+Aside from the fixes mentioned in the original comment, the following work has been done to improve test coverage and handling of such edge cases:
+
+Add functionality for deterministially enforcing replica divergence in system tests (#11704)
+Add system tests for inconsistent replica edge cases (diverging timestamps, missing on replica, with and without create: true) (vespa-engine/system-test#489)
+Ensure that we do not pick auto-created replicas to converge towards if updates are inconsistent and non-created document versions are available to pick (#11761)
+
+		</comment>
+	</comments>
+</bug>

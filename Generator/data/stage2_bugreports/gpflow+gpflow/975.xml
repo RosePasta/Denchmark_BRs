@@ -1,0 +1,279 @@
+<bug id='975' author='martiningram' open_date='2019-05-16T05:42:19Z' closed_time='2019-12-03T21:42:17Z'>
+	<summary>Restored model objective does not match objective reported during optimisation</summary>
+	<description>
+Hi there,
+I have a really strange bug which I would really appreciate some help with!
+System information:
+
+Python version: Python 3.6.4
+TensorFlow installed from (source or binary): binary (I believe)
+TensorFlow version (use command below): b'v1.13.1-0-g6612da8951' 1.13.1
+GPflow installed from (source or binary): binary
+GPflow version: 1.3.0
+
+... Describe the current behavior
+When running the new-style multi-output GP, the optimisation runs fine, and the objective reaches a low value. When saved, performance is terrible on reload, and the objective gives a correspondingly high value.
+... Describe the expected behavior
+Objective reported at end of optimisation should match that of restored model.
+... Code to reproduce the issue Provide a reproducible test case that is the bare minimum necessary to generate the problem.
+I first encountered this on my own data, but I've made an example with fake data below, which might be easier to debug.
+import os
+import argparse
+from sklearn.cluster import KMeans
+import gpflow as gpf
+import numpy as np
+from scipy.stats import norm
+import gpflow.multioutput.kernels as mk
+import gpflow.multioutput.features as mf
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--M', required=True, type=int)
+parser.add_argument('--L', required=True, type=int)
+parser.add_argument('--train-inducing-points', required=False,
+                    action='store_true')
+parser.add_argument('--output-dir', required=True)
+parser.add_argument('--n-data', required=False, type=int, default=1200)
+parser.add_argument('--n-covariates', required=False, type=int, default=8)
+parser.add_argument('--n-outputs', required=False, type=int, default=371)
+args = parser.parse_args()
+
+if not os.path.isdir(args.output_dir):
+    os.makedirs(args.output_dir)
+
+M = args.M
+L = args.L
+train_inducing_points = args.train_inducing_points
+
+# Set seed for reproducibility
+np.random.seed(2)
+
+# Generate some data
+X = np.random.normal(size=(args.n_data, args.n_covariates))
+
+bias = np.random.uniform(-3, 0, size=args.n_outputs)
+
+true_lin_weights = np.random.normal(size=(args.n_covariates, args.n_outputs))
+output = X @ true_lin_weights + bias
+
+y = (norm.cdf(output) &gt; np.random.uniform(size=output.shape)).astype(int)
+
+D = X.shape[1]
+P = y.shape[1]
+train_inducing_points = False
+maxiter = int(1E6)
+
+Z = KMeans(M).fit(X).cluster_centers_
+
+data_to_save = {
+    'X': X,
+    'y': y,
+    'Z': Z,
+    'M': M,
+    'L': L
+}
+
+np.savez(os.path.join(args.output_dir, 'data'), **data_to_save)
+
+gpf.reset_default_graph_and_session()
+
+# Values at the inducing points.
+# M inducing points; L different outputs.
+q_mu = np.zeros((M, L))
+q_sqrt = np.repeat(np.eye(M)[None, ...], L, axis=0) * 1.0
+
+kern_list = [gpf.kernels.RBF(D, ARD=True) for _ in range(L - 1)]
+kern_list += [gpf.kernels.Bias(D)]
+
+W_init = np.random.randn(P, L)
+kernel = mk.SeparateMixedMok(kern_list, W_init)
+
+feature = mf.MixedKernelSharedMof(gpf.features.InducingPoints(Z))
+
+m = gpf.models.SVGP(X, y, kernel, gpf.likelihoods.Bernoulli(),
+                    feat=feature, q_mu=q_mu, q_sqrt=q_sqrt)
+
+# Try without training the location of the inducing points
+m.feature.set_trainable(train_inducing_points)
+
+opt = gpf.train.ScipyOptimizer(options={'maxfun': maxiter})
+opt.minimize(m, disp=True, maxiter=maxiter)
+
+# Store the model itself
+saver = gpf.saver.Saver()
+saver.save(os.path.join(args.output_dir, 'problematic_model'), m)
+Run with M=100, L=12, final objective value is reported as:
+ F =   92721.086740390674
+However, when I run the result in a script:
+import sys
+import gpflow
+
+
+gpflow.reset_default_graph_and_session()
+m = gpflow.saver.Saver().load(sys.argv[1])
+
+sess = m.enquire_session()
+print(sess.run(m.objective))
+The objective reported is:
+507238.6801604379
+Which, needless to say, is much worse (and in fact extremely poor).
+I've attached the saved model. Unfortunately I didn't save the log, but it converged with
+CONVERGENCE: REL_REDUCTION_OF_F_&lt;=_FACTR*EPSMCH
+After 20,770 iterations.
+Strangely, things seem to work fine for L&lt;=10, and only goes wrong for higher values than that, as far as I can tell.
+&lt;denchmark-link:https://github.com/GPflow/GPflow/files/3185551/data_and_model.zip&gt;data_and_model.zip&lt;/denchmark-link&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='martiningram' date='2019-05-16T10:09:22Z'>
+		I've been able to work out that the problem occurs only when L&gt;10. As soon as L=11, the restore doesn't work properly.
+		</comment>
+		<comment id='2' author='martiningram' date='2019-05-16T10:24:12Z'>
+		I think I've found the problem. Tensorflow threw some useful Object was never used errors that pointed me in the right direction.
+The problematic line is:
+&lt;denchmark-link:https://github.com/GPflow/GPflow/blob/master/gpflow/saver/coders.py#L262&gt;https://github.com/GPflow/GPflow/blob/master/gpflow/saver/coders.py#L262&lt;/denchmark-link&gt;
+
+For L=11, the value of keys before sorting is:
+dict_keys(['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10'])
+Which is fine. But after sorting, it becomes:
+['0', '1', '10', '2', '3', '4', '5', '6', '7', '8', '9']
+Which scrambles everything, unsurprisingly.
+I guess this could be addressed either by:
+
+Using a key in sorted which converts things to int before sorting (which could fail if they are not always integers) or
+Relying on the dict order being correct (which I think is only reliable for recent versions of python...?) or
+Maybe switching to an OrderedDict which is guaranteed to conserve order.
+
+I don't know the codebase well enough to know which one would work here.
+		</comment>
+		<comment id='3' author='martiningram' date='2019-05-17T15:08:02Z'>
+		The GPflow saver will go away after GPflow 2.0. Standard TF2.0 checkpointing and saver will work with gpflow model. Check awav/gpflow-2.0 branch.
+Do you think we can close the issue?
+		</comment>
+		<comment id='4' author='martiningram' date='2019-05-17T21:53:13Z'>
+		&lt;denchmark-link:https://github.com/awav&gt;@awav&lt;/denchmark-link&gt;
+ I think this is something we still ought to fix. GPflow 1 is going to be around for a while longer- as much as you wish otherwise - and this is clearly a bug.
+&lt;denchmark-link:https://github.com/martiningram&gt;@martiningram&lt;/denchmark-link&gt;
+ thanks for already figuring out why and where it's going wrong! now we just have to figure out how to fix it (and if you have an idea/solution, please do open a pull request for it)!
+&lt;denchmark-link:https://github.com/awav&gt;@awav&lt;/denchmark-link&gt;
+ Why does the decoder sort the keys? Why does the encoder not sort the keys?
+		</comment>
+		<comment id='5' author='martiningram' date='2019-05-18T09:36:35Z'>
+		Well, I would still recommend to look at TF2.0 and GPflow 2.0, as it has much more appropriate solution to the problem. Changes are little in the API.
+&lt;denchmark-link:https://github.com/st--&gt;@st--&lt;/denchmark-link&gt;
+ , it requires debugging to answer that question (which I will be able to do after 24 May), but I'm not convinced that (un)sorted indices are the real issue, as the problematic list is restored by new empty list and target values are placed in positions by their keys==indices (sorted or unsorted - doesn't matter).
+&lt;denchmark-link:https://github.com/martiningram&gt;@martiningram&lt;/denchmark-link&gt;
+, check GPflow 2.0 modified example:
+# cd GPflow/
+# git checkout awav/gpflow-2.0
+# conda create -n tf2 python=3.6
+# conda activate tf2
+# pip install tf-nightly-2.0-preview tfp-nightly
+
+import numpy as np
+import tensorflow as tf
+from sklearn.cluster import KMeans
+from tensorflow_probability import distributions as tfd
+
+import gpflow
+from gpflow.features import InducingPoints, MixedKernelSharedMof
+from gpflow.kernels import RBF, Bias, SeparateMixedMok
+
+np.random.seed(999)
+tf.random.set_seed(999)
+
+output_dir = "/tmp/tf-checkpoint"
+M = 10
+L = 2
+train_inducing_points = 100
+num_data = 1000
+num_covariates = 3
+num_outputs = 2
+
+dtype = gpflow.default_float()
+
+# Generate some data
+X = tf.random.normal((num_data, num_covariates), dtype=dtype)
+bias = tf.random.uniform((num_outputs, ), minval=-3, maxval=0, dtype=dtype)
+
+true_lin_weights = tf.random.normal((num_covariates, num_outputs), dtype=dtype)
+output = X @ true_lin_weights + bias
+
+norm = tfd.Normal(loc=tf.cast(0., dtype), scale=tf.cast(1., dtype))
+y_uncasted = (norm.cdf(output) &gt; tf.random.uniform(output.shape, dtype=dtype))
+y = tf.cast(y_uncasted, tf.int32)
+
+D = X.shape[1]
+P = y.shape[1]
+train_inducing_points = False
+maxiter = int(1e3)
+
+Z = KMeans(M).fit(X.numpy()).cluster_centers_
+Z = Z + tf.random.normal(Z.shape, dtype=dtype) * 0.001
+
+W_init = tf.random.normal((P, L), dtype=dtype)
+
+# Values at the inducing points.
+# M inducing points; L different outputs.
+kern_list = [*[RBF(ard=True) for _ in range(L - 1)], Bias()]
+kernel = SeparateMixedMok(kern_list, W_init)
+feature = MixedKernelSharedMof(InducingPoints(Z))
+
+model = gpflow.models.SVGP(kernel=kernel, likelihood=gpflow.likelihoods.Bernoulli(), feature=feature, num_latent=L)
+
+# Try without training the location of the inducing points
+# model.feature.trainable = False
+
+
+def loss_closure():
+    return model.elbo(X, y)
+
+
+gpflow.optimizers.Scipy().minimize(loss_closure, variables=model.trainable_variables, options={'maxiter': maxiter})
+
+# Store model
+ckpt = tf.train.Checkpoint(model=model)
+mngr = tf.train.CheckpointManager(ckpt, output_dir, max_to_keep=3)
+mngr.save()
+
+trained_q_mu = model.q_mu.numpy()
+model.q_mu.assign(tf.zeros(model.q_mu.shape))
+assigned_q_mu = model.q_mu.numpy()
+
+# Restore
+ckpt.restore(mngr.latest_checkpoint)
+
+# Test restoring
+assert not np.allclose(model.q_mu.numpy(), assigned_q_mu)
+np.testing.assert_array_equal(model.q_mu.numpy(), trained_q_mu)
+		</comment>
+		<comment id='6' author='martiningram' date='2019-05-19T02:36:42Z'>
+		&lt;denchmark-link:https://github.com/awav&gt;@awav&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/st--&gt;@st--&lt;/denchmark-link&gt;
+ thanks for the comments!
+&lt;denchmark-link:https://github.com/awav&gt;@awav&lt;/denchmark-link&gt;
+ Thanks, the new-style code seems to be working for me. Am I right in thinking though that since the line  requires a  argument, we basically need to make sure to build the model before we're able to restore it? If so, while workable, that seems like a step back from the old way, where we could just load the entire model with , and it would restore the kernel settings and so on. If we need to build it first, there's always a possibility of getting the model build code out of sync with the saved model, which could be painful. What do you think?
+Re sorting / not sorting: Removing the line in question does fix the restore for me in this particular case, but of course I can't say whether it fixes it in general.
+		</comment>
+		<comment id='7' author='martiningram' date='2019-05-19T09:39:18Z'>
+		&lt;denchmark-link:https://github.com/martiningram&gt;@martiningram&lt;/denchmark-link&gt;
+ yes, that's right. I don't think it is a step back. The GPflow saver doesn't protect you from the code changes, moreover it is not safe to use it at all, as it only gives you false impression that you use the same model. The structure might be the same, but internal implementation might still change. The GPflow saver doesn't keep information about sources, therefore there is no guarantee that your trained model and loaded model use identical code - you still have to keep SHA which you used, checkout to that version and then load the model.
+In version 2.0 you have two choices: either checkpointing or tensor saving approach (tf.saved_model). I showed only checkpointing, check TF2.0 documentation for details.
+		</comment>
+		<comment id='8' author='martiningram' date='2019-05-22T05:48:06Z'>
+		I see, thanks. I might take a look at the saved model approach!
+		</comment>
+		<comment id='9' author='martiningram' date='2019-07-11T15:01:15Z'>
+		&lt;denchmark-link:https://github.com/awav&gt;@awav&lt;/denchmark-link&gt;
+ what should we do with this bug ?
+		</comment>
+		<comment id='10' author='martiningram' date='2019-12-03T21:42:17Z'>
+		&lt;denchmark-link:https://github.com/martiningram&gt;@martiningram&lt;/denchmark-link&gt;
+ is your issue resolved? If not please re-open (though I hope this will be less of an issue with gpflow 2.0 now!)
+		</comment>
+		<comment id='11' author='martiningram' date='2019-12-03T21:59:40Z'>
+		&lt;denchmark-link:https://github.com/st--&gt;@st--&lt;/denchmark-link&gt;
+ thanks for asking! I definitely found workarounds, so happy to close this. I look forward to trying out GPFlow 2.0!
+		</comment>
+	</comments>
+</bug>

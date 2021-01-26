@@ -1,0 +1,275 @@
+<bug id='12395' author='TanjaBayer' open_date='2020-11-25T09:28:20Z' closed_time='2020-12-14T18:38:25Z'>
+	<summary>[serve] Actor Ram size increases when sending large data</summary>
+	<description>
+&lt;denchmark-h:h3&gt;What is the problem?&lt;/denchmark-h&gt;
+
+When sending video data (binary data and numpy arrays) to a ray serve endpoint the ram size of that worker encreases on each call.
+&lt;denchmark-link:https://user-images.githubusercontent.com/30770185/100204164-d16e3480-2f03-11eb-85d4-5fcc5e8a72bc.gif&gt;&lt;/denchmark-link&gt;
+
+While in the same time no object storage is used:
+&lt;denchmark-link:https://user-images.githubusercontent.com/30770185/100204374-16926680-2f04-11eb-8a5b-d6a0348fb2a2.png&gt;&lt;/denchmark-link&gt;
+
+Setup:
+
+Ray: 1.0.1
+OS: Ubuntu 18.04
+Python: 3.7.5
+
+&lt;denchmark-h:h3&gt;Reproduction (REQUIRED)&lt;/denchmark-h&gt;
+
+I was able to reproduce it with that script:
+import time
+import requests
+from ray import serve
+
+client = serve.start()
+
+def echo(flask_request):
+    return "hello " + flask_request.args.get("name", "serve!")
+
+client.create_backend("hello", echo)
+client.create_endpoint("hello", backend="hello", route="/hello")
+url = "http://localhost:8000/hello"
+payload = {}
+
+while True:
+    
+    files = [
+        ('test', (
+            'my_video-53.webm', open('./my_video-53.webm', 'rb'),
+            'video/webm'))
+        ]
+    headers = {
+        'apikey': 'asdfasfwerqexcz'
+        }
+
+    response = requests.request("GET", url, headers=headers, data=payload, files=files)
+    time.sleep(1)
+The videos I used hat between 1MB and 4MB, if it is smaller the changes are not that obvious
+
+[x ] I have verified my script runs in a clean environment and reproduces the issue.
+ I have verified the issue also occurs with the latest wheels. -&gt; I am not able to check that because the console is broken (#11932) and does not display anything there
+
+	</description>
+	<comments>
+		<comment id='1' author='TanjaBayer' date='2020-11-25T21:43:09Z'>
+		Hi &lt;denchmark-link:https://github.com/TanjaBayer&gt;@TanjaBayer&lt;/denchmark-link&gt;
+, thanks for this report! I was able to reproduce it with the following script (swapped video file with np array) on latest master
+import time
+import requests
+from ray import serve
+import numpy as np
+import io
+
+client = serve.start()
+
+def echo(flask_request):
+    return "hello " + flask_request.args.get("name", "serve!")
+
+client.create_backend("hello", echo)
+client.create_endpoint("hello", backend="hello", route="/hello")
+url = "http://localhost:8000/hello"
+payload = {}
+
+while True:
+    
+    files = [
+        ('test', (
+            'my_video-53.webm', io.BytesIO(np.zeros(4*1024*1024, dtype=np.uint8).tobytes()),
+            'video/webm'))
+        ]
+    headers = {
+        'apikey': 'asdfasfwerqexcz'
+        }
+
+    response = requests.request("GET", url, headers=headers, data=payload, files=files)
+    time.sleep(1)
+At start:
+&lt;denchmark-link:https://user-images.githubusercontent.com/21118851/100284249-c4613d80-2f23-11eb-9573-069d2c0da2af.png&gt;&lt;/denchmark-link&gt;
+
+After a minute
+&lt;denchmark-link:https://user-images.githubusercontent.com/21118851/100284387-f6729f80-2f23-11eb-8c19-930f95abbcbf.png&gt;&lt;/denchmark-link&gt;
+
+(cc &lt;denchmark-link:https://github.com/edoakes&gt;@edoakes&lt;/denchmark-link&gt;
+ )
+		</comment>
+		<comment id='2' author='TanjaBayer' date='2020-11-25T21:50:04Z'>
+		&lt;denchmark-link:https://github.com/simon-mo&gt;@simon-mo&lt;/denchmark-link&gt;
+ nice. Does the memory grow unbounded or does it stabilize after running for awhile? That would be the first thing I'd check here.
+		</comment>
+		<comment id='3' author='TanjaBayer' date='2020-11-25T22:15:54Z'>
+		It kept growing!
+&lt;denchmark-link:https://user-images.githubusercontent.com/21118851/100286990-af3add80-2f28-11eb-9302-91404abc2ef2.png&gt;&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='4' author='TanjaBayer' date='2020-11-26T07:36:04Z'>
+		
+It kept growing!
+
+Yes same for us, as the data we are handling is even larger our service crashes after some time, because it runs out of memory
+		</comment>
+		<comment id='5' author='TanjaBayer' date='2020-11-30T17:36:05Z'>
+		Adding a call to the Python garbage collector inside of the backend solves the issue for me:
+&lt;denchmark-code&gt;def echo(flask_request):
+    import gc; gc.collect()
+    return "hello " + flask_request.args.get("name", "serve!")
+&lt;/denchmark-code&gt;
+
+This indicates that we probably have a reference cycle somewhere in the code that prevents the data from being cleaned up until the garbage collector is invoked. &lt;denchmark-link:https://github.com/TanjaBayer&gt;@TanjaBayer&lt;/denchmark-link&gt;
+ you could use manual calls to  as a workaround for now, though it will degrade performance. We will try to track down the reference cycle and address it in Serve.
+		</comment>
+		<comment id='6' author='TanjaBayer' date='2020-11-30T17:40:54Z'>
+		Output of using gc.DEBUG_SAVEALL indicates that the HTTP request object is indeed caught in a ref cycle:
+&lt;denchmark-code&gt;def echo(flask_request):
+    import gc
+    gc.set_debug(gc.DEBUG_SAVEALL)
+    gc.collect()
+    for item in gc.garbage:
+        print(item)
+    return "hello " + flask_request.args.get("name", "serve!")
+&lt;/denchmark-code&gt;
+
+Output (repeated for each request):
+&lt;denchmark-code&gt;(pid=13929) {'REQUEST_METHOD': 'GET', 'SCRIPT_NAME': '', 'PATH_INFO': '/hello', 'QUERY_STRING': '', 'SERVER_PROTOCOL': 'HTTP/1.1', 'wsgi.version': (1, 0), 'wsgi.url_scheme': 'http', 'wsgi.input': &lt;_io.BytesIO object at 0x7f8b480cfb80&gt;, 'wsgi.errors': &lt;_io.BytesIO object at 0x7f8b480cfcc0&gt;, 'wsgi.multithread': True, 'wsgi.multiprocess': True, 'wsgi.run_once': False, 'SERVER_NAME': '127.0.0.1', 'SERVER_PORT': '8000', 'REMOTE_ADDR': '127.0.0.1', 'HTTP_HOST': 'localhost:8000', 'HTTP_USER_AGENT': 'python-requests/2.24.0', 'HTTP_ACCEPT_ENCODING': 'gzip, deflate', 'HTTP_ACCEPT': '*/*', 'HTTP_CONNECTION': 'keep-alive', 'HTTP_APIKEY': 'asdfasfwerqexcz', 'CONTENT_LENGTH': '4194482', 'CONTENT_TYPE': 'multipart/form-data; boundary=05115f20499502f3d299bfebc81645d5', 'werkzeug.request': &lt;Request 'http://localhost:8000/hello' [GET]&gt;}
+(pid=13929) &lt;_io.BytesIO object at 0x7f8b480cfb80&gt;
+(pid=13929) &lt;_io.BytesIO object at 0x7f8b480cfcc0&gt;
+(pid=13929) ImmutableMultiDict([])
+(pid=13929) &lt;Request 'http://localhost:8000/hello' [GET]&gt;
+&lt;/denchmark-code&gt;
+
+Note that there is no garbage collected when using the ServeHandle interface, so this must be specific to the flask request object.
+		</comment>
+		<comment id='7' author='TanjaBayer' date='2020-12-01T15:54:35Z'>
+		&lt;denchmark-link:https://github.com/edoakes&gt;@edoakes&lt;/denchmark-link&gt;
+ thats an interesting insight, actually we are only useing  but the setup is really nested, so I tried to reproduce it in a really simple way and thought it was the same issue when using the flask handle.
+But so far I was not able to find a minimal sample which shows the same behavior with the serveHandle than the one we are facing. I will try tomorrow to find out more on that...
+		</comment>
+		<comment id='8' author='TanjaBayer' date='2020-12-04T13:33:28Z'>
+		So I tried to reproduce my exact issue with the ServerHandle but was not able to do so, so I assume the large increase of ram size is a mixture of tow things:
+
+some problem with some of our models, which really increase indefinitely, which I need to examine more in detail
+a behavior of ray which I don't know is a bug or not, but has a hugh impact on the RAM size in any way:
+
+When sending data between endpoints the RAM of the workers changes by the size of the data we need to handle, which makes completely sense, because the data needs to be kept in memory while working with it. But the ram does not decrease after the call (which might be a feature, because it might make sense to block the memory for the future, but I am not sure if that is really the case, just a guess 😄 )
+But the thing which is strange in my opinion is that when making the next call the actor increases again, approx same size as before, but now shows the behavior that this is only for the time the request is beeing executed, it returns to the size from before.
+When I run this code, I see the following behavior:
+import asyncio
+import time
+import uuid
+
+import ray
+from ray import serve
+from ray.serve.utils import ServeRequest
+
+client = serve.start(detached=True)
+
+import numpy as np
+
+
+async def nested_one(request: ServeRequest):
+    case_id = request.args["case_id"]
+
+    print(f'{case_id}: Received Batch data, forward it')
+    nested_handle = client.get_handle('nested_one_one')
+    task_handle = nested_handle.remote(batch=request.args.get("batch"), case_id=case_id)
+    await asyncio.sleep(5)
+    await task_handle
+    print(f'{case_id}: did some work and waited for task')
+    return []
+
+
+async def nested_one_one(request: ServeRequest):
+    await asyncio.sleep(5)
+    # Just creating random variables, that should not increase the model ram size after the task
+    # has been finished
+    [np.random.randint(0, 255, (1280, 720, 3), dtype=np.uint8) for _ in
+     range(0, 150)]
+    return []
+
+
+client.create_backend("nested_one", nested_one)
+client.create_endpoint("nested_one", backend="nested_one")
+
+client.create_backend("nested_one_one", nested_one_one)
+client.create_endpoint("nested_one_one", backend="nested_one_one")
+
+time.sleep(5)
+
+client = serve.connect()
+while True:
+    nested_one = client.get_handle('nested_one')
+    case_id = str(uuid.uuid4())
+    batch_of_numpys = [np.random.randint(0, 255, (1280, 720, 3), dtype=np.uint8) for _ in
+                       range(0, 150)]
+    print(ray.get(nested_one.remote(case_id=case_id, batch=batch_of_numpys)))
+
+    time.sleep(15)
+&lt;denchmark-h:h2&gt;Before any request&lt;/denchmark-h&gt;
+
+&lt;denchmark-link:https://user-images.githubusercontent.com/30770185/101168729-21ec3d00-363c-11eb-811b-1b28df4b8f66.png&gt;&lt;/denchmark-link&gt;
+
+&lt;denchmark-h:h2&gt;During 1st request&lt;/denchmark-h&gt;
+
+&lt;denchmark-link:https://user-images.githubusercontent.com/30770185/101168753-2dd7ff00-363c-11eb-93f0-b4d858d4ec28.png&gt;&lt;/denchmark-link&gt;
+
+&lt;denchmark-h:h2&gt;After 1st request&lt;/denchmark-h&gt;
+
+&lt;denchmark-link:https://user-images.githubusercontent.com/30770185/101168781-3a5c5780-363c-11eb-9e5a-ce673ebff60b.png&gt;&lt;/denchmark-link&gt;
+
+&lt;denchmark-h:h2&gt;Second request&lt;/denchmark-h&gt;
+
+&lt;denchmark-link:https://user-images.githubusercontent.com/30770185/101168767-34667680-363c-11eb-901e-262e18e651f1.png&gt;&lt;/denchmark-link&gt;
+
+&lt;denchmark-h:h2&gt;After second request&lt;/denchmark-h&gt;
+
+&lt;denchmark-link:https://user-images.githubusercontent.com/30770185/101168810-48aa7380-363c-11eb-9fb9-14da85599bb7.png&gt;&lt;/denchmark-link&gt;
+
+&lt;denchmark-h:h2&gt;After some more requests&lt;/denchmark-h&gt;
+
+&lt;denchmark-link:https://user-images.githubusercontent.com/30770185/101169163-d38b6e00-363c-11eb-8e1e-8df0dc7afaf0.png&gt;&lt;/denchmark-link&gt;
+
+So it does not seem to grow endlessly, but still I do not understand the largely increased memory of the idle actors, maybe there is some reason for it?
+And that blows up fast, if you have some more endpoints handling same amount of data.
+		</comment>
+		<comment id='9' author='TanjaBayer' date='2020-12-10T18:11:35Z'>
+		Hi &lt;denchmark-link:https://github.com/TanjaBayer&gt;@TanjaBayer&lt;/denchmark-link&gt;
+, can you try the nightly build and see if it fixes your issue?  It fixes it for me.  Also, the next release will be out fairly soon (in about 1 week).
+On the nightly, the script doesn’t run as written, you have to add the line client = serve.connect() in the body of nested_one to prevent the error “ray.serve.exceptions.RayServeException: Ray Serve client cannot be serialized. Please use serve.connect() to get a client from within a backend.”
+Once that is done, the issue appears to be resolved:
+After 0 requests:
+&lt;denchmark-link:https://user-images.githubusercontent.com/5459654/101811925-8c372e80-3acf-11eb-8e9e-e209cc24f72d.png&gt;&lt;/denchmark-link&gt;
+
+After 1 request:
+&lt;denchmark-link:https://user-images.githubusercontent.com/5459654/101811952-93f6d300-3acf-11eb-81f0-85ffa1e11f22.png&gt;&lt;/denchmark-link&gt;
+
+After 2 requests, 3 requests, 4 requests, and so on:
+&lt;denchmark-link:https://user-images.githubusercontent.com/5459654/101811989-9fe29500-3acf-11eb-90b4-2d9a6f423583.png&gt;&lt;/denchmark-link&gt;
+
+The situation stabilizes after 2 requests (the memory doesn’t keep increasing.)
+		</comment>
+		<comment id='10' author='TanjaBayer' date='2020-12-10T19:06:46Z'>
+		Let's keep it open until &lt;denchmark-link:https://github.com/TanjaBayer&gt;@TanjaBayer&lt;/denchmark-link&gt;
+ can verify it with nightly. Thanks!
+		</comment>
+		<comment id='11' author='TanjaBayer' date='2020-12-11T13:28:51Z'>
+		&lt;denchmark-link:https://github.com/simon-mo&gt;@simon-mo&lt;/denchmark-link&gt;
+ &lt;denchmark-link:https://github.com/architkulkarni&gt;@architkulkarni&lt;/denchmark-link&gt;
+ I verified it with latest nightly, I see the same behavior now as &lt;denchmark-link:https://github.com/architkulkarni&gt;@architkulkarni&lt;/denchmark-link&gt;
+ mentioned (only one_one grows in first and second call, the other stay stable), I will also check it with our more complex version if that changes anything.
+But what I still don't get, why does it grow twice?
+Update: I am not able to check with our more complex version, because I am not able to see the dashbord with nightly
+		</comment>
+		<comment id='12' author='TanjaBayer' date='2020-12-11T16:25:49Z'>
+		&lt;denchmark-link:https://github.com/TanjaBayer&gt;@TanjaBayer&lt;/denchmark-link&gt;
+ I'm not completely sure, but I'd guess that this is just because Python/numpy is ing on the first few requests and not relinquishing the memory as an optimization. You could try to verify this by running the same inference call in a local Python process and seeing if it's the same behavior.
+		</comment>
+		<comment id='13' author='TanjaBayer' date='2020-12-14T18:38:44Z'>
+		&lt;denchmark-link:https://github.com/TanjaBayer&gt;@TanjaBayer&lt;/denchmark-link&gt;
+ is there an open issue for the issue you're seeing with the dashboard?
+		</comment>
+		<comment id='14' author='TanjaBayer' date='2020-12-14T19:05:02Z'>
+		&lt;denchmark-link:https://github.com/edoakes&gt;@edoakes&lt;/denchmark-link&gt;
+ not yet but there is an open discussion in slack about it
+		</comment>
+	</comments>
+</bug>

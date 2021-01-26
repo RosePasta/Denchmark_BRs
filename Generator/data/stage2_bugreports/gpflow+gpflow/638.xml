@@ -1,0 +1,98 @@
+<bug id='638' author='hughsalimbeni' open_date='2018-02-01T13:43:40Z' closed_time='2019-12-03T22:13:49Z'>
+	<summary>fragility of minibatches</summary>
+	<description>
+I feel minibatches in gpflow are too easy to break. Recently I have fallen in to a trap (see below) resulting in my batches being out of sync. While this is really my fault and I should have noticed it sooner, I feel others might easily do the same and the behaviour can be difficult to diagnose (as without calling the autoflow function things are fine, but in my case the autoflow function was only being used for printing purposes, so I didn't initially investigate)
+Here's a minimal example of the trap:
+class Test(Model):
+    def __init__(self, X, Y, minibatch_size):
+        Model.__init__(self)
+        self.X = Minibatch(X.astype(float), batch_size=minibatch_size, seed=0)
+        self.Y = Minibatch(Y.astype(float), batch_size=minibatch_size, seed=0)
+    
+    @params_as_tensors
+    def _build_likelihood(self):
+        return tf.cast(0., dtype=tf.float64)
+    
+    @params_as_tensors
+    @autoflow()
+    def t1(self):
+        return self.X, self.Y
+    
+    @params_as_tensors
+    @autoflow()
+    def t2(self):
+        return self.X
+  
+t = Test(np.arange(4), np.arange(4), 2)
+#batches in sync
+print(t.t1())
+print(t.t1())
+
+# call the autoflow function only involving one minibatch object
+print(t.t2())
+
+# now batches are out of sync forever after 
+print(t.t1())
+	</description>
+	<comments>
+		<comment id='1' author='hughsalimbeni' date='2018-02-01T13:53:14Z'>
+		I fell into this trap as well. It is easy to diagnose though: The GP model should just predict random chance :)
+I do agree with this sentiment though, and I think we should think about solutions. However, I'm worried there aren't any easy fixes.
+		</comment>
+		<comment id='2' author='hughsalimbeni' date='2018-03-06T11:52:36Z'>
+		With tensorflow the dataset iterators are implicitly synchronized when you create them with the same tf.data.Dataset.from_tensor_slices(initial_tensor) call. Therefore, what one could do is define a structured DataHolder then a sliced DataHolder to separate parameters. E.g. in the example above
+class Test(Model):
+    def __init__(self, X, Y, minibatch_size):
+        Model.__init__(self)
+        synced_data = StructuredDataHolder((X.astype(float),Y.astype(float)), batch_size=minibatch_size, seed=0)
+        self.X = SlicedDataHolder(synced_data,index=0)
+        self.Y = SlicedDataHolder(synced_data,index=1)
+A second way is to include control dependencies in your code. E.g. using your above example,
+    # everything else the same
+    @params_as_tensors
+    @autoflow()
+    def t2(self):
+        with tf.control_dependencies([tf.identity(self.Y)]):
+            return tf.identity(self.X)
+I'd prefer the first option because then you don't need to worry about in in your code.
+		</comment>
+		<comment id='3' author='hughsalimbeni' date='2018-03-07T15:11:36Z'>
+		Something like the first option seems like a good way to go
+		</comment>
+		<comment id='4' author='hughsalimbeni' date='2018-03-28T22:56:36Z'>
+		I propose another way that I currently use, which works with the DataHolder. Firstly I define a helper function that produces synchronized minibatches. Then I feed these into the a sparse model with minibatch_size=None. Here is the helper function:
+def _synced_minibatch(*X,minibatch_size=100,seed=0, sess=None):
+    """Produce synchronized minibatches, and initializes if given a session"""
+    init_placeholders = tuple([tf.placeholder(tf.float64,shape=x.shape) for x in X])
+    data = tf.data.Dataset.from_tensor_slices(init_placeholders)
+    data = data.repeat()
+    data = data.shuffle(buffer_size=X[0].shape[0], seed=seed)
+    data = data.batch(batch_size=tf.constant(minibatch_size,dtype=tf.int64))
+    iterator_tensor = data.make_initializable_iterator()
+    if sess is not None:
+        sess.run(iterator_tensor.initializer, feed_dict={p:x for p,x in zip(init_placeholders,X)})
+    return init_placeholders, iterator_tensor.initializer, iterator_tensor.get_next()
+Now I'll use this in the example of a SVGP model.
+with tf.Session() as sess:
+    num_data = X.shape[0]
+    num_latent = Y.shape[1]
+    init_placeholders, iterator_initializer, (X,Y) = \
+        _synced_minibatch(X, Y,minibatch_size=100, sess = sess)
+    # X and Y and always in sync but we need to feed in num_latent and num_data explicitly
+    m_sgp = SVGP(X,Y, num_latent=num_latent, num_data=num_data,minibatch_size=None, ...)
+In the above example is put everything inside a session context, from which gpflow will pick it up as the default session for all operations. Also valid but less clean is,
+num_data = X.shape[0]
+num_latent = Y.shape[1]
+init_placeholders, iterator_initializer, (X,Y) = \
+    _synced_minibatch(X, Y,minibatch_size=100, sess = None)
+X,Y = data
+# X and Y and always in sync but uninitialized
+m_sgp = SVGP(X,Y, num_latent=num_latent, num_data=num_data,minibatch_size=None, ...)
+sess = m_sgp.enquire_session()
+sess.run(iterator_initializer, feed_dict={p:x for p,x in zip(init_placeholders,[X,Y])})
+		</comment>
+		<comment id='5' author='hughsalimbeni' date='2019-12-03T22:13:49Z'>
+		I believe this won't be an issue in gpflow2 anymore as the user will have to handle data manually - models no longer contain data, there is no DataHolder 🎉
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,375 @@
+<bug_data>
+<bug id='396' author='jneeven' open_date='2020-01-24T16:02:11Z' closed_time='2020-05-07T14:07:29Z'>
+ 	<summary>`CaseOptimizer` broken on multi-GPU</summary>
+ 	<description>
+ &lt;denchmark-h:h3&gt;Describe the bug&lt;/denchmark-h&gt;
+ 
+ When training a model using the CaseOptimizer on multi-GPU (4 of them in my case, both p100 and v100 will break), I get the following error:
+ &lt;denchmark-code&gt;WARNING:tensorflow:There is non-GPU devices in `tf.distribute.Strategy`, not using nccl allreduce.
+ distributed training:  False
+ Train on 60000 samples
+ 60000/60000 [==============================] - 4s 61us/sample - loss: 8.2390
+ Successfully fitted model
+ 
+ distributed training:  True
+ Train on 60000 samples
+ INFO:tensorflow:Error reported to Coordinator: list index out of range
+ Traceback (most recent call last):
+   File "/usr/local/lib/python3.7/dist-packages/tensorflow_core/python/training/coordinator.py", line 297, in stop_on_exception
+     yield
+   File "/usr/local/lib/python3.7/dist-packages/tensorflow_core/python/distribute/mirrored_strategy.py", line 190, in _call_for_each_replica
+     **merge_kwargs)
+   File "/usr/local/lib/python3.7/dist-packages/tensorflow_core/python/keras/optimizer_v2/optimizer_v2.py", line 446, in _distributed_apply
+     ds_reduce_util.ReduceOp.SUM, grads_and_vars)
+   File "/usr/local/lib/python3.7/dist-packages/tensorflow_core/python/distribute/distribute_lib.py", line 1481, in batch_reduce_to
+     return self._batch_reduce_to(reduce_op, value_destination_pairs)
+   File "/usr/local/lib/python3.7/dist-packages/tensorflow_core/python/distribute/mirrored_strategy.py", line 707, in _batch_reduce_to
+     value_destination_pairs)
+   File "/usr/local/lib/python3.7/dist-packages/tensorflow_core/python/distribute/cross_device_ops.py", line 317, in batch_reduce
+     value_destination_pairs[0][0].values) == 1:
+ IndexError: list index out of range
+    32/60000 [..............................] - ETA: 10:32Exception raised: 
+  list index out of range
+ &lt;/denchmark-code&gt;
+ 
+ &lt;denchmark-h:h3&gt;To Reproduce&lt;/denchmark-h&gt;
+ 
+ import contextlib
+ import numpy as np
+ import tensorflow.keras as keras
+ import larq as lq
+ import tensorflow as tf
+ 
+ 
+ def get_model():
+     model = keras.Sequential()
+     model.add(keras.layers.Flatten(input_shape=(28, 28)))
+     model.add(
+         lq.layers.QuantDense(
+             units=10,
+             input_quantizer="ste_sign",
+             kernel_quantizer="ste_sign",
+             kernel_constraint="weight_clip",
+             name="layer_1"
+         )
+     )
+     model.add(keras.layers.Dense(units=10, name="layer_2"))
+     
+     
+     def is_layer_1(var: tf.Variable) -&gt; bool:
+         layer_name = var.name.split("/")[-2]
+         return layer_name == "layer_1"
+     
+     optimizer = lq.optimizers.CaseOptimizer(
+         (is_layer_1, keras.optimizers.Adam()),
+         default_optimizer=keras.optimizers.Adam(),
+     )
+ 
+ #     optimizer = keras.optimizers.Adam()
+ 
+     model.compile(
+         optimizer=optimizer, loss="sparse_categorical_crossentropy"
+     )
+     return model
+ 
+ 
+ def attempt_fit(distributed_training=False):
+     fashion_mnist = keras.datasets.fashion_mnist
+     (train_images, train_labels), (test_images, test_labels) = fashion_mnist.load_data()
+     train_images = train_images / 255.0
+     test_images = test_images / 255.0
+ 
+     with strategy.scope() if distributed_training else contextlib.nullcontext():
+         model = get_model()
+         model.fit(train_images, train_labels, epochs=1)
+ 
+ 
+ if __name__ == "__main__":
+     keras.backend.clear_session()
+     
+     strategy = tf.distribute.MirroredStrategy()
+     for distributed_training in [False, True]:
+         print("distributed training: ", distributed_training)
+         try:
+             attempt_fit(distributed_training)
+             print("Successfully fitted model")
+         except Exception as e:
+             print("Exception raised: \n", e)
+         print()          
+ For simplicity, you can change the predicate of the optimizer to lambda x: False; it makes no difference whether it actually selects any layers or not. Using keras.optimizers.Adam instead of the CaseOptimizer will work just fine.
+ &lt;denchmark-h:h3&gt;Expected behavior&lt;/denchmark-h&gt;
+ 
+ I expected it to train, as it does in the single-GPU case.
+ &lt;denchmark-h:h3&gt;Environment&lt;/denchmark-h&gt;
+ 
+ TensorFlow version: 2.0.0
+ Larq version: 0.8.3
+ 	</description>
+ 	<comments>
+ 		<comment id='1' author='jneeven' date='2020-01-24T16:08:40Z'>
+ 		It's printing an interesting warning:
+ 
+ WARNING:tensorflow:There is non-GPU devices in tf.distribute.Strategy, not using nccl allreduce.
+ 
+ Anyway, if I submit this to Polyaxon using a more complex environment, I get a different error:
+ &lt;denchmark-code&gt;2020-01-24 14:50:52 UTC -- Epoch 1/20
+ 
+ 2020-01-24 14:50:55 UTC -- Traceback (most recent call last):
+ 
+ 2020-01-24 14:50:55 UTC --   File "/usr/local/lib/python3.7/dist-packages/tensorflow_core/python/distribute/values.py", line 470, in _type_spec
+ 
+ 2020-01-24 14:50:55 UTC --     value_specs = [type_spec.type_spec_from_value(v) for v in self._values]
+ 
+ 2020-01-24 14:50:55 UTC --   File "/usr/local/lib/python3.7/dist-packages/tensorflow_core/python/distribute/values.py", line 470, in &lt;listcomp&gt;
+ 
+ 2020-01-24 14:50:55 UTC --     value_specs = [type_spec.type_spec_from_value(v) for v in self._values]
+ 
+ 2020-01-24 14:50:55 UTC --   File "/usr/local/lib/python3.7/dist-packages/tensorflow_core/python/framework/type_spec.py", line 492, in type_spec_from_value
+ 
+ 2020-01-24 14:50:55 UTC --     (value, type(value).__name__))
+ 
+ 2020-01-24 14:50:55 UTC -- TypeError: Could not build a TypeSpec for &lt;tf.Operation 'train_with_group' type=NoOp&gt; with type Operation
+ 
+ 2020-01-24 14:50:55 UTC -- 
+ 
+ 2020-01-24 14:50:55 UTC -- The above exception was the direct cause of the following exception:
+ 
+ 2020-01-24 14:50:55 UTC -- 
+ 
+ 2020-01-24 14:50:55 UTC -- Traceback (most recent call last):
+ 
+ 2020-01-24 14:50:55 UTC --   File "/usr/local/bin/project", line 11, in &lt;module&gt;
+ 
+ 2020-01-24 14:50:55 UTC --     load_entry_point('research-project', 'console_scripts', 'project')()
+ 
+ 2020-01-24 14:50:55 UTC --   File "/code/main.py", line 19, in cli
+ 
+ 2020-01-24 14:50:55 UTC --     cli()
+ 
+ 2020-01-24 14:50:55 UTC --   File "/usr/local/lib/python3.7/dist-packages/click/core.py", line 764, in __call__
+ 
+ 2020-01-24 14:50:55 UTC --     return self.main(*args, **kwargs)
+ 
+ 2020-01-24 14:50:55 UTC --   File "/usr/local/lib/python3.7/dist-packages/click/core.py", line 717, in main
+ 
+ 2020-01-24 14:50:55 UTC --     rv = self.invoke(ctx)
+ 
+ 2020-01-24 14:50:55 UTC --   File "/usr/local/lib/python3.7/dist-packages/click/core.py", line 1137, in invoke
+ 
+ 2020-01-24 14:50:55 UTC --     return _process_result(sub_ctx.command.invoke(sub_ctx))
+ 
+ 2020-01-24 14:50:55 UTC --   File "/usr/local/lib/python3.7/dist-packages/click/core.py", line 956, in invoke
+ 
+ 2020-01-24 14:50:55 UTC --     return ctx.invoke(self.callback, **ctx.params)
+ 
+ 2020-01-24 14:50:55 UTC --   File "/usr/local/lib/python3.7/dist-packages/click/core.py", line 555, in invoke
+ 
+ 2020-01-24 14:50:55 UTC --     return callback(*args, **kwargs)
+ 
+ 2020-01-24 14:50:55 UTC --   File "/usr/local/lib/python3.7/dist-packages/zookeeper/core/task.py", line 60, in command
+ 
+ 2020-01-24 14:50:55 UTC --     task_instance.run()
+ 
+ 2020-01-24 14:50:55 UTC --   File "/code/core/polyaxon_experiment.py", line 31, in wrapper
+ 
+ 2020-01-24 14:50:55 UTC --     run_method(self)
+ 
+ 2020-01-24 14:50:55 UTC --   File "/code/project/experiments/project_experiment.py", line 221, in run
+ 
+ 2020-01-24 14:50:55 UTC --     callbacks=callbacks,
+ 
+ 2020-01-24 14:50:55 UTC --   File "/usr/local/lib/python3.7/dist-packages/tensorflow_core/python/keras/engine/training.py", line 728, in fit
+ 
+ 2020-01-24 14:50:55 UTC --     use_multiprocessing=use_multiprocessing)
+ 
+ 2020-01-24 14:50:55 UTC --   File "/usr/local/lib/python3.7/dist-packages/tensorflow_core/python/keras/engine/training_v2.py", line 324, in fit
+ 
+ 2020-01-24 14:50:55 UTC --     total_epochs=epochs)
+ 
+ 2020-01-24 14:50:55 UTC --   File "/usr/local/lib/python3.7/dist-packages/tensorflow_core/python/keras/engine/training_v2.py", line 123, in run_one_epoch
+ 
+ 2020-01-24 14:50:55 UTC --     batch_outs = execution_function(iterator)
+ 
+ 2020-01-24 14:50:55 UTC --   File "/usr/local/lib/python3.7/dist-packages/tensorflow_core/python/keras/engine/training_v2_utils.py", line 86, in execution_function
+ 
+ 2020-01-24 14:50:55 UTC --     distributed_function(input_fn))
+ 
+ 2020-01-24 14:50:55 UTC --   File "/usr/local/lib/python3.7/dist-packages/tensorflow_core/python/eager/def_function.py", line 457, in __call__
+ 
+ 2020-01-24 14:50:55 UTC --     result = self._call(*args, **kwds)
+ 
+ 2020-01-24 14:50:55 UTC --   File "/usr/local/lib/python3.7/dist-packages/tensorflow_core/python/eager/def_function.py", line 503, in _call
+ 
+ 2020-01-24 14:50:55 UTC --     self._initialize(args, kwds, add_initializers_to=initializer_map)
+ 
+ 2020-01-24 14:50:55 UTC --   File "/usr/local/lib/python3.7/dist-packages/tensorflow_core/python/eager/def_function.py", line 408, in _initialize
+ 
+ 2020-01-24 14:50:55 UTC --     *args, **kwds))
+ 
+ 2020-01-24 14:50:55 UTC --   File "/usr/local/lib/python3.7/dist-packages/tensorflow_core/python/eager/function.py", line 1848, in _get_concrete_function_internal_garbage_collected
+ 
+ 2020-01-24 14:50:55 UTC --     graph_function, _, _ = self._maybe_define_function(args, kwargs)
+ 
+ 2020-01-24 14:50:55 UTC --   File "/usr/local/lib/python3.7/dist-packages/tensorflow_core/python/eager/function.py", line 2150, in _maybe_define_function
+ 
+ 2020-01-24 14:50:55 UTC --     graph_function = self._create_graph_function(args, kwargs)
+ 
+ 2020-01-24 14:50:55 UTC --   File "/usr/local/lib/python3.7/dist-packages/tensorflow_core/python/eager/function.py", line 2041, in _create_graph_function
+ 
+ 2020-01-24 14:50:55 UTC --     capture_by_value=self._capture_by_value),
+ 
+ 2020-01-24 14:50:55 UTC --   File "/usr/local/lib/python3.7/dist-packages/tensorflow_core/python/framework/func_graph.py", line 915, in func_graph_from_py_func
+ 
+ 2020-01-24 14:50:55 UTC --     func_outputs = python_func(*func_args, **func_kwargs)
+ 
+ 2020-01-24 14:50:55 UTC --   File "/usr/local/lib/python3.7/dist-packages/tensorflow_core/python/eager/def_function.py", line 358, in wrapped_fn
+ 
+ 2020-01-24 14:50:55 UTC --     return weak_wrapped_fn().__wrapped__(*args, **kwds)
+ 
+ 2020-01-24 14:50:55 UTC --   File "/usr/local/lib/python3.7/dist-packages/tensorflow_core/python/keras/engine/training_v2_utils.py", line 73, in distributed_function
+ 
+ 2020-01-24 14:50:55 UTC --     per_replica_function, args=(model, x, y, sample_weights))
+ 
+ 2020-01-24 14:50:55 UTC --   File "/usr/local/lib/python3.7/dist-packages/tensorflow_core/python/distribute/distribute_lib.py", line 760, in experimental_run_v2
+ 
+ 2020-01-24 14:50:55 UTC --     return self._extended.call_for_each_replica(fn, args=args, kwargs=kwargs)
+ 
+ 2020-01-24 14:50:55 UTC --   File "/usr/local/lib/python3.7/dist-packages/tensorflow_core/python/distribute/distribute_lib.py", line 1787, in call_for_each_replica
+ 
+ 2020-01-24 14:50:55 UTC --     return self._call_for_each_replica(fn, args, kwargs)
+ 
+ 2020-01-24 14:50:55 UTC --   File "/usr/local/lib/python3.7/dist-packages/tensorflow_core/python/distribute/mirrored_strategy.py", line 661, in _call_for_each_replica
+ 
+ 2020-01-24 14:50:55 UTC --     fn, args, kwargs)
+ 
+ 2020-01-24 14:50:55 UTC --   File "/usr/local/lib/python3.7/dist-packages/tensorflow_core/python/distribute/mirrored_strategy.py", line 196, in _call_for_each_replica
+ 
+ 2020-01-24 14:50:55 UTC --     coord.join(threads)
+ 
+ 2020-01-24 14:50:55 UTC --   File "/usr/local/lib/python3.7/dist-packages/tensorflow_core/python/training/coordinator.py", line 389, in join
+ 
+ 2020-01-24 14:50:55 UTC --     six.reraise(*self._exc_info_to_raise)
+ 
+ 2020-01-24 14:50:55 UTC --   File "/usr/local/lib/python3.7/dist-packages/six.py", line 703, in reraise
+ 
+ 2020-01-24 14:50:55 UTC --     raise value
+ 
+ 2020-01-24 14:50:55 UTC --   File "/usr/local/lib/python3.7/dist-packages/tensorflow_core/python/training/coordinator.py", line 297, in stop_on_exception
+ 
+ 2020-01-24 14:50:55 UTC --     yield
+ 
+ 2020-01-24 14:50:55 UTC --   File "/usr/local/lib/python3.7/dist-packages/tensorflow_core/python/distribute/mirrored_strategy.py", line 190, in _call_for_each_replica
+ 
+ 2020-01-24 14:50:55 UTC --     **merge_kwargs)
+ 
+ 2020-01-24 14:50:55 UTC --   File "/usr/local/lib/python3.7/dist-packages/tensorflow_core/python/keras/mixed_precision/experimental/loss_scale_optimizer.py", line 241, in _apply_gradients_cross_replica
+ 
+ 2020-01-24 14:50:55 UTC --     control_flow_ops.no_op)
+ 
+ 2020-01-24 14:50:55 UTC --   File "/usr/local/lib/python3.7/dist-packages/tensorflow_core/python/framework/smart_cond.py", line 59, in smart_cond
+ 
+ 2020-01-24 14:50:55 UTC --     name=name)
+ 
+ 2020-01-24 14:50:55 UTC --   File "/usr/local/lib/python3.7/dist-packages/tensorflow_core/python/util/deprecation.py", line 507, in new_func
+ 
+ 2020-01-24 14:50:55 UTC --     return func(*args, **kwargs)
+ 
+ 2020-01-24 14:50:55 UTC --   File "/usr/local/lib/python3.7/dist-packages/tensorflow_core/python/ops/control_flow_ops.py", line 1174, in cond
+ 
+ 2020-01-24 14:50:55 UTC --     return cond_v2.cond_v2(pred, true_fn, false_fn, name)
+ 
+ 2020-01-24 14:50:55 UTC --   File "/usr/local/lib/python3.7/dist-packages/tensorflow_core/python/ops/cond_v2.py", line 84, in cond_v2
+ 
+ 2020-01-24 14:50:55 UTC --     op_return_value=pred)
+ 
+ 2020-01-24 14:50:55 UTC --   File "/usr/local/lib/python3.7/dist-packages/tensorflow_core/python/framework/func_graph.py", line 920, in func_graph_from_py_func
+ 
+ 2020-01-24 14:50:55 UTC --     expand_composites=True)
+ 
+ 2020-01-24 14:50:55 UTC --   File "/usr/local/lib/python3.7/dist-packages/tensorflow_core/python/util/nest.py", line 531, in map_structure
+ 
+ 2020-01-24 14:50:55 UTC --     flat_structure = [flatten(s, expand_composites) for s in structure]
+ 
+ 2020-01-24 14:50:55 UTC --   File "/usr/local/lib/python3.7/dist-packages/tensorflow_core/python/util/nest.py", line 531, in &lt;listcomp&gt;
+ 
+ 2020-01-24 14:50:55 UTC --     flat_structure = [flatten(s, expand_composites) for s in structure]
+ 
+ 2020-01-24 14:50:55 UTC --   File "/usr/local/lib/python3.7/dist-packages/tensorflow_core/python/util/nest.py", line 262, in flatten
+ 
+ 2020-01-24 14:50:55 UTC --     return _pywrap_tensorflow.Flatten(structure, expand_composites)
+ 
+ 2020-01-24 14:50:55 UTC --   File "/usr/local/lib/python3.7/dist-packages/tensorflow_core/python/pywrap_tensorflow_internal.py", line 2651, in Flatten
+ 
+ 2020-01-24 14:50:55 UTC --     return _pywrap_tensorflow_internal.Flatten(nested, expand_composites)
+ 
+ 2020-01-24 14:50:55 UTC -- SystemError: &lt;built-in function Flatten&gt; returned a result with an error set
+ &lt;/denchmark-code&gt;
+ 
+ 		</comment>
+ 		<comment id='2' author='jneeven' date='2020-01-24T16:13:59Z'>
+ 		I think we had a similar issue with  in &lt;denchmark-link:https://github.com/larq/larq/issues/286&gt;#286&lt;/denchmark-link&gt;
+  where distribution strategy will fail if no variables are available to be assigned too via an optimizer  : 
+ Could you double check that both optimizers actually receive variables to train?
+ 		</comment>
+ 		<comment id='3' author='jneeven' date='2020-01-24T16:15:49Z'>
+ 		
+ I think we had a similar issue with Bop in #286 where distribution strategy will fail if no variables are available to be assigned too via an optimizer : TypeError: Could not build a TypeSpec for &lt;tf.Operation 'train_with_group' type=NoOp&gt; with type Operation
+ Could you double check that both optimizers actually receive variables to train?
+ 
+ I have verified that is_layer_1 returns True for the first layer and False for the second layer (when called from the CaseOptimizer). Is there a more direct way to check which variables are assigned to which optimizer?
+ 		</comment>
+ 		<comment id='4' author='jneeven' date='2020-01-24T16:20:21Z'>
+ 		I can reproduce the error above in this &lt;denchmark-link:https://colab.research.google.com/drive/1vU9P20rzPNd-ioiQhZYbruGXAxEvL3Ip&gt;notebook&lt;/denchmark-link&gt;
+  with TensorFlow 2.0.0. TensorFlow 2.1.0 doesn't seem to show this error.
+ 		</comment>
+ 		<comment id='5' author='jneeven' date='2020-01-24T16:21:47Z'>
+ 		I believe I also obtained this error with TF2.1.0, but will try again
+ 		</comment>
+ 		<comment id='6' author='jneeven' date='2020-01-24T16:28:18Z'>
+ 		
+ I believe I also obtained this error with TF2.1.0, but will try again
+ 
+ I can reproduce this issue in TF 1.15.x as well, but can't with 2.1. Checkout &lt;denchmark-link:https://colab.research.google.com/drive/1BTTQVOyY737GtB_pddF-VvAdBrPN14HK&gt;this notebook&lt;/denchmark-link&gt;
+ 
+ 		</comment>
+ 		<comment id='7' author='jneeven' date='2020-01-27T10:18:44Z'>
+ 		&lt;denchmark-link:https://github.com/jneeven&gt;@jneeven&lt;/denchmark-link&gt;
+  is this fixed for you by running experiments on TF2.1?
+ 		</comment>
+ 		<comment id='8' author='jneeven' date='2020-01-27T10:22:41Z'>
+ 		
+ @jneeven is this fixed for you by running experiments on TF2.1?
+ 
+ Nope, I still get the same error with TF2.1 (actually using multiple GPUs). I could not test the fake multi-GPU case, because I ran into some XLA problems.
+ 		</comment>
+ 		<comment id='9' author='jneeven' date='2020-02-14T10:42:55Z'>
+ 		I found that the case optimizer breaks on multi-gpu when using TF 2.0 due to a distribution strategy related error, however works fine when using TF 2.1 with lq.optimizers.Bop.is_binary_variable as a predicate.
+ 		</comment>
+ 		<comment id='10' author='jneeven' date='2020-03-16T13:44:46Z'>
+ 		Hi, I found the case optimizer works for both TF 2.0 and 2.1. The original script above can be fixed by calling  in between the single and multi gpu test (&lt;denchmark-link:https://colab.research.google.com/drive/1j5p4NZmYBWfQYLisAIVlhaYRs-IqSpH2&gt;notebook&lt;/denchmark-link&gt;
+ ). I did encounter the problem with , but only when running in reduced precision.
+ Could someone double check if this solves the problems with the case optimizer? If so, we can close this issue.
+ 		</comment>
+ 	</comments>
+ </bug>
+<commit id='56d7dca6d3e68d82d1b172251f3c97c71bc9fe9a' author='Lukas Geiger' date='2020-05-07 15:07:28+01:00'>
+ 	<dmm_unit complexity='None' interfacing='None' size='None'></dmm_unit>
+ 	<modification change_type='MODIFY' old_name='larq\optimizers.py' new_name='larq\optimizers.py'>
+ 		<file_info nloc='273' complexity='39' token_count='1253'></file_info>
+ 		<method name='apply_gradients' parameters='self,grads_and_vars,None,kwargs'>
+ 				<method_info nloc='14' complexity='7' token_count='159' nesting_level='1' start_line='123' end_line='148'></method_info>
+ 			<added_lines>142,143,144,145,146,147,148</added_lines>
+ 			<deleted_lines>145</deleted_lines>
+ 		</method>
+ 		<method name='_apply_gradients' parameters='self,distribution,grad_var_lists,name,kwargs'>
+ 				<method_info nloc='11' complexity='3' token_count='76' nesting_level='1' start_line='150' end_line='162'></method_info>
+ 			<added_lines>150,154,155,156</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</method>
+ 		<modified_lines>
+ 			<added_lines>149</added_lines>
+ 			<deleted_lines></deleted_lines>
+ 		</modified_lines>
+ 	</modification>
+ </commit>
+</bug_data>

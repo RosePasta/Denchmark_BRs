@@ -1,0 +1,378 @@
+<bug id='804' author='sammhho' open_date='2018-06-28T05:19:25Z' closed_time='2018-06-28T05:47:56Z'>
+	<summary>Inference with DoReFa-Net giving high top-1/top-5 error</summary>
+	<description>
+Hi, I'm trying to do inference on DoReFa-Net with the ILSVRC2012 validation set as test data
+(just to test the setup, not normally a "correct" practice I guess, but should give better-than-actual results right?),
+and I'm getting really high top-1/top-5 error rate.
+For the first 100 test data, I'm getting top-1/top-5 error around 0.95 and 0.85,
+where the README page says alexnet-126 should give top-1 error of 46.8%.
+Models used are the alexnet-126.npz from the model zoo, and also one trained with alexnet-dorefa.py with slightly modified parameters.
+Report from training in log.log looks fine:
+&lt;denchmark-code&gt;train-error-top1: 0.41264
+train-error-top5: 0.19853
+val-error-top1: 0.4913
+val-error-top5: 0.25514
+&lt;/denchmark-code&gt;
+
+Tried on 2 setups:
+a) python2.7 + tensorflow-gpu ('v1.4.0-19-ga52c8d9', '1.4.1') + tensorpack 0.8.6 + CUDA8 + Tesla K40c +  from &lt;denchmark-link:https://github.com/tensorpack/tensorpack/blob/58529de18e9bdad1bab31aed9c397a8f340e7f94/examples/DoReFa-Net/dorefa.py&gt;here&lt;/denchmark-link&gt;
+ for TensorFlow&lt;1.7
+b) python3.6 + tensorflow 'v1.8.0-3921-gfb3ce04' 1.9.0-rc0 + Intel MKL(for data_format NCHW on CPU) + tensorpack 0.8.6
+The inference script was slightly modified from alexnet-dorefa.py at the end of the run_image function,
+just to use the ILSVRC data and also print the top-1/top-5 error, as given below.
+Did I do anything silly? Can someone help try this script on your setup?
+import cv2
+import tensorflow as tf
+import argparse
+import numpy as np
+import os
+import sys
+
+
+from tensorpack import *
+from tensorpack.tfutils.summary import add_param_summary
+from tensorpack.tfutils.varreplace import remap_variables
+from tensorpack.dataflow import dataset
+from tensorpack.utils.gpu import get_nr_gpu
+
+from imagenet_utils import get_imagenet_dataflow, fbresnet_augmentor, ImageNetModel
+from dorefa import get_dorefa, ternarize
+
+
+BITW = 1
+BITA = 2
+BITG = 6
+TOTAL_BATCH_SIZE = 256
+BATCH_SIZE = None
+
+
+class Model(ImageNetModel):
+    weight_decay = 5e-6
+    weight_decay_pattern = 'fc.*/W'
+
+    def get_logits(self, image):
+        if BITW == 't':
+            fw, fa, fg = get_dorefa(32, 32, 32)
+            fw = ternarize
+        else:
+            fw, fa, fg = get_dorefa(BITW, BITA, BITG)
+
+        # monkey-patch tf.get_variable to apply fw
+        def new_get_variable(v):
+            name = v.op.name
+            # don't binarize first and last layer
+            if not name.endswith('W') or 'conv0' in name or 'fct' in name:
+                return v
+            else:
+                logger.info("Quantizing weight {}".format(v.op.name))
+                return fw(v)
+
+        def nonlin(x):
+            if BITA == 32:
+                return tf.nn.relu(x)    # still use relu for 32bit cases
+            return tf.clip_by_value(x, 0.0, 1.0)
+
+        def activate(x):
+            return fa(nonlin(x))
+
+        with remap_variables(new_get_variable), \
+                argscope([Conv2D, BatchNorm, MaxPooling], data_format='channels_first'), \
+                argscope(BatchNorm, momentum=0.9, epsilon=1e-4), \
+                argscope(Conv2D, use_bias=False):
+            logits = (LinearWrap(image)
+                      .Conv2D('conv0', 96, 12, strides=4, padding='VALID', use_bias=True)
+                      .apply(activate)
+                      .Conv2D('conv1', 256, 5, padding='SAME', split=2)
+                      .apply(fg)
+                      .BatchNorm('bn1')
+                      .MaxPooling('pool1', 3, 2, padding='SAME')
+                      .apply(activate)
+
+                      .Conv2D('conv2', 384, 3)
+                      .apply(fg)
+                      .BatchNorm('bn2')
+                      .MaxPooling('pool2', 3, 2, padding='SAME')
+                      .apply(activate)
+
+                      .Conv2D('conv3', 384, 3, split=2)
+                      .apply(fg)
+                      .BatchNorm('bn3')
+                      .apply(activate)
+
+                      .Conv2D('conv4', 256, 3, split=2)
+                      .apply(fg)
+                      .BatchNorm('bn4')
+                      .MaxPooling('pool4', 3, 2, padding='VALID')
+                      .apply(activate)
+
+                      .FullyConnected('fc0', 4096)
+                      .apply(fg)
+                      .BatchNorm('bnfc0')
+                      .apply(activate)
+
+                      .FullyConnected('fc1', 4096, use_bias=False)
+                      .apply(fg)
+                      .BatchNorm('bnfc1')
+                      .apply(nonlin)
+                      .FullyConnected('fct', 1000, use_bias=True)())
+        add_param_summary(('.*/W', ['histogram', 'rms']))
+        tf.nn.softmax(logits, name='output')  # for prediction
+        return logits
+
+    def optimizer(self):
+        lr = tf.get_variable('learning_rate', initializer=2e-4, trainable=False)
+        return tf.train.AdamOptimizer(lr, epsilon=1e-5)
+
+
+def run_image(model, sess_init, inputs, inLabels=None):
+    pred_config = PredictConfig(
+        model=model,
+        session_init=sess_init,
+        input_names=['input'],
+        output_names=['output']
+    )
+    predictor = OfflinePredictor(pred_config)
+    meta = dataset.ILSVRCMeta()
+    pp_mean = meta.get_per_pixel_mean()
+    pp_mean_224 = pp_mean[16:-16, 16:-16, :]
+    words = meta.get_synset_words_1000()
+
+    def resize_func(im):
+        h, w = im.shape[:2]
+        scale = 256.0 / min(h, w)
+        desSize = map(int, (max(224, min(w, scale * w)),
+                            max(224, min(h, scale * h))))
+        im = cv2.resize(im, tuple(desSize), interpolation=cv2.INTER_CUBIC)
+        return im
+    transformers = imgaug.AugmentorList([
+        imgaug.MapImage(resize_func),
+        imgaug.CenterCrop((224, 224)),
+        imgaug.MapImage(lambda x: x - pp_mean_224),
+    ])
+    top1 = 0
+    top5 = 0
+    for idx, f in enumerate(inputs):
+        assert os.path.isfile(f)
+        img = cv2.imread(f).astype('float32')
+        assert img is not None
+
+        img = transformers.augment(img)[np.newaxis, :, :, :]
+        outputs = predictor(img)[0]
+        prob = outputs[0]
+        ret = prob.argsort()[-10:][::-1]
+
+        names = [words[i] for i in ret]
+        print(f + ":")
+        print(list(zip(names, prob[ret])))
+        if inLabels is not None:
+          label = inLabels[idx]
+          if label != ret[0]:
+            top1 += 1
+            print('top1 failed, label={}, ret[0]={}'.format(label, ret[0]))
+          if label not in ret[:5]:
+            top5 += 1
+            print('top5 failed, ret[:5]={}'.format(ret[:5]))
+    print('number of test inputs={}'.format(len(inputs)))
+    print('top-5 err rate={}'.format(float(top5) / len(inputs)))
+    print('top-1 err rate={}'.format(float(top1) / len(inputs)))
+
+
+if __name__ == '__main__':
+  model = './alexnet-126.npz'
+  #model = './xAlexnet-126.npz'
+  testpath = './ILSVRC2012_img/val/'
+  #testset = [f for f in os.listdir(testpath) if os.path.isfile(os.path.join(testpath, f))]
+  meta = dataset.ILSVRCMeta()
+  testset = [os.path.join(testpath, f) for f, l in meta.get_image_list('val')]
+  testlabel = [l for f, l in meta.get_image_list('val')]
+
+  run_image(Model(), DictRestore(dict(np.load(model))), testset[:100], testlabel[:100])
+	</description>
+	<comments>
+		<comment id='1' author='sammhho' date='2018-06-28T05:32:26Z'>
+		I changed the preprocessing of the model in &lt;denchmark-link:https://github.com/tensorpack/tensorpack/commit/18b19d6dec901415ab8877a1405145cb5dda919b&gt;18b19d6&lt;/denchmark-link&gt;
+, but forgot to update the  function accordingly.
+I'll push a fix. You can also evaluate the model with this diff:
+diff --git i/examples/DoReFa-Net/alexnet-dorefa.py w/examples/DoReFa-Net/alexnet-dorefa.py        
+index 95a1e84..1b30f1b 100755                    
+--- i/examples/DoReFa-Net/alexnet-dorefa.py      
++++ w/examples/DoReFa-Net/alexnet-dorefa.py      
+@@ -220,6 +220,13 @@ if __name__ == '__main__':  
+     else:                                       
+         BITW, BITA, BITG = map(int, dorefa)     
+                                                 
++    from imagenet_utils import eval_on_ILSVRC12 
++    from tensorpack.tfutils.sessinit import get_model_loader                                     
++    BATCH_SIZE = 128                            
++    eval_on_ILSVRC12(Model(), get_model_loader(args.load),                                       
++            get_data('val'))                    
++    import sys; sys.exit()                      
++                                                
+     if args.gpu:                                
+         os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu                                            
+                                      
+		</comment>
+		<comment id='2' author='sammhho' date='2018-06-28T07:26:39Z'>
+		Thx for the quick response, things work as expected now.
+		</comment>
+		<comment id='3' author='sammhho' date='2018-06-28T10:26:24Z'>
+		&lt;denchmark-link:https://github.com/ppwwyyxx&gt;@ppwwyyxx&lt;/denchmark-link&gt;
+
+two questions:
+
+in here why did you quantize the activations after batchnorm,  but not before batchnorm?
+in here, it seems that there is no quantization on the activations(or called "outputs") of the element-wise-adding operation in resnet, why?
+
+thanks a lot!
+		</comment>
+		<comment id='4' author='sammhho' date='2018-06-28T16:23:33Z'>
+		The goal of the paper is to make the input of every conv layer quantized.
+		</comment>
+		<comment id='5' author='sammhho' date='2018-06-29T00:53:08Z'>
+		&lt;denchmark-link:https://github.com/ppwwyyxx&gt;@ppwwyyxx&lt;/denchmark-link&gt;
+
+in &lt;denchmark-link:https://github.com/tensorpack/tensorpack/blob/master/examples/DoReFa-Net/resnet-dorefa.py#L87&gt;here&lt;/denchmark-link&gt;
+ it seems that there is no quantization on the activations(or called "outputs") of the element-wise-adding operation in resnet,  but this can be the input of the first conv layer of the next resblock, right?
+		</comment>
+		<comment id='6' author='sammhho' date='2018-06-29T00:56:30Z'>
+		
+this can be the input of the first conv layer of the next resblock, right?
+
+If so, could you point out in code which conv layer?
+		</comment>
+		<comment id='7' author='sammhho' date='2018-06-29T01:11:23Z'>
+		&lt;denchmark-link:https://github.com/ppwwyyxx&gt;@ppwwyyxx&lt;/denchmark-link&gt;
+
+here : &lt;denchmark-link:https://github.com/tensorpack/tensorpack/blob/master/examples/DoReFa-Net/resnet-dorefa.py#L60&gt;https://github.com/tensorpack/tensorpack/blob/master/examples/DoReFa-Net/resnet-dorefa.py#L60&lt;/denchmark-link&gt;
+
+output of  get_stem_full function is not quanitzed, so here the return of function resblock: &lt;denchmark-link:https://github.com/tensorpack/tensorpack/blob/master/examples/DoReFa-Net/resnet-dorefa.py#L80&gt;https://github.com/tensorpack/tensorpack/blob/master/examples/DoReFa-Net/resnet-dorefa.py#L80&lt;/denchmark-link&gt;
+
+and the return of function group:
+&lt;denchmark-link:https://github.com/tensorpack/tensorpack/blob/master/examples/DoReFa-Net/resnet-dorefa.py#L88&gt;https://github.com/tensorpack/tensorpack/blob/master/examples/DoReFa-Net/resnet-dorefa.py#L88&lt;/denchmark-link&gt;
+
+are not quantized. So the group output is the input of the next group--- But the first layer in a group is a conv layer.
+		</comment>
+		<comment id='8' author='sammhho' date='2018-06-29T01:18:20Z'>
+		You're not answering my question..
+The output of each block is not quantized. The first layer in each block is batchnorm followed by quantization, not a conv layer.
+		</comment>
+		<comment id='9' author='sammhho' date='2018-07-16T11:34:55Z'>
+		Hi &lt;denchmark-link:https://github.com/ppwwyyxx&gt;@ppwwyyxx&lt;/denchmark-link&gt;
+, one question.
+When doing run_image,  the input image goes thru
+ResizeShortestEdge and CenterCrop provided by fbresnet_augmentor,
+and then the returned img is passed to the OfflinePredictor,
+and since the model is an ImageNetModel,
+eventually inside the graph, due to build_graph of ImageNetModel the img goes thru image_preprocess (and NCHW/NHWC handling) before being passed into get_logits,
+and what image_preprocess does is divide values by 255, minus per channel mean and then divides std,
+is that all !?
+So what I'm doing is similar to replicating the inference result in say pure python+numpy environment,
+the image after the ResizeShortestEdge and CenterCrop does match in both env,
+but then if I just do "div 255, minus mean, div std"
+(I copied the exact mean and std used in ImageNetModel ),
+the resulting image has different mean and std values than that given by TensorBoard.
+On the pure env I used numpy's np.mean and np.std, on TensorPack/TensorFlow I added variable_summaries(image, '-image') to the model, where
+def variable_summaries(var, name):
+  """Attach a lot of summaries to a Tensor (for TensorBoard visualization)."""
+  with tf.name_scope('summaries' + name):
+    mean = tf.reduce_mean(var)
+    tf.summary.scalar('mean', mean)
+    with tf.name_scope('stddev'):
+      stddev = tf.sqrt(tf.reduce_mean(tf.square(var - mean)))
+    tf.summary.scalar('stddev', stddev)
+    tf.summary.scalar('max', tf.reduce_max(var))
+    tf.summary.scalar('min', tf.reduce_min(var))
+    tf.summary.histogram('histogram', var)
+Am I missing anything ?
+On both envs the image is read using cv2.imread, so both are in BGR, and they both still match after resize + crop so no problem there...
+		</comment>
+		<comment id='10' author='sammhho' date='2018-07-16T16:51:17Z'>
+		
+is that all?
+
+That is all.
+If you're wondering what you did wrong, I can not tell much because I can only guess what you did, based on the limited description you've given. From the code snippet it looks like you're subtracting the mean of the image somehow, but in the code you can see that the mean/std are constants.
+		</comment>
+		<comment id='11' author='sammhho' date='2018-07-20T08:55:59Z'>
+		&lt;denchmark-link:https://github.com/ppwwyyxx&gt;@ppwwyyxx&lt;/denchmark-link&gt;
+ Thx for the reply.
+I used the above variable_summaries function only for TensorBoard visualization purpose, sorry for the confusion.
+So within alexnet-dorefa.py's get_logits I added these (since TensorPack callbacks/monitors are for training but not inference...) to visualize the input image tensor's values:
+variable_summaries(image, '-image')
+self.merged = tf.summary.merge_all(tf.GraphKeys.SUMMARIES)
+Some findings:
+If I comment out the "minus mean divide std" part within image_preprocess like this:
+    @staticmethod
+    def image_preprocess(image, bgr=True):
+        with tf.name_scope('image_preprocess'):
+            if image.dtype.base_dtype != tf.float32:
+                image = tf.cast(image, tf.float32)
+            image = image * (1.0 / 255)
+
+            mean = [0.485, 0.456, 0.406]    # rgb
+            std = [0.229, 0.224, 0.225]
+            if bgr:
+                mean = mean[::-1]
+                std = std[::-1]
+            image_mean = tf.constant(mean, dtype=tf.float32)
+            image_std = tf.constant(std, dtype=tf.float32)
+            #image = (image - image_mean) / image_std
+            #image = (image - image_mean)
+            return image
+With the same picture as input, I get the mean and std values of the picture after resize+centerCrop from both TensorPack and pure Python env almost matched to 2 or 3 decimal place;
+However, in TensorPack the min and max value of the image tensor was shown as 0. and 1. on TensorBoard;
+But in run_image I also printed the image's stats after augement, before launching OfflinePredictor,
+def run_image(model, sess_init, inputs):
+    pred_config = PredictConfigMod(
+        model=model,
+        session_init=sess_init,
+        input_names=['input'],
+        output_names=['output']
+    )
+    predictor = OfflinePredictorMod(pred_config)
+    meta = dataset.ILSVRCMeta()
+    words = meta.get_synset_words_1000()
+    print('type(predictor)={}'.format(type(predictor)))
+
+    writer = tf.summary.FileWriter(logger.get_logger_dir())
+    
+    transformers = imgaug.AugmentorList(fbresnet_augmentor(isTrain=False))
+    for f in inputs:
+        assert os.path.isfile(f), f
+        img = cv2.imread(f).astype('float32')
+        assert img is not None
+
+        print('img.shape ={}'.format(img.shape))
+        print('img mean={}, var={}, stddev={}'.format(np.mean(img), np.var(img), np.std(img)))
+        img = transformers.augment(img)[np.newaxis, :, :, :]
+        print('img.shape ={}'.format(img.shape))
+        print('img mean={}, var={}, stddev={}'.format(np.mean(img), np.var(img), np.std(img)))
+        print('img min={} max={}'.format(np.min(img), np.max(img)))
+        predicted = predictor(img)
+        outputs = predicted[0]
+        prob = outputs[0]
+        ret = prob.argsort()[-10:][::-1]
+
+        names = [words[i] for i in ret]
+        print(f + ":")
+        print(list(zip(names, prob[ret])))
+        print(ret)
+        
+        writer.add_summary(predicted[1])
+and got the image min and max as: img min=-10.28548526763916 max=275.43719482421875,
+which is the same value as I got in pure Python env too,
+but then things doesn't add up coz if all that's done within image_preprocess now is
+image = image * (1.0 / 255),
+we really shouldn't have got min=0.0, max=1.0 on the image tensor, no !?
+Sorry for the long story and thx for any opinions in advance.
+		</comment>
+		<comment id='12' author='sammhho' date='2018-07-20T15:05:30Z'>
+		img in the graph has type uint8
+		</comment>
+		<comment id='13' author='sammhho' date='2018-07-23T10:08:39Z'>
+		&lt;denchmark-link:https://github.com/ppwwyyxx&gt;@ppwwyyxx&lt;/denchmark-link&gt;
+ ah right that's what's missing!
+Did a  and now both envs matches, thx a lot!
+		</comment>
+	</comments>
+</bug>

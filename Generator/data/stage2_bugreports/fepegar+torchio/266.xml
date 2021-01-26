@@ -1,0 +1,267 @@
+<bug id='266' author='fepegar' open_date='2020-08-12T17:25:52Z' closed_time='2020-08-19T13:04:05Z'>
+	<summary>RuntimeWarning: Files have different affine matrices</summary>
+	<description>
+🐛Bug
+This is a warning in tests/data/test_image.py::TestImage::test_with_a_list_of_2d_paths.
+&lt;denchmark-link:https://github.com/GFabien&gt;@GFabien&lt;/denchmark-link&gt;
+, you wrote that one. Could you please take a look?
+To reproduce
+$ pytest
+TorchIO version
+0.17.25.
+	</description>
+	<comments>
+		<comment id='1' author='fepegar' date='2020-08-13T07:50:04Z'>
+		Hi &lt;denchmark-link:https://github.com/fepegar&gt;@fepegar&lt;/denchmark-link&gt;
+! I had a look and it seems that it's an issue with  from .
+Indeed, in test.utils.get_image_path, the first path from tests/data/test_image.py::TestImage::test_with_a_list_of_2d_paths is created with suffix "img". When saving the image with that path, torchio.data.io.write_image first tries to save it using torchio.data.io._write_nibabel but fails when calling nii.to_filename(str(path)) saying that "Filespec [...] does not look right for class &lt;class 'nibabel.nifti1Nifti1Image'&gt;".
+Therefore it calls torchio.data.io._write_sitk which manages to save the image but seems to mess up with the affine. I'll dive more into details to understand what's the matter there.
+		</comment>
+		<comment id='2' author='fepegar' date='2020-08-13T08:05:55Z'>
+		I think that's because
+
+torchio.data.io._write_sitk maybe doesn't have proper support to write .img images
+In torchio.data.io._write_nibabel, the image type is hardcoded to be NIfTI, which I think can only have suffix .nii.
+
+.img is Analyze, right? Either we use an appropriate NiBabel class according to the extension (checking NiBabel code to see how they do that) or we discourage the use of Analyze and throw an error. However, it's very possible that some people still use it (despite the limitations in image orientation).
+		</comment>
+		<comment id='3' author='fepegar' date='2020-08-13T08:33:27Z'>
+		I think I found it. It's a problem between nib_to_sitk and sitk_to_nib with 2D images. To go to SimpleITK format you multiply by FLIP_XY to go from RAS to LPS coordinates and to go back to NiBabel format you multiply again by FLIP_XY which is fine in most cases. However, in the case of 2D images, you remove the X axis so when you recover the rotation from the direction in sitk_to_nib you start from the identity matrix and fill the bottom right square of it with the direction making the rotation matrix the following:
+affine = [
+    [1    0    0    0],
+    [0   -1    0    0],
+    [0    0    1    0],
+    [0    0    0    1]
+]
+Therefore, when you multiply it with FLIP_XY you don't get the identity back. I guess the fix is just to start with a -1 in the upper left corner when recreating the rotation. Tell me if you think it can lead to other issues.
+		</comment>
+		<comment id='4' author='fepegar' date='2020-08-13T09:06:10Z'>
+		From what I read on this &lt;denchmark-link:https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3948928/&gt;article&lt;/denchmark-link&gt;
+,  can be Analyze or Nifti but more importantly, if the voxels are saved in the  file, the header is saved in an  file so we should probably save two files to handle this format correctly, I don't know if SimpleITK and NiBabel do this or not.
+NiBabel seems to have some mechanism to find a header file from an image file according to its &lt;denchmark-link:https://nipy.org/nibabel/reference/nibabel.loadsave.html&gt;documentation&lt;/denchmark-link&gt;
+. In fact I just tried, using  instead of method  works fine and NiBabel manages to save and load the image without any problem.
+To be sure, I checked and SimpleITK creates both a .img and a hdr file so it seems to work as expected.
+		</comment>
+		<comment id='5' author='fepegar' date='2020-08-13T09:23:06Z'>
+		
+I think I found it. It's a problem between nib_to_sitk and sitk_to_nib with 2D images.
+
+Even if this is indeed a problem, correcting this does not solve the issue as sitk_to_nib is not called because NiBabel manages to load the image which means that there is a problem in the header saved by SimpleITK.
+(Using nib.save instead of to_filename solves the issue)
+		</comment>
+		<comment id='6' author='fepegar' date='2020-08-13T09:39:00Z'>
+		
+I think I found it. It's a problem between nib_to_sitk and sitk_to_nib with 2D images. To go to SimpleITK format you multiply by FLIP_XY to go from RAS to LPS coordinates and to go back to NiBabel format you multiply again by FLIP_XY which is fine in most cases. However, in the case of 2D images, you remove the X axis so when you recover the rotation from the direction in sitk_to_nib you start from the identity matrix and fill the bottom right square of it with the direction making the rotation matrix the following:
+affine = [
+[1    0    0    0],
+[0   -1    0    0],
+[0    0    1    0],
+[0    0    0    1]
+]
+Therefore, when you multiply it with FLIP_XY you don't get the identity back. I guess the fix is just to start with a -1 in the upper left corner when recreating the rotation. Tell me if you think it can lead to other issues.
+
+Good catch!
+
+I don't know if SimpleITK and NiBabel do this or not.
+
+AFAIK NiBabel handles this automatically. You can give either path, it will look for the other one.
+
+NiBabel seems to have some mechanism to find a header file from an image file according to its documentation. In fact I just tried, using nib.save instead of method to_filename works fine and NiBabel manages to save and load the image without any problem.
+
+I thought these two methods worked the same way... I wonder why it's different.
+		</comment>
+		<comment id='7' author='fepegar' date='2020-08-14T11:05:42Z'>
+		Ok I've played a bit with SimpleITK and NiBabel and what I think is happening is that when SimpleITK saves a 2D image it considers that the axes used are X and Y but not Y and Z as torchio is handling 2D images.
+Therefore, when you save a 2D image using SimpleITK, you first flip axes X and Y, get the direction, then remove axis X from the direction and save the image. In a Nifty header, it appears that quatern_b = 1 while quatern_c = 0 and quatern_d = 0 and pixdim[0]=-1. It means that there is a 180° rotation around axis X (i.e. a flip of axes Y and Z) and axis Z is flipped again. So in the end, only axis Y gets flipped. That's why when NiBabel tries to read the image it finds that axis Y is flipped resulting in a wrong affine.
+The other way around, if you save the 2D image with NiBabel and read it with SimpleITK, SimpleITK finds that the direction for the first two axes (which it thinks are X and Y) is 'RA' so it sets its direction to -1, 0, 0, -1 (as it is in 'LP'). Then, you reconstruct the 3x3 matrix by adding axis X and flip axes X and Y. However, because of the direction vector, you get that axis Z has been flipped resulting in a wrong affine.
+I do think that SimpleITK expects 2D images to be on the X and Y axes but I haven't found any evidence in the documentation so far...
+from numpy.testing import assert_array_equal
+
+class TestIO(TorchioTestCase)
+...
+    def test_write_2d_with_itk_read_it_with_nib(self):
+        tensor = torch.randn(1, 1, 20, 30)
+        affine = np.eye(4)
+        path = self.dir / 'test_io.nii.gz'
+        io._write_sitk(tensor, affine, path)
+        loaded_tensor, loaded_affine = io._read_nibabel(path)
+        assert_array_equal(tensor, loaded_tensor)
+        assert_array_equal(affine, loaded_affine)
+
+    def test_write_2d_with_nib_read_it_with_itk(self):
+        tensor = torch.randn(1, 1, 20, 30)
+        affine = np.eye(4)
+        path = self.dir / 'test_io.nii.gz'
+        io._write_nibabel(tensor, affine, path)
+        loaded_tensor, loaded_affine = io._read_sitk(path)
+        assert_array_equal(tensor, loaded_tensor)
+        assert_array_equal(affine, loaded_affine)
+		</comment>
+		<comment id='8' author='fepegar' date='2020-08-15T22:49:40Z'>
+		Do you think changing the behaviour of the library so that it assumes 2D images if the shape along the last axis is 1 instead? I don't think it would be too late, as 2D support is still very experimental anyway. That would probably be friendlier with respect to ITK.
+		</comment>
+		<comment id='9' author='fepegar' date='2020-08-17T08:49:29Z'>
+		Yes that's probably a good idea and their choice seems natural as when you have a 2D image you would say that you have a height and a width but no depth.
+		</comment>
+		<comment id='10' author='fepegar' date='2020-08-17T09:58:51Z'>
+		The docs say (channels, depth, height, width) everywhere. This was for compatibility with PyTorch docs. But I agree it feels more natural in medical imaging to talk about (height, width, depth). A potential issue is that SimpleITK gives you (height, width):
+&lt;denchmark-code&gt;$ curl -LO https://cdn.eso.org/images/thumb300y/eso1907a.jpg                                                                   
+$ identify eso1907a.jpg                        
+eso1907a.jpg JPEG 515x300 515x300+0+0 8-bit sRGB 7817B 0.000u 0:00.000
+$ python -c "import SimpleITK as sitk; print(sitk.ReadImage('eso1907a.jpg').GetSize())"                                     
+(515, 300)
+&lt;/denchmark-code&gt;
+
+This is the image:
+&lt;denchmark-link:https://camo.githubusercontent.com/d24d7cad329f01f7acf6b2926196a16eb91981929ba7c57316b0e9bca2cdacaa/68747470733a2f2f63646e2e65736f2e6f72672f696d616765732f7468756d62333030792f65736f31393037612e6a7067&gt;&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='11' author='fepegar' date='2020-08-17T11:11:07Z'>
+		
+The docs say (channels, depth, height, width) everywhere. This was for compatibility with PyTorch docs.
+
+Is there any impact in PyTorch to have (channels, height, width, depth) instead of (channels, depth, height, width) ? PyTorch should be generic enough to handle both exactly the same way so maybe there's no need to follow this convention and we should use (channels, height, width, depth) instead.
+		</comment>
+		<comment id='12' author='fepegar' date='2020-08-17T11:20:58Z'>
+		Yeah it was mostly for consistency. What's height and width in a 3D acquisition anyway? I'll open a PR.
+		</comment>
+		<comment id='13' author='fepegar' date='2020-08-17T19:06:45Z'>
+		I've made a lot of changes in &lt;denchmark-link:https://github.com/fepegar/torchio/pull/270&gt;#270&lt;/denchmark-link&gt;
+. However, the one that seemed to solve this issue is the last commit: saving .img files with NiBabel.
+		</comment>
+		<comment id='14' author='fepegar' date='2020-08-18T08:16:13Z'>
+		Nice work! I have a few questions about it. Is there a reason why you chose to distinguish between suffixes and use either Nifti1Image or Nifti1Pair objects and not just calling nib.save?
+I'm not sure I get when transpose_2d in _read_sitk or _write_sitk will be used. I've added a few tests to io.py and some of them fail with transpose_2d=True (test_write_2d_with_itk_read_it_with_nib and test_write_2d_with_nib_read_it_with_itk):
+    def test_write_3d_with_itk_read_it_with_itk(self):
+        tensor = torch.randn(1, 10, 20, 30)
+        affine = np.eye(4)
+        path = self.dir / 'test_io.nii.gz'
+        io._write_sitk(tensor, affine, path)
+        loaded_tensor, loaded_affine = io._read_sitk(path)
+        assert_array_equal(tensor.squeeze(), loaded_tensor.squeeze())
+        assert_array_equal(affine, loaded_affine)
+
+    def test_write_3d_with_itk_read_it_with_nib(self):
+        tensor = torch.randn(1, 10, 20, 30)
+        affine = np.eye(4)
+        path = self.dir / 'test_io.nii.gz'
+        io._write_sitk(tensor, affine, path)
+        loaded_tensor, loaded_affine = io._read_nibabel(path)
+        assert_array_equal(tensor.squeeze(), loaded_tensor.squeeze())
+        assert_array_equal(affine, loaded_affine)
+
+    def test_write_3d_with_nib_read_it_with_itk(self):
+        tensor = torch.randn(1, 10, 20, 30)
+        affine = np.eye(4)
+        path = self.dir / 'test_io.nii.gz'
+        io._write_nibabel(tensor, affine, path)
+        loaded_tensor, loaded_affine = io._read_sitk(path)
+        assert_array_equal(tensor.squeeze(), loaded_tensor.squeeze())
+        assert_array_equal(affine, loaded_affine)
+
+    def test_write_3d_with_nib_read_it_with_nib(self):
+        tensor = torch.randn(1, 10, 20, 30)
+        affine = np.eye(4)
+        path = self.dir / 'test_io.nii.gz'
+        io._write_nibabel(tensor, affine, path)
+        loaded_tensor, loaded_affine = io._read_nibabel(path)
+        assert_array_equal(tensor.squeeze(), loaded_tensor.squeeze())
+        assert_array_equal(affine, loaded_affine)
+
+    def test_write_2d_with_itk_read_it_with_itk(self):
+        tensor = torch.randn(1, 10, 20, 1)
+        affine = np.eye(4)
+        path = self.dir / 'test_io.nii.gz'
+        io._write_sitk(tensor, affine, path)
+        loaded_tensor, loaded_affine = io._read_sitk(path)
+        assert_array_equal(tensor.squeeze(), loaded_tensor.squeeze())
+        assert_array_equal(affine, loaded_affine)
+
+    def test_write_2d_with_itk_read_it_with_nib(self):
+        tensor = torch.randn(1, 10, 20, 1)
+        affine = np.eye(4)
+        path = self.dir / 'test_io.nii.gz'
+        io._write_sitk(tensor, affine, path)
+        loaded_tensor, loaded_affine = io._read_nibabel(path)
+        assert_array_equal(tensor.squeeze(), loaded_tensor.squeeze())
+        assert_array_equal(affine, loaded_affine)
+
+    def test_write_2d_with_nib_read_it_with_itk(self):
+        tensor = torch.randn(1, 10, 20, 1)
+        affine = np.eye(4)
+        path = self.dir / 'test_io.nii.gz'
+        io._write_nibabel(tensor, affine, path)
+        loaded_tensor, loaded_affine = io._read_sitk(path)
+        assert_array_equal(tensor.squeeze(), loaded_tensor.squeeze())
+        assert_array_equal(affine, loaded_affine)
+
+    def test_write_2d_with_nib_read_it_with_nib(self):
+        tensor = torch.randn(1, 10, 20, 1)
+        affine = np.eye(4)
+        path = self.dir / 'test_io.nii.gz'
+        io._write_nibabel(tensor, affine, path)
+        loaded_tensor, loaded_affine = io._read_nibabel(path)
+        assert_array_equal(tensor.squeeze(), loaded_tensor.squeeze())
+        assert_array_equal(affine, loaded_affine)
+		</comment>
+		<comment id='15' author='fepegar' date='2020-08-18T15:46:47Z'>
+		Should we also transpose 2D images with NiBabel then?
+
+Is there a reason why you chose to distinguish between suffixes and use either Nifti1Image or Nifti1Pair objects and not just calling nib.save?
+
+I think NiBabel raised an error when trying to save Nifti1Image as .img.
+		</comment>
+		<comment id='16' author='fepegar' date='2020-08-19T06:34:44Z'>
+		
+Should we also transpose 2D images with NiBabel then?
+
+I don't know, why would we need to transpose 2D images in the first place?
+
+I think NiBabel raised an error when trying to save Nifti1Image as .img.
+
+I tried it with nib.save instead of nib.to_filename and it worked fine.
+		</comment>
+		<comment id='17' author='fepegar' date='2020-08-19T09:49:59Z'>
+		
+I don't know, why would we need to transpose 2D images in the first place?
+
+Well, I thought it'd be more user-friendly to think of the first axis as up-&gt;down and second as left-&gt;right, as in a numpy matrix.
+In [1]: import SimpleITK as sitk
+
+In [2]: image = sitk.ReadImage('eso1907a.jpg')
+
+In [3]: image.GetSize()
+Out[3]: (515, 300)
+
+In [4]: array = sitk.GetArrayFromImage(image)
+
+In [5]: array.shape
+Out[5]: (300, 515, 3)
+But maybe it's a bad idea and makes things just confusing.
+
+I tried it with nib.save instead of nib.to_filename and it worked fine.
+
+I guess we'll use that one instead, then. I opened an issue on the NiBabel repo to ask about the differences.
+I'll open a PR and this time I'll wait for your review.
+		</comment>
+		<comment id='18' author='fepegar' date='2020-08-19T10:01:26Z'>
+		
+Well, I thought it'd be more user-friendly to think of the first axis as up-&gt;down and second as left-&gt;right, as in a numpy matrix.
+
+OK I get it now. I think it does not matter for deep learning and it may probably be the role of a viewer to handle this kind of things.
+		</comment>
+		<comment id='19' author='fepegar' date='2020-08-19T10:05:34Z'>
+		I need to change everything again from (C, H, W, D) to (C, W, H, D) 🤦🤦🤦🤦🤦
+		</comment>
+		<comment id='20' author='fepegar' date='2020-08-19T10:38:41Z'>
+		Sorry ^^'
+		</comment>
+		<comment id='21' author='fepegar' date='2020-08-19T12:41:31Z'>
+		I think it's done. I refactored your tests to run in a loop. They fail if I add 4D images. Maybe we should follow again ITK conventions about where channels are in the saved files... but that's a different issue.
+		</comment>
+		<comment id='22' author='fepegar' date='2020-08-19T12:41:53Z'>
+		Here's the 2D notebook: &lt;denchmark-link:https://colab.research.google.com/drive/1yEhhFvUqvwCOsu_w7taHvRpvfD656fS3#scrollTo=ZB8RsAUOHJ1L&gt;https://colab.research.google.com/drive/1yEhhFvUqvwCOsu_w7taHvRpvfD656fS3#scrollTo=ZB8RsAUOHJ1L&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

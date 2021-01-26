@@ -1,0 +1,196 @@
+<bug id='1158' author='schipiga' open_date='2018-10-24T12:33:42Z' closed_time='2018-11-02T09:48:39Z'>
+	<summary>tensorflow_model_server predict fails for keras model with Reshape and LSTM</summary>
+	<description>
+Hi!
+Seems, I met a bug, and it happens locally with tensorflow/serving docker image usage and in sagemaker batch transform as their docker image uses tensorflow_model_server inside.
+As first I met in sagemaker, pls see, how it happens there. Local reproducing is after that.
+&lt;denchmark-h:h2&gt;Sagemaker reproducing&lt;/denchmark-h&gt;
+
+I try to make batch transform with keras model in sagemaker and get reshape error: Input to reshape is a tensor with 500 values, but the requested shape has 250000.
+My model is:
+import tensorflow as tf
+from tensorflow import keras
+
+regularizers = keras.regularizers
+GaussianNoise = keras.layers.GaussianNoise
+Masking = keras.layers.Masking
+Sequential = keras.models.Sequential
+Dense = keras.layers.Dense
+TimeDistributed = keras.layers.TimeDistributed
+LSTM = keras.layers.LSTM
+GRU = keras.layers.GRU
+BD = keras.layers.Bidirectional
+Reshape = keras.layers.Reshape
+Flatten = keras.layers.Flatten
+InputLayer = keras.layers.InputLayer
+
+
+class NonMasking(keras.layers.Layer): 
+
+    def __init__(self, **kwargs):   
+        self.supports_masking = True  
+        super(NonMasking, self).__init__(**kwargs)   
+  
+    def build(self, input_shape):   
+        input_shape = input_shape   
+  
+    def compute_mask(self, input, input_mask=None):   
+        # do not pass the mask to the next layers   
+        return None   
+  
+    def call(self, x, mask=None):   
+        return x   
+  
+    def get_output_shape_for(self, input_shape):   
+        return input_shape
+
+
+def keras_model_fn(params):  
+    model = Sequential([
+        InputLayer(input_shape=(500,), name='inputs'),
+        Reshape((50, 10)),
+        Masking(mask_value=-10.1),
+        LSTM(4*50, return_sequences=True, return_state=False),
+        LSTM(2*50, return_sequences=True, return_state=False),
+        LSTM(50, return_sequences=True, return_state=False),
+        LSTM(15, return_sequences=True, return_state=False),
+        TimeDistributed(Dense(15)),
+        TimeDistributed(Dense(5)),
+        TimeDistributed(Dense(2)),
+        NonMasking(),
+        Flatten(),
+    ])
+    
+    _model = keras.Model(inputs=model.input, outputs=model.output)
+    _model.compile(loss="mse", optimizer="rmsprop")
+    return _model
+My code to train and transform batch:
+estimator = TensorFlow(entry_point='my_model.py',
+                       role=role,
+                       framework_version='1.10.0',
+                       training_steps=10,
+                       evaluation_steps=10,
+                       output_path='s3://my/output/path',
+                       hyperparameters={'learning_rate': 0.01},
+                       train_instance_count=1,
+                       train_instance_type='ml.m4.xlarge')
+estimator.fit(inputs)
+transformer = estimator.transformer(instance_count=1, instance_type='ml.m4.xlarge')
+transformer.transform('s3://my/batch/data', content_type='text/csv')
+transformer.wait()
+Training works well. But when I launch batch transform with input text/csv which contains 1 line with 500 float numbers, the job fails with error:
+&lt;denchmark-code&gt;[2018-10-23 19:50:46,270] ERROR in serving: AbortionError(code=StatusCode.INVALID_ARGUMENT, details="Input to reshape is a tensor with 500 values, but the requested shape has 250000
+#011 [[Node: reshape/Reshape = Reshape[T=DT_FLOAT, Tshape=DT_INT32, _device="/job:localhost/replica:0/task:0/device:CPU:0"](_arg_Placeholder_0_0, reshape/Reshape/shape)]]")
+Traceback (most recent call last):
+File "/usr/local/lib/python2.7/dist-packages/container_support/serving.py", line 182, in _invoke
+self.transformer.transform(content, input_content_type, requested_output_content_type)
+File "/usr/local/lib/python2.7/dist-packages/tf_container/serve.py", line 281, in transform
+return self.transform_fn(data, content_type, accepts), accepts
+File "/usr/local/lib/python2.7/dist-packages/tf_container/serve.py", line 208, in f
+prediction = self.predict_fn(input)
+File "/usr/local/lib/python2.7/dist-packages/tf_container/serve.py", line 223, in predict_fn
+return self.proxy_client.request(data)
+File "/usr/local/lib/python2.7/dist-packages/tf_container/proxy_client.py", line 71, in request
+return request_fn(data)
+File "/usr/local/lib/python2.7/dist-packages/tf_container/proxy_client.py", line 99, in predict
+result = self.prediction_service_stub.Predict(request, self.request_timeout)
+File "/usr/local/lib/python2.7/dist-packages/grpc/beta/_client_adaptations.py", line 309, in __call__
+self._request_serializer, self._response_deserializer)
+File "/usr/local/lib/python2.7/dist-packages/grpc/beta/_client_adaptations.py", line 195, in _blocking_unary_unary
+raise _abortion_error(rpc_error_call)
+&lt;/denchmark-code&gt;
+
+Input data format/length &amp; model signature are correct.
+&lt;denchmark-code&gt;2018-10-23 19:50:46,193 INFO - tf_container - {
+"modelSpec": {
+"version": "1540324008", 
+"name": "generic_model"
+}, 
+"metadata": {
+"signature_def": {
+"@type": "type.googleapis.com/tensorflow.serving.SignatureDefMap", 
+"signatureDef": {
+"serving_default": {
+"inputs": {
+"inputs": {
+"dtype": "DT_FLOAT", 
+"name": "Placeholder:0", 
+"tensorShape": {
+"dim": [
+{
+"size": "-1"
+}, 
+{
+"size": "500"
+}
+]
+}
+}
+}, 
+"methodName": "tensorflow/serving/predict", 
+"outputs": {
+"flatten": {
+"dtype": "DT_FLOAT", 
+"name": "flatten/Reshape:0", 
+"tensorShape": {
+"dim": [
+{
+"size": "-1"
+}, 
+{
+"size": "100"
+}
+]
+}
+}
+}
+}
+}
+}
+}
+}
+&lt;/denchmark-code&gt;
+
+Funny, that sagemaker batch transform works correct, if I disable LSTM layer, like:
+def keras_model_fn(params):  
+    model = Sequential([
+        InputLayer(input_shape=(500,), name='inputs'),
+        Reshape((50, 10)),
+        TimeDistributed(Dense(2)),
+        Flatten(),
+    ])
+    
+    _model = keras.Model(inputs=model.input, outputs=model.output)
+    _model.compile(loss="mse", optimizer="rmsprop")
+    return _model
+And it works with LSTM on my local PC via mlflow serve.
+So it looks like tensorflow-model-server has a problem with keras Reshape &amp; LSTM usage.
+&lt;denchmark-h:h2&gt;Local reproducing&lt;/denchmark-h&gt;
+
+
+Launch docker image:
+
+docker run -p 8501:8501 -v /home/user/models/export/Servo:/home/my_model -it tensorflow/serving  tensorflow_model_server --port=8500 --rest_api_port=8501 --model_name=generic_model --model_base_path="/home/my_model"
+
+Send curl request:
+
+curl -d '{"inputs": [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]}' -X POST http://localhost:8501/v1/models/generic_model:predict
+=&gt; Got result:
+{ "error": "Input to reshape is a tensor with 500 values, but the requested shape has 250000\n\t [[{{node reshape/Reshape}} = Reshape[T=DT_FLOAT, Tshape=DT_INT32, _output_shapes=[[?,50,10]], _device=\"/job:localhost/replica:0/task:0/device:CPU:0\"](_arg_Placeholder_0_0, reshape/Reshape/shape)]]" }
+	</description>
+	<comments>
+		<comment id='1' author='schipiga' date='2018-10-25T18:00:08Z'>
+		Can you use the SavedModel CLI (&lt;denchmark-link:https://www.tensorflow.org/guide/saved_model#cli_to_inspect_and_execute_savedmodel&gt;https://www.tensorflow.org/guide/saved_model#cli_to_inspect_and_execute_savedmodel&lt;/denchmark-link&gt;
+) to see if you can reproduce the problem with your input on the model? If so, it's a problem with the model and input (instead of model server), and you can check with the tensorflow community (&lt;denchmark-link:https://github.com/tensorflow/tensorflow/issues&gt;https://github.com/tensorflow/tensorflow/issues&lt;/denchmark-link&gt;
+). The SavedModel CLI also provides tfdbg integration, with which you can watch the intermediate Tensors and runtime graphs or subgraphs while running the SavedModel.
+		</comment>
+		<comment id='2' author='schipiga' date='2018-10-25T20:35:24Z'>
+		hey &lt;denchmark-link:https://github.com/lilao&gt;@lilao&lt;/denchmark-link&gt;
+ , thank you for info! I will try to debug.
+		</comment>
+		<comment id='3' author='schipiga' date='2018-11-02T09:48:39Z'>
+		&lt;denchmark-link:https://github.com/lilao&gt;@lilao&lt;/denchmark-link&gt;
+ , unfortunately I don't have enough time to debug it, especially we found workaround to avoid  usage, and to use multidimensional arrays via json input. So, if it doesn't affect anyone else, I think, the issue can be closed as not actual.
+		</comment>
+	</comments>
+</bug>

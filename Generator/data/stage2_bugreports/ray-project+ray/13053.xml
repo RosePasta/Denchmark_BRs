@@ -1,0 +1,153 @@
+<bug id='13053' author='yangysc' open_date='2020-12-23T04:07:52Z' closed_time='2020-12-31T00:15:34Z'>
+	<summary>[rllib] TorchSquashedGaussian distribution: should the entropy and kl functions return scalar value per sample?</summary>
+	<description>
+&lt;denchmark-h:h3&gt;What is the problem?&lt;/denchmark-h&gt;
+
+In current latest code of TorchSquashedGaussian distribution ( and tf version) : should the entropy and kl function return scalar value per sample? For now, the current implementation seems to omit to sum in the last dimension
+&lt;denchmark-h:h3&gt;Reproduction (REQUIRED)&lt;/denchmark-h&gt;
+
+Here are the codes for TorchSquashedGaussian and DiagGaussian. It seems we need to override the entropy and kl functions in TorchSquashedGaussian, like wha we did in DiagGaussian .
+class TorchSquashedGaussian(TorchDistributionWrapper):
+    """A tanh-squashed Gaussian distribution defined by: mean, std, low, high.
+
+    The distribution will never return low or high exactly, but
+    `low`+SMALL_NUMBER or `high`-SMALL_NUMBER respectively.
+    """
+
+    def __init__(self,
+                 inputs: List[TensorType],
+                 model: TorchModelV2,
+                 low: float = -1.0,
+                 high: float = 1.0):
+        """Parameterizes the distribution via `inputs`.
+
+        Args:
+            low (float): The lowest possible sampling value
+                (excluding this value).
+            high (float): The highest possible sampling value
+                (excluding this value).
+        """
+        super().__init__(inputs, model)
+        # Split inputs into mean and log(std).
+        mean, log_std = torch.chunk(self.inputs, 2, dim=-1)
+        # Clip `scale` values (coming from NN) to reasonable values.
+        log_std = torch.clamp(log_std, MIN_LOG_NN_OUTPUT, MAX_LOG_NN_OUTPUT)
+        std = torch.exp(log_std)
+        self.dist = torch.distributions.normal.Normal(mean, std)
+        assert np.all(np.less(low, high))
+        self.low = low
+        self.high = high
+
+    @override(ActionDistribution)
+    def deterministic_sample(self) -&gt; TensorType:
+        self.last_sample = self._squash(self.dist.mean)
+        return self.last_sample
+
+    @override(TorchDistributionWrapper)
+    def sample(self) -&gt; TensorType:
+        # Use the reparameterization version of `dist.sample` to allow for
+        # the results to be backprop'able e.g. in a loss term.
+        normal_sample = self.dist.rsample()
+        self.last_sample = self._squash(normal_sample)
+        return self.last_sample
+
+    @override(ActionDistribution)
+    def logp(self, x: TensorType) -&gt; TensorType:
+        # Unsquash values (from [low,high] to ]-inf,inf[)
+        unsquashed_values = self._unsquash(x)
+        # Get log prob of unsquashed values from our Normal.
+        log_prob_gaussian = self.dist.log_prob(unsquashed_values)
+        # For safety reasons, clamp somehow, only then sum up.
+        log_prob_gaussian = torch.clamp(log_prob_gaussian, -100, 100)
+        log_prob_gaussian = torch.sum(log_prob_gaussian, dim=-1)
+        # Get log-prob for squashed Gaussian.
+        unsquashed_values_tanhd = torch.tanh(unsquashed_values)
+        log_prob = log_prob_gaussian - torch.sum(
+            torch.log(1 - unsquashed_values_tanhd**2 + SMALL_NUMBER), dim=-1)
+        return log_prob
+
+    def _squash(self, raw_values: TensorType) -&gt; TensorType:
+        # Returned values are within [low, high] (including `low` and `high`).
+        squashed = ((torch.tanh(raw_values) + 1.0) / 2.0) * \
+            (self.high - self.low) + self.low
+        return torch.clamp(squashed, self.low, self.high)
+
+    def _unsquash(self, values: TensorType) -&gt; TensorType:
+        normed_values = (values - self.low) / (self.high - self.low) * 2.0 - \
+                        1.0
+        # Stabilize input to atanh.
+        save_normed_values = torch.clamp(normed_values, -1.0 + SMALL_NUMBER,
+                                         1.0 - SMALL_NUMBER)
+        unsquashed = atanh(save_normed_values)
+        return unsquashed
+
+    @staticmethod
+    @override(ActionDistribution)
+    def required_model_output_shape(
+            action_space: gym.Space,
+            model_config: ModelConfigDict) -&gt; Union[int, np.ndarray]:
+        return np.prod(action_space.shape) * 2
+class TorchDiagGaussian(TorchDistributionWrapper):
+    """Wrapper class for PyTorch Normal distribution."""
+
+    @override(ActionDistribution)
+    def __init__(self, inputs: List[TensorType], model: TorchModelV2):
+        super().__init__(inputs, model)
+        mean, log_std = torch.chunk(self.inputs, 2, dim=1)
+        self.dist = torch.distributions.normal.Normal(mean, torch.exp(log_std))
+
+    @override(ActionDistribution)
+    def deterministic_sample(self) -&gt; TensorType:
+        self.last_sample = self.dist.mean
+        return self.last_sample
+
+    @override(TorchDistributionWrapper)
+    def logp(self, actions: TensorType) -&gt; TensorType:
+        return super().logp(actions).sum(-1)
+
+    @override(TorchDistributionWrapper)
+    def entropy(self) -&gt; TensorType:
+        return super().entropy().sum(-1)
+
+    @override(TorchDistributionWrapper)
+    def kl(self, other: ActionDistribution) -&gt; TensorType:
+        return super().kl(other).sum(-1)
+
+    @staticmethod
+    @override(ActionDistribution)
+    def required_model_output_shape(
+            action_space: gym.Space,
+            model_config: ModelConfigDict) -&gt; Union[int, np.ndarray]:
+        return np.prod(action_space.shape) * 2
+If the code snippet cannot be run by itself, the issue will be closed with "needs-repro-script".
+
+[- ] I have verified my script runs in a clean environment and reproduces the issue.
+[- ] I have verified the issue also occurs with the latest wheels.
+
+	</description>
+	<comments>
+		<comment id='1' author='yangysc' date='2020-12-30T15:32:57Z'>
+		Yeah, this seems to be a bug. We probably never noticed this as we only use this distribution in SAC right now, where we don't need the entropy or kl methods. Will fix ...
+		</comment>
+		<comment id='2' author='yangysc' date='2020-12-30T15:33:11Z'>
+		Thanks for filing this &lt;denchmark-link:https://github.com/yangysc&gt;@yangysc&lt;/denchmark-link&gt;
+ !
+		</comment>
+		<comment id='3' author='yangysc' date='2020-12-30T23:16:03Z'>
+		The problem with SquashedGaussian is that there is no analytical entropy term to evaluate. Instead, one would have to sample n times from the distribution and then take the mean neg log likelihood as an entropy estimate.
+We should probably raise an error when entropy or kl are called on this distribution.
+		</comment>
+		<comment id='4' author='yangysc' date='2020-12-30T23:36:12Z'>
+		PR: &lt;denchmark-link:https://github.com/ray-project/ray/pull/13126&gt;#13126&lt;/denchmark-link&gt;
+
+Btw, if you would like to use a bounded distribution for e.g. PPO, you can use the Beta distributions instead, which do have kl and entropy methods.
+		</comment>
+		<comment id='5' author='yangysc' date='2020-12-31T00:06:23Z'>
+		
+Yeah, this seems to be a bug. We probably never noticed this as we only use this distribution in SAC right now, where we don't need the entropy or kl methods. Will fix ...
+
+Thanks, &lt;denchmark-link:https://github.com/sven1977&gt;@sven1977&lt;/denchmark-link&gt;
+ ~    I was trying using recurrent PPO for continuous action space, since SAC does not have the recurrent policy. So I tried using squashedgaussian instead of diaggaussion, hoping for better performance. Thanks for your advice, I'll try the Beta distribution.
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,144 @@
+<bug id='37' author='Artemis-Skade' open_date='2020-05-29T14:21:18Z' closed_time='2020-06-29T09:49:21Z'>
+	<summary>Memory allocation for buffers</summary>
+	<description>
+With the current implementation of buffers.py one can request a buffersize which doesn't fit in the memory provided but because of numpys implementation of np.zeros() the memory is not allocated before it is actually used. But because the buffer is meant to be filled completely (otherwise one could just use a smaller buffer) the computer will finally run out of memory and start to swap heavily. Because there are only smaller parts of the buffer that are accessed at once (minibatches) the system will just swap the necessary pages in and out of memory. At that moment the progress of the run is most likely lost and one has to start a new run with a smaller buffer.
+I would recommend using np.ones instead, as it will allocate the buffer at the beginning and fail if there is not enough memory provided by the system. The only issue is that there is no clear error description in the case where the system memory is exceeded but python gets simply killed by the OS with a SIGKILL. Maybe one could catch that command?
+	</description>
+	<comments>
+		<comment id='1' author='Artemis-Skade' date='2020-05-29T14:26:37Z'>
+		I suggest using np.empty((shape)) instead of np.ones, np.ones takes a long time to fill if the memory is available, whereas np.empty does not, but it still performs memory checking.
+&lt;denchmark-code&gt;&gt;&gt;&gt; try:np.empty((100000,1000000000))
+... except MemoryError:
+...     print('====caught')
+...
+python(36866,0x107e22dc0) malloc: can't allocate region
+:*** mach_vm_map(size=800000000000000, flags: 60000100) failed (error code=3)
+python(36866,0x107e22dc0) malloc: *** set a breakpoint in malloc_error_break to debug
+====caught
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='2' author='Artemis-Skade' date='2020-05-29T14:28:23Z'>
+		Yes, that will also display a nice error message. Thank you
+		</comment>
+		<comment id='3' author='Artemis-Skade' date='2020-05-29T14:31:23Z'>
+		np.empty sound good (np.ones does throw an error for me, but np.empty is faster and semantically sounds better). I think you could include this change in the DQN branch, being a trivial change.
+		</comment>
+		<comment id='4' author='Artemis-Skade' date='2020-05-29T14:33:43Z'>
+		Well, actually np.empty has the same issue as np.zeros. It uses sparse arrays and therefore doesn't allocate the whole array at the beginning, whereas np.zeros necessarily does, maybe I can provide an example code.
+		</comment>
+		<comment id='5' author='Artemis-Skade' date='2020-05-29T14:41:29Z'>
+		Ah yes, that indeed is the case. Seems like you only get memory errors when you try to allocate past RAM+swap size. e.g. I have 64GB RAM and 64GB swap, and following happens (similar behaviour without allocating with zeros and empty:
+&gt;&gt;&gt; import numpy as np
+&gt;&gt;&gt; _ = np.ones((70000,500,500))
+Traceback (most recent call last):
+MemoryError: Unable to allocate 130. GiB for an array with shape (70000, 500, 500) and data type float64
+&gt;&gt;&gt; _ = np.ones((65000,500,500))
+# Begins to allocate memory and goes to swap
+Looks like this needs bit more work, but I still agree that such feature should exist.
+		</comment>
+		<comment id='6' author='Artemis-Skade' date='2020-05-29T14:42:32Z'>
+		The difference is only detectable when the memory area is close to the existing memory capacity (I have 16g), e.g. trying to allocate 17.6g of memory with np.zeros((1000000,18950),dtype=np.int8) fails but 17.5g np.zeros((1000000,18940),dtype=np.int8)passes without warning. And only fails if I try np.ones((1000000,18940),dtype=np.int8)
+		</comment>
+		<comment id='7' author='Artemis-Skade' date='2020-05-29T14:43:36Z'>
+		This is OS dependent though:
+&lt;denchmark-link:https://user-images.githubusercontent.com/52372765/83272468-dad84780-a1d3-11ea-86f9-0a1fc37ba06a.png&gt;&lt;/denchmark-link&gt;
+
+My machine managed to almost fill the disk before killing the process.
+Edit: yup, 60GiB disk-space, nearly all of it filled when it began to write onto the swap.
+Edit2: Using 1 isn't the best way to test this as kernels oftens reuse memory pages that are identical until one of them is modified. Afaik, this exist in both Windows and Linux.
+		</comment>
+		<comment id='8' author='Artemis-Skade' date='2020-05-29T14:51:40Z'>
+		This should work:
+import psutil
+
+import psutil
+mem = psutil.virtual_memory()
+# svmem(total=17179869184, available=7359184896, percent=57.2, used=9309233152, free=2441043968, active=4924092416, inactive=4230881280, wired=4385140736)
+mem.available
+# 7359184896
+
+import numpy as np
+x = np.empty(1000000000)
+x.nbytes
+# 8000000000
+assert x.nbytes &lt; mem.available
+# Traceback (most recent call last):
+#   File "&lt;stdin&gt;", line 1, in &lt;module&gt;
+# AssertionError
+		</comment>
+		<comment id='9' author='Artemis-Skade' date='2020-05-29T14:51:50Z'>
+		&lt;denchmark-code&gt;from psutil import virtual_memory
+
+buffer = np.zeros((shape),dtype)
+mem = virtual_memory()
+if(buffer.nbytes &gt; mem.total):
+    # issue warning
+&lt;/denchmark-code&gt;
+
+maybe one could use this pseudo code to warn the user
+		</comment>
+		<comment id='10' author='Artemis-Skade' date='2020-05-29T14:52:02Z'>
+		oh too slow
+		</comment>
+		<comment id='11' author='Artemis-Skade' date='2020-05-29T14:53:02Z'>
+		Actually per-arrays checks like this are not enough, as buffers contain multiple arrays, which total to too many arrays. I think best bet is to use the psutils (like you guys already posted, but yh... more dependencies...) and np.zeros, create the arrays and then check if summed nbytes fits into the memory. np.zeros arrays have correct nbytes (the one they will use when all is in use) even though they do not use all that memory.
+		</comment>
+		<comment id='12' author='Artemis-Skade' date='2020-05-29T15:22:55Z'>
+		&lt;denchmark-link:https://github.com/Miffyli&gt;@Miffyli&lt;/denchmark-link&gt;
+ I'm not sure if we should add it as a requirement... maybe document it and do a try/except rather than forcing people to download it?
+I would say it should be part of the tests or extra requirements?
+		</comment>
+		<comment id='13' author='Artemis-Skade' date='2020-05-29T15:24:44Z'>
+		&lt;denchmark-link:https://github.com/araffin&gt;@araffin&lt;/denchmark-link&gt;
+ I agree, I am not fan of more requirements. Another option would be to print out the memory usage, and give buffers a "verbose" parameter too (e.g.   -&gt; print out maximum memory usage of buffer in GB).
+		</comment>
+		<comment id='14' author='Artemis-Skade' date='2020-05-30T06:41:18Z'>
+		This shouldn't be addresed in the DQN patch, it also isn't the time to deal with this tbh.
+Since n-step methods are in 1.1+, this should be addressed along with/ or after them simply because off-policy correction requires state-action pairs and storing action selection probability for the behavior policy. It follows that any non trivial solution will probably have to be modified.
+		</comment>
+		<comment id='15' author='Artemis-Skade' date='2020-05-30T07:42:21Z'>
+		I think we can still have a simple print or check &lt;denchmark-link:https://github.com/Artemis-Skade&gt;@Artemis-Skade&lt;/denchmark-link&gt;
+ already implemented. It is not too many lines, and yes, while it will be modified off later on we have something to work on.
+		</comment>
+		<comment id='16' author='Artemis-Skade' date='2020-06-02T12:13:03Z'>
+		Quick thought: am i missing something or the next_observations variable is just the observations shifted by one?
+If so, we could reduce the buffer size by almost a factor of two!
+		</comment>
+		<comment id='17' author='Artemis-Skade' date='2020-06-02T12:20:17Z'>
+		Yeap it is. I think other implementations like some Rainbow ones do it this way (only one buffer for observations, and then you take two consecutive ones you return). Changing things to work like this takes bit more of complex-ish code, but also will support any future changes better (e.g. n-step returns).
+		</comment>
+		<comment id='18' author='Artemis-Skade' date='2020-06-02T12:20:22Z'>
+		This works iff the observations are stored sequentially. We need to ensure that sampled trajectories don't blend together.
+By blend, i mean that a the next state of a transition can't belong to a state from a different trajectory. We can blend only on a terminal transition (done=true), because the next state is irrelevant because of the (1-done)  term  in the DQN update.
+		</comment>
+		<comment id='19' author='Artemis-Skade' date='2020-06-02T12:25:56Z'>
+		it was fast and easy ;) &lt;denchmark-link:https://github.com/DLR-RM/stable-baselines3/commit/81bc9c0f9407fee74f01ea90ed0fdbbc6b5da3f9&gt;81bc9c0&lt;/denchmark-link&gt;
+
+I can finally have a 1M buffer =)
+true, would work only for 1-step buffer. For n-step, we need to avoid copying things and only use references.
+		</comment>
+		<comment id='20' author='Artemis-Skade' date='2020-06-02T12:27:23Z'>
+		After some more thought, we can further reduce the memory cost by k-fold, where k is the number of stacked frames by keeping track of single frame references, but it will make it slightly trickier and introduces implementation issues in the algorithm.
+The buffer effectively becomes one large lazy frame.
+		</comment>
+		<comment id='21' author='Artemis-Skade' date='2020-06-02T12:30:33Z'>
+		&lt;denchmark-link:https://github.com/araffin&gt;@araffin&lt;/denchmark-link&gt;
+
+Looks good! I was afraid it would be more work but this indeed should work fine :D.
+&lt;denchmark-link:https://github.com/PartiallyTyped&gt;@PartiallyTyped&lt;/denchmark-link&gt;
+
+Good point, but yeah that should be for later (also tying it to frame stacking makes this bit complicated). My personal suggestion would be to try out LZ4 compression for buffers (using it in personal projects with ~10% slowdown and 3x memory saved), but that too is for waaaay later versions and updates ^^
+		</comment>
+		<comment id='22' author='Artemis-Skade' date='2020-06-02T12:31:10Z'>
+		
+The buffer effectively becomes one large lazy frame.
+
+yes, would be nice if it does not complexify things too much. There was a LazyFrame wrapper in SB  (used only by DQN apparently) which is now in gym.
+
+LZ4 compression for buffers
+
+I saw something like that in gym too...
+		</comment>
+	</comments>
+</bug>

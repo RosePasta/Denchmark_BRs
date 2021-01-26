@@ -1,0 +1,163 @@
+<bug id='2898' author='derisavi' open_date='2019-03-26T15:35:03Z' closed_time='2019-04-26T21:10:43Z'>
+	<summary>[TEXPR][PASS] Loop distribution pass generates incorrect code</summary>
+	<description>
+With the following input DSL:
+import tvm
+m = 48
+A = tvm.placeholder((m,), name='A', dtype="float16")
+C = tvm.compute((m,), lambda i: A[i], name='C')
+D = tvm.compute((m,), lambda i: C[i], name='D')
+
+s = tvm.create_schedule(D.op)
+# We split the two axis with factors where neither counts the other
+co, ci = s[C].split(C.op.axis[0], 10)
+do, di = s[D].split(D.op.axis[0], 32)
+s[C].compute_at(s[D], do)
+
+bounds = tvm.schedule.InferBound(s)
+stmt = tvm.schedule.ScheduleOps(s, bounds)
+stmt = tvm.ir_pass.CanonicalSimplify(stmt)
+print(stmt)
+
+stmt = tvm.ir_pass.LoopPartition(stmt, True)
+stmt = tvm.ir_pass.CanonicalSimplify(stmt)
+print(stmt)
+The following is the output of first print statement. Code is correct.
+&lt;denchmark-code&gt;// attr [compute(D, 0x1e4d7e0)] realize_scope = ""
+realize D([0, 48]) {
+  produce D {
+    for (i.outer, 0, 2) {
+      // attr [compute(C, 0x195b3a0)] realize_scope = ""
+      realize C([(i.outer*32), 32]) {
+        produce C {
+          for (i.outer, 0, 4) {
+            for (i.inner, 0, 10) {
+              if (likely((((i.outer*10) + i.inner) &lt; 32))) {
+                if (likely(((((i.outer*32) + (i.outer*10)) + i.inner) &lt; 48))) {
+                  C((((i.outer*32) + (i.outer*10)) + i.inner)) =A((((i.outer*32) + (i.outer*10)) + i.inner))
+                }
+              }
+            }
+          }
+        }
+        for (i.inner, 0, 32) {
+          if (likely((((i.outer*32) + i.inner) &lt; 48))) {
+            if (likely((((i.outer*32) + i.inner) &lt; 48))) {
+              D(((i.outer*32) + i.inner)) =C(((i.outer*32) + i.inner))
+            }
+          }
+        }
+      }
+    }
+  }
+}
+&lt;/denchmark-code&gt;
+
+The following is the output of the second print statement. Code is incorrect in that in the second produce C only 10 (instead of 16) elements of A are copied to C.
+&lt;denchmark-code&gt;// attr [compute(D, 0x1e4d7e0)] realize_scope = ""
+realize D([0, 48]) {
+  produce D {
+    for (i.outer, 0, 1) {
+      // attr [compute(C, 0x195b3a0)] realize_scope = ""
+      realize C([(i.outer*32), 32]) {
+        produce C {
+          for (i.outer, 0, 3) {
+            for (i.inner, 0, 10) {
+              C((((i.outer*32) + (i.outer*10)) + i.inner)) =A((((i.outer*32) + (i.outer*10)) + i.inner))
+            }
+          }
+          for (i.inner, 0, 2) {
+            C(((30 + (i.outer*32)) + i.inner)) =A(((30 + (i.outer*32)) + i.inner))
+          }
+        }
+        for (i.inner, 0, 32) {
+          D(((i.outer*32) + i.inner)) =C(((i.outer*32) + i.inner))
+        }
+      }
+    }
+    // attr [compute(C, 0x195b3a0)] realize_scope = ""
+    realize C([32, 32]) {
+      produce C {
+        for (i.outer, 0, 1) {
+          for (i.inner, 0, 10) {
+            C(((32 + (i.outer*10)) + i.inner)) =A(((32 + (i.outer*10)) + i.inner))
+          }
+        }
+      }
+      for (i.inner, 0, 16) {
+        D((32 + i.inner)) =C((32 + i.inner))
+      }
+    }
+  }
+}
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='derisavi' date='2019-03-26T16:12:51Z'>
+		Thanks for reporting this, we should fix this asap. Let us see if it is caused by some of the recent changes &lt;denchmark-link:https://github.com/dmlc/tvm/commits/master/src/pass/loop_partition.cc&gt;https://github.com/dmlc/tvm/commits/master/src/pass/loop_partition.cc&lt;/denchmark-link&gt;
+ or was just something we overlooked.
+		</comment>
+		<comment id='2' author='derisavi' date='2019-03-26T16:18:38Z'>
+		I'm working on a fix now. In addition to this problem, I'm trying to fix general problems that I have found in the code as well. I will submit a PR as soon as I have it ready (likely in the next day or two).
+To answer your question, I don't know whether this has been caused by recent changes in loop_partition.cc or not.
+		</comment>
+		<comment id='3' author='derisavi' date='2019-03-26T16:37:32Z'>
+		Please also check if it has something to do with the fact that high-level produce consume pattern is involved, i.e. if we can reproduce the same error using tvm.lower
+		</comment>
+		<comment id='4' author='derisavi' date='2019-04-01T21:55:37Z'>
+		The bug is also reproducible using tvm.lower. Setting the input DSL to:
+import tvm
+m = 48
+A = tvm.placeholder((m,), name='A', dtype="float16")
+C = tvm.compute((m,), lambda i: A[i], name='C')
+D = tvm.compute((m,), lambda i: C[i], name='D')
+
+s = tvm.create_schedule(D.op)
+co, ci = s[C].split(C.op.axis[0], factor=10)
+do, di = s[D].split(D.op.axis[0], 32)
+s[C].compute_at(s[D], do)
+
+with tvm.build_config(partition_const_loop=True):
+    print(tvm.lower(s, [A, C, D], name="fadd1", simple_mode=False).body);
+generates the following output, which has the same problem explained above:
+&lt;denchmark-code&gt;...
+// attr [0] compute_scope = "fadd1_compute_"
+produce D {
+  for (i.outer, 0, 1) {
+    produce C {
+      for (i.outer, 0, 3) {
+        for (i.inner, 0, 10) {
+          C[(((i.outer*32) + (i.outer*10)) + i.inner)] = A[(((i.outer*32) + (i.outer*10)) + i.inner)]
+        }
+      }
+      for (i.inner, 0, 2) {
+        C[(((i.outer*32) + i.inner) + 30)] = A[(((i.outer*32) + i.inner) + 30)]
+      }
+    }
+    for (i.inner, 0, 32) {
+      D[((i.outer*32) + i.inner)] = C[((i.outer*32) + i.inner)]
+    }
+  }
+  produce C {
+    for (i.outer, 0, 1) {
+      for (i.inner, 0, 10) {
+        C[(((i.outer*10) + i.inner) + 32)] = A[(((i.outer*10) + i.inner) + 32)]
+      }
+    }
+  }
+  for (i.inner, 0, 16) {
+    D[(i.inner + 32)] = C[(i.inner + 32)]
+  }
+}
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='5' author='derisavi' date='2019-04-03T02:38:07Z'>
+		This bug will not be fixed only by the change in Halide IR. It also requires quite a bit of code in TVM (I am almost ready to send a PR for that part). So should we reopen this issue?
+		</comment>
+		<comment id='6' author='derisavi' date='2019-04-03T03:00:32Z'>
+		it was automatically closed by github association rule :)
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,364 @@
+<bug id='1047' author='tobegit3hub' open_date='2018-08-10T10:40:31Z' closed_time='2018-08-21T22:03:06Z'>
+	<summary>RESTful server checks consistency of batch size which breaks the model with arbitrary input or output shape</summary>
+	<description>
+&lt;denchmark-h:h2&gt;Bug Report&lt;/denchmark-h&gt;
+
+&lt;denchmark-h:h3&gt;System information&lt;/denchmark-h&gt;
+
+
+OS Platform and Distribution (e.g., Linux Ubuntu 16.04): Linux Ubuntu 16.04
+TensorFlow Serving installed from (source or binary): binary
+TensorFlow Serving version: 1.8.0
+
+&lt;denchmark-h:h3&gt;Describe the problem&lt;/denchmark-h&gt;
+
+The RESTful server will check the consistency of batch size which may requires all the input and output tensor to support "batch size". In fact, our models may output the tensor which does not have batch size. These models work like a charm with TensorFlow Serving gRPC APIs but not TensorFlow Serving RESTful APIs.
+&lt;denchmark-h:h3&gt;Exact Steps to Reproduce&lt;/denchmark-h&gt;
+
+This is easy to re-produce and we can export the example SavedModel with these script. The code to break RESTful server is constant_op = tf.constant([1.0, 2.0]) which is a tensor with shape [2].
+&lt;denchmark-code&gt;import os
+import tensorflow as tf
+from tensorflow.python.saved_model import builder as saved_model_builder
+from tensorflow.python.saved_model import (
+    signature_constants, signature_def_utils, tag_constants, utils)
+from tensorflow.python.util import compat
+
+model_path = "model"
+model_version = 1
+
+keys_placeholder = tf.placeholder(tf.int32, shape=[None, 1], name="keys")
+keys_identity = tf.identity(keys_placeholder, name="inference_keys")
+
+constant_op = tf.constant([1.0, 2.0])
+
+sess = tf.Session()
+sess.run(tf.global_variables_initializer())
+
+model_signature = signature_def_utils.build_signature_def(
+    inputs={
+        "keys": utils.build_tensor_info(keys_placeholder),
+    },
+    outputs={
+        "keys": utils.build_tensor_info(keys_identity),
+        "constant": utils.build_tensor_info(constant_op)
+    },
+    method_name=signature_constants.PREDICT_METHOD_NAME)
+
+export_path = os.path.join(
+    compat.as_bytes(model_path), compat.as_bytes(str(model_version)))
+
+builder = saved_model_builder.SavedModelBuilder(export_path)
+builder.add_meta_graph_and_variables(
+    sess, [tag_constants.SERVING],
+    clear_devices=True,
+    signature_def_map={
+        signature_constants.DEFAULT_SERVING_SIGNATURE_DEF_KEY: model_signature,
+    })
+
+builder.save()
+&lt;/denchmark-code&gt;
+
+Then load the model with TensorFlow Serving while exposing both gRPC and RESTful APIs. Remember to change the absolute path of your model.
+&lt;denchmark-code&gt;tensorflow_model_server --port=8501 --rest_api_port=8502 --model_base_path="/foo/bar/model/"
+&lt;/denchmark-code&gt;
+
+Then request the RESTful APIs with simple curl command.
+&lt;denchmark-code&gt;curl -H "Content-Type: application/json" -X POST -d '{"instances": [{"keys": [[1]]}]}' http://127.0.0.1:8502/v1/models/default:predict
+&lt;/denchmark-code&gt;
+
+This will get the error message of { "error": "Tensor name: keys has inconsistent batch size: 1 expecting: 2" }. If we change to code of model signature with constant_op = tf.constant([1.0]), this will work because our request just have the batch size of [1].
+And we have implement the gRPC client to make sure the model is normal. Here is the code of the gRPC client for this mode.
+&lt;denchmark-code&gt;import time
+import numpy
+import tensorflow as tf
+from grpc.beta import implementations
+from tensorflow_serving.apis import predict_pb2, prediction_service_pb2
+
+def main():
+  host = "0.0.0.0"
+  port = 8501
+  model_name = "default"
+  model_version = -1
+  signature_name = ""
+  request_timeout = 10.0
+
+  # Generate inference data
+  keys = numpy.asarray([[1]])
+  keys_tensor_proto = tf.contrib.util.make_tensor_proto(keys, dtype=tf.int32)
+
+  # Create gRPC client
+  channel = implementations.insecure_channel(host, port)
+  stub = prediction_service_pb2.beta_create_PredictionService_stub(channel)
+  request = predict_pb2.PredictRequest()
+  request.model_spec.name = model_name
+  if model_version &gt; 0:
+    request.model_spec.version.value = model_version
+  if signature_name != "":
+    request.model_spec.signature_name = signature_name
+  request.inputs["keys"].CopyFrom(keys_tensor_proto)
+
+  # Send request
+  result = stub.Predict(request, request_timeout)
+  print(result)
+
+if __name__ == "__main__":
+  main()
+&lt;/denchmark-code&gt;
+
+And this gRPC client will work and output the expected result.
+&lt;denchmark-code&gt;outputs {
+  key: "constant"
+  value {
+    dtype: DT_FLOAT
+    tensor_shape {
+      dim {
+        size: 2
+      }
+    }
+    float_val: 1.0
+    float_val: 2.0
+  }
+}
+outputs {
+  key: "keys"
+  value {
+    dtype: DT_INT32
+    tensor_shape {
+      dim {
+        size: 1
+      }
+      dim {
+        size: 1
+      }
+    }
+    int_val: 1
+  }
+}
+model_spec {
+  name: "default"
+  version {
+    value: 1
+  }
+  signature_name: "serving_default"
+}
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h3&gt;Source code / logs&lt;/denchmark-h&gt;
+
+Above.
+	</description>
+	<comments>
+		<comment id='1' author='tobegit3hub' date='2018-08-10T10:56:27Z'>
+		The root  cause is in &lt;denchmark-link:https://github.com/tensorflow/serving/blob/master/tensorflow_serving/util/json_tensor.cc#L819&gt;https://github.com/tensorflow/serving/blob/master/tensorflow_serving/util/json_tensor.cc#L819&lt;/denchmark-link&gt;
+ . It requires all the named tensors to have the same first dimension.
+It is quite unreasonable and inconvenient. In one of our scenarios, we generated the vocabulary(hash table) to map label index and string names and export it as part of the model. This vocabulary obviously does not have the same first dimension as the request data.
+This is not the consistent interfaces of the original TensorFlow Serving gRPC APIs and hope this can change.
+		</comment>
+		<comment id='2' author='tobegit3hub' date='2018-08-10T23:01:44Z'>
+		Thanks for the detailed report. The intent of the code was to keep the input
+and output symmetric. IOW input tensors for each feature, all need to have
+the same batch size. Clearly this does not apply for output.
+If you can prepare a PR with the fix i'd be happy to review!
+Thanks again.
+		</comment>
+		<comment id='3' author='tobegit3hub' date='2018-08-13T03:09:45Z'>
+		Thanks for your response &lt;denchmark-link:https://github.com/netfs&gt;@netfs&lt;/denchmark-link&gt;
+ . I can submit the PR to check input tensor only.
+But is it possible for users to specify different input shapes? For example, some developers may want to restrict the number of top-N prediction and add [tf.int32] placeholder in SavedModel which has different shape of other input tensors. I have test with the following code to construct model with different-shape inputs and it is supported in TensorFlow Serving.
+&lt;denchmark-code&gt;keys_placeholder = tf.placeholder(tf.int32, shape=[None, 1], name="keys")
+another_keys_placeholder = tf.placeholder(tf.int32, shape=[3], name="another_keys")
+keys_identity = tf.identity(keys_placeholder, name="inference_keys")
+constant_op = tf.constant([1.0, 2.0])
+
+sess = tf.Session()
+sess.run(tf.global_variables_initializer())
+
+model_signature = signature_def_utils.build_signature_def(
+    inputs={
+        "keys": utils.build_tensor_info(keys_placeholder),
+        "another_keys": utils.build_tensor_info(another_keys_placeholder),
+    },
+    outputs={
+        "keys": utils.build_tensor_info(keys_identity),
+        "constant": utils.build_tensor_info(constant_op)
+    },
+    method_name=signature_constants.PREDICT_METHOD_NAME)
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='4' author='tobegit3hub' date='2018-08-14T18:03:01Z'>
+		i see what you mean, and its seems plausible that models requiring inputs
+each with a different batch size. though this presents a problem expressing
+such values in JSON requests.
+the JSON request is list of rows of individual inputs, that we internally columnize
+(and where the present checks are tripping your usage). we expect each row
+of the input to  have all named inputs. so a request typically looks as follows
+(with a batch_size of 2, for all inputs):
+&lt;denchmark-code&gt;{
+  "instances": [ 
+    {
+       "tag": ["foo"]
+       "signal": [1, 2, 3, 4, 5]
+       "sensor": [[1, 2], [3, 4]]
+    },
+    {
+       "tag": ["bar"]
+       "signal": [3, 4, 1, 2, 5]]
+       "sensor": [[4, 5], [6, 8]]
+    },
+ ] 
+}
+&lt;/denchmark-code&gt;
+
+assuming we had another input say "location_id", that has batch_size=1, how
+would such a request look? one way would be:
+&lt;denchmark-code&gt;{
+  "instances": [ 
+    {
+       "tag": ["foo"]
+       "signal": [1, 2, 3, 4, 5]
+       "location_id": "baz"
+    },
+    {
+       "tag": ["bar"]
+       "signal": [3, 4, 1, 2, 5]]
+        // missing: "location_id"
+    },
+ ] 
+}
+&lt;/denchmark-code&gt;
+
+(note missing "location_id" in the second element of instances list)
+this can get confusing (or maybe not :-) seeing missing named input
+in some rows. we could choose to ignore such missing values, and
+let the model processing complain if the batch size is not correct
+(it would). i think this should be ok. let me think about this and get
+back.
+		</comment>
+		<comment id='5' author='tobegit3hub' date='2018-08-15T07:34:01Z'>
+		Thanks &lt;denchmark-link:https://github.com/netfs&gt;@netfs&lt;/denchmark-link&gt;
+ for the detailed explaination.
+Actually we know about this limitation after reading the format of JSON requests. Since we separate batch data into items in instances array, it requires each item of instances has the same shape. Otherwise, passing optional parameters in different items is really confusing.
+Because both the inputs and outputs of TensorFlow models are , have you considerated using the following format? It is much more compact which may improves performance and more similar with . We have another RESTful serving called &lt;denchmark-link:https://github.com/tobegit3hub/simple_tensorflow_serving&gt;simple_tensorflow_serving&lt;/denchmark-link&gt;
+ which uses this format and be compatible with all TensorFlow SavedModels.
+&lt;denchmark-code&gt;{
+  "instances": {
+    "tag": ["foo", "bar"],
+    "signal": [[1, 2, 3, 4, 5], [3, 4, 1, 2, 5]],
+    "sensor": [[[1, 2], [3, 4]], [[4, 5], [6, 8]]]
+  }
+}
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='6' author='tobegit3hub' date='2018-08-15T20:01:45Z'>
+		yes columnar format is what i am presently leaning towards (maybe under a different key called "inputs").
+additionally we need to make sure if batching is enabled:
+&lt;denchmark-link:https://github.com/tensorflow/serving/blob/master/tensorflow_serving/g3doc/serving_advanced.md#batching&gt;https://github.com/tensorflow/serving/blob/master/tensorflow_serving/g3doc/serving_advanced.md#batching&lt;/denchmark-link&gt;
+
+it degrades gracefully when we have inputs with differing 0-th dimension (i.e. batch sizes).
+		</comment>
+		<comment id='7' author='tobegit3hub' date='2018-08-15T23:18:42Z'>
+		My current proposal is as follows:
+
+
+Continue to support the current row-format of instances and predictions (as the input/output) with the restriction that 0-th dimension of all inputs/outputs should be same (read: consistent batch size). This format is easier to read for common use-cases.
+
+
+In addition to above row-format, we allow a new column-format style (similar to your proposal) with inputs key in request and outputs key in response. These keys would hold values in column-format. This would be very similar to the gRPC predict API. This would make your request look as follows:
+
+
+&lt;denchmark-code&gt;{
+  "inputs": {
+    "tag": ["foo", "bar"],
+    "signal": [[1, 2, 3, 4, 5], [3, 4, 1, 2, 5]],
+    "sensor": [[[1, 2], [3, 4]], [[4, 5], [6, 8]]]
+  }
+}
+&lt;/denchmark-code&gt;
+
+and response will be:
+&lt;denchmark-code&gt;{
+  "outputs": {
+    "constant": ...,
+    "keys": ...,
+  }
+}
+&lt;/denchmark-code&gt;
+
+
+We do not allow mixing these two formats in the same request. And response format will match with that of input. So you get predictions for instances (row-format) and outputs for inputs (column-format).
+
+This will allow users to choose suitable format to express their input/output for their models.
+		</comment>
+		<comment id='8' author='tobegit3hub' date='2018-08-20T08:24:05Z'>
+		Great and looking forward to the new column-format 👍
+Thanks &lt;denchmark-link:https://github.com/netfs&gt;@netfs&lt;/denchmark-link&gt;
+ . This issue may be closed if we have supported the  for arbitrary input or output shapes.
+		</comment>
+		<comment id='9' author='tobegit3hub' date='2018-08-20T21:52:35Z'>
+		thanks for taking a look. i will compose a change to add support for column format and update this thread once the change is ready. will be great if you can help test it, once its ready.
+		</comment>
+		<comment id='10' author='tobegit3hub' date='2018-08-24T08:31:12Z'>
+		Great! The implementation is nice and we are glad to test it.
+There is one problem I found in that commit &lt;denchmark-link:https://github.com/tensorflow/serving/commit/a5b7cfd0e57dcf8af9b6210ef25006f2eb647aad&gt;a5b7cfd&lt;/denchmark-link&gt;
+ . The request json data for columnar inputs should be something like  instead of , right?  &lt;denchmark-link:https://github.com/netfs&gt;@netfs&lt;/denchmark-link&gt;
+
+&lt;denchmark-code&gt;def testPredictColumnarREST(self):
+    """Test Predict implementation over REST API with columnar inputs."""
+    model_path = self._GetSavedModelBundlePath()
+    host, port = TensorflowModelServerTest.RunServer('default',
+                                                     model_path)[2].split(':')
+     # Prepare request
+    url = 'http://{}:{}/v1/models/default:predict'.format(host, port)
+    json_req = {'inputs': [2.0, 3.0, 4.0]}
+     # Send request
+    resp_data = None
+    try:
+      resp_data = CallREST('Predict', url, json_req)
+    except Exception as e:  # pylint: disable=broad-except
+      self.fail('Request failed with error: {}'.format(e))
+     # Verify response
+    self.assertEquals(json.loads(resp_data), {'outputs': [3.0, 3.5, 4.0]})
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='11' author='tobegit3hub' date='2018-08-24T18:57:10Z'>
+		if 'constant' is the only named input, then you can skip specifying that,
+if there are more inputs then you need to use the object notation and
+specify each.
+see the unit tests &lt;denchmark-link:https://github.com/tensorflow/serving/commit/a5b7cfd0e57dcf8af9b6210ef25006f2eb647aad#diff-a8a252f963e32d57426b166ad91b1aea&gt;a5b7cfd#diff-a8a252f963e32d57426b166ad91b1aea&lt;/denchmark-link&gt;
+ for details.
+		</comment>
+		<comment id='12' author='tobegit3hub' date='2018-08-27T01:45:26Z'>
+		Thanks &lt;denchmark-link:https://github.com/netfs&gt;@netfs&lt;/denchmark-link&gt;
+ !
+		</comment>
+		<comment id='13' author='tobegit3hub' date='2019-03-13T05:26:14Z'>
+		
+Thanks @netfs for the detailed explaination.
+Actually we know about this limitation after reading the format of JSON requests. Since we separate batch data into items in instances array, it requires each item of instances has the same shape. Otherwise, passing optional parameters in different items is really confusing.
+Because both the inputs and outputs of TensorFlow models are Tensor, have you considerated using the following format? It is much more compact which may improves performance and more similar with TensorFlow Serving gRPC APIs. We have another RESTful serving called simple_tensorflow_serving which uses this format and be compatible with all TensorFlow SavedModels.
+{
+  "instances": {
+    "tag": ["foo", "bar"],
+    "signal": [[1, 2, 3, 4, 5], [3, 4, 1, 2, 5]],
+    "sensor": [[[1, 2], [3, 4]], [[4, 5], [6, 8]]]
+  }
+}
+
+
+When I use columnar format to infer using TF Serving, I get the following error,
+&lt;denchmark-code&gt;{
+    "error": "seq_lens input must be 1-dim, not 2\n\t [[{{node model/att_seq2seq/encode/bidi_rnn_encoder/bidirectional_rnn/bw/ReverseSequence}}]]"
+}
+&lt;/denchmark-code&gt;
+
+The model is based on &lt;denchmark-link:https://github.com/google/seq2seq/&gt;seq2seq&lt;/denchmark-link&gt;
+ library.
+Does the error mean the model does not support batching?
+Also, the different format of input gives different error. Kindly see &lt;denchmark-link:https://github.com/tensorflow/serving/issues/1269#issuecomment-471994048&gt;here&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

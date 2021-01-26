@@ -1,0 +1,117 @@
+<bug id='635' author='zjost' open_date='2019-02-08T21:36:52Z' closed_time='2019-02-19T20:18:09Z'>
+	<summary>Batch Transform not working with TensorFlow</summary>
+	<description>
+&lt;denchmark-h:h3&gt;System Information&lt;/denchmark-h&gt;
+
+
+Framework (e.g. TensorFlow) / Algorithm (e.g. KMeans):  TensorFlow
+Framework Version: 1.11
+Python Version:  2.7
+CPU or GPU:  CPU
+Python SDK Version:    1.18.2
+Are you using a custom image:  No
+
+&lt;denchmark-h:h3&gt;Describe the problem&lt;/denchmark-h&gt;
+
+Batch transform does not appear to create batches from input data.  This seems to cause the serving request to fail due to either timeout or resource exhaustion.
+&lt;denchmark-h:h3&gt;Minimal repro / logs&lt;/denchmark-h&gt;
+
+&lt;denchmark-code&gt;[2019-02-08 21:13:46,043] ERROR in serving: &lt;_Rendezvous of RPC that terminated with:
+#011status = StatusCode.RESOURCE_EXHAUSTED
+#011details = "Received message larger than max (170662612 vs. 4194304)"
+#011debug_error_string = "
+{
+    "created": "@1549660426.041906580",
+    "description": "Received message larger than max (170662612 vs. 4194304)",
+    "file": "src/core/ext/filters/message_size/message_size_filter.cc",
+    "file_line": 174,
+    "grpc_status": 8
+}
+"
+&gt;
+Traceback (most recent call last):
+File "/usr/local/lib/python2.7/dist-packages/container_support/serving.py", line 221, in _invoke
+self.transformer.transform(content, input_content_type, requested_output_content_type)
+File "/usr/local/lib/python2.7/dist-packages/tf_container/serve.py", line 297, in transform
+return self.transform_fn(data, content_type, accepts), accepts
+File "/usr/local/lib/python2.7/dist-packages/tf_container/serve.py", line 224, in f
+prediction = self.predict_fn(input)
+File "/usr/local/lib/python2.7/dist-packages/tf_container/serve.py", line 239, in predict_fn
+return self.proxy_client.request(data)
+File "/usr/local/lib/python2.7/dist-packages/tf_container/proxy_client.py", line 82, in request
+return request_fn(data)
+File "/usr/local/lib/python2.7/dist-packages/tf_container/proxy_client.py", line 110, in predict
+result = self.prediction_service_stub.Predict(request, self.request_timeout)
+File "/usr/local/lib/python2.7/dist-packages/grpc/_channel.py", line 550, in __call__
+return _end_unary_response_blocking(state, call, False, None)
+File "/usr/local/lib/python2.7/dist-packages/grpc/_channel.py", line 467, in _end_unary_response_blocking
+raise _Rendezvous(state, None, None, deadline)
+&lt;/denchmark-code&gt;
+
+
+Exact command to reproduce:
+
+&lt;denchmark-code&gt;t = estimator.transformer(
+    1, 
+    'ml.m5.4xlarge', 
+    strategy='MultiRecord', 
+    output_path='s3://&lt;bucket&gt;/&lt;key&gt;', 
+    max_payload=1, 
+    role='&lt;role&gt;', 
+    env={'SAGEMAKER_TFS_GRPC_REQUEST_TIMEOUT': '300'}, 
+    max_concurrent_transforms=1
+)
+t.transform(
+    's3://&lt;bucket&gt;/&lt;input_file.csv&gt;', 
+    content_type='text/csv', 
+    split_type='Line', 
+    job_name='&lt;job_name&gt;'
+)
+&lt;/denchmark-code&gt;
+
+If I do not include the env={'SAGEMAKER_TFS_GRPC_REQUEST_TIMEOUT': '300'}, then I get a timeout error.  If I do include it, I get a RESOURCE_EXHAUSTED error.
+My input_fn looks like:
+&lt;denchmark-code&gt;def input_fn(serialized_input, content_type):
+    if content_type == 'text/csv':
+        rows = list()
+        csv_buff = StringIO(serialized_input)
+        csv_to_parse = csv.reader(csv_buff, delimiter=',')
+        for row in csv_to_parse:
+            rows.append(row[0])
+        data = {"input": rows}
+        # Goes on to create predict_pb2.PredictRequest(), which works as intended with inference
+&lt;/denchmark-code&gt;
+
+I can confirm that this works when I manually invoke the endpoint with multiple records using text/csv and the csv_serializer.
+&lt;denchmark-h:h3&gt;Questions&lt;/denchmark-h&gt;
+
+
+Why is the message so large?  The entire file, uncompressed, is an 8.6 MB csv file.  I have requested a max payload size of 1 MB and 1 max concurrent transforms.  Why is TensorFlow serving reporting a message size of 170662612?  It seems like this message size is larger than my entire file.  My file is two columns: ,, where  is model input and  is label.
+How does the transform service decide how to split a single input csv file into batches?
+
+	</description>
+	<comments>
+		<comment id='1' author='zjost' date='2019-02-08T23:04:05Z'>
+		Update:
+
+I tried with SingleRecord batch transform, and it completed after an hour.  If I bump max_concurrent_transforms to 100, it takes ~13 minutes.
+If I split the file into 100 sub-files, each of which are ~90kB, and then run MultiRecord, I just get a resource exhaustion error for each file, with message details = "Received message larger than max (14669907 vs. 4194304)".  So, the message size dropped by a single order of magnitude, but the 8MB file was split by two orders of magnitude.  Surely a 90kB file isn't exhausting the resources of an ml.m5.4xlarge?
+
+		</comment>
+		<comment id='2' author='zjost' date='2019-02-19T01:30:04Z'>
+		Hello &lt;denchmark-link:https://github.com/zjost&gt;@zjost&lt;/denchmark-link&gt;
+,
+I apologize for the late correspondence.
+I will begin by attempting to reproduce this issue.
+Within your input_fn, can you by any chance print out the size of the tensor within the request being returned?
+		</comment>
+		<comment id='3' author='zjost' date='2019-02-19T20:18:08Z'>
+		Closing this issue, as I have resolved the problem.  It is due to the response from the model exceeding the message size, not the input request.  This is because I was returning a vector from the model, not just the prediction score.  When I remove this from the model response, the error disappears and BatchTransform works as intended.
+		</comment>
+		<comment id='4' author='zjost' date='2019-11-05T01:29:45Z'>
+		Hi,
+I'm running into the same issue here. I saw the solution from &lt;denchmark-link:https://github.com/zjost&gt;@zjost&lt;/denchmark-link&gt;
+ is to remove the large response. However, my response is detection bounding boxes, which are for sure gonna be large response. Is there a way to solve the 'Timed out waiting for notification' issue?
+		</comment>
+	</comments>
+</bug>

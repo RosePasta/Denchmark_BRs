@@ -1,0 +1,107 @@
+<bug id='365' author='chunfuchen' open_date='2017-08-08T02:01:03Z' closed_time='2017-08-08T07:22:10Z'>
+	<summary>error in DataParallelInferenceRunner</summary>
+	<description>
+I was using DataParallelInferenceRunner without any issue but after I pull your recent changes, it throws an error about undefined attribute.  Do I need to revise the usage of this class?
+Thanks for your kindly support.
+Here is my code to use DataParallelInferenceRunner (refer to cifar10-resnet.py)
+DataParallelInferenceRunner(dataset_test,
+  [ScalarStats('cost'), ClassificationError()], [ x for x in range(get_nr_gpu()) ]),
+and the log is
+&lt;denchmark-code&gt;raceback (most recent call last):
+  File "examples/ResNet/cifar10-resnet.py", line 178, in &lt;module&gt;
+    SyncMultiGPUTrainerParameterServer(config).train()
+  File "/u/chenrich/Developer/tensorpack/tensorpack/train/base.py", line 100, in train
+    self.setup()
+  File "/u/chenrich/Developer/tensorpack/tensorpack/train/base.py", line 140, in setup
+    self._callbacks.setup_graph(weakref.proxy(self))
+  File "/u/chenrich/Developer/tensorpack/tensorpack/callbacks/base.py", line 54, in setup_graph
+    self._setup_graph()
+  File "/u/chenrich/Developer/tensorpack/tensorpack/callbacks/group.py", line 64, in _setup_graph
+    cb.setup_graph(self.trainer)
+  File "/u/chenrich/Developer/tensorpack/tensorpack/callbacks/base.py", line 54, in setup_graph
+    self._setup_graph()
+  File "/u/chenrich/Developer/tensorpack/tensorpack/callbacks/inference_runner.py", line 170, in _setup_graph
+    cbs = self._input_source.setup(self.trainer.model.get_inputs_desc())
+  File "/u/chenrich/Developer/tensorpack/tensorpack/graph_builder/input_source_base.py", line 43, in setup
+    self._setup(inputs_desc)
+  File "/u/chenrich/Developer/tensorpack/tensorpack/graph_builder/input_source.py", line 136, in _setup
+    self._cb = self._DataParallelFeedCallback(self._repeat_ds, self._placehdrs_per_tower)
+AttributeError: 'DataParallelFeedInput' object has no attribute '_repeat_ds'
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='chunfuchen' date='2017-08-08T02:07:58Z'>
+		Probably a bug I introduced while working on &lt;denchmark-link:https://github.com/tensorpack/tensorpack/issues/139&gt;#139&lt;/denchmark-link&gt;
+. I will take a look.
+btw are you able to see any speed improvements over the non-parallel InferenceRunner? It's quite slow in my cases so I reopen &lt;denchmark-link:https://github.com/tensorpack/tensorpack/issues/139&gt;#139&lt;/denchmark-link&gt;
+.
+		</comment>
+		<comment id='2' author='chunfuchen' date='2017-08-08T03:18:34Z'>
+		Here are my logs on resnet-18 over the ImageNet dataset. (I tested on P100)
+w/o DataParallelInfereneRunner: ~50 seconds
+w/  DataParallelInfereneRunner (4 gpus): ~26 seconds
+Even if it is not linear speedup, it still helps a lot.
+Btw, to achieve the above results, I need to enable data prefetch for inference as well (in your example codes, the prefetch is disable.)
+&lt;denchmark-link:https://github.com/ppwwyyxx/tensorpack/blob/master/examples/ResNet/imagenet-resnet.py#L79&gt;examples/ResNet/imagenet-resnet.py line 79&lt;/denchmark-link&gt;
+
+&lt;denchmark-code&gt;if isTrain:
+    ds = PrefetchDataZMQ(ds, min(20, multiprocessing.cpu_count()))
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='3' author='chunfuchen' date='2017-08-08T03:31:52Z'>
+		One more results, resneXt-50 over the ImageNet dataset. (ResNeXt is implemented by using split in Conv2d.)
+w/o DataParallelInfereneRunner : ~180 seconds
+w/ DataParallelInfereneRunner : ~60 seconds
+		</comment>
+		<comment id='4' author='chunfuchen' date='2017-08-08T03:37:32Z'>
+		You shouldn't enable multi-process prefetch for inference (and that's one of the reasons why inference is slow and that's what I'm fixing).
+You can use at most one process for prefetching in inference, otherwise you have many processes reading validation data at the same time -- processes don't talk to each other, you may end up getting one data point multiple times. The second process might produce image 1,2,3 which the first process already read and produced.
+As a result you get an estimate of the validation error, but not the true validation error. When you use shuffle=True for validation you get an unbiased estimate of the validation error.
+		</comment>
+		<comment id='5' author='chunfuchen' date='2017-08-08T04:10:50Z'>
+		Thanks. I see. Nonetheless, in this case, for training data, after completing one epoch, it also does not guarantee all images are processed once, right? (It might be okay for training.)
+		</comment>
+		<comment id='6' author='chunfuchen' date='2017-08-08T04:15:06Z'>
+		Yes. For stochastic training it doesn't matter.
+		</comment>
+		<comment id='7' author='chunfuchen' date='2017-08-08T05:21:24Z'>
+		What about introducing ranges for RngDataFlow? So each process handles a disjoin subset.
+		</comment>
+		<comment id='8' author='chunfuchen' date='2017-08-08T05:55:37Z'>
+		I guess there are two types of solutions: either fork ImageNet reader or not.
+My current plan was to use a single reader (to just produce file names, for example) but multiple workers to process it (ThreadedMapData is already doing something similar). This way the imagenet reader doesn't need to be aware of potential parallelism.
+It might be also a solution to fork but let each reader have its own range.
+		</comment>
+		<comment id='9' author='chunfuchen' date='2017-08-08T07:22:10Z'>
+		    ds = ILSVRCNames()
+
+    aug = imgaug.AugmentorList(augs)
+    def mapf(dp):
+        fname, cls = dp
+        im = cv2.imread(fname, cv2.IMREAD_COLOR)
+        if im.ndim == 2:
+            im = np.expand_dims(im, 2).repeat(3, 2)
+        im = aug.augment(im)
+        return im, cls
+    ds = ThreadedMapData(ds, 30, mapf, buffer_size=1000, strict=True)
+    ds = BatchData(ds, batch)
+    ds = PrefetchDataZMQ(ds, 1)
+    TestDataSpeed(ds).start_test()
+With this &lt;denchmark-link:https://bitbucket.org/ppwwyyxx/tensorpack-benchmark/src/66999b67b20712575e2ed87f0f2a32e817897813/ImageNet/benchmark-ImageNet.py?at=master&amp;fileviewer=file-view-default&gt;code&lt;/denchmark-link&gt;
+, and  producing simply (filename, label) pairs, I am able to get about 20x speed up (about 1.8k images/s) over the non-prefetched dataflow, while still keeping it equal to the whole validation set. This speed is often enough to keep at least a couple of GPUs busy.
+GPUs are becoming so fast that it's already pretty hard to keep them busy at training -- for inference it's harder, especially with Python. I'll go with this solution for now and update examples/docs these days unless some day I found it's becoming a bottleneck again.
+Closing this now and track &lt;denchmark-link:https://github.com/tensorpack/tensorpack/issues/139&gt;#139&lt;/denchmark-link&gt;
+ on inference performance.
+		</comment>
+		<comment id='10' author='chunfuchen' date='2017-08-08T15:23:51Z'>
+		Thanks for rapid reply. Then, I think the above codes can be used for DataParallelInfereneRunner , right?
+With this improvement, I can ~2x by using DataParallelInfereneRunner  ( 4 gpus are used.)
+		</comment>
+		<comment id='11' author='chunfuchen' date='2017-08-08T15:41:39Z'>
+		Yes. &lt;denchmark-link:https://github.com/tensorpack/tensorpack/issues/139&gt;#139&lt;/denchmark-link&gt;
+ has a todo list about improving the performance.
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,176 @@
+<bug id='11' author='honnibal' open_date='2019-08-05T09:57:20Z' closed_time='2019-08-09T19:17:09Z'>
+	<summary>Glue scores don't match pytorch-transformers performance for BERT</summary>
+	<description>
+I'm currently adapting the Glue benchmark scripts from pytorch-transformers for this repo, so that we have more confidence the models are running correctly.
+This has highlighted an issue with the pytt_textcat. If I run the following with pytorch-transformers:
+&lt;denchmark-code&gt;#!/usr/bin/env bash
+
+export TASK_NAME="SST-2"
+export GLUE_DIR="../data/glue"
+
+python ./examples/run_glue.py \
+     --model_type bert \
+     --model_name_or_path bert-base-uncased \
+     --task_name $TASK_NAME \
+     --do_train \
+     --do_eval \
+     --do_lower_case \
+     --data_dir $GLUE_DIR/$TASK_NAME \
+     --max_seq_length 128 \
+     --per_gpu_eval_batch_size=8   \
+     --per_gpu_train_batch_size=8   \
+     --learning_rate 5e-5 \
+     --num_train_epochs 1.0 \
+     --output_dir ../checkpoints/$TASK_NAME/ \
+     --overwrite_output_dir
+&lt;/denchmark-code&gt;
+
+I get accuracy of about 91%. Then when I try to match the same settings with pytt_textcat, I'm getting 87%. So clearly something is wrong.
+I think the problem is that I'm not using the pretrained pooler output, but am instead just getting the vectors for the class variables myself, and adding a softmax layer. This has two differences:
+
+BERT's pooler output has a hidden layer in there, with a tanh activation.
+BERT's pooler output provides pretrained weights, from the next-sentence prediction task.
+
+I tried to fix 1, and accuracy went down to 85%! It looks to me like the pretrained weights are unexpectedly important? I find this very strange, as it's just two 786x786 hidden layers. Maybe my initialization is bad, or there's some other error.
+Anyway. I'll continue tracking this down. But if your pytt_textcat results aren't impressive yet, this is probably why.
+	</description>
+	<comments>
+		<comment id='1' author='honnibal' date='2019-08-05T10:27:31Z'>
+		The plot thickens? I think I have the pooler output being used correctly, but accuracy's still at 87.7%.
+I'll try to remove various complications from the PyTorch-Transformers version (e.g. the learning rate schedule) and see if any of these take their accuracy down to 87%.
+		</comment>
+		<comment id='2' author='honnibal' date='2019-08-05T10:46:20Z'>
+		Disabling the learning rate schedule in pytorch-transformers takes it to 85.8% 🎉
+So, I guess it might be that the handling of the learning rate schedule in my Glue script must be wrong. If the schedules are this important, we'll also need a more elegant way to support them.
+Important to note that this isn't a smoking gun, even though the accuracy matches...Often there are several different settings one could break and the accuracy will fall back to the same sort of level. So it could still be something else.
+		</comment>
+		<comment id='3' author='honnibal' date='2019-08-06T17:39:10Z'>
+		Implemented the learning schedule and fixed a number of small issues.
+One thing that seems to have had a big impact on accuracy was that we had a default L2 penalty on the Thinc optimizer, which was being applied to the softmax weights (but not to the transformer). I've now set this to 0 in the PyTT_Language.resume_training() method.
+		</comment>
+		<comment id='4' author='honnibal' date='2019-08-06T18:57:42Z'>
+		IDK if this is helpful, but here is an allennlp config for a bert base classifier which gets 92.7% dev acc on SST-2:
+&lt;denchmark-code&gt;local bert_model = "bert-base-uncased";
+local do_lower_case = true;
+local task_type = "classification";
+
+{
+  "dataset_reader": {
+    "type": "glue",
+    task: task_type,
+    "text_a_field": "sentence",
+    "label_field": "label",
+    max_sequence_length: 512,
+    "bert_model": bert_model,
+    "do_lower_case": do_lower_case,
+    },
+  "train_data_path": "input/glue_data/SST-2/train.tsv",
+  "validation_data_path": "input/glue_data/SST-2/dev.tsv",
+  "model": {
+    "type": "simple-classifier",
+    task: task_type,
+    bert_model: bert_model,
+	dropout_prob: 0.1,
+    "num_labels": 2,
+    metric_a: {
+        type: "categorical_accuracy"
+    }
+  },
+  "iterator": {
+    "type": "basic",
+    "batch_size": 32
+  },
+   "trainer": {
+    "fp16": true,
+    "num_epochs": 3,
+    "num_serialized_models_to_keep": 2,
+    "should_log_learning_rate": false,
+
+    "cuda_device": 0,
+
+    "optimizer": {
+      "type": "fused_adam",
+      "bias_correction": false,
+      "lr": 2e-5,
+      "max_grad_norm": 1.0,
+      "weight_decay": 0.01,
+
+      "parameter_groups": [
+          [["model.classifier.weight", "model.classifier.bias"], {"weight_decay": 0.0}],
+    ],
+
+    },
+
+    "learning_rate_scheduler": {
+        "type": "slanted_triangular",
+        "gradual_unfreezing": false,
+        "discriminative_fine_tuning": false,
+
+        "num_epochs": 3,
+        "ratio": 32,
+        "num_steps_per_epoch": 2104,
+    },
+}
+}
+
+&lt;/denchmark-code&gt;
+
+The model is a linear classifier on top of the BertPooler output. I think you might have a hard time fine tuning with batch size 8, maybe? 🤷‍♂
+		</comment>
+		<comment id='5' author='honnibal' date='2019-08-06T22:38:09Z'>
+		Yeah I did think 8 was a bit low. I was trying to work from the (probably completely arbitrary) settings in the HF repo.
+Sigh. Do you ever feel like neural networks were a mistake? Neural networks were a mistake.
+		</comment>
+		<comment id='6' author='honnibal' date='2019-08-06T22:51:40Z'>
+		I spammed evaluation every 100 updates, and within the first epoch the best result hits 92.7. So, success I guess? Variance is huge though -- it hits 92.7, then down to 92.2, then down to 90.3, then back up to 90.7, 90.8, 92.3 -- etc.
+I find this quite unsatisfying! Anyway, the above config was definitely very helpful, thanks!
+		</comment>
+		<comment id='7' author='honnibal' date='2019-08-06T23:08:44Z'>
+		How often do you guys checkpoint? Have you ever looked at a log of dev accuracies evaluated every 100 or 200 steps? It's pretty sobering:
+&lt;denchmark-code&gt;4900   0.10   0.928
+5000   0.11   0.930
+5100   0.12   0.929
+5200   0.14   0.924
+5300   0.15   0.933
+5400   0.17   0.9289
+5500   0.18   0.9278
+5600   0.19   0.9267
+5700   0.21   0.9278
+5800   0.22   0.9289
+5900   0.23   0.9278
+6000   0.25   0.9300
+6100   0.25   0.9300
+6200   0.25   0.9300
+6300   0.25   0.9300
+&lt;/denchmark-code&gt;
+
+That's right at the end of training, with a linear learning rate schedule --- so the LR is effectively zero in the final epochs, which is why it settles down. But even at 5200-&gt;5300, it's jumping 1%.
+I normally just sample at the end of the epoch. But the variance is so high here --- if I sample a few hundred iterations earlier, my error rate goes up or down by over 10%! If I run two different configs and one gets 92.3 and the other gets 93.3, I'd definitely want to believe there was an actual effect there (especially if the 93.3 was my baby).
+		</comment>
+		<comment id='8' author='honnibal' date='2019-08-06T23:47:46Z'>
+		This is my go to paper for anything BERT performance related:
+&lt;denchmark-link:https://arxiv.org/abs/1811.01088&gt;https://arxiv.org/abs/1811.01088&lt;/denchmark-link&gt;
+
+The paper's ok, but Figure 1 and Table 4 in the appendix are 1) sobering and 2) decent science, which helps explain why reproducing the results is so hard.
+We'd typically only save models at the end of a full pass over the training data, rather than per a fixed number of steps - although we also just maintain a "best" model over time and don't update it unless the validation score improves.
+Also just from practical experience i've found that the number of epochs isn't really important - the weird LR schedule seems just as effective if you squash it into a couple of epochs compared to say, 15 full iterations over the training data.
+The difference between BERT and ELMo is definitely real, but between BERT and XLNet and XLNet on Stilts on a Ladder holding a Transformer XL? Not so sure.
+Guillaume Lample and Alexis Conneau showed in this twitter thread that you don't even need the next sentence prediction bit of Bert either:
+&lt;denchmark-link:https://twitter.com/GuillaumeLample/status/1142176959998414850&gt;https://twitter.com/GuillaumeLample/status/1142176959998414850&lt;/denchmark-link&gt;
+
+and it's better just to have bigger contexts so you can smash more numbers through your 64 16GB GPUs you probably have to hand.
+		</comment>
+		<comment id='9' author='honnibal' date='2019-08-07T09:12:49Z'>
+		Thanks for the link, will definitely check it out.
+I agree that the difference in performance between BERT and Elmo is real. We're betting that the difference between BERT and spaCy's default textcat will be even bigger, which should let people productively "uptrain" -- use the BERT model to supervise spaCy.
+I haven't read the paper yet but a quick glance at just the SST-2 columns are worrying. Looking at the scores in the BERT section of Table 1, the accuracies are from 92.1 to 93.5 --- and I've just seen differences that big depending on whether I checkpoint 200 samples earlier or 200 samples later. Without some variance correction we shouldn't be drawing any conclusion from those differences.
+Stochastic Weight Averaging is immediately giving much more reassuring numbers --- the dev accuracy is pretty much just slowly rising monotonically, which is what I like to see. I'm using:
+&lt;denchmark-code&gt;optimizer = torchcontrib.option.SWA(optimizer, swa_start=1, swa_freq=10, swa_lr=2e-5)
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='10' author='honnibal' date='2019-08-09T18:56:23Z'>
+		Now getting within the right range for the single-sentence tasks. Still need to set up the text-pair tasks (which are a bit awkward as a pipeline component). But, closing this 🎉
+		</comment>
+	</comments>
+</bug>

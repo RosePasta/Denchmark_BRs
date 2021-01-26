@@ -1,0 +1,101 @@
+<bug id='336' author='atumanov' open_date='2017-03-05T02:42:14Z' closed_time='2017-04-22T03:35:44Z'>
+	<summary>reconnecting cluster slave nodes to the head node fails</summary>
+	<description>
+Steps to reproduce:
+Start head node:
+scripts/start_ray.sh --num-cpus 100 --num-gpus 0 --num-workers 100 --head
+Login to the second (slave) node and start ray, pointing to the head node:
+./scripts/start_ray.sh --redis-address &lt;headnode_ip:redis_port&gt;
+Then stop Ray on the slave node :
+./scripts/stop_ray.sh 
+And now try to start Ray on the slave node again:
+&lt;denchmark-code&gt;./scripts/start_ray.sh --redis-address &lt;headnode_ip:redis_port&gt;
+Waiting for redis server at &lt;headnode_ip:redis_port&gt; to respond...
+Using IP address ####### for this node.
+Traceback (most recent call last):
+  File "/data/atumanov/ray/scripts/start_ray.py", line 109, in &lt;module&gt;
+    check_no_existing_redis_clients(node_ip_address, args.redis_address)
+  File "/data/atumanov/ray/scripts/start_ray.py", line 34, in check_no_existing_redis_clients
+    raise Exception("This Redis instance is already connected to clients with this IP address.")
+Exception: This Redis instance is already connected to clients with this IP address.
+&lt;/denchmark-code&gt;
+
+Takeaway: starting and stopping Ray on slave nodes is not idempotent and it should be.
+	</description>
+	<comments>
+		<comment id='1' author='atumanov' date='2017-03-05T02:45:15Z'>
+		Every time I want to restart a slave node with different resource configuration, I have to restart the head node, due to this issue. This is also related to handling node failures. If the node just reboots and attempts to reconnect to the headnode on startup, it should be able to.
+		</comment>
+		<comment id='2' author='atumanov' date='2017-03-05T02:58:53Z'>
+		Good point, this should probably be handled the same way we handle node failures (e.g., when you run ./scripts/stop_ray.sh it could be handled the same way as any other node failure). If you then rerun ./scripts/start_ray.sh ... then it should reconnect but the local scheduler will have a different DBClientID, so any tasks assigned to the old local scheduler will not be picked up by the new one (and ideally those will already have been cleaned up by the monitor process).
+		</comment>
+		<comment id='3' author='atumanov' date='2017-03-08T05:51:09Z'>
+		I haven't tested it out, but this should be addressed in &lt;denchmark-link:https://github.com/ray-project/ray/pull/347&gt;#347&lt;/denchmark-link&gt;
+.
+		</comment>
+		<comment id='4' author='atumanov' date='2017-04-01T23:01:29Z'>
+		still not working for me as of master commit &lt;denchmark-link:https://github.com/ray-project/ray/commit/227c916c250020cd362345f533f9d01f76264a64&gt;227c916&lt;/denchmark-link&gt;
+
+Steps to reproduce:
+
+start head node:
+scripts/start_ray.sh --head --num-workers 144 --num-cpus 144
+start slave node (on a different physical machine):
+./scripts/start_ray.sh --redis-address IP:PORT --num-workers 0 --num-cpus 0
+stop Ray on slave node:
+./scripts/stop_ray.sh
+sleep for minimum 15 seconds:
+sleep 15
+Attempt to start ray on slave node again:
+./scripts/start_ray.sh --redis-address IP:PORT --num-workers 0 --num-cpus 0
+
+Error message:
+&lt;denchmark-code&gt;Waiting for redis server at IP:PORT to respond...
+Using IP address LOCAL_IP for this node.
+Traceback (most recent call last):
+  File "/Users/atumanov/devrepo/github/ray-mydev/scripts/start_ray.py", line 132, in &lt;module&gt;
+    check_no_existing_redis_clients(node_ip_address, args.redis_address)
+  File "/Users/atumanov/devrepo/github/ray-mydev/scripts/start_ray.py", line 52, in check_no_existing_redis_clients
+    raise Exception("This Redis instance is already connected to clients "
+Exception: This Redis instance is already connected to clients with this IP address.
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='5' author='atumanov' date='2017-04-04T07:33:35Z'>
+		I just tried this out and it worked for me. Any additional tips for reproducing the problem?
+Note, I do see the problem if I call start_ray.sh too soon after stop_ray.sh.
+		</comment>
+		<comment id='6' author='atumanov' date='2017-04-04T10:03:10Z'>
+		Yes, I can consistently reproduce this on a master if I connect and then disconnect a driver on the local node after step 2 and before step 3 above:
+&lt;denchmark-code&gt;python -c 'import ray; ray.init(redis_address="IP:PORT")'
+&lt;/denchmark-code&gt;
+
+Simplified set of steps to reproduce on master as of commit &lt;denchmark-link:https://github.com/ray-project/ray/commit/1e84747e1306aab0c0e0f9b94731fae2dcbb36bb&gt;1e84747&lt;/denchmark-link&gt;
+
+
+start head node scripts/start_ray.sh --head
+start local node:  ./scripts/start_ray.sh --redis-address IP:PORT
+connect and disconnect a driver on the local node : python -c 'import ray; ray.init(redis_address="IP:PORT")'
+stop ray on local node : scripts/stop_ray.sh
+sleep 15 (tried sleeping minutes)
+attempt to start ray on local node : ./scripts/start_ray.sh --redis-address IP:PORT
+
+		</comment>
+		<comment id='7' author='atumanov' date='2017-04-04T22:29:37Z'>
+		I'm not able to reproduce this with the additional step, &lt;denchmark-link:https://github.com/atumanov&gt;@atumanov&lt;/denchmark-link&gt;
+. Are you sure step 6 is not being run on the head node?
+There does seem to be a bug in the Python worker code that prevents a driver from reconnecting to a node that was stopped and then restarted. The steps are the same as above. After the local node is restarted, the command python -c 'import ray; ray.init(redis_address="IP:PORT")' will fail with an error message like:
+[ERROR] (/home/ubuntu/ray/src/common/io.cc:121: errno: Connection refused) Connection to socket failed for pathname /tmp/plasma_store84702062.
+I'm fixing this now, along with the ability to immediately remove clients that are killed with the stop_ray.sh script (rather than waiting for the full heartbeat timeout).
+		</comment>
+		<comment id='8' author='atumanov' date='2017-04-22T03:35:44Z'>
+		Closing because I think this has been resolved. If anyone comes across this problem again, please re-open the issue.
+		</comment>
+		<comment id='9' author='atumanov' date='2017-11-16T19:43:22Z'>
+		I was able to replicate this issue on &lt;denchmark-link:https://github.com/ray-project/ray/commit/eadb9986435d588dcdfb95624e0761b673961bec&gt;eadb998&lt;/denchmark-link&gt;
+, Python 3.6.3 MacOS locally, Python 3.5.2 Ubuntu 16.04 remotely.
+Same repro steps as &lt;denchmark-link:https://github.com/atumanov&gt;@atumanov&lt;/denchmark-link&gt;
+ (using  and  with appropriate flags). The only way I can start ray on the local node again is if I restart the head node. I must be missing something really basic, but  isn't clearing the local node's ip from the head node's redis.
+		</comment>
+	</comments>
+</bug>

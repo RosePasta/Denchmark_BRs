@@ -1,0 +1,188 @@
+<bug id='8763' author='Svalorzen' open_date='2020-06-03T13:17:11Z' closed_time='2020-12-23T06:32:50Z'>
+	<summary>[rllib] Memory usage growing infinitely using QMIX</summary>
+	<description>
+&lt;denchmark-h:h3&gt;What is the problem?&lt;/denchmark-h&gt;
+
+I am training QMIX with a custom 6-agent environment, and memory usage just seem to grow infinitely over time. The problem might be related to &lt;denchmark-link:https://github.com/ray-project/ray/issues/3884&gt;#3884&lt;/denchmark-link&gt;
+ but I am not sure.
+The custom environment is wrapper around a dynamic C++ library built with Boost Python. I can share it if needed. I have tried to limit the memory of Ray in the init() call but it doesn't seem to have any effect. Memory usage grows slowly over time, reaching ~64GB after 1 hours.
+Ray version: 0.8.0
+Python version: 3.7.4
+OS: CENTOS 7.7.1908 (cluster)
+&lt;denchmark-h:h3&gt;Reproduction&lt;/denchmark-h&gt;
+
+This is the Python script I am using (the first two imports are the custom libraries). Ray reports, after initialization:
+Starting Ray with 29.79 GiB memory available for workers and up to 18.63 GiB for objects.
+But total memory usage exceeds 64GB which makes the training crash as I don't have more.
+&lt;denchmark-code&gt;import AIToolbox
+import FFPython
+import gym
+from gym.spaces import Discrete, MultiDiscrete, Tuple, Dict
+import ray
+import numpy as np
+from ray import tune
+from ray.rllib.agents import qmix
+from ray.rllib.env.multi_agent_env import MultiAgentEnv
+from ray.rllib.agents.qmix.qmix_policy import ENV_STATE
+from ray.tune.registry import register_env
+
+class FF(MultiAgentEnv):
+    def __init__(self, width, height, reach, maxFire, seed):
+        super(FF, self).__init__()
+
+        import AIToolbox
+        self.model = FFPython.FFPython(width, height, reach, maxFire, seed)
+        self.agents = width * height
+
+    def step(self, action):
+        a = [0] * self.agents
+        for i in range(self.agents):
+            a[i] = int(action[i])
+
+        self.model.step(a)
+        s = np.array(self.model.getState())
+        r = np.array(self.model.getReward())
+        ss = {}
+        rr = {}
+        for i in range(self.agents):
+            ss[i] = { "obs": s, ENV_STATE: s }
+            rr[i] = r[i]
+            
+        return ss, rr, {"__all__":False}, {}
+
+    def reset(self):
+        self.model.reset()
+
+        s = np.array(self.model.getState())
+        ss = {}
+        for i in range(self.agents):
+            ss[i] = { "obs": s, ENV_STATE: s }
+
+        return ss
+
+    def render(self):
+        pass
+    def close(self):
+        pass
+
+def env_creator(env_config):
+    print("env_creator...")
+    agents = env_config["width"] * env_config["height"]
+    grouping = {
+        "group_1" : list(range(agents))
+    }
+    ospace_one = Dict({
+        "obs": MultiDiscrete([env_config["maxFire"]] * agents),
+        ENV_STATE: MultiDiscrete([env_config["maxFire"]] * agents)
+    })
+    print(ospace_one["obs"].sample())
+    ospace = Tuple([ospace_one] * agents)
+    aspace = Tuple([Discrete(4)] * agents)
+    
+    return \
+    FF(
+        env_config["width"], 
+        env_config["height"], 
+        env_config["reach"], 
+        env_config["maxFire"], 
+        env_config["seed"]) \
+    .with_agent_groups(
+        grouping,
+        ospace,
+        aspace
+    )
+
+register_env('FF-v0', env_creator)
+
+if __name__ == "__main__":
+    config = qmix.DEFAULT_CONFIG.copy()
+    config["gamma"] = 0.95
+
+    config["env"] = 'FF-v0'
+    config["env_config"] = {
+        "width": 3,
+        "height": 2,
+        "reach": 1,
+        "maxFire": 3,
+        "seed": 0,
+    }
+    config["num_workers"] = 6
+
+    ray.init(memory=32000000000)
+    result = tune.run(
+        "QMIX",
+        stop = {
+            "timesteps_total": 1000000,
+            "episodes_total": 20,
+            "time_total_s" : 3600 * 3 - 300
+        },
+        config = config,
+        local_dir = "/scratch/brussel/102/vsc10219/ray_test_1"
+    )
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='Svalorzen' date='2020-06-03T17:32:39Z'>
+		Can you reproduce this with a toy env? We can't debug scripts that aren't self contained.
+		</comment>
+		<comment id='2' author='Svalorzen' date='2020-07-16T14:55:10Z'>
+		Hi, I got same error with this issue, any update here??
+		</comment>
+		<comment id='3' author='Svalorzen' date='2020-07-16T14:56:31Z'>
+		&lt;denchmark-link:https://user-images.githubusercontent.com/37624747/87686824-f1585380-c7bf-11ea-98f2-360b4a2c5f1c.png&gt;&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='4' author='Svalorzen' date='2020-07-16T20:10:33Z'>
+		I think I risolved the problem, for me the length of the episodes was way too high, and so ray was trying to keep in memory a ton of experiences which basically ate infinite memory. Not sure if this is the same as what you are seeing.
+		</comment>
+		<comment id='5' author='Svalorzen' date='2020-07-17T04:54:30Z'>
+		Oh OK mine is 2000 per episode, do you happen to remember the length?
+		</comment>
+		<comment id='6' author='Svalorzen' date='2020-07-27T06:51:46Z'>
+		I have the same issue using DDPG. I use 50 workers, and replay buffer of size 100000. It is consuming more than 60go after 50M iterations, and it is linearly increasing since the beginning. I'm using release 0.8.6.
+		</comment>
+		<comment id='7' author='Svalorzen' date='2020-08-11T06:02:31Z'>
+		I am using sac,
+&lt;denchmark-code&gt;analysis = tune.run(sac.SACTrainer, 
+                config={"env": "RsmAtt",
+                       "num_gpus" : 1,
+                       "num_workers" : 0,
+                       "use_pytorch" : 1,
+                       "framework" : 'torch',
+                       "buffer_size" : int(1e4),
+                       "rollout_fragment_length":100},
+                stop={"training_iteration": 200},
+                )
+&lt;/denchmark-code&gt;
+
+and memory keep increasing 300Mb each iteration
+		</comment>
+		<comment id='8' author='Svalorzen' date='2020-12-09T06:18:53Z'>
+		Hi, I'm a bot from the Ray team :)
+To help human contributors to focus on more relevant issues, I will automatically add the stale label to issues that have had no activity for more than 4 months.
+If there is no further activity in the 14 days, the issue will be closed!
+
+If you'd like to keep the issue open, just leave any comment, and the stale label will be removed!
+If you'd like to get more attention to the issue, please tag one of Ray's contributors.
+
+You can always ask for help on our &lt;denchmark-link:https://discuss.ray.io/&gt;discussion forum&lt;/denchmark-link&gt;
+ or &lt;denchmark-link:https://github.com/ray-project/ray#getting-involved&gt;Ray's public slack channel&lt;/denchmark-link&gt;
+.
+		</comment>
+		<comment id='9' author='Svalorzen' date='2020-12-23T06:32:49Z'>
+		Hi again! The issue will be closed because there has been no more activity in the 14 days since the last message.
+Please feel free to reopen or open a new issue if you'd still like it to be addressed.
+Again, you can always ask for help on our &lt;denchmark-link:https://discuss.ray.io&gt;discussion forum&lt;/denchmark-link&gt;
+ or &lt;denchmark-link:https://github.com/ray-project/ray#getting-involved&gt;Ray's public slack channel&lt;/denchmark-link&gt;
+.
+Thanks again for opening the issue!
+		</comment>
+		<comment id='10' author='Svalorzen' date='2020-12-24T11:37:49Z'>
+		
+I have the same issue using DDPG. I use 50 workers, and replay buffer of size 100000. It is consuming more than 60go after 50M iterations, and it is linearly increasing since the beginning. I'm using release 0.8.6.
+
+Could you find the reason for the increasing memory issue?
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,166 @@
+<bug id='285' author='dougnd' open_date='2018-08-27T19:22:28Z' closed_time='2021-01-11T08:20:37Z'>
+	<summary>NewMatFromBytes directly uses an unsafe pointer to the []byte, but no reference preventing garbage collection</summary>
+	<description>
+&lt;denchmark-h:h2&gt;Description&lt;/denchmark-h&gt;
+
+The current NewMatFromBytes (in gocv 0.15) does not copy the data from the slice but instead uses an unsafe pointer to the data when initializing the OpenCV Mat.  Furthermore, the gocv Mat maintains no reference or anything to this data to prevent that slice from being garbage collected (the relationship between the Mat and the byte slice may not even be picked up by the escape analysis -- perhaps the byte slices are being allocated on the stack!).
+I don't know if this was expected behavior or not, but I was caught off guard!  If this is working as designed, kindly leave a few notes in the documentation for NewMatFromBytes.
+My workaround for now is to clone the Mat after calling NewMatFromBytes (before the []byte goes out of scope).
+&lt;denchmark-h:h2&gt;Steps to Reproduce&lt;/denchmark-h&gt;
+
+Here is a test case that reproduces the strange problems I was experiencing (Mat's getting overridden after the byte slice is out of scope).
+&lt;denchmark-code&gt;import (
+	"crypto/rand"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+	"gocv.io/x/gocv"
+)
+
+// Equal returns whether the images are equal.
+func Equal(img1, img2 gocv.Mat) bool {
+	eqMat := gocv.NewMat()
+	gocv.Compare(img1, img2, &amp;eqMat, gocv.CompareNE)
+	count := gocv.CountNonZero(eqMat)
+	eqMat.Close()
+	return count == 0
+}
+
+func TestMatFromBytes(t *testing.T) {
+	size := 500
+	var img, imgCloned gocv.Mat
+	var err error
+
+	makeImg := func() {
+		b := make([]byte, size*size)
+		_, err = rand.Read(b)
+		img, err = gocv.NewMatFromBytes(size, size, gocv.MatTypeCV8U, b)
+		require.NoError(t, err)
+		imgCloned = img.Clone()
+	}
+
+	useMemory := func() {
+		b := make([]byte, size*size)
+		_, err = rand.Read(b)
+	}
+
+	makeImg()
+
+	// This assertion will pass.
+	require.True(t, Equal(img, imgCloned))
+	for i := 0; i &lt; 100; i++ {
+		useMemory()
+	}
+
+	// This assertion will fail!
+	require.True(t, Equal(img, imgCloned))
+}
+
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h2&gt;Your Environment&lt;/denchmark-h&gt;
+
+
+Operating System and version: Mac OSX 10.13.6
+OpenCV version used: 3.4.2
+How did you install OpenCV? (homebrew)
+GoCV version used: 0.15.0
+Go version: 1.10.3
+Did you run the env.sh or env.cmd script before trying to go run or go build? (N/A?)
+
+P.S.  OpenCV in go is awesome and I look forward to this project becoming mature!  Thanks for all the work you guys do!
+	</description>
+	<comments>
+		<comment id='1' author='dougnd' date='2018-10-02T13:24:35Z'>
+		Any thoughts on this? I don't mind submitting a PR, but would like some guidance.
+Possibilities that I can see:
+
+
+Things are working as designed.  Namely, you you create a Mat m with NewMatFromBytes using a []byte bthen accessing m after b goes out of scope is undefined.   I can submit a PR to add some comments that warn about this.
+
+
+You don't like the current system. I see a few fixes I feel qualified to code up.
+a) I can add a Clone at the end of NewMatFromBytes. I don't really like this: it adds overhead and prevents changes from the byte slice in go affecting the Mat.
+b) I can add a private variable of type []byte to Mat that is nil most of the time, but get assigned the input slice passed to NewMatFromBytes.  That means the array backing the slice won't be garbage collected until the Mat is.   This solution feels a bit ugly, but has the behavior I'd expect.
+
+
+I'd love any feedback. Thanks!
+		</comment>
+		<comment id='2' author='dougnd' date='2018-10-03T17:58:01Z'>
+		Hi &lt;denchmark-link:https://github.com/dougnd&gt;@dougnd&lt;/denchmark-link&gt;
+ sorry it is taking a bit to get back to you on this issue. You bring up some interesting points, I need to consider the implications briefly. Anyone else want to comment here?
+		</comment>
+		<comment id='3' author='dougnd' date='2019-03-29T12:01:47Z'>
+		Any progress on this? I believe i just hit an issue that is directly related to this.
+In my application I have a cache of preprocessed mats that are re-used under certain conditions.
+So when processing a video feed i can see that after a while it get's distorted and i believe the culprit is that the underlying byte array in my cached mat is gc'ed.
+If I instead of using NewMatFromBytes I create a empty mat and then fill it with data with SetSCharAt then everything is working as intended.
+		</comment>
+		<comment id='4' author='dougnd' date='2020-01-22T23:42:25Z'>
+		I happen to think it is a good thing it does not do a copy. I guess an easy solution to this might be some well placed runtime.KeepAlive() One way to do this might be to set a dummy finalizer on the Mat that makes that call. Something like this (untested):
+func NewMatFromBytes(rows int, cols int, mt MatType, data []byte) (Mat, error) {
+cBytes, err := toByteArray(data)
+if err != nil {
+return Mat{}, err
+}
+nm := newMat(C.Mat_NewFromBytes(C.int(rows), C.int(cols), C.int(mt), *cBytes))
+runtime.SetFinalizer(m, func(m Mat) {
+runtime.KeepAlive(data)
+})
+return nm, nil
+}
+		</comment>
+		<comment id='5' author='dougnd' date='2020-01-23T07:23:47Z'>
+		The pattern in GoCV has been that if you get a Mat returned from any method, you have to call Close() on it yourself and manage the lifecycle. It is generally been a CGo antipattern to hook into the finalizer since you do not know exactly when it will be called. At least at this point seems like that is the pattern we will be sticking with.
+Separately from that, there are still some leaks that might need to be fixed internally from memory allocated by GoCV's wrapper itself.
+		</comment>
+		<comment id='6' author='dougnd' date='2020-01-23T17:09:23Z'>
+		The problem here is that the lifetime of the data slice is not tied to the Mat at all. You can manage the Mat's lifecycle as much as you might want but you may still get the data slice garbage collected behind your back.
+I do not think using a finalizer here is an anti-pattern. In this specific case you are just making sure that the data slice will necessarily be around at least until the Mat object is garbage collected (the finalizer will never run before it is garbage collected, of course, and here it does not really matter if it will ever run at all.
+Another simpler way to have the same effect is to add a the slice itself to Mat. Something like:
+type Mat struct {
+data []byte  // Nil unless the baking memory for the Mat is a byte slice.
+p C.Mat
+}
+Then when creating a Mat backed by a data slice, you just assign data to it AND add runtime.Keepalive(mat.data) to your Close() call (I am not sure this is really necessary but, conceivably, a struct member might still be garbage collected even if the struct is still around if the member is never used).
+The thing here is trying to apply the law of least surprise. Without knowing an implementation detail (Mat uses the data byte slice directly from C), no one would expect Mat method calls to fail/crash because the data slice used ended up being garbage collected.
+		</comment>
+		<comment id='7' author='dougnd' date='2020-01-23T17:53:16Z'>
+		FYI, I asked in the golang-nuts list and it seems that the runtime.KeepAlive(0 call would not be required as as long as the Mat instance is alive, all its attributes will also be alive. So only keeping a reference to the data slice should be enough.
+		</comment>
+		<comment id='8' author='dougnd' date='2020-04-23T14:12:36Z'>
+		Is there any update on this, I'm experiencing serious memory leaks when using this function NewMatFromBytes.
+		</comment>
+		<comment id='9' author='dougnd' date='2020-09-28T14:15:33Z'>
+		Any news? Could you please at least leave a few notes in the documentation for NewMatFromBytes() to warn about that?
+		</comment>
+		<comment id='10' author='dougnd' date='2020-10-16T11:00:56Z'>
+		I am starting to think that NewMatFromBytes() should do the copy() and then the caller should be responsible for calling Close(). Otherwise we end up with somewhat unexpected behavior.
+		</comment>
+		<comment id='11' author='dougnd' date='2020-10-19T15:37:23Z'>
+		
+I am starting to think that NewMatFromBytes() should do the copy() and then the caller should be responsible for calling Close(). Otherwise we end up with somewhat unexpected behavior.
+
+This will most likely be pretty expensive on critical paths. I still think it is simpler just to make sure the associated byte slice is not garbage collected while the Mat still exists.
+Is there a specific reason why you did not like my suggestion of adding a reference to the data slice inside the Mat? Because that would solve everything at the cost of a few extra bytes per Mat.
+		</comment>
+		<comment id='12' author='dougnd' date='2020-10-20T05:43:15Z'>
+		&lt;denchmark-link:https://github.com/brunoga&gt;@brunoga&lt;/denchmark-link&gt;
+ now that I think about it a bit further, the proposed solution of adding  in the case of using  is quite a good one. As long as  does a  that should take care of the referencing as you point out.
+Can you submit a PR with these changes? :)
+		</comment>
+		<comment id='13' author='dougnd' date='2020-10-22T03:59:28Z'>
+		Sure. Will do it tomorrow.
+		</comment>
+		<comment id='14' author='dougnd' date='2020-10-22T14:08:35Z'>
+		Pull request sent.
+		</comment>
+		<comment id='15' author='dougnd' date='2020-10-30T04:54:08Z'>
+		This was addressed by &lt;denchmark-link:https://github.com/hybridgroup/gocv/pull/755&gt;#755&lt;/denchmark-link&gt;
+ and has been marked to be closed when our next release goes out. Thanks!
+		</comment>
+		<comment id='16' author='dougnd' date='2021-01-11T08:20:37Z'>
+		This was released with v0.26.0 so now closing. Thank you everyone!
+		</comment>
+	</comments>
+</bug>

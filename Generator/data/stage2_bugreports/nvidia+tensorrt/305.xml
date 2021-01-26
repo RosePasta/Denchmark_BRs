@@ -1,0 +1,310 @@
+<bug id='305' author='allenling' open_date='2019-12-30T06:51:26Z' closed_time='2020-01-28T02:03:49Z'>
+	<summary>trt7, add outputs from convolution2d and relu get different result when building engine from onnx</summary>
+	<description>
+&lt;denchmark-h:h2&gt;Description&lt;/denchmark-h&gt;
+
+&lt;denchmark-h:h2&gt;Environment&lt;/denchmark-h&gt;
+
+TensorRT Version: 6.0.1.5, 7.0.0.11
+GPU Type:  RTX2080
+Nvidia Driver Version: 440.33.01
+CUDA Version: 10.1, 10.2
+CUDNN Version: 7.6.3
+Operating System + Version: Ubuntu16.04
+Python Version (if applicable): 3.5.2
+TensorFlow Version (if applicable):
+PyTorch Version (if applicable): 1.3
+Baremetal or Container (if container which image + tag):
+&lt;denchmark-h:h2&gt;Relevant Files&lt;/denchmark-h&gt;
+
+import tensorrt as trt
+import torch
+from torch import nn
+
+
+input_names = ["x", "y"]
+# input_names = ["x"]
+output_names = ["o1"]
+
+
+class TestNet(torch.nn.modules.Module):
+
+    def __init__(self):
+        super(TestNet, self).__init__()
+        self.conv2d = nn.Conv2d(in_channels=3, out_channels=64,
+                   kernel_size=3, stride=1,
+                   padding=1)
+        self.relu = nn.ReLU()
+        return
+
+    def not_add_and_no_relu(self, x):
+        print("not_add_and_no_relu")
+        res = self.conv2d(x)
+        return res
+
+    def no_relu_but_add(self, x, y):
+        print("no_relu_but_add")
+        x_res = self.conv2d(x)
+        y_res = self.conv2d(y)
+        return x_res + y_res
+
+    def add_with_relu(self, x, y):
+        print("add_with_relu")
+        x_res = self.conv2d(x)
+        x_res = self.relu(x_res)
+        
+        y_res = self.conv2d(y)
+        y_res = self.relu(y_res)
+        return x_res + y_res
+
+    def only_relu_add(self, x, y):
+        print("only_relu_add")
+        x_res = self.relu(x)
+        y_res = self.relu(y)
+        return x_res + y_res
+
+    def forward(self, *args):
+#         res = self.not_add_and_no_relu(*args)
+#         res = self.no_relu_but_add(*args)
+        res = self.add_with_relu(*args)
+#         res = self.only_relu_add(*args)
+        return res
+
+
+def export_onnx(net, its):
+    onnx_path = "test_relu.onnx"
+    torch.onnx.export(net, its, onnx_path, export_params=True, input_names=input_names, output_names=output_names,
+                      keep_initializers_as_inputs=True)
+    return onnx_path
+
+
+def build_trt_from_onnx(onnx_path):
+    if trt.__version__ &lt; "7.0":
+        explicit_batch = 0
+    else:
+        explicit_batch = 1 &lt;&lt; (int)(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+    print("explicit_batch:", explicit_batch)
+    with trt.Logger(trt.Logger.INFO) as TRT_LOGGER, trt.Builder(TRT_LOGGER) as builder,\
+    builder.create_network(explicit_batch) as network, trt.OnnxParser(network, TRT_LOGGER) as parser:
+        with open(onnx_path, 'rb') as onnx_file:
+            suc = parser.parse(onnx_file.read())
+            print("parse onnx", suc)
+            if suc is False:
+                print(parser.get_error(0))
+                exit(1)
+        print("=======&gt; network")
+        for i in range(network.num_layers):
+            l = network.get_layer(i)
+            print(i, l.type)
+        print("=======&gt; end of network")
+        builder.max_workspace_size = 1&lt;&lt;32
+        builder.fp16_mode = False
+        builder.max_batch_size = 1
+        builder.strict_type_constraints = False
+        raw_trt_name = "test_relu.trt"
+        with builder.build_cuda_engine(network) as engine:
+            with open(raw_trt_name, "wb") as f:
+                f.write(engine.serialize())
+            output_shapes = tuple([tuple(engine.get_binding_shape(i)) for i in range(len(input_names), engine.num_bindings)])
+    return raw_trt_name, output_shapes
+
+
+
+def compare(net, its, trt_file, output_shapes):
+    print("compare, trt_file:", trt_file)
+    logger = trt.Logger(trt.Logger.VERBOSE)
+    runtime = trt.Runtime(logger)
+    with open(trt_file,  "rb") as f:
+        engine = runtime.deserialize_cuda_engine(f.read())
+        context = engine.create_execution_context()
+    
+    outputs = [torch.zeros(size=i, dtype=torch.float32).to("cuda:0") for i in output_shapes]
+    
+    bindings = [i.data_ptr() for i in its] + [i.data_ptr() for i in outputs]
+    print(bindings)
+    context.execute_async(1, bindings, torch.cuda.current_stream().cuda_stream)
+    torch.cuda.current_stream().synchronize()
+    
+    res = net(*its)
+
+    if len(output_names) == 1:
+        print(res.shape, outputs[0].shape)
+        diff = torch.max(torch.abs(res - outputs[0]))
+        print("max:", torch.max(res), "min:", torch.min(res), "max diff:", diff)
+    else:
+        for index in range(0, len(output_names)):
+            torch_res = res[index]
+            trt_res = outputs[index]
+            print(torch_res.shape, trt_res.shape)
+            diff = torch.max(torch.abs(torch_res - trt_res))
+            print("max:", torch.max(torch_res), "min:", torch.min(torch_res), "max diff:", diff)
+    return
+
+
+
+def main():
+    print("trt version:", trt.__version__)
+    print("torch version:", torch.__version__)
+    net = TestNet()
+    print(net)
+    net.cuda()
+    
+    
+    its = []
+    for _ in input_names:
+        its.append(torch.randn(1, 3, 224, 224).to("cuda:0"))
+    
+    its = tuple(its)
+    
+    onnx_path = export_onnx(net, its)
+    trt_name, output_shapes = build_trt_from_onnx(onnx_path)
+    print(output_shapes)
+    compare(net, its, trt_name, output_shapes)
+    
+    return
+    
+    
+    
+    
+if __name__ == "__main__":
+    main()
+    
+    
+&lt;denchmark-h:h2&gt;Steps To Reproduce&lt;/denchmark-h&gt;
+
+measure the difference from two tensors by torch.max(torch.abs(tensor_a - tensor_b))
+not_add_and_no_relu, no_relu_but_add,  only_relu_add  are OK, the max diff is 0
+but when call add_with_relu in forward, which add two outputs from conv2d and relu, get a almost &gt;25% diff resut, here is the console output:
+&lt;denchmark-code&gt;trt version: 7.0.0.11
+torch version: 1.3.0
+TestNet(
+  (conv2d): Conv2d(3, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+  (relu): ReLU()
+)
+add_with_relu
+explicit_batch: 1
+parse onnx True
+=======&gt; network
+0 LayerType.CONVOLUTION
+1 LayerType.ACTIVATION
+2 LayerType.CONVOLUTION
+3 LayerType.ACTIVATION
+4 LayerType.ELEMENTWISE
+=======&gt; end of network
+[TensorRT] INFO: Detected 2 inputs and 1 output network tensors.
+((1, 64, 224, 224),)
+compare, trt_file: test_relu.trt
+[TensorRT] VERBOSE: Deserialize required 5369 microseconds.
+[TensorRT] WARNING: Current optimization profile is: 0. Please ensure there are no enqueued operations pending in this context prior to switching profiles
+[140192010739200, 140192011341312, 140192306429952]
+[TensorRT] WARNING: Explicit batch network detected and batch size specified, use enqueue without batch size instead.
+add_with_relu
+torch.Size([1, 64, 224, 224]) torch.Size([1, 64, 224, 224])
+max: tensor(4.7667, device='cuda:0', grad_fn=&lt;MaxBackward1&gt;) min: tensor(0., device='cuda:0', grad_fn=&lt;MinBackward1&gt;) max diff: tensor(1.8634, device='cuda:0', grad_fn=&lt;MaxBackward1&gt;)
+
+
+&lt;/denchmark-code&gt;
+
+but when i switch to trt6, result no diff
+&lt;denchmark-code&gt;trt version: 6.0.1.5
+torch version: 1.3.0
+TestNet(
+  (conv2d): Conv2d(3, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+  (relu): ReLU()
+)
+add_with_relu
+explicit_batch: 0
+parse onnx True
+=======&gt; network
+0 LayerType.CONVOLUTION
+1 LayerType.ACTIVATION
+2 LayerType.CONVOLUTION
+3 LayerType.ACTIVATION
+4 LayerType.ELEMENTWISE
+=======&gt; end of network
+[TensorRT] INFO: Detected 2 inputs and 1 output network tensors.
+((64, 224, 224),)
+compare, trt_file: test_relu.trt
+[TensorRT] VERBOSE: Deserialize required 5370 microseconds.
+[139724473769472, 139724474371584, 139725255999488]
+add_with_relu
+torch.Size([1, 64, 224, 224]) torch.Size([64, 224, 224])
+max: tensor(4.5402, device='cuda:0', grad_fn=&lt;MaxBackward1&gt;) min: tensor(0., device='cuda:0', grad_fn=&lt;MinBackward1&gt;) max diff: tensor(0., device='cuda:0', grad_fn=&lt;MaxBackward1&gt;)
+
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='allenling' date='2019-12-30T20:03:17Z'>
+		I thought that either using newer API:
+context.execute_async_v2(bindings, torch.cuda.current_stream().cuda_stream)
+or explicitly creating the optimization profile before inference might help:
+profile = builder.create_optimization_profile()
+input_name = network.get_input(0).name
+shape = (1, 3, 224, 224)
+profile.set_shape(input_name, min=shape, opt=shape, max=shape)
+config.add_optimization_profile(profile)
+...
+with builder.build_engine(network, config) as engine:
+    ...
+But it still didn't work. I can still repro the difference on a V100.
+Seems like a bug, I'll look into this.
+		</comment>
+		<comment id='2' author='allenling' date='2019-12-31T03:24:15Z'>
+		&lt;denchmark-link:https://github.com/rmccorm4&gt;@rmccorm4&lt;/denchmark-link&gt;
+
+thanks for reply!
+using new execute_async_v2 api  does not work for me, and  explicitly creating the optimization profile before inference either...
+		</comment>
+		<comment id='3' author='allenling' date='2019-12-31T08:27:36Z'>
+		I reproduced the same problem when I use tr7.   I get the fusion log using same model:
+in tr6, elementwise not fused:
+VERBOSE: Fusing conv1_1_conv with activation0
+VERBOSE: Fusing conv1_2_conv with activation1
+VERBOSE: Fusing conv1_3_conv with activation2
+VERBOSE: Fusing conv1_4_conv with activation3
+VERBOSE: Fusing conv1_5_conv with activation4
+VERBOSE: Fusing conv1_6_conv with activation5
+however, in tr7, elementwise fused in to conv + relu, but seems fused to wrong layer
+VERBOSE: Fusing conv1_1_conv with activation0
+VERBOSE: Fusing conv1_2_conv with activation1
+VERBOSE: Fusing conv1_3_conv with activation2
+VERBOSE: Fusing conv1_3_conv + activation2 with elementwisesum0
+VERBOSE: Fusing conv1_4_conv with activation3
+VERBOSE: Fusing conv1_5_conv with activation4
+VERBOSE: Fusing conv1_5_conv + activation4 with elementwisesum1
+any idea?
+		</comment>
+		<comment id='4' author='allenling' date='2020-01-28T02:03:49Z'>
+		Hi &lt;denchmark-link:https://github.com/allenling&gt;@allenling&lt;/denchmark-link&gt;
+,
+This has been fixed and will be in the next release, thanks for your patience:
+&lt;denchmark-code&gt;torch version: 1.3.0
+TestNet(
+  (conv2d): Conv2d(3, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+  (relu): ReLU()
+)
+add_with_relu
+explicit_batch: 1
+parse onnx True
+=======&gt; network
+0 LayerType.CONVOLUTION
+1 LayerType.ACTIVATION
+2 LayerType.CONVOLUTION
+3 LayerType.ACTIVATION
+4 LayerType.ELEMENTWISE
+=======&gt; end of network
+[TensorRT] INFO: Detected 2 inputs and 1 output network tensors.
+((1, 64, 224, 224),)
+compare, trt_file: test_relu.trt
+[TensorRT] VERBOSE: Deserialize required 11565 microseconds.
+[140247662861824, 140247663463936, 140246553460736]
+add_with_relu
+torch.Size([1, 64, 224, 224]) torch.Size([1, 64, 224, 224])
+max: tensor(4.7387, device='cuda:0', grad_fn=&lt;MaxBackward1&gt;) min: tensor(0., device='cuda:0', grad_fn=&lt;MinBackward1&gt;) max diff: tensor(0., device='cuda:0', grad_fn=&lt;MaxBackward1&gt;)
+&lt;/denchmark-code&gt;
+
+max diff: tensor(0., device='cuda:0', grad_fn=)
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,289 @@
+<bug id='316' author='kalaluthien' open_date='2020-03-27T02:03:59Z' closed_time='2020-04-02T02:51:29Z'>
+	<summary>Failed to convert quantization-aware trained MNIST model in examples because of `FAKE_QUANT`</summary>
+	<description>
+Describe the bug
+TFLite Converter cannot post-training quantize mnist model that is quantization-aware trained.
+System information
+TensorFlow installed from (source or binary): binary ($ pip install tensorflow-gpu)
+TensorFlow version: 2.1.0
+TensorFlow Model Optimization version: master (built from source)
+Python version: 3.7
+Describe the expected behavior
+Convert quantization-aware trained keras model into integer-quantized tflite model
+Describe the current behavior
+RuntimeError. Python interpreter said: FakeQuant does not be supported, maybe introduced by fake_quant operations in QAT wrappers.
+Traceback (most recent call last):
+  File "test_minist_qat.py", line 186, in &lt;module&gt;
+    tflite_model = converter.convert()
+  File "(hidden)/tensorflow_core/lite/python/lite.py", line 469, in convert
+    self.experimental_new_quantizer)
+  File "(hidden)/tensorflow_core/lite/python/lite.py", line 243, in _calibrate_quantize_model
+    inference_output_type, allow_float, enable_mlir_quantizer)
+  File "(hidden)/tensorflow_core/lite/python/optimize/calibrator.py", line 81, in calibrate_and_quantize
+    enable_mlir_quantizer)
+  File "(hidden)/tensorflow_core/lite/python/optimize/tensorflow_lite_wrap_calibration_wrapper.py", line 115, in QuantizeModel
+    return _tensorflow_lite_wrap_calibration_wrapper.CalibrationWrapper_QuantizeModel(self, *args)
+RuntimeError: Quantization not yet supported for op: FAKE_QUANT
+Code to reproduce the issue
+Below code is manually fixed version of tensorflow_model_optimization/python/examples/quantization/keras/mnist_cnn_cont_quant.py.
+My goal is to replace "MnistSequential" model to "MnistCustomLayer", which uses subclass api for mnist network layer. But now, it does not work for Keras Sequential model...
+import numpy as np
+import tensorflow as tf
+
+from tensorflow_model_optimization.python.core.quantization.keras.quantize import quantize_apply
+from tensorflow_model_optimization.python.core.quantization.keras.quantize import quantize_annotate_layer
+from tensorflow_model_optimization.python.core.quantization.keras.quantize import quantize_scope
+
+
+""" Step0: configure test
+"""
+batch_size = 128
+num_epochs = 10
+calibration_size = 300
+input_shape = (28, 28, 1)
+num_classes = 10
+
+""" Step1: prepare dataset
+"""
+(x_train, y_train), (x_test, y_test) = tf.keras.datasets.mnist.load_data()
+
+x_train = x_train.reshape((x_train.shape[0],) + input_shape).astype('float32') / 255
+x_test = x_test.reshape((x_test.shape[0],) + input_shape).astype('float32') / 255
+
+y_train = tf.keras.utils.to_categorical(y_train, num_classes)
+y_test = tf.keras.utils.to_categorical(y_test, num_classes)
+
+
+def calibration_gen():
+    for i in range(calibration_size):
+        yield [x_train[i].reshape((1,) + input_shape)]
+
+
+""" Step2: prepare models
+"""
+trained_models = []
+quantization_aware_trained_models = []
+
+model_sequential = tf.keras.Sequential(
+    [
+        quantize_annotate_layer(
+            tf.keras.layers.Conv2D(
+                32, 5,
+                padding='same',
+                activation='relu',
+                use_bias=False,
+                input_shape=input_shape,
+            )
+        ),
+        tf.keras.layers.MaxPooling2D((2, 2), (2, 2), padding='same'),
+        quantize_annotate_layer(
+            tf.keras.layers.Conv2D(
+                64, 5,
+                padding='same',
+                activation='relu',
+                use_bias=False,
+            )
+        ),
+        tf.keras.layers.MaxPooling2D((2, 2), (2, 2), padding='same'),
+        tf.keras.layers.Flatten(),
+        quantize_annotate_layer(tf.keras.layers.Dense(1024, activation='relu')),
+        tf.keras.layers.Dropout(0.4),
+        quantize_annotate_layer(tf.keras.layers.Dense(num_classes)),
+        tf.keras.layers.Softmax(),
+    ],
+    name='MnistSequential',
+)
+trained_models.append(model_sequential)
+
+model_sequential_quantized = quantize_apply(model_sequential)
+quantization_aware_trained_models.append(model_sequential_quantized)
+
+
+""" Step3: train models
+"""
+for model in trained_models:  # Default Mnist model
+    print(f'Train {model.name}...')
+    model.compile(
+        loss=tf.keras.losses.categorical_crossentropy,
+        optimizer=tf.keras.optimizers.Adadelta(),
+        metrics=['accuracy']
+    )
+    model.fit(
+        x_train, y_train,
+        validation_data=(x_test, y_test),
+        batch_size=batch_size,
+        epochs=num_epochs,
+        verbose=True,
+    )
+
+for model in quantization_aware_trained_models:  # QAT Mnist model
+    print(f'Train {model.name}_QAT...')
+    model.compile(
+        loss=tf.keras.losses.categorical_crossentropy,
+        optimizer=tf.keras.optimizers.Adadelta(),
+        metrics=['accuracy']
+    )
+    model.fit(
+        x_train, y_train,
+        validation_data=(x_test, y_test),
+        batch_size=batch_size,
+        epochs=num_epochs,
+        verbose=True,
+    )
+
+
+""" Step4: convert models
+"""
+converted_models = []
+for model in trained_models:  # Default Mnist tflite model (float32)
+    converter = tf.lite.TFLiteConverter.from_keras_model(model)
+    converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS]
+    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+
+    tflite_model = converter.convert()
+    tflite_path = f'./{model.name}.tflite'
+    open(tflite_path, "wb").write(tflite_model)
+    converted_models.append(tflite_path)
+
+for model in quantization_aware_trained_models:  # QAT Mnist tflite model (float32)
+    converter = tf.lite.TFLiteConverter.from_keras_model(model)
+    converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS]
+    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+
+    tflite_model = converter.convert()
+    tflite_path = f'./{model.name}_QAT.tflite'
+    open(tflite_path, "wb").write(tflite_model)
+    converted_models.append(tflite_path)
+
+with quantize_scope():
+    for model in trained_models:  # PTQ Mnist tflite model (int8)
+        converter = tf.lite.TFLiteConverter.from_keras_model(model)
+        converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+        converter.optimizations = [tf.lite.Optimize.OPTIMIZE_FOR_SIZE]
+        converter.representative_dataset = calibration_gen
+        converter._experimental_new_quantizer = True
+
+        tflite_model = converter.convert()
+        tflite_path = f'./{model.name}_PTQ.tflite'
+        open(tflite_path, "wb").write(tflite_model)
+        converted_models.append(tflite_path)
+
+    for model in quantization_aware_trained_models:  # QAT + PTQ Mnist tflite model (int8)
+        converter = tf.lite.TFLiteConverter.from_keras_model(model)
+        converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+        converter.optimizations = [tf.lite.Optimize.OPTIMIZE_FOR_SIZE]
+        converter.representative_dataset = calibration_gen
+        converter._experimental_new_quantizer = True
+
+        tflite_model = converter.convert(). # ERROR!!!!
+        tflite_path = f'./{model.name}_QAT_PTQ.tflite'
+        open(tflite_path, "wb").write(tflite_model)
+        converted_models.append(tflite_path)
+
+""" Step5: evaluate keras models &amp; tflite models
+"""
+x_test = x_test[:calibration_size, :]
+y_test = y_test[:calibration_size, :]
+
+for model in trained_models:
+    total_seen = 0
+    num_correct = 0
+
+    for img, label in zip(x_test, y_test):
+        inp = img.reshape((1,) + input_shape)
+        total_seen += 1
+        predictions = model(inp)
+        if np.argmax(predictions) == np.argmax(label):
+            num_correct += 1
+
+    score = float(num_correct) / float(total_seen)
+    print(f'{model.name} accuracy: {score}')
+
+for model in quantization_aware_trained_models:
+    total_seen = 0
+    num_correct = 0
+
+    for img, label in zip(x_test, y_test):
+        inp = img.reshape((1,) + input_shape)
+        total_seen += 1
+        predictions = model(inp)
+        if np.argmax(predictions) == np.argmax(label):
+            num_correct += 1
+
+    score = float(num_correct) / float(total_seen)
+    print(f'{model.name}_QAT accuracy: {score}')
+
+for tflite_path in converted_models:
+    interpreter = tf.lite.Interpreter(model_path=tflite_path)
+    interpreter.allocate_tensors()
+    input_index = interpreter.get_input_details()[0]['index']
+    output_index = interpreter.get_output_details()[0]['index']
+
+    total_seen = 0
+    num_correct = 0
+
+    for img, label in zip(x_test, y_test):
+        inp = img.reshape((1,) + input_shape)
+        total_seen += 1
+        interpreter.set_tensor(input_index, inp)
+        interpreter.invoke()
+        predictions = interpreter.get_tensor(output_index)
+        if np.argmax(predictions) == np.argmax(label):
+            num_correct += 1
+
+    score = float(num_correct) / float(total_seen)
+    print(f'{tflite_path} accuracy: {score}')
+Screenshots
+None
+Additional context
+None
+	</description>
+	<comments>
+		<comment id='1' author='kalaluthien' date='2020-03-27T02:07:02Z'>
+		If there are supported combinations of TF2.x and TFMOT, rough timelines to handle this problem, or anything I can help, let me know : )
+		</comment>
+		<comment id='2' author='kalaluthien' date='2020-03-27T02:27:12Z'>
+		I reproduced the same error, too. Is there some methods to solve it?
+		</comment>
+		<comment id='3' author='kalaluthien' date='2020-03-31T02:34:10Z'>
+		&lt;denchmark-link:https://github.com/sdukaka&gt;@sdukaka&lt;/denchmark-link&gt;
+ I think found a bypass: to target_spec feed OpsSet builtins too.
+Before:
+onverter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+After:
+converter.target_spec.supported_ops = [
+  tf.lite.OpsSet.TFLITE_BUILTINS,
+  tf.lite.OpsSet.TFLITE_BUILTINS_INT8,
+]
+converter._experimental_new_quantizer = True  # for tensorflow v2.2.0-rc2
+I am not sure this is a best practice... Examples or interfaces should be fixed.
+		</comment>
+		<comment id='4' author='kalaluthien' date='2020-04-02T02:51:29Z'>
+		Hi &lt;denchmark-link:https://github.com/kalaluthien&gt;@kalaluthien&lt;/denchmark-link&gt;
+,
+Thanks a lot for the detailed feedback.
+Yes, conversion for QAT models currently only works with . You can follow the conversion in this &lt;denchmark-link:https://github.com/tensorflow/model-optimization/blob/master/tensorflow_model_optimization/python/core/quantization/keras/utils.py&gt;utils.py&lt;/denchmark-link&gt;
+ script.
+Also, for QAT conversion, please use tf-nightly instead. It has some code to handle conversion, which TF 2.1 does not. v2.2 should have these changes in.
+Thanks a lot. I'm closing this for now. Please feel free to reopen if you face any other issues.
+		</comment>
+		<comment id='5' author='kalaluthien' date='2020-04-10T01:26:28Z'>
+		TF 2.2 () also reports strange bug when converting QAT models....
+Please see &lt;denchmark-link:https://gist.github.com/kalaluthien/cc24dda07ecc1d183ae36f67bab05c60&gt;gist&lt;/denchmark-link&gt;
+. Thanks!
+ps. I cannot reopen issue...
+&lt;denchmark-h:hr&gt;&lt;/denchmark-h&gt;
+
+&lt;denchmark-link:https://github.com/tensorflow/model-optimization/blob/master/tensorflow_model_optimization/python/core/quantization/keras/utils.py&gt;utils.py&lt;/denchmark-link&gt;
+ racks one option:  for combination of QAT and PTQ.
+Now no error for that toy example. Thanks!
+		</comment>
+		<comment id='6' author='kalaluthien' date='2020-04-10T01:41:27Z'>
+		FYI. By enabling experimental_new_converter to TF 2.1 similar bugs
+with BUILTINS: RuntimeError: Unable to find min/max value for output 0 in QUANTIZE in subgraph 0, node: 0
+with BUILTINS_INT8: RuntimeError: tensorflow/lite/kernels/pooling.cc:93 input-&gt;params.scale != output-&gt;params.scale (9 != 385225248)Node number 3 (AVERAGE_POOL_2D) failed to prepare.
+goto &lt;denchmark-link:https://gist.github.com/kalaluthien/3d5ce82f84616a8a7d29ae19a581158d&gt;gist&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>

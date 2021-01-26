@@ -1,0 +1,176 @@
+<bug id='412' author='ekinakyurek' open_date='2018-12-11T20:44:04Z' closed_time='2018-12-13T16:59:49Z'>
+	<summary>strange gc error</summary>
+	<description>
+I was trying to port ResNet example in Metalhead.jl repository. It resulted with strange gc error.
+Download &lt;denchmark-link:https://github.com/FluxML/Metalhead.jl/releases/download/v0.1.1/resnet.bson&gt;resnet.bson&lt;/denchmark-link&gt;
+
+Include below code:
+using Knet, KnetLayers, BSON
+
+struct ResidualBlock
+  conv_layers
+  norm_layers
+  shortcut
+end
+
+function ResidualBlock(filters, kernels::Array{Tuple{Int,Int}}, pads::Array{Tuple{Int,Int}}, strides::Array{Tuple{Int,Int}}, shortcut = identity)
+  conv_layers = []
+  norm_layers = []
+  for i in 2:length(filters)
+    push!(conv_layers, Conv(height=kernels[i-1][1], width=kernels[i-1][1], channels=filters[i-1], filters=filters[i], padding = pads[i-1], stride = strides[i-1], mode=1))
+    push!(norm_layers, BatchNorm(filters[i]))
+  end
+  ResidualBlock(Tuple(conv_layers),Tuple(norm_layers),shortcut)
+end
+
+function ResidualBlock(filters, kernels::Array{Int}, pads::Array{Int}, strides::Array{Int}, shortcut = identity)
+  ResidualBlock(filters, [(i,i) for i in kernels], [(i,i) for i in pads], [(i,i) for i in strides], shortcut)
+end
+
+function (block::ResidualBlock)(input)
+  value = input
+  for i in 1:length(block.conv_layers)-1
+    value = relu.((block.norm_layers[i])((block.conv_layers[i])(value)))
+  end
+  relu.(((block.norm_layers[end])((block.conv_layers[end])(value))) + block.shortcut(input))
+end
+
+import Base: getindex
+mutable struct Chain 
+     layers
+end
+Chain(x...)= Chain(x)
+function (m::Chain)(x)
+    for l in m.layers
+        x = l(x)
+    end
+    return x
+end
+getindex(chain::Chain,i::Int)  = chain.layers[i]
+
+function Bottleneck(filters::Int, downsample::Bool = false, res_top::Bool = false)
+  if(!downsample &amp;&amp; !res_top)
+    return ResidualBlock([4 * filters, filters, filters, 4 * filters], [1,3,1], [0,1,0], [1,1,1])
+  elseif(downsample &amp;&amp; res_top)
+    return ResidualBlock([filters, filters, filters, 4 * filters], [1,3,1], [0,1,0], [1,1,1], Chain(Conv(width=1,height=1, channels=filters, filters=4 * filters, padding = (0,0), stride = (1,1), mode=1), BatchNorm(4 * filters)))
+  else
+    shortcut = Chain(Conv(width=1, height=1, channels=2 * filters, filters=4 * filters, padding = (0,0), stride = (2,2), mode=1), BatchNorm(4 * filters))
+    return ResidualBlock([2 * filters, filters, filters, 4 * filters], [1,3,1], [0,1,0], [1,1,2], shortcut)
+  end
+end
+
+function resnet50()
+  layers = [3, 4, 6, 3]
+  layer_arr = []
+
+  push!(layer_arr, Conv(height=7,width=7, channels=3, filters=64, padding = (3,3), stride = (2,2), mode=1))
+  push!(layer_arr, Pool(window=(3,3), padding=(1,1), stride =(2,2), mode=0))
+
+  initial_filters = 64
+  for i in 1:length(layers)
+    push!(layer_arr, Bottleneck(initial_filters, true, i==1))
+    for j in 2:layers[i]
+      push!(layer_arr, Bottleneck(initial_filters))
+    end
+    initial_filters *= 2
+  end
+
+  push!(layer_arr, Pool(window=(7,7), mode=1))
+  push!(layer_arr, x -&gt; reshape(x, :, size(x,4)))
+  push!(layer_arr, (Dense(input=2048, output=1000)))
+  push!(layer_arr, SoftMax())
+
+  Chain(layer_arr...)
+end
+
+function loadsingle(weights, ls; layer=1, p=1, j=3:5, branch= "a", count=1)
+    ls[p].conv_layers[layer].weight[:] = KnetArray(weights[Symbol("gpu_0/res$(count)_$(p-j[1])_branch2$(branch)_w_0")])
+    sz = (1,1,length(weights[Symbol("gpu_0/res$(count)_$(p-j[1])_branch2$(branch)_bn_s_0")]),1)
+    ls[p].norm_layers[layer].moments.mean = reshape(KnetArray(weights[Symbol("gpu_0/res$(count)_$(p-j[1])_branch2$(branch)_bn_rm_0")]),sz)
+    ls[p].norm_layers[layer].moments.var = reshape(KnetArray(weights[Symbol("gpu_0/res$(count)_$(p-j[1])_branch2$(branch)_bn_riv_0")]),sz).^2
+    ls[p].norm_layers[layer].params = vcat(KnetArray(weights[Symbol("gpu_0/res$(count)_$(p-j[1])_branch2$(branch)_bn_s_0")]), KnetArray(weights[Symbol("gpu_0/res$(count)_$(p-j[1])_branch2$(branch)_bn_b_0")]))                                                     
+
+end
+
+function resnet_layers()
+  weight = BSON.load("resnet.bson")
+  ls = resnet50()
+  ls[1].weight[:] = weight[Symbol("gpu_0/conv1_w_0")]
+  count = 2
+  for j in [3:5, 6:9, 10:15, 16:18]
+    for p in j        
+        loadsingle(weight,ls;p=p,j=j,layer=1,branch="a",count=count)
+        loadsingle(weight,ls;p=p,j=j,layer=2,branch="b",count=count)
+        loadsingle(weight,ls;p=p,j=j,layer=3,branch="c",count=count)
+    end
+    count += 1
+  end
+  ls[21].linear.mult.weight[:] = transpose(weight[Symbol("gpu_0/pred_w_0")])[:]; ls[21].linear.bias[:] = weight[Symbol("gpu_0/pred_b_0")][:]
+  return ls
+end
+
+struct ResNet 
+  layers::Chain
+end
+
+ResNet() = ResNet(resnet_layers())
+
+Base.show(io::IO, ::ResNet) = print(io, "ResNet()")
+
+(m::ResNet)(x) = m.layers(x)
+
+Then,
+resnet = ResNet()
+x = KnetArray(rand(Float32, 224, 224, 3, 1))
+resnet(x)
+julia&gt; resnet(x)
+ERROR: an illegal memory access was encountered
+Stacktrace:
+ [1] error(::String) at ./error.jl:33
+ [2] gc(::Int64) at /kuacc/users/eakyurek13/.julia/packages/Knet/3lzCR/src/gpu.jl:23
+ [3] gc() at /kuacc/users/eakyurek13/.julia/packages/Knet/3lzCR/src/kptr.jl:159
+ [4] #conv4_algo#381(::Ptr{Nothing}, ::Base.Iterators.Pairs{Symbol,Any,NTuple{4,Symbol},NamedTuple{(:stride, :padding, :mode, :upscale),Tuple{Tuple{Int64,Int64},Tuple{Int64,Int64},Int64,Int64}}}, ::Function, ::KnetArray{Float32,4}, ::KnetArray{Float32,4}, ::KnetArray{Float32,4}) at /kuacc/users/eakyurek13/.julia/packages/Knet/3lzCR/src/conv.jl:603
+ [5] (::getfield(Knet, Symbol("#kw##conv4_algo")))(::NamedTuple{(:handle, :stride, :padding, :mode, :upscale),Tuple{Ptr{Nothing},Tuple{Int64,Int64},Tuple{Int64,Int64},Int64,Int64}}, ::typeof(Knet.conv4_algo), ::KnetArray{Float32,4}, ::KnetArray{Float32,4}, ::KnetArray{Float32,4}) at ./none:0
+ [6] #conv4#226(::Ptr{Nothing}, ::Int64, ::Base.Iterators.Pairs{Symbol,Any,NTuple{4,Symbol},NamedTuple{(:stride, :padding, :mode, :upscale),Tuple{Tuple{Int64,Int64},Tuple{Int64,Int64},Int64,Int64}}}, ::Function, ::KnetArray{Float32,4}, ::KnetArray{Float32,4}) at /kuacc/users/eakyurek13/.julia/packages/Knet/3lzCR/src/conv.jl:39
+ [7] (::getfield(Knet, Symbol("#kw##conv4")))(::NamedTuple{(:stride, :padding, :mode, :upscale, :alpha),Tuple{Tuple{Int64,Int64},Tuple{Int64,Int64},Int64,Int64,Int64}}, ::typeof(conv4), ::KnetArray{Float32,4}, ::KnetArray{Float32,4}) at ./none:0
+ [8] #forw#4(::Base.Iterators.Pairs{Symbol,Any,NTuple{5,Symbol},NamedTuple{(:stride, :padding, :mode, :upscale, :alpha),Tuple{Tuple{Int64,Int64},Tuple{Int64,Int64},Int64,Int64,Int64}}}, ::Function, ::Function, ::Param{KnetArray{Float32,4}}, ::Vararg{Any,N} where N) at /kuacc/users/eakyurek13/.julia/packages/AutoGrad/eAmjh/src/core.jl:91
+ [9] #forw at ./none:0 [inlined]
+ [10] #conv4#239 at ./none:0 [inlined]
+ [11] (::getfield(Knet, Symbol("#kw##conv4")))(::NamedTuple{(:stride, :padding, :mode, :upscale, :alpha),Tuple{Tuple{Int64,Int64},Tuple{Int64,Int64},Int64,Int64,Int64}}, ::typeof(conv4), ::Param{KnetArray{Float32,4}}, ::KnetArray{Float32,4}) at ./none:0
+ [12] (::KnetLayers.GenericConv)(::KnetArray{Float32,4}) at /kuacc/users/eakyurek13/.julia/packages/KnetLayers/giMwe/src/cnn.jl:99
+ [13] (::ResidualBlock)(::KnetArray{Float32,4}) at /scratch/users/eakyurek13/ResNet/resnetlib.jl:26
+ [14] (::Chain)(::KnetArray{Float32,4}) at /scratch/users/eakyurek13/ResNet/resnetlib.jl:38
+ [15] (::ResNet)(::KnetArray{Float32,4}) at /scratch/users/eakyurek13/ResNet/resnetlib.jl:113
+ [16] top-level scope at none:0
+&lt;denchmark-link:https://github.com/ekinakyurek/KnetLayers.jl/issues/6&gt;ekinakyurek/KnetLayers.jl#6&lt;/denchmark-link&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='ekinakyurek' date='2018-12-12T18:36:39Z'>
+		I find something more interesting when I dug a bit:
+julia&gt; KnetArray(randn(Float64,4,4,4,4)).^2
+256-element Array{Float64,1}:
+ 1.631893769759235
+ 0.8678080534591551
+ 0.15043959518746478
+ 0.05798511593972784
+ 1.3321216617065292
+ 1.7600490168397585
+ 0.023299534007010212
+ 1.6992994684461047
+ ⋮
+ 0.11138126770714787
+ 0.006621291269027796
+ 0.1295259013107023
+ 1.4344883548926228
+ 0.9109623102172322
+ 2.7862023319055402
+ 1.834991352217444
+		</comment>
+		<comment id='2' author='ekinakyurek' date='2018-12-12T20:29:41Z'>
+		I fixed the .^ problem.
+The gc error seems to occur in conv4_algo, which selects the best algorithm for a certain input size by trying out all algorithms. These tests use a temporary workspace which currently is shared among calls for each input size and do not get deallocated to avoid cudaMalloc for the next call. After solving this issue, we should review this to see if there is a better memory management strategy.
+After conv4_algo the stack points to kptr.jl:159 and gpu.jl:23 -- I see nothing special in these lines. Are you using the master branch?
+		</comment>
+	</comments>
+</bug>

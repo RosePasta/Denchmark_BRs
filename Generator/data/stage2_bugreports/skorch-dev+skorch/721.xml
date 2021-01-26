@@ -1,0 +1,140 @@
+<bug id='721' author='JustasB' open_date='2020-11-19T17:31:00Z' closed_time='2020-11-22T15:23:33Z'>
+	<summary>predict() shape discrepancy when using NeuralNet with BCEWithLogitsLoss</summary>
+	<description>
+Hello,
+In a multi-label setting, .predict() method results in an additional dimension in the output.
+&lt;denchmark-code&gt;import torch
+from skorch import NeuralNet
+import numpy as np
+
+class TestModule(torch.nn.Module):
+    def __init__(self):
+        super(TestModule, self).__init__()
+        self.linear = nn.Linear(100, 10)
+
+    def forward(self, X, **kwargs):
+        return self.linear(X)
+
+net = NeuralNet(
+    TestModule,
+    criterion=torch.nn.BCEWithLogitsLoss,
+    max_epochs=1,
+)
+
+X = np.zeros((10, 100), dtype=np.float32)
+y = np.ones((10, 10), dtype=np.float32)
+
+net.fit(X, y)
+y_pred = net.predict(X)
+
+print('X.shape', X.shape, 'y.shape', y.shape, 'y_pred.shape', y_pred.shape)
+&lt;/denchmark-code&gt;
+
+Yields:
+&lt;denchmark-code&gt;  epoch    train_loss    valid_loss     dur
+-------  ------------  ------------  ------
+      1        0.6839        0.6837  0.0028
+X.shape (10, 100) y.shape (10, 10) y_pred.shape (10, 2, 10)
+&lt;/denchmark-code&gt;
+
+Expected:
+y_pred.shape == (10, 10)
+Actual:
+y_pred.shape == (10, 2, 10)
+Changing net declaration to the following results in correct output shape:
+&lt;denchmark-code&gt;net = NeuralNet(
+    TestModule,
+    criterion=torch.nn.BCEWithLogitsLoss,
+    max_epochs=1,
+    predict_nonlinearity=torch.sigmoid,
+)
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='JustasB' date='2020-11-19T23:17:29Z'>
+		Interesting, this looks like a bug. I will investigate once I have a bit of time. Thanks for reporting.
+		</comment>
+		<comment id='2' author='JustasB' date='2020-11-21T16:12:11Z'>
+		Hey &lt;denchmark-link:https://github.com/JustasB&gt;@JustasB&lt;/denchmark-link&gt;
+, I think this might not be an error after all. By using , you assume that you're dealing with a  classification problem. As such, having 10 outputs is contradictory.
+However, one could assume that the 10 outputs are used for a multioutput problem, i.e. you're trying to predict 10 independent binary classification problems. If that was the case, the output shape of (10, 2, 10) could be considered reasonable. Could you please specify what kind of problem you're trying to solve?
+Looking at sklearn,  of &lt;denchmark-link:https://scikit-learn.org/stable/modules/generated/sklearn.multioutput.MultiOutputClassifier.html&gt;MultiOutputClassifier&lt;/denchmark-link&gt;
+ returns a list of , where each element of the list represents one of the outputs of each multioutput classification tasks. We could emulate this, but tbh the 3-dim array that we return might be easier to work with than a list of 2-dim arrays, so I don't consider it urgent to change our output.
+PS: One could argue that the name &lt;denchmark-link:https://github.com/skorch-dev/skorch/blob/be7f6f90a0f8c89b540a882f704747fc9adf09b2/skorch/utils.py#L561&gt;_sigmoid_then_2d&lt;/denchmark-link&gt;
+, which is the name of the nonlinearity being used here, is not well chosen, since the output dimension can be more than 2, as is the case here. But since it's , it's also not very urgent to change the name, but still a good idea to do eventually.
+		</comment>
+		<comment id='3' author='JustasB' date='2020-11-21T21:48:45Z'>
+		Hi &lt;denchmark-link:https://github.com/BenjaminBossan&gt;@BenjaminBossan&lt;/denchmark-link&gt;
+ ,
+Thank you for taking a closer look.
+Yes my use case is a multi-output case. Each item in X can have more than one label (e.g. multiple objects visible in a photo).
+So that X has shape (N_samples, N_pixels) and y has shape (N_samples, N_classes), where N_classes &gt; 2.
+I think the confusing part for me was that net.fit(X, y) with the above shapes trained correctly, yet y_pred=net.predict(X) resulted in a shape different than the shape of y it was trained with.
+So then if I used e.g. accuracy_score(y, y_pred), it would result in an error about mismatched dimensions.
+		</comment>
+		<comment id='4' author='JustasB' date='2020-11-22T13:57:48Z'>
+		Just to be sure that I understand your case correctly: For each sample in your dataset (which is an image), you want to classify whether it contains one of multiple objects, with the total number of objects per sample being variable (one image contains 0 objects, another contains 5 objects). I would consider this to be a  classification task (see this &lt;denchmark-link:https://scikit-learn.org/stable/modules/multiclass.html&gt;description&lt;/denchmark-link&gt;
+).
+One way to model this is to treat it as a multioutput binary classification task, which is what I understand you did. So that part looks good. One problem I see is that you use NeuralNet when you are facing a classification task. Therefore, I would recommend you use NeuralNetClassifier. I will show code below.
+Another problem comes from the use of accuracy. What exactly would be the accuracy of a multilabel classification task? AFAIK, this is not well defined. It is better to use F1 score, which allows you to determine what averaging strategy you want to employ for your different labels. Below is a complete example:
+from functools import partial
+
+import numpy as np
+from sklearn.metrics import f1_score, make_scorer
+from skorch import NeuralNetClassifier
+from skorch.callbacks import EpochScoring
+from skorch.dataset import CVSplit
+import torch
+
+class TestModule(torch.nn.Module):
+    def __init__(self):
+        super(TestModule, self).__init__()
+        self.linear = torch.nn.Linear(100, 10)
+
+    def forward(self, X, **kwargs):
+        return self.linear(X)
+
+X = np.random.random((500, 100)).astype(np.float32)
+y = (np.random.random((500, 10)) &gt; 0.8).astype(np.float32)
+print(y[0])
+# =&gt; array([0., 1., 0., 0., 0., 1., 0., 0., 0., 0.], dtype=float32)
+
+# define our scoring functions, using both micro and macro averaging
+f1_micro = make_scorer(partial(f1_score, average='micro'))
+f1_macro = make_scorer(partial(f1_score, average='macro'))
+
+# we cannot use default cv split because NeuralNetClassifier tries to
+# apply a stratified split, but this doesn't work for multi-label tasks
+cv_split = CVSplit(0.2)  # 20% of data for validation
+
+net = NeuralNetClassifier(
+    TestModule,
+    criterion=torch.nn.BCEWithLogitsLoss,
+    train_split=cv_split,
+    max_epochs=2,
+    callbacks=[
+        ('f1_micro', EpochScoring(f1_micro, name='f1_micro', lower_is_better=False)),
+        ('f1_macro', EpochScoring(f1_macro, name='f1_macro', lower_is_better=False)),
+    ],
+)
+
+net.fit(X, y)
+# =&gt;
+#   epoch    f1_macro    f1_micro    train_loss    valid_acc    valid_loss     dur
+# -------  ----------  ----------  ------------  -----------  ------------  ------
+#       1      0.2144      0.2852        0.6734       0.0100        0.6638  0.0215
+#       2      0.2100      0.2792        0.6657       0.0200        0.6566  0.0129
+
+print('X.shape:', X.shape, ', y.shape:', y.shape, ', y_pred.shape:', net.predict(X).shape, ', y_propa.shape:', net.predict_proba(X).shape)
+
+print('X.shape:', X.shape, ', y.shape:', y.shape, ', y_pred.shape:', net.predict(X).shape, ', y_propa.shape:', net.predict_proba(X).shape)
+# =&gt; X.shape: (500, 100) , y.shape: (500, 10) , y_pred.shape: (500, 10) , y_propa.shape: (500, 2, 10)
+I hope this is what you require for your task. As you can see, the shape of net.predict(X) is what you expected.
+		</comment>
+		<comment id='5' author='JustasB' date='2020-11-22T15:23:33Z'>
+		&lt;denchmark-link:https://github.com/BenjaminBossan&gt;@BenjaminBossan&lt;/denchmark-link&gt;
+ Thank you for the detailed example. This will work.
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,171 @@
+<bug id='3590' author='chengtbf' open_date='2020-09-22T09:08:43Z' closed_time='2020-09-23T14:14:53Z'>
+	<summary>[BUG] GRPC: control server wrong way of deconstruction.</summary>
+	<description>
+我们之前oneflow/core/control/ctrl_server.cpp里对ServerCompletionQueue的处理是有BUG的。老版本的grpc没有做检查，升级新版本以后会在程序退出的时候check failed。 出错日志如下（根据新增的CtrlTest单测结果）:
+[----------] 1 test from CtrlServer
+[ RUN      ] CtrlServer.new_delete
+WARNING: Logging before InitGoogleLogging() is written to STDERR
+I0922 16:00:52.537562 23315 global.h:32] NewGlobal N7oneflow7EnvDescE
+I0922 16:00:52.537617 23315 global.h:32] NewGlobal N7oneflow10CtrlServerE
+I0922 16:00:52.538344 23315 ctrl_server.cpp:53] CtrlServer listening on 0.0.0.0:46323
+I0922 16:00:52.538403 23315 global.h:32] NewGlobal N7oneflow10CtrlClientE
+I0922 16:00:52.539320 23315 ctrl_client.cpp:231] LoadServer 127.0.0.1 Successful at 0 times
+I0922 16:00:52.539412 23315 global.h:32] NewGlobal N7oneflow10MachineCtxE
+I0922 16:00:52.539434 23315 machine_context.cpp:33] this machine id: 0
+I0922 16:00:52.539453 23315 global.h:32] NewGlobal N7oneflow12ResourceDescE
+I0922 16:00:52.539467 23315 global.h:32] NewGlobal N7oneflow12ResourceDescE
+I0922 16:00:52.539482 23315 global.h:37] DeleteGlobal N7oneflow12ResourceDescE
+I0922 16:00:52.539494 23315 global.h:37] DeleteGlobal N7oneflow12ResourceDescE
+I0922 16:00:52.539502 23315 global.h:37] DeleteGlobal N7oneflow10MachineCtxE
+I0922 16:00:52.539520 23315 global.h:37] DeleteGlobal N7oneflow10CtrlClientE
+I0922 16:01:04.540406 23315 global.h:37] DeleteGlobal N7oneflow10CtrlServerE
+E0922 16:01:04.541139682   23315 completion_queue.cc:245]    assertion failed: queue.num_items() == 0
+Aborted (core dumped)
+	</description>
+	<comments>
+		<comment id='1' author='chengtbf' date='2020-09-22T09:15:05Z'>
+		我们之前老版本的ctrl_server的处理相关代码如下：
+void CtrlServer::HandleRpcs() {
+  EnqueueRequests();
+
+  void* tag = nullptr;
+  bool ok = false;
+  while (true) {
+    CHECK(cq_-&gt;Next(&amp;tag, &amp;ok));
+    CHECK(ok);
+    auto call = static_cast&lt;CtrlCallIf*&gt;(tag);
+    if (call) {
+      call-&gt;Process();
+    } else {
+      break;
+    }
+  }
+}
+
+CtrlServer::~CtrlServer() {
+  grpc::Alarm alarm(cq_.get(), gpr_now(GPR_CLOCK_MONOTONIC), nullptr);
+  loop_thread_.join();
+  grpc_server_-&gt;Shutdown();
+  cq_-&gt;Shutdown();
+}
+其中loop_thread_会执行CtrlServer::HandleRpcs，并在一个while(true)循环中不断轮询cq。当CtrlServer的析构函数被调用时，首先会通过alarm插入一个null的tag，用于通知HandleRpcs退出while循环。之后会分别调用grpc_server_-&gt;Shutdown();和cq_-&gt;Shutdown();
+但在shutdown之后，程序退出时，新版grpc的cq内部检查会发现仍有item在cq中，出发check failed 并挂掉。
+		</comment>
+		<comment id='2' author='chengtbf' date='2020-09-22T09:23:07Z'>
+		&lt;denchmark-h:h3&gt;BUG的原理&lt;/denchmark-h&gt;
+
+当执行了grpc_server_-&gt;Shutdown() 和 cq_-&gt;Shutdown() 之后，其实会触发cq的多个cancel事件（每个cancel事件对应之前的一个特定的RPC）。所以在while循环中直接break是错误的，而是需要等shutdown被调用之后，继续调用cq_-&gt;Next() 取完所有的cancel事件（每个cancel事件的ok都是false，直接跳过即可）。直到cq_-&gt;Next()返回false。
+&lt;denchmark-h:h3&gt;解决方案的代码如下:&lt;/denchmark-h&gt;
+
+void CtrlServer::HandleRpcs() {
+  EnqueueRequests();
+
+  void* tag = nullptr;
+  bool ok = false;
+  // NOTE(chengcheng): The is_shutdown bool flag make sure that 'ok = false' occurs ONLY after
+  // cq_-&gt;Shutdown() for security check.
+  bool is_shutdown = false;
+  // NOTE(chengcheng): The final end is that cq_-&gt;Next() get false and cq_ is empty with no item.
+  while (cq_-&gt;Next(&amp;tag, &amp;ok)) {
+    auto call = static_cast&lt;CtrlCallIf*&gt;(tag);
+    if (!ok) {
+      // NOTE(chengcheng): After call grpc_server_-&gt;Shutdown() and cq_-&gt;Shutdown(),
+      // there will trigger some cancel tag items on each RPC. And cq_-&gt;Next() can get these tag
+      // with ok = false. Then delete the tag with CtrlCallIf pointer for recovery.
+      CHECK(is_shutdown);
+      CHECK(call);
+      delete call;
+      continue;
+    }
+    if (call) {
+      call-&gt;Process();
+    } else {
+      // NOTE(chengcheng): A null `call` indicates that this is the shutdown alarm.
+      CHECK(!is_shutdown);
+      is_shutdown = true;
+      grpc_server_-&gt;Shutdown();
+      cq_-&gt;Shutdown();
+
+      // NOTE(chengcheng): You CANNOT use code 'break;' in this block because that
+      // there still be items in the cq_.
+      // 'break;'
+    }
+  }
+}
+
+CtrlServer::~CtrlServer() {
+  // NOTE(chengcheng): This enqueues a special event (with a null tag) that causes
+  // the completion queue to be shut down on the polling thread.
+  grpc::Alarm alarm(cq_.get(), gpr_now(GPR_CLOCK_MONOTONIC), nullptr);
+  loop_thread_.join();
+}
+&lt;denchmark-h:h3&gt;解决方案介绍&lt;/denchmark-h&gt;
+
+
+析构函数不能直接调用shutdown，shutdown需要在while循环中被触发
+while循环的判断条件不是while(true) ，而是 while (cq_-&gt;Next(&amp;tag, &amp;ok)) ，因为要一直取到cq为空才行
+当null tag被触发，调用shutdown
+当is shutdown为true，过滤掉所有的ok = false的cancel事件
+
+		</comment>
+		<comment id='3' author='chengtbf' date='2020-09-22T09:28:19Z'>
+		参考实现：
+
+TF2.3 grpc master service
+TF2.3 AsyncServiceInterface::Shutdown 注释介绍
+TF2.3 处理callback的tag 和 ok
+
+参考资料和讨论：
+
+gRPC: What is the recommended way to shut down an asynchronous server in C++?
+grpc::CompletionQueue Class Reference
+Correct way to Stop grpc Async server : C++
+
+		</comment>
+		<comment id='4' author='chengtbf' date='2020-09-22T09:29:43Z'>
+		最主要的参考内容是这篇： &lt;denchmark-link:https://groups.google.com/g/grpc-io/c/qtZya6AuGAQ?pli=1&gt;https://groups.google.com/g/grpc-io/c/qtZya6AuGAQ?pli=1&lt;/denchmark-link&gt;
+
+这里贴出主要的对话内容：
+&lt;denchmark-h:h4&gt;Q:&lt;/denchmark-h&gt;
+
+&lt;denchmark-code&gt;My server implementation is, Async Streaming server.
+
+What is the correct way to stop grpc Async server. As soon as i call this:
+
+server_-&gt;Shutdown();
+ cq_-&gt;Shutdown();
+
+my handleRpc code (which is blocked on cq-&gt;Next ()), i am hitting Assert, as value of "ok" is false.
+
+bool ret = cq_-&gt;Next(&amp;tag, &amp;ok);
+GPR_ASSERT(ok);
+ 
+I tried to check the return value for (cq-&gt;Next() ) , which is coming as true, but when i checked in manual, it says, Next returns false if server is shutting down. i can skip the assert if ret value is false, but in my case it is coming as true. Does Server expects all calldata instances to be deleted before closing the server as in my case, i am not deleting all calldata instances and directly shutting down the server
+&lt;/denchmark-code&gt;
+
+&lt;denchmark-h:h4&gt;A:&lt;/denchmark-h&gt;
+
+&lt;denchmark-code&gt;Your server has one or more RPC's, and doing a shutdown implies a Cancel on each RPC. This cancel results in all of the outstanding tags to become available (i.e. Next returns with the "tag" set) on the completion queue, but with the "ok" variable set to false. This indicates that this tag can no longer be returned by subsequent Next calls, and the operation associated with this tag was cancelled. This is the ideal moment to release resources associated with this tag.
+Only after all of the tags that were still in use, have been returned by the Next calls, Next will start to return false. In that case, neither "tag" nor "ok" are set by grpc.
+
+So there is a clear distinction between the purpose of "ok" and the bool that gets returned by Next.
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='5' author='chengtbf' date='2020-09-22T09:30:52Z'>
+		&lt;denchmark-h:h3&gt;仍需要确认的问题：&lt;/denchmark-h&gt;
+
+为什么python调用oneflow多机跑完不会挂掉？
+		</comment>
+		<comment id='6' author='chengtbf' date='2020-09-23T06:24:30Z'>
+		shutdown 时，cq 里为什么还有item 呢？ 还有请求没有被处理，表示某个rpc 请求还没有被处理，逻辑上还有错误吧。
+		</comment>
+		<comment id='7' author='chengtbf' date='2020-09-23T08:03:28Z'>
+		
+shutdown 时，cq 里为什么还有item 呢？ 还有请求没有被处理，表示某个rpc 请求还没有被处理，逻辑上还有错误吧。
+
+就是因为shutdown触发了cancel事件，shutdown之前，cq里是没东西的。shutdown之后，cq里才会新塞入用于cancel rpc的item，调用cq_-&gt;Next(&amp;tag, &amp;ok) 得到的ok=false。这个原因在 &lt;denchmark-link:https://groups.google.com/g/grpc-io/c/qtZya6AuGAQ?pli=1&gt;https://groups.google.com/g/grpc-io/c/qtZya6AuGAQ?pli=1&lt;/denchmark-link&gt;
+ 这里有说明
+		</comment>
+	</comments>
+</bug>

@@ -1,0 +1,130 @@
+<bug id='526' author='Tessil' open_date='2020-08-21T09:59:22Z' closed_time='2020-08-21T11:45:17Z'>
+	<summary>QAT with custom QuantizeConfig results in a tensor output mismatch error for Dense layers on export</summary>
+	<description>
+
+Using Quantization Aware Training with a custom  similar to the &lt;denchmark-link:https://www.tensorflow.org/model_optimization/guide/quantization/training_comprehensive_guide#setup_defaultdensequantizeconfig&gt;QAT guide&lt;/denchmark-link&gt;
+ with MobileNetV2 results in an  when converting the model with  in int8. It seems there is an error with the pattern matching as  should match .
+The code below uses a pre-trained MobileNetV2 fine-tuned on the tf_flowers dataset. The problem seems to be with the Dense layers as exclusively quantizing the Conv2D layers works fine.
+Using tfmot.quantization.keras.quantize_model(trained_model) without any custom QuantizeConfig also works.
+System information
+TensorFlow version (installed from source or binary): 2.3.0 from binary
+TensorFlow Model Optimization version (installed from source or binary): 0.4.1 from binary
+Python version: 3.6.11
+Code to reproduce the issue
+import tensorflow as tf
+import tensorflow_datasets as tfds
+import tensorflow_model_optimization as tfmot
+
+class QuantizeConfigTest(tfmot.quantization.keras.QuantizeConfig):
+    def get_weights_and_quantizers(self, layer):
+        return [(layer.kernel, tfmot.quantization.keras.quantizers.LastValueQuantizer(
+                    num_bits=8, symmetric=True, narrow_range=False, per_axis=False
+                ))]
+
+    def get_activations_and_quantizers(self, layer):
+        return []
+
+    def get_output_quantizers(self, layer):
+        return []
+
+    def set_quantize_weights(self, layer, quantize_weights):
+        layer.kernel = quantize_weights[0]
+
+    def set_quantize_activations(self, layer, quantize_activations):
+        return
+
+    def get_config(self):
+        return {}
+
+def get_trained_model(input_shape, train_ds, validation_ds, epochs=5):
+    base_model = tf.keras.applications.MobileNetV2(weights='imagenet', include_top=False,
+                                                   input_shape=input_shape)
+    base_model.trainable = False
+
+    output = base_model.output
+    output = tf.keras.layers.GlobalAveragePooling2D()(output)
+    output = tf.keras.layers.Dropout(0.5)(output)
+    output = tf.keras.layers.Dense(5, activation='softmax')(output)
+
+    model = tf.keras.Model(inputs=base_model.input, outputs=output)
+    model.compile(optimizer='adam', loss='sparse_categorical_crossentropy',
+                  metrics=['accuracy'])
+
+    model.fit(train_ds, validation_data=validation_ds, epochs=epochs)
+    model.trainable = True
+
+    return model
+
+def get_finetuned_qat_model(trained_model, train_ds, validation_ds, epochs=1):
+    def apply_quantizer(layer):
+        if isinstance(layer, tf.keras.layers.Dense):
+            return tfmot.quantization.keras.quantize_annotate_layer(layer, QuantizeConfigTest())
+        else:
+            return layer
+
+    qat_model = tf.keras.models.clone_model(trained_model, clone_function=apply_quantizer)
+    with tfmot.quantization.keras.quantize_scope({'QuantizeConfigTest': QuantizeConfigTest}):
+        qat_model = tfmot.quantization.keras.quantize_apply(qat_model)
+
+    qat_model.compile(optimizer='adam', loss='sparse_categorical_crossentropy',
+                      metrics=['accuracy'])
+    qat_model.fit(train_ds, validation_data=validation_ds, epochs=epochs)
+
+    return qat_model
+
+def get_preprocessing(input_shape):
+    def preprocess(image, label):
+        image = tf.image.resize(image, input_shape[:2])
+        image = image / 255.0
+
+        return image, label
+    return preprocess
+
+def main():
+    input_shape = (224, 224, 3)
+    batch_size = 64
+
+    train_ds, validation_ds, test_ds = (
+        ds.map(get_preprocessing(input_shape)) for ds in tfds.load(
+            'tf_flowers', split=['train[:80%]','train[80%:90%]', 'train[90%:]'],
+             as_supervised=True, batch_size=batch_size, shuffle_files=True
+        )
+    )
+
+
+    trained_model = get_trained_model(input_shape, train_ds, validation_ds)
+    qat_model = get_finetuned_qat_model(trained_model, train_ds, validation_ds)
+
+    converter = tf.lite.TFLiteConverter.from_keras_model(qat_model)
+    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+    tflite_qat_model = converter.convert()
+
+if __name__ == '__main__':
+    main()
+Output
+&lt;denchmark-code&gt;loc(fused[callsite("functional_1/quant_dense/MatMul"("~/workspace/tf-env/lib/python3.6/site-packages/tensorflow/python/keras/layers/ops/core.py":53:0) at callsite("~/workspace/tf-env/lib/python3.6/site-packages/tensorflow/python/keras/layers/core.py":1198:0 at callsite("~/workspace/tf-env/lib/python3.6/site-packages/tensorflow_model_optimization/python/core/quantization/keras/quantize_wrapper.py":167:0 at callsite("~/workspace/tf-env/lib/python3.6/site-packages/tensorflow/python/autograph/impl/api.py":302:0 at callsite("~/workspace/tf-env/lib/python3.6/site-packages/tensorflow/python/keras/engine/base_layer.py":985:0 at callsite("~/workspace/tf-env/lib/python3.6/site-packages/tensorflow/python/keras/engine/functional.py":508:0 at callsite("~/workspace/tf-env/lib/python3.6/site-packages/tensorflow/python/keras/engine/functional.py":386:0 at callsite("~/workspace/tf-env/lib/python3.6/site-packages/tensorflow/python/keras/engine/base_layer.py":985:0 at callsite("~/workspace/tf-env/lib/python3.6/site-packages/tensorflow/python/keras/saving/saving_utils.py":134:0 at "~/workspace/tf-env/lib/python3.6/site-packages/tensorflow/python/eager/def_function.py":600:0))))))))), callsite("functional_1/quant_dense/LastValueQuant/FakeQuantWithMinMaxVars"("~/workspace/tf-env/lib/python3.6/site-packages/tensorflow/python/framework/op_def_library.py":744:0) at callsite("~/workspace/tf-env/lib/python3.6/site-packages/tensorflow/python/ops/gen_array_ops.py":2922:0 at callsite("~/workspace/tf-env/lib/python3.6/site-packages/tensorflow_model_optimization/python/core/quantization/keras/quant_ops.py":340:0 at callsite("~/workspace/tf-env/lib/python3.6/site-packages/tensorflow_model_optimization/python/core/quantization/keras/quant_ops.py":157:0 at callsite("~/workspace/tf-env/lib/python3.6/site-packages/tensorflow_model_optimization/python/core/quantization/keras/quantizers.py":195:0 at callsite("~/workspace/tf-env/lib/python3.6/site-packages/tensorflow_model_optimization/python/core/quantization/keras/quantize_wrapper.py":132:0 at callsite("~/workspace/tf-env/lib/python3.6/site-packages/tensorflow/python/framework/smart_cond.py":56:0 at callsite("~/workspace/tf-env/lib/python3.6/site-packages/tensorflow_model_optimization/python/core/keras/utils.py":54:0 at callsite("~/workspace/tf-env/lib/python3.6/site-packages/tensorflow_model_optimization/python/core/quantization/keras/quantize_wrapper.py":149:0 at "~/workspace/tf-env/lib/python3.6/site-packages/tensorflow/python/autograph/impl/api.py":302:0)))))))))]): error: 'std.constant' op requires attribute's type ('tensor&lt;5x1280xf32&gt;') to match op's return type ('tensor&lt;*xf32&gt;')
+Traceback (most recent call last):
+  File "~/workspace/tf-env/lib/python3.6/site-packages/tensorflow/lite/python/convert.py", line 199, in toco_convert_protos
+    enable_mlir_converter)
+  File "~/workspace/tf-env/lib/python3.6/site-packages/tensorflow/lite/python/wrap_toco.py", line 38, in wrapped_toco_convert
+    enable_mlir_converter)
+Exception: ~/workspace/tf-env/lib/python3.6/site-packages/tensorflow/python/keras/layers/ops/core.py:53:0: error: 'std.constant' op requires attribute's type ('tensor&lt;5x1280xf32&gt;') to match op's return type ('tensor&lt;*xf32&gt;')
+~/workspace/tf-env/lib/python3.6/site-packages/tensorflow/python/keras/layers/core.py:1198:0: note: called from
+~/workspace/tf-env/lib/python3.6/site-packages/tensorflow_model_optimization/python/core/quantization/keras/quantize_wrapper.py:167:0: note: called from
+~/workspace/tf-env/lib/python3.6/site-packages/tensorflow/python/autograph/impl/api.py:302:0: note: called from
+~/workspace/tf-env/lib/python3.6/site-packages/tensorflow/python/keras/engine/base_layer.py:985:0: note: called from
+~/workspace/tf-env/lib/python3.6/site-packages/tensorflow/python/keras/engine/functional.py:508:0: note: called from
+~/workspace/tf-env/lib/python3.6/site-packages/tensorflow/python/keras/engine/functional.py:386:0: note: called from
+~/workspace/tf-env/lib/python3.6/site-packages/tensorflow/python/keras/engine/base_layer.py:985:0: note: called from
+~/workspace/tf-env/lib/python3.6/site-packages/tensorflow/python/keras/saving/saving_utils.py:134:0: note: called from
+~/workspace/tf-env/lib/python3.6/site-packages/tensorflow/python/eager/def_function.py:600:0: note: called from
+~/workspace/tf-env/lib/python3.6/site-packages/tensorflow/python/keras/layers/ops/core.py:53:0: note: see current operation: %cst_106 = "std.constant"() {value = dense&lt;"0x91C50E3D1ECDC*long hexadecimal string*4BC4E6FE4BB"&gt; : tensor&lt;5x1280xf32&gt;} : () -&gt; tensor&lt;*xf32&gt;
+&lt;/denchmark-code&gt;
+
+	</description>
+	<comments>
+		<comment id='1' author='Tessil' date='2020-08-21T11:45:17Z'>
+		After further investigation the problem doesn't occur in tf-nightly-2.4.0.dev20200821. It seems to be a bug that has been fixed since the latest tf-2.3.0 stable release.
+		</comment>
+	</comments>
+</bug>

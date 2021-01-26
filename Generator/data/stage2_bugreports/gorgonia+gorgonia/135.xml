@@ -1,0 +1,278 @@
+<bug id='135' author='chewxy' open_date='2017-08-13T02:09:38Z' closed_time='2017-09-17T21:54:16Z'>
+	<summary>Iterator.Chan() considered harmful</summary>
+	<description>
+sketch space for describing how to create a chan int of negative length, and how to reproduce it
+&lt;denchmark-h:h1&gt;Background/Context of the Issue&lt;/denchmark-h&gt;
+
+Gorgonia is a library for representing and executing mathematical equations, and performing automatic differentiation. It's like Tensorflow and PyTorch for Go. It's currently undergoing some major internal refactor (that will not affect the public APIs much)
+I was improving the backend  package by splitting up the data structure into a data structure + pluggable execution engine, instead of having built in methods (see also &lt;denchmark-link:https://github.com/gorgonia/gorgonia/issues/128&gt;#128&lt;/denchmark-link&gt;
+). The reasons are so that it's easier to change out execution backends (CPU, GPU... even a network CPU (actual experiment I did was to run a small neural network on a Raspberry Pi and all computation is offshored to my workstation, and vice versa, which turned out to be a supremely bad idea)).
+Another reason was due to the fact that I wanted to do some experiments at my work which use algorithms that involve sparse tensors (see also &lt;denchmark-link:https://github.com/gorgonia/gorgonia/pull/127&gt;#127&lt;/denchmark-link&gt;
+)  for matrix factorization tasks.
+Lastly, I wanted to clean up the generics support of the  package. The current master branch of the  package had a lot of code to support arbitrary tensor types. With the split of execution engines and data structure, more of this support could be offloaded to the execution engine instead.  This package provides a default execution engine  (: &lt;denchmark-link:https://github.com/chewxy/gorgonia/blob/debugrace/tensor/defaultengine.go&gt;https://github.com/chewxy/gorgonia/blob/debugrace/tensor/defaultengine.go&lt;/denchmark-link&gt;
+), which could be extended (example: &lt;denchmark-link:https://github.com/chewxy/gorgonia/blob/debugrace/tensor/example_extension_test.go&gt;https://github.com/chewxy/gorgonia/blob/debugrace/tensor/example_extension_test.go&lt;/denchmark-link&gt;
+) . The idea was to have an  package which held all the code for the default execution engine.
+&lt;denchmark-h:h1&gt;Data Structures&lt;/denchmark-h&gt;
+
+The most fundamental data structure is &lt;denchmark-link:https://github.com/chewxy/gorgonia/blob/debugrace/tensor/internal/storage/header.go#L11&gt;storage.Header&lt;/denchmark-link&gt;
+, which is an analogue for a Go slice: it's a three word structure. It's chosen because it is a ridiculously simple structure can store Go-allocated memory, C-allocated memory and device-allocated memory (like CUDA).
+On top of  is  &lt;denchmark-link:https://github.com/chewxy/gorgonia/blob/debugrace/tensor/array.go#L13&gt;tensor.array&lt;/denchmark-link&gt;
+. It's essentially a  with an additional field for the type. The  field will eventually be phased out once the refactor is complete.
+On top of  are the various implementations of . Chief amongst these is the  struct. Essentially it's a  coupled with some &lt;denchmark-link:https://github.com/chewxy/gorgonia/blob/debugrace/tensor/ap.go#L20&gt;access patterns and meta information&lt;/denchmark-link&gt;
+.
+Access to the data in the  can be achieved by use of &lt;denchmark-link:https://github.com/chewxy/gorgonia/blob/debugrace/tensor/iterator.go#L43&gt;Iterators&lt;/denchmark-link&gt;
+. The  basically assumes that the data is held in a flat slice, and returns the next index on the slice. There are auxiliary methods like  to handle special case tensors like masked tensors, where some elements are masked from operations.
+The bug happens in the Chan method of the FlatIterator type.
+&lt;denchmark-h:h1&gt;How to reproduce&lt;/denchmark-h&gt;
+
+The branch where the bug is known to exist is the  branch,  which can be found here: &lt;denchmark-link:https://github.com/gorgonia/gorgonia/commit/1dee6d288652eeb5138eae4793653150c219335e&gt;1dee6d2&lt;/denchmark-link&gt;
+ .
+
+git checkout debugrace
+Run tests with various GOMAXPROCS like so: GOMAXPROCS=1 go test -run=. . Try it with various GOMAXPROCS, one of them is bound to trigger an issue.
+The test won't panic, because I have added a recover statement here https://github.com/chewxy/gorgonia/blob/debugrace/tensor/dense_viewstack_specializations.go#L636. Removing the deferred function causes a index out of bounds panic.
+All the tests must be run to trigger the issue.
+The issue is found in the test for the Stack function: https://github.com/chewxy/gorgonia/blob/debugrace/tensor/dense_matop_test.go#L768 . If only the stack test is run (for example GOMAXPROCS=1 go test -run=Stack), it is unlikely the problem will show up (I wrote a tiny python script to run it as many times as possible with many GOMAXPROCS configurations and none of them caused an error).
+
+You should get something like this:
+&lt;denchmark-link:https://user-images.githubusercontent.com/471890/29297381-ef9a80b4-81a3-11e7-96c6-88251930a5d8.png&gt;&lt;/denchmark-link&gt;
+
+&lt;denchmark-h:h1&gt;Environments&lt;/denchmark-h&gt;
+
+I've managed to reproduce the issue on OS X, with Go 1.8 and on Ubuntu 16.10 with Go 1.8.2 and Go tip (whatever gvm thinks is Go tip). I've no access to Go on a windows box so I can't test it on Windows.
+&lt;denchmark-h:h1&gt;Magic and Unsafe Use&lt;/denchmark-h&gt;
+
+As part of the refactoring, there are a few magic bits being used. Here I attempt to list them all (may not be exhaustive):
+
+The Go slice structure is re-implemented in https://github.com/chewxy/gorgonia/blob/debugrace/tensor/internal/storage/header.go. Note that here an unsafe.Pointer is used instead of the standard one like reflect.SliceHeader  which stores a uintptr. This is due to the fact that I want Go to keep a reference to the actual slice. This may affect the runtime and memory allocation.. I'm not too sure.
+//go:linkname is used in some internal packages (specific example here: https://github.com/chewxy/gorgonia/blob/debugrace/tensor/internal/execution/generic_arith_vv.go). It's basically just a rename of functions in github.com/chewxy/vecf32 and github.com/chewxy/vecf64. Those packages contain optional AVX/SSE related vector operations like arithmetics. However, those have to be manually invoked via a build tag. By default it uses go algorithms, not SSE/AVX operations.
+//go:linkname is used in unsafe.go: https://github.com/chewxy/gorgonia/blob/debugrace/tensor/unsafe.go#L105. However it should be noted that memmove is never called as after some tests I decided it would be too unsafe to use (also explains why there are comments that say TODO: implement memmove.
+There are several naughty pointer arithmetics at play:
+
+array.sliceInto
+reflect based getting and setting
+overlap checks
+
+
+
+&lt;denchmark-h:h1&gt;What I suspect&lt;/denchmark-h&gt;
+
+I suspect that there may be some naughty things happening in memory (because it only happens when all the tests are run). The problem is I don't know exactly where to start looking.
+	</description>
+	<comments>
+		<comment id='1' author='chewxy' date='2017-08-15T00:26:15Z'>
+		Note: the solution to this was to not use Chan, which is what I did in the current sparse branch. But I would still like to get to the bottom of this
+		</comment>
+		<comment id='2' author='chewxy' date='2017-08-15T10:38:30Z'>
+		I'm getting a few compilation errors when trying to run it:
+&lt;denchmark-code&gt;# github.com/chewxy/gorgonia
+./op_tensor.go:958: zdvdT.Materialize undefined (type tensor.Tensor has no field or method Materialize)
+./operatorPointwise_binary.go:379: t.Materialize undefined (type tensor.Tensor has no field or method Materialize)
+./operatorPointwise_binary.go:387: other.Materialize undefined (type tensor.Tensor has no field or method Materialize)
+./operatorPointwise_binary.go:396: t.Materialize undefined (type tensor.Tensor has no field or method Materialize)
+./operatorPointwise_binary_const.go:16: undefined: tensor.Lt
+./operatorPointwise_binary_const.go:17: undefined: tensor.Gt
+./operatorPointwise_binary_const.go:18: undefined: tensor.Lte
+./operatorPointwise_binary_const.go:19: undefined: tensor.Gte
+./operatorPointwise_binary_const.go:20: undefined: tensor.ElEq
+./operatorPointwise_binary_const.go:21: undefined: tensor.ElNe
+./operatorPointwise_binary.go:396: too many errors
+FAIL	github.com/chewxy/gorgonia [build failed]
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='3' author='chewxy' date='2017-08-15T10:40:37Z'>
+		Yeah, that's fine..  the gorgonia package is still not yet fixed in the refactor. This problem is specific to the tensor subpackage ("github.com/chewxy/gorgonia/tensor"). The tests I refer to are the tests in the tensor package
+		</comment>
+		<comment id='4' author='chewxy' date='2017-08-15T12:35:28Z'>
+		Is this intentional that func extractPointer(a interface{}) unsafe.Pointer { is called on a float32/float64?
+With small values the second data contains the actual value instead of a pointer to the value (&lt;denchmark-link:https://research.swtch.com/interfaces&gt;https://research.swtch.com/interfaces&lt;/denchmark-link&gt;
+ see Memory Optimization). Effectively Header.Ptr is not an  and maybe that confuses the runtime somehow?
+		</comment>
+		<comment id='5' author='chewxy' date='2017-08-15T12:36:33Z'>
+		That's not true since Go 1.4 right (because I recall being quite upset I can no longer stuff small values into interfaces)?
+Also I don't think extractPointer is being used anywhere (there may be a test or two that uses it)
+		</comment>
+		<comment id='6' author='chewxy' date='2017-08-15T14:16:01Z'>
+		Preliminary tests seem to agree with your information. There seems to be some code still about it &lt;denchmark-link:https://github.com/golang/go/blob/964639cc338db650ccadeafb7424bc8ebb2c0f6c/src/runtime/typekind.go#L42&gt;https://github.com/golang/go/blob/964639cc338db650ccadeafb7424bc8ebb2c0f6c/src/runtime/typekind.go#L42&lt;/denchmark-link&gt;
+... but I wasn't able to construct one nor able to find in the compiler in what cases it might be constructed.
+		</comment>
+		<comment id='7' author='chewxy' date='2017-08-15T14:48:58Z'>
+		First interesting datapoint, changing GOGC (e.g. GOGC=off or GOGC=50) can make "broken" test into "working"  one.
+		</comment>
+		<comment id='8' author='chewxy' date='2017-08-15T15:02:24Z'>
+		With GOGC=130 I managed to get a proper segfault:
+&lt;denchmark-code&gt;unexpected fault address 0xb01dfacedebac1e
+fatal error: fault
+[signal SIGSEGV: segmentation violation code=0x1 addr=0xb01dfacedebac1e pc=0x105b125]
+
+goroutine 201 [running]:
+runtime.throw(0x18abf8f, 0x5)
+	/usr/local/Cellar/go/1.8.3/libexec/src/runtime/panic.go:596 +0x95 fp=0xc420045168 sp=0xc420045148
+runtime.sigpanic()
+	/usr/local/Cellar/go/1.8.3/libexec/src/runtime/signal_unix.go:297 +0x28c fp=0xc4200451b8 sp=0xc420045168
+runtime.memmove(0x3ff0000000000000, 0x18adc66, 0x5)
+	/usr/local/Cellar/go/1.8.3/libexec/src/runtime/memmove_amd64.s:163 +0x6b5 fp=0xc4200451c0 sp=0xc4200451b8
+fmt.(*pp).doPrintf(0xc420096f00, 0x18adc66, 0x7, 0xc420045380, 0x1, 0x1)
+	/usr/local/Cellar/go/1.8.3/libexec/src/fmt/print.go:959 +0x12f1 fp=0xc4200452a0 sp=0xc4200451c0
+fmt.Sprintf(0x18adc66, 0x7, 0xc420045380, 0x1, 0x1, 0x101, 0x1d52dc0)
+	/usr/local/Cellar/go/1.8.3/libexec/src/fmt/print.go:196 +0x6a fp=0xc4200452f8 sp=0xc4200452a0
+github.com/chewxy/gorgonia/tensor.NormOrder.String(0xc008000000000000, 0x20, 0x10bcfec)
+	/Users/egon/go/src/github.com/chewxy/gorgonia/tensor/types.go:384 +0x1af fp=0xc4200453a0 sp=0xc4200452f8
+github.com/chewxy/gorgonia/tensor.(*NormOrder).String(0xc4203deb70, 0x18cced0, 0xc4200975c0)
+	&lt;autogenerated&gt;:373 +0x4f fp=0xc4200453e0 sp=0xc4200453a0
+fmt.(*pp).handleMethods(0xc4200975c0, 0x76, 0xc420390c01)
+	/usr/local/Cellar/go/1.8.3/libexec/src/fmt/print.go:596 +0x294 fp=0xc420045470 sp=0xc4200453e0
+fmt.(*pp).printArg(0xc4200975c0, 0x1836360, 0xc4203deb70, 0x76)
+	/usr/local/Cellar/go/1.8.3/libexec/src/fmt/print.go:679 +0x1a0 fp=0xc4200454f8 sp=0xc420045470
+fmt.(*pp).doPrintf(0xc4200975c0, 0x18c4cf0, 0x2d, 0xc420045a78, 0x2, 0x2)
+	/usr/local/Cellar/go/1.8.3/libexec/src/fmt/print.go:998 +0x11e7 fp=0xc4200455d8 sp=0xc4200454f8
+fmt.Sprintf(0x18c4cf0, 0x2d, 0xc420045a78, 0x2, 0x2, 0xc420045688, 0x100f2bf)
+	/usr/local/Cellar/go/1.8.3/libexec/src/fmt/print.go:196 +0x6a fp=0xc420045630 sp=0xc4200455d8
+github.com/pkg/errors.Errorf(0x18c4cf0, 0x2d, 0xc420045a78, 0x2, 0x2, 0x2, 0x0)
+	/Users/egon/go/src/github.com/pkg/errors/errors.go:113 +0x5d fp=0xc420045698 sp=0xc420045630
+github.com/chewxy/gorgonia/tensor.(*Dense).Norm(0xc420590000, 0xc008000000000000, 0x0, 0x2, 0x2, 0x0, 0x0, 0x0)
+	/Users/egon/go/src/github.com/chewxy/gorgonia/tensor/dense_norms.go:336 +0x1675 fp=0xc420045ac8 sp=0xc420045698
+github.com/chewxy/gorgonia/tensor.testNormVal(0xc420590000, 0xc008000000000000, 0x7ff8000000000001, 0x0, 0x0)
+	/Users/egon/go/src/github.com/chewxy/gorgonia/tensor/dense_norms_test.go:14 +0x6a fp=0xc420045b98 sp=0xc420045ac8
+github.com/chewxy/gorgonia/tensor.TestTensor_Norm(0xc42017ad00)
+	/Users/egon/go/src/github.com/chewxy/gorgonia/tensor/dense_norms_test.go:98 +0x10e6 fp=0xc420045fa8 sp=0xc420045b98
+testing.tRunner(0xc42017ad00, 0x18cd750)
+	/usr/local/Cellar/go/1.8.3/libexec/src/testing/testing.go:657 +0x96 fp=0xc420045fd0 sp=0xc420045fa8
+runtime.goexit()
+	/usr/local/Cellar/go/1.8.3/libexec/src/runtime/asm_amd64.s:2197 +0x1 fp=0xc420045fd8 sp=0xc420045fd0
+created by testing.(*T).Run
+	/usr/local/Cellar/go/1.8.3/libexec/src/testing/testing.go:697 +0x2ca
+&lt;/denchmark-code&gt;
+
+This script should help find your own breaking point:
+&lt;denchmark-code&gt;#!/bin/bash
+
+for gc in `seq 100 5 200`;
+do
+	echo "======= GOGC=$gc ======="
+	GOGC=$gc GOMAXPROCS=1 go test .
+done
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='9' author='chewxy' date='2017-08-15T15:11:19Z'>
+		GOGC=129:
+&lt;denchmark-code&gt;unexpected fault address 0xb01dfacedebac1e
+fatal error: fault
+[signal SIGSEGV: segmentation violation code=0x1 addr=0xb01dfacedebac1e pc=0x105b0dc]
+
+goroutine 183 [running]:
+runtime.throw(0x18abf8f, 0x5)
+	/usr/local/Cellar/go/1.8.3/libexec/src/runtime/panic.go:596 +0x95 fp=0xc420045858 sp=0xc420045838
+runtime.sigpanic()
+	/usr/local/Cellar/go/1.8.3/libexec/src/runtime/signal_unix.go:297 +0x28c fp=0xc4200458a8 sp=0xc420045858
+runtime.memmove(0x3ff0000000000000, 0x18cad52, 0x3d)
+	/usr/local/Cellar/go/1.8.3/libexec/src/runtime/memmove_amd64.s:188 +0x66c fp=0xc4200458b0 sp=0xc4200458a8
+fmt.(*pp).doPrintf(0xc4200960c0, 0x18cad52, 0x57, 0xc420045b10, 0x2, 0x2)
+	/usr/local/Cellar/go/1.8.3/libexec/src/fmt/print.go:959 +0x12f1 fp=0xc420045990 sp=0xc4200458b0
+fmt.Sprintf(0x18cad52, 0x57, 0xc420045b10, 0x2, 0x2, 0xc420045a40, 0x100f2bf)
+	/usr/local/Cellar/go/1.8.3/libexec/src/fmt/print.go:196 +0x6a fp=0xc4200459e8 sp=0xc420045990
+github.com/pkg/errors.Errorf(0x18cad52, 0x57, 0xc420045b10, 0x2, 0x2, 0x3, 0x1868800)
+	/Users/egon/go/src/github.com/pkg/errors/errors.go:113 +0x5d fp=0xc420045a50 sp=0xc4200459e8
+github.com/chewxy/gorgonia/tensor.Shape.Repeat(0xc42011aca0, 0x3, 0x3, 0x0, 0x1cd16b0, 0x3, 0x3, 0x0, 0x0, 0x0, ...)
+	/Users/egon/go/src/github.com/chewxy/gorgonia/tensor/shape.go:281 +0x2f7 fp=0xc420045b60 sp=0xc420045a50
+github.com/chewxy/gorgonia/tensor.StdEng.denseRepeat(0x1ce7560, 0xc42010d540, 0x0, 0x1cd16b0, 0x3, 0x3, 0xbed3039bb9, 0x0, 0x20, 0x18)
+	/Users/egon/go/src/github.com/chewxy/gorgonia/tensor/defaultengine_matop.go:273 +0xa2 fp=0xc420045c68 sp=0xc420045b60
+github.com/chewxy/gorgonia/tensor.StdEng.Repeat(0x1ce6100, 0xc42010d540, 0x0, 0x1cd16b0, 0x3, 0x3, 0x1813ea0, 0x18860a0, 0x1, 0x1fb7808)
+	/Users/egon/go/src/github.com/chewxy/gorgonia/tensor/defaultengine_matop.go:264 +0x11a fp=0xc420045cd8 sp=0xc420045c68
+github.com/chewxy/gorgonia/tensor.(*StdEng).Repeat(0x1d4f368, 0x1ce6100, 0xc42010d540, 0x0, 0x1cd16b0, 0x3, 0x3, 0xc420045e50, 0x1, 0x1, ...)
+	&lt;autogenerated&gt;:533 +0x8e fp=0xc420045d38 sp=0xc420045cd8
+github.com/chewxy/gorgonia/tensor.(*Dense).Repeat(0xc42010d540, 0x0, 0x1cd16b0, 0x3, 0x3, 0xc420045e50, 0x1, 0x1, 0x1)
+	/Users/egon/go/src/github.com/chewxy/gorgonia/tensor/dense_matop.go:250 +0xb6 fp=0xc420045da0 sp=0xc420045d38
+github.com/chewxy/gorgonia/tensor.TestDense_Repeat(0xc42029ec30)
+	/Users/egon/go/src/github.com/chewxy/gorgonia/tensor/dense_matop_test.go:432 +0x11c fp=0xc420045fa8 sp=0xc420045da0
+testing.tRunner(0xc42029ec30, 0x18cd5b0)
+	/usr/local/Cellar/go/1.8.3/libexec/src/testing/testing.go:657 +0x96 fp=0xc420045fd0 sp=0xc420045fa8
+runtime.goexit()
+	/usr/local/Cellar/go/1.8.3/libexec/src/runtime/asm_amd64.s:2197 +0x1 fp=0xc420045fd8 sp=0xc420045fd0
+created by testing.(*T).Run
+	/usr/local/Cellar/go/1.8.3/libexec/src/testing/testing.go:697 +0x2ca
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='10' author='chewxy' date='2017-08-15T20:00:04Z'>
+		if 0xb01dfacdebac1e is not an edited memory address, it's extremely remarkable that it errored at a human readble memory.
+Both these segfaults are interesting - they relate to strings and pointers from strings. Will read more
+		</comment>
+		<comment id='11' author='chewxy' date='2017-08-15T21:54:27Z'>
+		So I ran this
+&lt;denchmark-code&gt;cat /dev/null &gt; err.txt
+cat /dev/null &gt; out.txt
+for gc in `seq 0 1 250`;
+do
+	echo "======= GOGC=$gc =======" &gt;&gt; err.txt
+	echo "======= GOGC=$gc =======" &gt;&gt; out.txt
+	GOGC=$gc GOMAXPROCS=1 go test -run=. &gt;&gt; out.txt 2&gt;&gt; err.txt
+done
+&lt;/denchmark-code&gt;
+
+There were no segfaults.
+		</comment>
+		<comment id='12' author='chewxy' date='2017-08-16T09:18:08Z'>
+		 is a poison address... see &lt;denchmark-link:https://go.googlesource.com/go/+/17f9423&gt;https://go.googlesource.com/go/+/17f9423&lt;/denchmark-link&gt;
+
+		</comment>
+		<comment id='13' author='chewxy' date='2017-08-16T22:16:40Z'>
+		Ran this on a macbook with 1.8.3 ... can't find the poison address either. What the hell is happening?
+		</comment>
+		<comment id='14' author='chewxy' date='2017-08-16T22:20:38Z'>
+		I'm also trying to learn what the diff is between &lt;denchmark-link:https://github.com/davecgh&gt;@davecgh&lt;/denchmark-link&gt;
+ 's &lt;denchmark-link:https://github.com/davecgh/go-spew&gt;go-spew&lt;/denchmark-link&gt;
+ that caused a poison address bug about a year back and how he fixed it...
+		</comment>
+		<comment id='15' author='chewxy' date='2017-08-17T11:02:44Z'>
+		I wasn't able to crash it with 1.9rc2 on Windows either, but I was able to get a few different values:
+&lt;denchmark-code&gt;2017/08/17 11:09:34 id 825743092544 c0421fab40  (-3, 0) | 6 
+2017/08/17 11:09:46 id 8027139005968310646 6f662065756c6176  (-1, 0) | 6 
+2017/08/17 11:09:58 id 7596763766493112403 696d206570616853  (-1, 0) | 6 
+2017/08/17 11:10:23 id 8027139005968310646 6f662065756c6176  (-1, 0) | 6 
+2017/08/17 11:11:15 id 40 28  (-1, 0) | 6 
+2017/08/17 11:11:39 id 8318823007734479427 73726573555c3a43  (-1, 0) | 6 
+2017/08/17 11:11:51 id 8027139005968310646 6f662065756c6176  (-1, 0) | 6 
+2017/08/17 11:12:29 id 8027139005968310646 6f662065756c6176  (-1, 0) | 6 
+2017/08/17 11:14:11 id 825745926400 c0424ae900  (-3, 0) | 6 
+2017/08/17 11:14:22 id 8027139005968310646 6f662065756c6176  (-1, 0) | 6 
+2017/08/17 11:14:34 id 7863412971331805507 6d20746f6e6e6143  (-1, 0) | 6 
+2017/08/17 11:14:46 id 8028074728749885764 6f69736e656d6944  (-1, 0) | 6 
+2017/08/17 11:14:58 id 8027139005968310646 6f662065756c6176  (-1, 0) | 6 
+2017/08/17 11:17:59 id 7863412971331805507 6d20746f6e6e6143  (-1, 0) | 6 
+&lt;/denchmark-code&gt;
+
+The only thing I can deduce is that something is corrupting the memory. I was trying to create boundaries to check content overwriting or misuse &lt;denchmark-link:https://github.com/egonelbre/gorgonia/tree/debugcheck&gt;https://github.com/egonelbre/gorgonia/tree/debugcheck&lt;/denchmark-link&gt;
+... but there's probably some unsafe use I missed. Effectively, write and check Before/After...
+&lt;denchmark-code&gt;type Header struct {
+	Before [256]byte
+	Ptr    unsafe.Pointer
+	L      int
+	C      int
+	After  [256]byte
+}
+&lt;/denchmark-code&gt;
+
+But, yeah... I give up for now. The only thing I can think of is to start replacing all unsafe parts and properly containing them...
+On a sidenote - this looks like a bug:
+&lt;denchmark-code&gt;// swap swaps the elements i and j in the array
+func (a array) swap(i, j int) {
+	if a.t == String {
+		ss := *(*[]string)(a.Ptr)
+		ss[i], ss[j] = ss[j], ss[i]
+		return
+	}
+&lt;/denchmark-code&gt;
+
+		</comment>
+		<comment id='16' author='chewxy' date='2017-08-17T23:13:13Z'>
+		Thanks for that bug finding. :)  I'll go dick around with your example and see what happens
+		</comment>
+		<comment id='17' author='chewxy' date='2017-09-17T21:54:15Z'>
+		This issue was moved to &lt;denchmark-link:https://github.com/gorgonia/tensor/issues/5&gt;gorgonia/tensor#5&lt;/denchmark-link&gt;
+
+		</comment>
+	</comments>
+</bug>
