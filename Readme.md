@@ -21,6 +21,6 @@ Misoo Kim, Youngkyoung Kim, Eunseok Lee, "[Denchmark: A Bug Benchmark of Deep Le
    - Data schema for dataset in JsonSet
 
 # Contributor
-   - Misoo Kim (misoo12@skku.edu)
+   - Misoo Kim (misoo12@skku.edu, hanul1546@gmail.com)
    - Youngkyoung Kim (agnes66@skku.edu)
    - Eunseok Lee (leees@skku.edu)
