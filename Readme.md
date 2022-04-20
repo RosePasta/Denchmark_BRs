@@ -23,3 +23,4 @@ Misoo Kim, Youngkyoung Kim, Eunseok Lee, "[Denchmark: A Bug Benchmark of Deep Le
 # Contributor
    - Misoo Kim (misoo12@skku.edu)
    - Youngkyoung Kim (agnes66@skku.edu)
+   - Eunseok Lee (leees@skku.edu)
