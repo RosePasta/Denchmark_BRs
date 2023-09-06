@@ -19,7 +19,7 @@ target_languages  = ["javascript","python","java","go","c++","ruby","typescript"
 
 date_criteria = datetime.datetime(2020, 1, 1)
 
-access_tokens = [ "eb70e3bb56fb272e26cb94810a5c18a87a7beaab", "69c6b06d66e7af6943f3058266587935278ad901"]
+access_tokens = [ "your_own_token"]
 token_id = 0
 g = Github(access_tokens[token_id])
 
